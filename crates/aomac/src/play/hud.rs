@@ -648,6 +648,11 @@ impl Hud {
         Some(self.shortcuts.get(bar)?.slot_screen_pos(gui, slot))
     }
 
+    #[cfg(test)]
+    pub(super) fn bar_slot_names(&self, bar: usize) -> Vec<String> {
+        self.shortcuts.get(bar).map(|b| b.slot_names()).unwrap_or_default()
+    }
+
     /// True while the pointer carries an inventory item.
     pub(super) fn item_dragging(&self) -> bool {
         self.stats.dragging_item()

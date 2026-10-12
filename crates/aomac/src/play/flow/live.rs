@@ -9,7 +9,7 @@
 //! `clickdyn=<instance>` world click on a dynel, `mdrag=x1:y1:x2:y2` GUI drag, `watch=secs` own-stat changes.
 //! `rightclickitem=<slot hex>` real right-click on the bag/wear cell currently showing `inv`'s slot (bug 10 equip/unequip/use).
 //! `ncurightclick` real right-click on the NCU window's first row (bug 21 cancel). `dragnano=<bar>:<slot>` drags the
-//! Programs window's first row onto a shortcut bar slot (bug 18).
+//! Programs window's first row onto a shortcut bar slot (bug 18). `barnames` prints bar 0's slot names, `clickslot=<bar>:<slot>` real-clicks one.
 //! `nanos` prints learned program IDs; `buffs` prints running buffs and NCU usage.
 //! `down=KEY` / `up=KEY` hold across steps; `clickcorpse` / `rightcorpse` click a visible, GUI-unobscured corpse pick point.
 //! `focuslost` cancels held game input as the host's window-focus-loss event does.
@@ -1037,6 +1037,20 @@ fn live_walk() {
                 l.p.input(ao_gui::InputEvent::MouseUp { x: bx, y: by, button: ao_gui::MouseButton::Left }, &mut l.o.host);
                 l.tick();
                 eprintln!("dragnano to bar {bar} slot {slot} at ({bx},{by})");
+            }
+            // `barnames`: slot names of shortcut bar 0 (verifies a persisted nano/macro/action survives a relog).
+            "barnames" => eprintln!("barnames {:?}", l.p.hud.as_ref().unwrap().bar_slot_names(0)),
+            // `clickslot=<bar>:<slot>`: real left click (press/release, GUI mouse dispatch) activating a shortcut bar slot.
+            "clickslot" => {
+                let (bar, slot) = v.split_once(':').map(|(b, s)| (b.parse().unwrap(), s.parse().unwrap())).unwrap();
+                let (x, y) = l.p.hud.as_ref().unwrap().shortcut_slot_pos(&l.p.gui, bar, slot).expect("shortcut bar/slot out of range");
+                l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
+                for ev in [ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }] {
+                    l.tick();
+                    l.p.input(ev, &mut l.o.host);
+                }
+                l.tick();
+                eprintln!("clickslot bar {bar} slot {slot} at ({x},{y})");
             }
             // `clickdyn=[shift+|ctrl+]<instance>` / `hoverdyn=…`: left-click / hover the first screen point whose pick ray hits the dynel's box
             // with those modifiers held; `hoverdyn` prints the pointer sprites (GFX_GUI_POINTER* 0x135..0x14e) of the frame
