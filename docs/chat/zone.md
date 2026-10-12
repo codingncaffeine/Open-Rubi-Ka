@@ -159,4 +159,16 @@ is delivered by the chat server: `ChatGUIModule_c::HandleVicinityMessage` [GUI 0
 
 * `SimpleChar_t+0x80` (condition for `FormatFeedbackIIR_t`): meaning unknown (`header_is_char` is the caller's decision).
 * Consumer of signal `GlobalSignals_c+0x1d8` (FormatFeedback mode 1) and the overlay behaviour of AFCM `0x19` (`RenderTextModule_t`).
+* **Confirmed PRK server-side off-by-one (not an aomac bug), equip refusal text.** Retail Gamecode's criteria evaluator [GC `FUN_100065d8`] case 2
+  (`op` 2, "greater than": a requirement record `[stat, N, 2]` passes when `value > N`) feeds `RemoteFormat::Feed(..., N + 1)` before dumping the
+  `Feedback_IsRequiredToBeAtLeast` blob — i.e. retail always transmits the *display* minimum (`N + 1`), not the raw record threshold `N`. A live
+  PRK capture (item 85693 "Battered Flak Body Armor", rdb criteria `[18, 7, 2]` = Stamina) showed the server's refusal text reading "Your Stamina is
+  required to be at least 7!" while aomac's own Info panel — computed entirely client-side from the same rdb criterion via
+  `item_effects::criterion`'s `op == 2 => value.wrapping_add(1)` branch, docs/gui.md's item-tooltip path — correctly showed "8" (the character's
+  actual Stamina needed to pass, matching `value > 7`). `ao_net::n3::chat::parse_remote`/`from_base85` is a lossless round-trip of whatever
+  `RemoteFormat::Feed` encoded (`RfArg::Int(v) => f.int(*v)` plugs the wire integer in with no arithmetic), so aomac cannot be introducing this
+  difference: the number reaching the player is exactly what the server put on the wire. This means PRK's server sends the raw criterion value `N`
+  for `Feedback_IsRequiredToBeAtLeast` instead of retail's `N + 1` — a PRK server text bug, off by one low on every "at least" refusal of this kind.
+  The underlying pass/fail decision itself is correct (the item does require Stamina 8, and PRK does refuse below it); only the displayed number is
+  wrong. Nothing to fix client-side; flagged for PRK, not tracked further here.
 * Real traffic: no capture contains these messages; ids/colour codes the server actually uses (and the channel values) are unverified.
