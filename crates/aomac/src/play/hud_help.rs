@@ -11,6 +11,9 @@ pub(super) struct HelpButton {
 }
 impl HelpButton {
     pub(super) fn help_mode(&self) -> bool { self.help_mode }
+    pub(super) fn close(&mut self, gui: &mut Gui) {
+        if let Some(w) = self.window.take() { gui.close_window(w); }
+    }
     pub(super) fn update(&mut self, gui: &mut Gui, values: &DValues, cfg: &mut WinCfgs, screen: (u32, u32)) {
         if !values.flag("ShowHelpButtonWindow") {
             if let Some(w) = self.window.take() { gui.close_window(w); }

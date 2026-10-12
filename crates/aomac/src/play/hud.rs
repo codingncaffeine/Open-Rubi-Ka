@@ -1598,8 +1598,9 @@ impl Hud {
         }
         if let Some(c) = self.compass {
             c.close(gui);
-        self.target.close(gui);
         }
+        self.target.close(gui);
+        self.help_button.close(gui);
         gui.close_window(self.cc);
     }
 }
