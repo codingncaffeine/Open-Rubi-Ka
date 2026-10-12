@@ -38,6 +38,9 @@ pub const STEP_HEIGHT: f32 = 0.48;
 pub const RAY_LIFT: f32 = 0.4;
 /// The solid floor is never below `liquid surface - WADE_DEPTH` (`n3TilemapSurface_t::CalculateClosestPoint`: `y = level - _DAT_1003d370`, 1.2).
 pub const WADE_DEPTH: f32 = 1.2;
+/// Footstep/landing material lookup stays on the ground texture only this close above the terrain surface, else the
+/// client's default material 5 (`_DAT_1015def8`, Gamecode.dll f64, `FUN_10045069`).
+pub const GROUND_MATERIAL_TOLERANCE: f32 = 0.1;
 
 const CELL: f32 = 4.0;
 /// A triangle covering more grid cells than this is kept in the always-tested list.
@@ -271,6 +274,12 @@ impl Terrain {
         let y = t[0][1] - (n[0] * (x - t[0][0]) + n[2] * (z - t[0][2])) / n[1];
         Some((y, n))
     }
+    /// Ground texture id at AO world `(x, z)` (`ground::Tilemap::ground_texture`, the same cell the height came from).
+    fn texture_at(&self, x: f32, z: f32) -> Option<u16> {
+        let tm = &self.tm;
+        let (ix, iz) = ((x / tm.cell_size) as usize, (z / tm.cell_size) as usize);
+        tm.ground_texture(ix, iz)
+    }
 }
 
 impl Collision {
@@ -469,6 +478,20 @@ impl Collision {
     /// dungeons), and never below `liquid level - 1.2`. `None` outside the map / the dungeon rooms.
     pub fn ground(&self, p: [f32; 3]) -> Option<f32> {
         self.closest(p, -1).map(|c| c.pos[1])
+    }
+
+    /// Footstep/landing ground material at `p` (`FUN_10045069` [GC 0x10045069] `local_8`, fed to `PlayGameSound`'s material
+    /// argument): the outdoor tile's ground-texture material ([`ground::ground_material`]) only while `p` is at or within
+    /// `GROUND_MATERIAL_TOLERANCE` (`_DAT_1015def8` = 0.1 m) above the terrain surface; indoors, off the heightfield, or
+    /// higher above it (mid-jump), the client's own default material 5.
+    pub fn ground_material(&self, p: [f32; 3]) -> i32 {
+        let Some(terrain) = &self.terrain else { return 5 };
+        let (x, z) = (p[0], -p[2]);
+        let Some((h, _)) = terrain.at(x, z) else { return 5 };
+        if p[1] > h + GROUND_MATERIAL_TOLERANCE {
+            return 5;
+        }
+        terrain.texture_at(x, z).map_or(0, ground::ground_material)
     }
 
     /// Liquid at the ground point `p` (`liquid_probe` with the point itself as the probed height).
@@ -888,6 +911,24 @@ mod tests {
         assert!(c.veto(&mut p, &mut SurfaceState::default()) && (p[0] - 0.1).abs() < 1e-6);
         let w = c.walk([0.5, 0.0, -1.0], [-3.0, 0.0, -1.0]);
         assert!(w.pos[0] >= 0.0, "{w:?}");
+    }
+
+    #[test]
+    fn ground_material_reads_the_terrain_texture_near_the_surface_else_the_default() {
+        use super::ground::Tilemap;
+        // tile_texture[0] = rdb 1 ("sand", ground::ground_material -> 2), tile_texture[1] = rdb 2 ("grass" -> 15).
+        let tm = Tilemap {
+            cells_x: 2, cells_z: 2, cell_size: 4.0, height_scale: 256.0,
+            tile_texture: vec![1, 2], verts_x: 3, verts_z: 3, heights: vec![0; 9],
+            tiles: vec![0, 1, 0, 1], tile_mask: 0xff,
+        };
+        let c = Collision::build(Vec::new(), Some(Terrain { tm }), None, Vec::new());
+        assert_eq!(c.ground_material([1.0, 0.05, -1.0]), 2, "sand tile, standing on it");
+        assert_eq!(c.ground_material([5.0, 0.05, -1.0]), 15, "grass tile, standing on it");
+        assert_eq!(c.ground_material([1.0, 5.0, -1.0]), 5, "well above the surface: the client's default material");
+        assert_eq!(c.ground_material([-1.0, 0.05, -1.0]), 5, "outside the map: the default material");
+        let indoor = Collision::build(Vec::new(), None, None, Vec::new());
+        assert_eq!(indoor.ground_material([1.0, 0.05, -1.0]), 5, "no outdoor terrain (dungeon): always the default material");
     }
 
     #[test]

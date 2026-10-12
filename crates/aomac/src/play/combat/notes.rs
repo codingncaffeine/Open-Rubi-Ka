@@ -25,6 +25,10 @@ pub mod id {
     /// `attack_effect_1..4` (= the special-attack stat ids 142..145): the same weapon sound path as `attack`.
     pub const ATTACK_EFFECT_1: u32 = 0x8e;
     pub const ATTACK_EFFECT_4: u32 = 0x91;
+    /// `step` / `stepfast` / `left` / `right`: a footfall of the walk/run clip (`FUN_10045069`'s ground-material block).
+    pub const STEP: u32 = 0x26;
+    /// `land`: the jump-landing clip's foot-down event (same ground-material block, silent while still submerged).
+    pub const LAND: u32 = 0x85;
 }
 
 /// `FUN_10075c84` [DS 0x10075c84]: the note id of an event name, in the function's order with its `strncmp(name, literal, len(literal))` prefix tests
@@ -130,6 +134,17 @@ pub fn swish_name(note: u32) -> Option<&'static str> {
         0x74 => "SM_Sandy_Swish_kick",
         0x75 => "SM_Sandy_Swish_tail",
         0x76 => "SM_Sandy_Swish_huge",
+        _ => return None,
+    })
+}
+
+/// `SM_Sandy_Game_Feet_Man_{Walk,Land}` (`AnimHolder_t` ctor `FUN_10044702` members `+0x00` / `+0x20`, played by notes `STEP` / `LAND`
+/// when the character has no NPC record). Every breed and sex shares these same two samples: the ctor's third foot sound,
+/// `SM_Sandy_Game_Feet_Atrox_Land` (`+0x24`), is dead data with no reader in `FUN_10045069`.
+pub fn footstep_name(note: u32) -> Option<&'static str> {
+    Some(match note {
+        id::STEP => "SM_Sandy_Game_Feet_Man_Walk",
+        id::LAND => "SM_Sandy_Game_Feet_Man_Land",
         _ => return None,
     })
 }
@@ -241,6 +256,13 @@ mod tests {
         ] {
             assert_eq!(note_id(n), want, "{n:?}");
         }
+    }
+
+    #[test]
+    fn footstep_sounds_are_the_shared_man_samples_whatever_breed_or_sex() {
+        assert_eq!(footstep_name(id::STEP), Some("SM_Sandy_Game_Feet_Man_Walk"));
+        assert_eq!(footstep_name(id::LAND), Some("SM_Sandy_Game_Feet_Man_Land"));
+        assert_eq!(footstep_name(id::ATTACK), None);
     }
 
     #[test]

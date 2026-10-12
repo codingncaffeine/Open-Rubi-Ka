@@ -49,6 +49,29 @@ impl Tilemap {
     pub fn tile(&self, x: usize, z: usize) -> u16 {
         self.tiles[z * (self.verts_x - 1) + x] & self.tile_mask
     }
+    /// Ground texture rdb id (1010006/1010021/1010022) under a cell: `tile_texture[tile(x, z)]`
+    /// (`n3Tilemap_t::GetMainTileIDs()[idx]`, consumed by [`ground_material`]).
+    pub fn ground_texture(&self, x: usize, z: usize) -> Option<u16> {
+        self.tile_texture.get(self.tile(x, z) as usize).copied()
+    }
+}
+
+/// Footstep/landing sound material of a ground texture id (`n3TilemapController_t::GetTileMaterialType` [N3 0x10018420],
+/// rdb `1000024`/1 `RDBTileMaterial_t`; loader `RDBTileMaterial_t::ReadBlob` [N3 0x1001c537] string-matches each entry's raw
+/// texture-name hash against ~60 known ground texture names and bakes the small material id in place). Transcribed directly
+/// from the decoded live blob (format 2, 61 entries; every id/material pair verified by re-hashing the matched name with the
+/// same case-insensitive rotating-xor hash as `ao_audio::sbf::sound_id`) rather than the name table, since the resolved ints
+/// are smaller and exactly equivalent. An id absent here is 0 (the loader's own unmatched-name default, e.g. rdb tile 937).
+const GROUND_MATERIAL: &[(u16, i32)] = &[
+    (1, 2), (2, 15), (5, 14), (6, 14), (8, 2), (10, 3), (12, 3), (13, 14), (15, 4), (16, 4), (17, 1), (18, 5), (19, 3), (20, 14),
+    (21, 5), (22, 5), (23, 5), (24, 5), (25, 5), (26, 5), (27, 16), (258, 15), (259, 2), (291, 6), (312, 1), (313, 5), (329, 3),
+    (330, 14), (364, 14), (395, 2), (397, 3), (409, 1), (410, 1), (411, 14), (437, 17), (463, 2), (473, 14), (476, 10), (548, 3),
+    (562, 14), (585, 14), (606, 2), (640, 14), (673, 14), (685, 6), (702, 14), (703, 14), (704, 14), (706, 14), (720, 14), (741, 14),
+    (748, 5), (752, 17), (774, 0), (788, 3), (828, 14), (849, 14), (882, 2), (915, 5), (916, 5), (937, 0),
+];
+
+pub fn ground_material(texture: u16) -> i32 {
+    GROUND_MATERIAL.iter().find(|&&(t, _)| t == texture).map_or(0, |&(_, m)| m)
 }
 
 /// Minimal object-archive walker: name table + objects, returns the members of object 1.
@@ -283,5 +306,15 @@ mod tests {
         raw[3] = 100;
         let tm = parse(&fixture(&raw)).unwrap();
         assert_eq!(tm.heights[3] >> 8, 44);
+    }
+
+    #[test]
+    fn ground_material_resolves_known_footstep_textures_and_defaults_unknown_ids_to_zero() {
+        assert_eq!(ground_material(1), 2, "sand");
+        assert_eq!(ground_material(2), 15, "grass");
+        assert_eq!(ground_material(291), 6, "drygrass");
+        assert_eq!(ground_material(476), 10, "shadow1_lava");
+        assert_eq!(ground_material(774), 0, "shadowbrink, its own explicit zero");
+        assert_eq!(ground_material(9999), 0, "unlisted texture id: the loader's own unmatched-name default");
     }
 }

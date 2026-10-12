@@ -1766,6 +1766,7 @@ impl Dynels {
                     self.weapon_hit(who, note, h);
                 }
             }
+            id::STEP | id::LAND => self.footstep(who, note),
             _ => {}
         }
     }
@@ -1792,6 +1793,25 @@ impl Dynels {
         let Some(at) = self.char_pos(who) else { return };
         let id = self.record_of(who).and_then(|(sounds, _)| self.pick_of(&sounds, note));
         self.sounds.extend(id.map(|id| GameSound::at(id, at)));
+    }
+
+    /// Notes `step`/`stepfast`/`left`/`right` (0x26) and `land` (0x85, `FUN_10045069`'s ground-material block): a player plays
+    /// `SM_Sandy_Game_Feet_Man_Walk` / `_Land`, a creature a value of its record's list `note`; both with the ground material
+    /// under the character ([`ao_formats::playfield::collision::Collision::ground_material`]). A `land` note is silent while the
+    /// character is still in liquid (`FUN_10045069`'s submersion guard: no splash thud for the jump-landing clip).
+    fn footstep(&mut self, who: i32, note: u32) {
+        use super::combat::notes::id;
+        let (Some(at), Some(npc)) = (self.char_pos(who), self.chars.get(&who).map(|c| c.npc)) else { return };
+        if note == id::LAND && self.collision.as_ref().is_some_and(|c| c.borrow().liquid_at(at).is_some()) {
+            return;
+        }
+        let sound = if npc {
+            self.record_of(who).and_then(|(sounds, _)| self.pick_of(&sounds, note))
+        } else {
+            super::combat::notes::footstep_name(note).map(ao_audio::sbf::sound_id)
+        };
+        let material = self.collision.as_ref().map_or(5, |c| c.borrow().ground_material(at));
+        self.sounds.extend(sound.map(|id| GameSound { id, pos: at, material, size: 1 }));
     }
 
     /// An `attack` / `attack_effect_N` note of `who`'s swing clip with `key` = the note id: `FUN_100688f9` [GC 0x100688f9] on the item behind the
@@ -4512,6 +4532,39 @@ mod variant_tests {
             let want = rec.iter().find(|s| s.0 == note).map_or(&[][..], |s| &s.1[..]);
             assert_eq!(got.len(), usize::from(!want.is_empty()), "note {note:#x}: {want:?}");
             assert!(got.iter().all(|g| want.contains(&g.id) && g.pos == lp));
+        }
+    }
+
+    /// `step`/`land` notes (the walk/run footfall and jump-landing clip): a player plays the shared `Feet_Man_Walk`/`Feet_Man_Land`
+    /// samples (not something per breed/sex), a creature its own record list instead, with no collision loaded the default
+    /// material 5 (`Collision::ground_material`'s own no-terrain fallback, covered separately in ao-formats).
+    #[test]
+    fn footstep_and_land_notes_play_the_shared_feet_sounds_or_the_creatures_own_list() {
+        use crate::play::combat::notes::id;
+        let Some((mut z, player, leet)) = fight_zone() else { return };
+        let (pp, lp) = (scene_pos(z.world.chars[&player].pose.pos), scene_pos(z.world.chars[&leet].pose.pos));
+        let sid = ao_audio::sbf::sound_id;
+        z.world.note_sounds(player, id::STEP, -1);
+        z.world.note_sounds(player, id::LAND, -1);
+        assert_eq!(
+            z.world.take_sounds(),
+            [
+                GameSound { id: sid("SM_Sandy_Game_Feet_Man_Walk"), pos: pp, material: 5, size: 1 },
+                GameSound { id: sid("SM_Sandy_Game_Feet_Man_Land"), pos: pp, material: 5, size: 1 },
+            ],
+            "no collision loaded: the client's default ground material 5"
+        );
+        let rec = {
+            let c = &z.world.chars[&leet];
+            let Some(Model::Ready { built, .. }) = z.world.models.get(&c.key) else { panic!("leet model not ready") };
+            built.sounds.clone()
+        };
+        for note in [id::STEP, id::LAND] {
+            z.world.note_sounds(leet, note, -1);
+            let got = z.world.take_sounds();
+            let want = rec.iter().find(|s| s.0 == note).map_or(&[][..], |s| &s.1[..]);
+            assert_eq!(got.len(), usize::from(!want.is_empty()), "note {note:#x}: {want:?}");
+            assert!(got.iter().all(|g| want.contains(&g.id) && g.pos == lp && g.material == 5), "a creature plays its own list, not the player's sample, at the same default material");
         }
     }
 
