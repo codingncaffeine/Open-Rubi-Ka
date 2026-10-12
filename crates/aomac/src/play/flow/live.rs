@@ -797,6 +797,13 @@ fn live_walk() {
                 h.set_dvalue(&mut l.p.gui, d, v != "off");
                 l.tick();
             }
+            // `winopen=<dvalue>[:off]`: any other HUD window dvalue (e.g. `team_view`, `mission_window`), for frame checks.
+            "winopen" => {
+                let (d, state) = v.split_once(':').unwrap_or((v, "on"));
+                let h = l.p.hud.as_mut().expect("hud");
+                h.set_dvalue(&mut l.p.gui, d, state != "off");
+                l.tick();
+            }
             "tab" => {
                 l.p.input(ao_gui::InputEvent::Key { key: ao_gui::Key::Tab, pressed: true, mods: ao_gui::Modifiers::default() }, &mut l.o.host);
                 eprintln!("target {:?}", l.p.zone.target);
@@ -1316,6 +1323,13 @@ fn live_walk() {
                 let p = &mut l.p;
                 let i = p.interact.as_mut().unwrap();
                 eprintln!("feedback {:?}\nloot: {:?}", i.take_feedback(), i.loot_dump(&mut p.gui));
+            }
+            // `windump`: all open window ids, outer position/size and named views, for locating tab/click targets.
+            "windump" => {
+                let p = &l.p;
+                for w in p.gui.window_ids() {
+                    eprintln!("window {w:?} pos={:?} size={:?} views={:?}", p.gui.window_pos(w), p.gui.outer_size(w), p.gui.view_names(w));
+                }
             }
             "grid" => {
                 let p = &l.p;
