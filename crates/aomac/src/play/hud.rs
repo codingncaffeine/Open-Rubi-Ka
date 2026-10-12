@@ -788,8 +788,20 @@ impl Hud {
         let mode = self.dvalues.get_i64("MouseCursorMode").unwrap_or(2);
         let dblclick = self.dvalues.get_i64("DoubleclickAction").is_none_or(|v| v != 0);
         let (mx, my) = self.target.mouse_pos();
-        let gui_item_hover = host.mods.shift && self.stats.info_slot_at(gui, zone, mx, my).is_some();
+        let gui_item_hover = host.mods.shift && self.icon_hover_at(gui, zone, mx, my);
         self.target.draw_cursor(gui, zone, player, host, list, self.size, mode, dblclick, self.help_button.help_mode(), gui_item_hover);
+    }
+
+    /// Whether the mouse sits over any of the GUI's 8 shift-to-inspect icon categories: `MP_Item_Icon` / `MP_Ref_Icon`
+    /// (Wear/Inventory, `HudStats::info_slot_at`), `MP_Spell_Icon` (Nano/Programs, NCU), `MP_Quest_Icon` (Mission),
+    /// `MP_Action_Icon` / `MP_Macro_Icon` (shortcut bar; this port has no separate macro-bar concept, dragged macros
+    /// render in the same shortcut slots). `MP_TradeItem_Icon` / `MP_ShopItem_Icon` are covered by `Interact::icon_hover_at`.
+    pub(super) fn icon_hover_at(&self, gui: &Gui, zone: &Zone, x: f32, y: f32) -> bool {
+        self.stats.info_slot_at(gui, zone, x, y).is_some()
+            || self.nano.icon_at(gui, x, y)
+            || self.ncu.icon_at(gui, x, y)
+            || self.mission.icon_at(gui, x, y)
+            || self.shortcuts.iter().any(|b| b.slot_at(gui, x, y).is_some())
     }
 
     pub(super) fn take_uses(&mut self) -> Vec<SlotUse> {

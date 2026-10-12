@@ -77,6 +77,11 @@ impl HudNcu {
         kind == WindowKind::Ncu
     }
 
+    /// Whether `(x, y)` sits over an NCU buff icon in the grid (`MP_Spell_Icon`, shift-to-inspect cursor).
+    pub(super) fn icon_at(&self, gui: &Gui, x: f32, y: f32) -> bool {
+        self.win.as_ref().is_some_and(|w| w.view.row_at(gui, w.win, x, y, lv::ICON_32).is_some())
+    }
+
     pub(super) fn set_screen(&mut self, screen: (u32, u32)) {
         self.screen = screen;
         if let Some(w) = &mut self.win {

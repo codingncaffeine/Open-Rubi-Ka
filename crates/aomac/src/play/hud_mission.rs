@@ -96,6 +96,11 @@ impl HudMission {
         kind == WindowKind::Mission
     }
 
+    /// Whether `(x, y)` sits over a quest icon in the Mission list (`MP_Quest_Icon`, shift-to-inspect cursor).
+    pub(super) fn icon_at(&self, gui: &Gui, x: f32, y: f32) -> bool {
+        self.win.as_ref().is_some_and(|w| w.view.row_at(gui, w.win, x, y, lv::ICON_32).is_some())
+    }
+
     pub(super) fn set_screen(&mut self, screen: (u32, u32)) {
         self.screen = screen;
         if let Some(w) = &mut self.win {
@@ -408,5 +413,27 @@ mod tests {
         m.quests.push(quest(3, "Keep", 1 << 10, 0));
         m.remove(&zone, 3);
         assert!(m.take_outbox().is_empty());
+    }
+
+    /// `MP_Quest_Icon`: `icon_at` finds a quest row and misses empty space (regression for the shift-to-inspect cursor).
+    #[test]
+    fn icon_at_finds_quest_row() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() || !dir.join("cd_image/gui").exists() {
+            eprintln!("skipping: no client");
+            return;
+        }
+        let labels = TextDb::load(&dir).unwrap();
+        let mut gui = Gui::new(&dir, Some(Box::new(move |s: &str| Some(labels.label(s)).filter(|r| r != s)))).unwrap();
+        let mut m = HudMission::new(&dir, (1100, 760)).unwrap();
+        m.open(&mut gui);
+        m.quests = vec![quest(1, "Rat Hunt", 0, 0)];
+        m.sync = Some((0, 0.0));
+        m.serial += 1;
+        m.update(&mut gui, 0.0);
+        let win = m.win.as_ref().unwrap();
+        let r = gui.view_rect(win.win, "lv_line0").unwrap();
+        assert!(m.icon_at(&gui, r.l + 2.0, r.t + 2.0));
+        assert!(!m.icon_at(&gui, 0.0, 0.0));
     }
 }

@@ -101,6 +101,11 @@ impl HudNano {
         kind == WindowKind::Nano
     }
 
+    /// Whether `(x, y)` sits over a nano/program icon in the Programs grid (`MP_Spell_Icon`, shift-to-inspect cursor).
+    pub(super) fn icon_at(&self, gui: &Gui, x: f32, y: f32) -> bool {
+        self.win.as_ref().is_some_and(|w| w.w.view.row_at(gui, w.w.win, x, y, lv::ICON_32).is_some())
+    }
+
     pub(super) fn set_screen(&mut self, screen: (u32, u32)) {
         self.screen = screen;
         if let Some(w) = &mut self.win {
@@ -537,5 +542,30 @@ mod tests {
         // double click on the nano casts it on self (Shadow Touch needs no target)
         let frames = s.nano.take_outbox();
         assert!(frames.is_empty());
+    }
+
+    /// `MP_Spell_Icon`: `icon_at` finds the Programs grid icon and misses empty space (regression for the shift-to-inspect cursor).
+    #[test]
+    fn icon_at_finds_programs_grid_icon() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() || !dir.join("cd_image/gui").exists() {
+            eprintln!("skipping: no client");
+            return;
+        }
+        let size = (1100, 760);
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut rollup = Rollup::new(&dir, size);
+        let mut programs = HudNano::new(&dir, size).unwrap();
+        let mut zone = Zone::new(7);
+        zone.nanos.programs = vec![163449];
+        zone.nanos.serial += 1;
+        programs.open(&mut gui, &mut rollup);
+        programs.set_page(4);
+        programs.update(&mut gui, &zone, 0.0);
+        assert_eq!(programs.shown(), vec![163449]);
+        let win = programs.win.as_ref().unwrap();
+        let r = gui.view_rect(win.w.win, "grid").unwrap();
+        assert!(programs.icon_at(&gui, r.l + lv::BORDER + 2.0, r.t + lv::BORDER + 2.0));
+        assert!(!programs.icon_at(&gui, 0.0, 0.0));
     }
 }

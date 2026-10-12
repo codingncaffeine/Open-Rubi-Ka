@@ -358,7 +358,7 @@ impl ShortcutBar {
     }
 
     /// Slot under a screen position.
-    fn slot_at(&self, gui: &Gui, x: f32, y: f32) -> Option<usize> {
+    pub(super) fn slot_at(&self, gui: &Gui, x: f32, y: f32) -> Option<usize> {
         if !gui.window_visible(self.window) { return None; }
         let (px, py) = gui.window_pos(self.window);
         let (lx, ly) = (x - px as f32 - CHROME_W, y - py as f32);
@@ -701,6 +701,20 @@ mod tests {
         assert!(bar.drag.is_some(), "other button release does not end the captured drag");
         bar.input(&mut gui, &InputEvent::MouseUp { x, y, button: MouseButton::Right }, &list, Default::default());
         assert!(bar.drag.is_none());
+    }
+
+    /// `MP_Action_Icon` / `MP_Macro_Icon`: `slot_at` finds a bar slot and misses empty space (regression for the
+    /// shift-to-inspect cursor; this port has no separate macro bar, macros share the shortcut bar's slots).
+    #[test]
+    fn slot_at_finds_a_bar_slot() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let bar = ShortcutBar::new(&mut gui, &dir, 0, (1280, 800)).unwrap();
+        let (x, y) = gui.window_pos(bar.window);
+        let (x, y) = (x as f32 + CHROME_W + 10.0, y as f32 + 10.0);
+        assert_eq!(bar.slot_at(&gui, x, y), Some(0));
+        assert_eq!(bar.slot_at(&gui, 0.0, 0.0), None);
     }
 
     #[test]
