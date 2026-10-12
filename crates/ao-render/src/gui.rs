@@ -11,7 +11,7 @@
 use crate::Renderer;
 use ao_gui::{DrawCmd, DrawList, Gui};
 use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
+use crate::gpu_stats::{GpuStatsExt, TextureViewStatsExt};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -49,7 +49,7 @@ type Batch = (Option<[i32; 4]>, Option<usize>, std::ops::Range<u32>);
 impl GuiRenderer {
     /// View of the shared UNORM gamma-space framebuffer.
     pub fn view(tex: &wgpu::Texture) -> wgpu::TextureView {
-        tex.create_view(&Default::default())
+        tex.create_view_tracked(&Default::default())
     }
 
     /// Uploads the skin atlas of `gui` and builds the pipeline for `r.format`.
@@ -58,7 +58,7 @@ impl GuiRenderer {
         let atlas = gui.atlas();
         let pages = atlas.pages.len().max(1) as u32;
         let (pw, ph) = atlas.pages.first().map_or((1, 1), |p| (p.width, p.height));
-        let tex = device.create_texture(&wgpu::TextureDescriptor {
+        let tex = device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: Some("gui skin atlas"),
             size: wgpu::Extent3d { width: pw, height: ph, depth_or_array_layers: pages },
             mip_level_count: 1,
@@ -76,9 +76,9 @@ impl GuiRenderer {
                 wgpu::Extent3d { width: p.width, height: p.height, depth_or_array_layers: 1 },
             );
         }
-        let gfx_view = tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let gfx_view = tex.create_view_tracked(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
         let ga = gui.glyph_atlas();
-        let glyph_tex = device.create_texture(&wgpu::TextureDescriptor {
+        let glyph_tex = device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: Some("gui glyph atlas"),
             size: wgpu::Extent3d { width: ga.width, height: ga.height, depth_or_array_layers: 1 },
             mip_level_count: 1,
@@ -88,8 +88,8 @@ impl GuiRenderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let glyph_view = glyph_tex.create_view(&Default::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Nearest, min_filter: wgpu::FilterMode::Nearest, ..Default::default() });
+        let glyph_view = glyph_tex.create_view_tracked(&Default::default());
+        let sampler = device.create_sampler_tracked(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Nearest, min_filter: wgpu::FilterMode::Nearest, ..Default::default() });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("gui"),
             entries: &[
@@ -148,7 +148,7 @@ impl GuiRenderer {
             pipeline,
             layout,
             sampler,
-            linear: device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, address_mode_u: wgpu::AddressMode::ClampToEdge, address_mode_v: wgpu::AddressMode::ClampToEdge, ..Default::default() }),
+            linear: device.create_sampler_tracked(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, address_mode_u: wgpu::AddressMode::ClampToEdge, address_mode_v: wgpu::AddressMode::ClampToEdge, ..Default::default() }),
             extras: Vec::new(),
             gfx_view,
             page_px: atlas.pages.iter().map(|p| (p.width as f32, p.height as f32)).collect(),
@@ -173,7 +173,7 @@ impl GuiRenderer {
             self.glyph_version = ga.version;
         }
         for img in gui.extra_images().iter().skip(self.extras.len()) {
-            let t = r.device.create_texture(&wgpu::TextureDescriptor {
+            let t = r.device.create_texture_tracked(&wgpu::TextureDescriptor {
                 label: Some("gui image"),
                 size: wgpu::Extent3d { width: img.w, height: img.h, depth_or_array_layers: 1 },
                 mip_level_count: 1,
@@ -189,7 +189,7 @@ impl GuiRenderer {
                 wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(img.w * 4), rows_per_image: Some(img.h) },
                 wgpu::Extent3d { width: img.w, height: img.h, depth_or_array_layers: 1 },
             );
-            let v = t.create_view(&Default::default());
+            let v = t.create_view_tracked(&Default::default());
             self.extras.push((t, v));
         }
         // vertices + per-clip batches
@@ -273,8 +273,8 @@ impl GuiRenderer {
             return;
         }
         let device = &r.device;
-        let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("gui verts"), contents: bytemuck::cast_slice(&verts), usage: wgpu::BufferUsages::VERTEX });
-        let globals = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let vb = device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor { label: Some("gui verts"), contents: bytemuck::cast_slice(&verts), usage: wgpu::BufferUsages::VERTEX });
+        let globals = device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
             label: Some("gui globals"),
             contents: bytemuck::bytes_of(&Globals { screen: [size.0 as f32, size.1 as f32], _pad: [0.0; 2] }),
             usage: wgpu::BufferUsages::UNIFORM,
@@ -284,7 +284,7 @@ impl GuiRenderer {
                 Some(k) => (&self.extras[k].1, if gui.extra_images()[k].smooth { &self.linear } else { &self.sampler }),
                 None => (&self.glyph_view, &self.sampler),
             };
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
+            device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
                 label: Some("gui"),
                 layout: &self.layout,
                 entries: &[
@@ -353,7 +353,7 @@ mod tests {
         let mut r = Renderer::new(&instance, None).unwrap();
         r.upload(&ao_scene::Scene::default());
         let (w, h) = (1280u32, 800u32);
-        let out = r.device.create_texture(&wgpu::TextureDescriptor {
+        let out = r.device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             mip_level_count: 1,
@@ -363,7 +363,7 @@ mod tests {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let view = out.create_view(&Default::default());
+        let view = out.create_view_tracked(&Default::default());
         let mut gr = GuiRenderer::new(&r, &gui);
         let rss = |pid: u32| -> u64 {
             let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().unwrap();

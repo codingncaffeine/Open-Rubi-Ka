@@ -224,7 +224,7 @@ impl Renderer {
         }
         let holo = [0x28022, 0x28023].map(|id| view_of.iter().find(|(key, _)| key.id == id).map(|(_, &view)| view));
         let holo = match holo {
-            [Some(a), Some(b)] => Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            [Some(a), Some(b)] => Some(self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
                 label: Some("native Holo textures"), layout: &self.holo_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[a]) },
@@ -244,7 +244,7 @@ impl Renderer {
             }
             let vbytes = vertex_bytes(&mesh.vertices);
             let vertex_capacity = ((vbytes.len() * 4) as u64).next_power_of_two().max(1);
-            let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
+            let vb = self.device.create_buffer_tracked(&wgpu::BufferDescriptor {
                 label: None, size: vertex_capacity, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
             });
             self.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&vbytes));
@@ -261,12 +261,12 @@ impl Renderer {
                 let view = s.texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0);
                 let mut bind = |view: usize, clamp: bool, u: [f32; 20]| {
                     *mat_of.entry((view, clamp, u.map(f32::to_bits))).or_insert_with(|| {
-                        let ub = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        let ub = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                             label: None,
                             contents: bytemuck::bytes_of(&u),
                             usage: wgpu::BufferUsages::UNIFORM,
                         });
-                        mats.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        mats.push(self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
                             label: None,
                             layout: &self.tex_layout,
                             entries: &[
@@ -294,7 +294,7 @@ impl Renderer {
                 }
             }
             let index_capacity = ((indices.len() * 4) as u64).next_power_of_two().max(1);
-            let ib = self.device.create_buffer(&wgpu::BufferDescriptor {
+            let ib = self.device.create_buffer_tracked(&wgpu::BufferDescriptor {
                 label: None, size: index_capacity, usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
             });
             self.queue.write_buffer(&ib, 0, bytemuck::cast_slice(&indices));
@@ -345,7 +345,7 @@ impl Renderer {
                         let reused = self.act.vb_pool.get_mut(&f.model).and_then(Vec::pop);
                         a.vb = Some(match reused {
                             Some(vb) => { self.queue.write_buffer(&vb, 0, &bytes); vb }
-                            None => { self.act.vb_created += 1; self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            None => { self.act.vb_created += 1; self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                                 label: None,
                                 contents: &bytes,
                                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
@@ -433,7 +433,7 @@ impl Renderer {
             layer.cap = xf.len().next_power_of_two().max(64);
             layer.bufs = (0..INST_RING)
                 .map(|_| {
-                    self.device.create_buffer(&wgpu::BufferDescriptor {
+                    self.device.create_buffer_tracked(&wgpu::BufferDescriptor {
                         label: Some("actor instances"),
                         size: (layer.cap * std::mem::size_of::<ActorInstance>()) as u64,
                         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
@@ -521,12 +521,12 @@ fn env_pipe(blend: Blend, two_sided: bool) -> usize {
 
 /// Grows `buf` to `needed` bytes (next power of two), in place, only when it no longer fits (returns `true`);
 /// a no-op otherwise (returns `false`). Mirrors `native_liquid.rs`'s `vertex_capacity`/`index_capacity` buffers.
-fn ensure_capacity(device: &wgpu::Device, buf: &mut wgpu::Buffer, capacity: &mut u64, needed: u64, usage: wgpu::BufferUsages, label: &str) -> bool {
+pub(crate) fn ensure_capacity(device: &wgpu::Device, buf: &mut wgpu::Buffer, capacity: &mut u64, needed: u64, usage: wgpu::BufferUsages, label: &str) -> bool {
     if needed <= *capacity {
         return false;
     }
     *capacity = needed.next_power_of_two().max(1);
-    *buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: *capacity, usage, mapped_at_creation: false });
+    *buf = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some(label), size: *capacity, usage, mapped_at_creation: false });
     true
 }
 
@@ -534,7 +534,7 @@ fn ensure_capacity(device: &wgpu::Device, buf: &mut wgpu::Buffer, capacity: &mut
 /// triangle list, which varies frame to frame for dynamic actor geometry -- buff auras, particle effects -- and
 /// never affects which bind group/pipeline a draw uses). Strips `indices` and reuses the struct's derived
 /// `PartialEq` for the rest, so a new `Submesh` field is automatically covered here instead of silently ignored.
-fn same_material(a: &ao_scene::Submesh, b: &ao_scene::Submesh) -> bool {
+pub(crate) fn same_material(a: &ao_scene::Submesh, b: &ao_scene::Submesh) -> bool {
     let strip = |s: &ao_scene::Submesh| {
         let mut s = s.clone();
         s.indices.clear();
@@ -756,11 +756,11 @@ mod tests {
         let capture = |r: &mut Renderer| -> Vec<u8> {
             r.set_actors(vec![frame.clone()]);
             let targets = Targets::new(r, w, h);
-            let out = r.device.create_texture(&wgpu::TextureDescriptor {
+            let out = r.device.create_texture_tracked(&wgpu::TextureDescriptor {
                 label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
                 dimension: wgpu::TextureDimension::D2, format: r.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
             });
-            r.render(&out.create_view(&Default::default()), &targets, &Camera::look_at(eye.into(), look_at.into()));
+            r.render(&out.create_view_tracked(&Default::default()), &targets, &Camera::look_at(eye.into(), look_at.into()));
             super::texture_to_rgba(r, &out, w, h).unwrap()
         };
         let new_renderer = || {

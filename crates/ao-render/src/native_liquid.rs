@@ -2,6 +2,7 @@
 //! The option changes camera-cell geometry, not the presence of a liquid.
 use ao_scene::{liquid::Surface, Vertex};
 use super::{Renderer, Vec3};
+use crate::gpu_stats::GpuStatsExt;
 
 pub(super) const PIPE: usize = 28;
 
@@ -119,7 +120,7 @@ impl Renderer {
             if vertex_size > run.vertex_capacity || index_size > run.index_capacity {
                 run.vertex_capacity = vertex_size.next_power_of_two();
                 run.index_capacity = index_size.next_power_of_two();
-                let buffer = |label, size, usage| self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
+                let buffer = |label, size, usage| self.device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
                 self.gpu.meshes[run.source.mesh] = Some((
                     buffer("native liquid vertices", run.vertex_capacity, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST),
                     buffer("native liquid indices", run.index_capacity, wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST),

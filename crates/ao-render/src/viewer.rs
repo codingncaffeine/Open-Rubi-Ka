@@ -1,4 +1,5 @@
 use crate::{default_view, Camera, Renderer, Targets, Vec3};
+use crate::gpu_stats::{GpuStatsExt, TextureViewStatsExt};
 use anyhow::Result;
 use ao_scene::Scene;
 use std::collections::HashSet;
@@ -642,7 +643,7 @@ impl State {
                 return quit; // timeout / occluded: skip this frame
             }
         };
-        let view = frame.texture.create_view(&Default::default());
+        let view = frame.texture.create_view_tracked(&Default::default());
         let t0 = self.perf.then(Instant::now);
         let submission = self.renderer.render(&view, &self.targets, &self.cam);
         if let Some(t) = t0 { self.cpu += t.elapsed().as_secs_f32(); }
@@ -902,7 +903,7 @@ impl Offscreen {
 
     /// Renders the current scene with the host camera, draws `list` over it and writes the PNG.
     pub fn png(&mut self, fe: &dyn Frontend, list: &ao_gui::DrawList, path: &std::path::Path) -> Result<()> {
-        let tex = self.r.device.create_texture(&wgpu::TextureDescriptor {
+        let tex = self.r.device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d { width: self.size.0, height: self.size.1, depth_or_array_layers: 1 },
             mip_level_count: 1,
@@ -912,7 +913,7 @@ impl Offscreen {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let view = tex.create_view(&Default::default());
+        let view = tex.create_view_tracked(&Default::default());
         self.r.render(&view, &self.targets, &self.host.camera);
         self.gr.draw(&self.r, &crate::GuiRenderer::view(&tex), self.size, 1, fe.gui(), list);
         crate::texture_to_png(&self.r, &tex, self.size.0, self.size.1, path)

@@ -10,6 +10,8 @@ pub use native_fog::{NativeFog,SharedNativeFog,NativeFogControl};
 mod native_ground;
 mod native_texture;
 mod native_liquid;
+mod gpu_stats;
+use gpu_stats::{GpuStatsExt, TextureViewStatsExt};
 pub use native_ground::GroundPath;
 
 use anyhow::{anyhow, Context, Result};
@@ -19,7 +21,6 @@ pub use winit::keyboard::KeyCode;
 use glam::{Mat4, Vec4};
 use std::collections::HashMap;
 use std::path::Path;
-use wgpu::util::DeviceExt;
 
 pub use gui::GuiRenderer;
 pub use viewer::{run_frontend, GameInput, Offscreen, run_viewer, run_viewer_hooked, run_viewer_live, FrameHook, Frontend, Host, LiveSky};
@@ -354,9 +355,28 @@ struct GroundRun {
 }
 
 /// Sky backdrop with its own mesh/material tables, so [`Renderer::set_sky`] can swap it while the world stays.
+///
+/// `meshes`/`mats`/`mat_of`/`topology` persist across `set_sky` calls (the fast path writes new vertex/index/material
+/// data into them in place instead of recreating buffers and bind groups): `LiveSky` calls `set_sky` about twice a
+/// second for the whole time a zone is outdoors, so recreating every GPU object on every tick (the previous
+/// behaviour) was the dominant confirmed GPU-object leak (`AOMAC_GPU_STATS=1`, live at ICC: a steady, never-zero
+/// per-second churn of sky vertex/index/uniform buffers and bind groups, independent of actor/combat/movement).
 #[derive(Default)]
 struct SkyGpu {
     meshes: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>, // indexed like the uploaded scene's meshes
+    /// Current GPU buffer sizes in bytes of `meshes[i]`, next power of two of the largest vertex/index byte count
+    /// seen since the last full rebuild (mirrors `ModelMesh::vertex_capacity`/`index_capacity` in `actors.rs`).
+    vertex_capacity: Vec<u64>,
+    index_capacity: Vec<u64>,
+    /// `(vertex count, submeshes)` of `meshes[i]`'s last upload: the fast path's eligibility check (same counts
+    /// and `actors::same_material` submeshes) against the new scene's meshes.
+    topology: Vec<(usize, Vec<ao_scene::Submesh>)>,
+    /// Bind group index by `(texture, clamp, uniform)`, content-addressed and persisted: a submesh whose material
+    /// is byte-identical to one already uploaded (the common case -- `Submesh::uv_scroll` is a rate, not a baked
+    /// offset, so a given sky submesh's uniform is stable tick to tick) reuses the existing uniform buffer and
+    /// bind group instead of creating new ones. Bounded by the sky's own small, fairly static material count
+    /// (sun, moon, stars, a handful of cloud/overlay layers); never pruned, same as the rest of this cache.
+    mat_of: HashMap<(Option<TextureKey>, bool, [u32; 20]), usize>,
     mats: Vec<wgpu::BindGroup>,
     draws: Vec<(Draw, u32)>, // (draw, index into `xf`) in scene order
     xf: Vec<Mat4>,
@@ -365,6 +385,13 @@ struct SkyGpu {
     bufs: Vec<wgpu::Buffer>, // ring of per-frame instance transforms (translation = camera)
     colors: Vec<ColorAnim>,
     clouds: Vec<CloudAnim>,
+    /// `set_sky` calls that fell through to a full rebuild (every GPU buffer/bind group recreated), since the
+    /// renderer started: a regression counter, not drained. In steady state (a stable sky mesh/material set) this
+    /// must stop climbing even as `LiveSky` keeps calling `set_sky` with new per-tick vertex data.
+    pub(crate) rebuilds: u64,
+    /// Sky mesh vertex/index GPU buffers actually (re)created (new or capacity-grown) since the renderer started,
+    /// for leak regressions: converges once the sky's largest mesh has been seen and its material set is stable.
+    pub(crate) buffer_creates: u64,
 }
 
 struct CloudAnim {
@@ -408,18 +435,16 @@ pub struct Targets {
 impl Targets {
     pub fn new(r: &Renderer, w: u32, h: u32) -> Self {
         let mk = |format, label| {
-            r.device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: MSAA,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
-                })
-                .create_view(&Default::default())
+            r.device.create_texture_tracked(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: MSAA,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            }).create_view_tracked(&Default::default())
         };
         Self { msaa: mk(r.format, "msaa"), depth: mk(DEPTH, "depth"), size: (w, h) }
     }
@@ -451,6 +476,10 @@ pub struct Renderer {
     cloud_preferences: (bool, bool, bool),
     /// Sky textures by key; kept across [`Renderer::set_sky`] so a live sky only ships new textures.
     sky_views: HashMap<TextureKey, wgpu::TextureView>,
+    /// The untextured-submesh placeholder view, lazily created once and reused (`set_sky`'s fast path runs about
+    /// twice a second for as long as a zone is outdoors; a fresh 1x1 texture every tick was a small but real
+    /// leftover per-tick GPU object churn after the rest of the sky rebuild was fixed).
+    sky_white_view: std::sync::OnceLock<wgpu::TextureView>,
     env: Environment,
     /// Lens of the loaded scene (`Scene::lens`).
     lens: ao_scene::Lens,
@@ -542,7 +571,7 @@ impl Renderer {
             label: Some("scene"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
-        let globals = device.create_buffer(&wgpu::BufferDescriptor {
+        let globals = device.create_buffer_tracked(&wgpu::BufferDescriptor {
             label: Some("globals"),
             size: std::mem::size_of::<Globals>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -587,7 +616,7 @@ impl Renderer {
                 uniform_entry(2, wgpu::ShaderStages::VERTEX_FRAGMENT),
             ],
         });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        let sampler = device.create_sampler_tracked(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
             address_mode_w: wgpu::AddressMode::Repeat,
@@ -750,6 +779,7 @@ impl Renderer {
             sky: SkyGpu::default(),
             cloud_preferences: (true, true, false),
             sky_views: HashMap::new(),
+            sky_white_view: std::sync::OnceLock::new(),
             gpu: Gpu { meshes: vec![], inst_bufs: vec![], mats: vec![], opaque: vec![], blended: vec![], liquid: vec![], insts: vec![], mesh_range: vec![], radius: 100.0, grid: ([0.0; 4], [0; 4]) },
             env: default_environment(100.0),
             lens: ao_scene::Lens::default(),
@@ -783,7 +813,7 @@ impl Renderer {
     fn texture_view(&self, rgba: &[u8], w: u32, h: u32, source: ao_scene::TextureSource) -> wgpu::TextureView {
         let encoding = self.texture_policy.encoding(source, self.device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC), w, h);
         let mips = 32 - w.max(h).leading_zeros();
-        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+        let tex = self.device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             mip_level_count: mips,
@@ -823,11 +853,11 @@ impl Renderer {
             }
             (cw, ch, data) = (nw, nh, next);
         }
-        tex.create_view(&Default::default())
+        tex.create_view_tracked(&Default::default())
     }
     fn material_sampler(&self, clamp: bool) -> &wgpu::Sampler {
         if !clamp { return &self.sampler; }
-        self.clamp_sampler.get_or_init(|| self.device.create_sampler(&wgpu::SamplerDescriptor {
+        self.clamp_sampler.get_or_init(|| self.device.create_sampler_tracked(&wgpu::SamplerDescriptor {
             label: Some("native D3D texture clamp"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
@@ -844,14 +874,14 @@ impl Renderer {
     // neither an sRGB tile nor subject to RGB565/BC resource preferences.
     fn ground_palette_view(&self, t: &ao_scene::Texture) -> wgpu::TextureView {
         let size = wgpu::Extent3d { width: t.width, height: t.height, depth_or_array_layers: 1 };
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+        let texture = self.device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: Some("native ground palette"), size, mip_level_count: 1, sample_count: 1,
             dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[],
         });
         self.queue.write_texture(texture.as_image_copy(), &t.rgba,
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(t.width * 4), rows_per_image: Some(t.height) }, size);
-        texture.create_view(&Default::default())
+        texture.create_view_tracked(&Default::default())
     }
 
 
@@ -875,12 +905,12 @@ impl Renderer {
             let mut u = mat_uniform(s);
             if let Some([x, z]) = ground_scale { u[12] = x; u[14] = z; }
             *mat_of.entry((view, s.texture_clamp, u.map(f32::to_bits))).or_insert_with(|| {
-                let ub = dev.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                let ub = dev.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                     label: None,
                     contents: bytemuck::bytes_of(&u),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
-                mats.push(dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                mats.push(dev.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &dev.tex_layout,
                     entries: &[
@@ -929,7 +959,7 @@ impl Renderer {
             }
             mesh_range.push(range);
             insts.extend(list);
-            let vb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            let vb = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(&vertex_bytes(&mesh.vertices)),
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
@@ -964,7 +994,7 @@ impl Renderer {
                     }
                 }
             }
-            let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            let ib = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(&indices),
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
@@ -977,7 +1007,7 @@ impl Renderer {
         } else {
             (0..INST_RING)
                 .map(|_| {
-                    self.device.create_buffer(&wgpu::BufferDescriptor {
+                    self.device.create_buffer_tracked(&wgpu::BufferDescriptor {
                         label: Some("instances"),
                         size: (insts.len() * 64) as u64,
                         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
@@ -1037,7 +1067,7 @@ impl Renderer {
             for p in &scene.ground_detail {
                 has_shadow[p.mesh] = p.shadow_texture.is_some();
                 let view = &views[p.shadow_texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0)];
-                materials[p.mesh] = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                materials[p.mesh] = Some(self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
                     label: Some("native ground shadow palette"), layout: &self.holo_layout,
                     entries: &[0, 1].map(|binding| wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(view) }),
                 }));
@@ -1048,6 +1078,15 @@ impl Renderer {
 
     /// Replaces only the sky backdrop (`scene.sky` instances of `scene.meshes`) and, when given, the environment (sun, ambient,
     /// fog base, volumes kept); the world stays. Textures are cached by key, so `scene.textures` need only hold keys not sent before.
+    ///
+    /// Fast path: when every sky mesh's vertex count and submeshes (`actors::same_material`, ignoring `indices`) match
+    /// the last upload, vertex/index data is written into the existing GPU buffers in place (growing them, capacity-
+    /// doubled, only when a frame needs more room) and materials are looked up by content in a persisted cache, reusing
+    /// their existing uniform buffer and bind group -- no buffer or bind group is created. `LiveSky` calls this about
+    /// twice a second for the whole time a zone is outdoors; recreating every GPU object on every tick (the previous
+    /// behaviour) was the dominant confirmed GPU-object leak (measured live at ICC with `AOMAC_GPU_STATS=1`: a steady,
+    /// never-zero per-second churn of sky buffers/bind groups, independent of actor/combat/movement). A changed sky
+    /// mesh/material set (zone or weather change) still falls through to a full rebuild.
     pub fn set_sky(&mut self, scene: &Scene) {
         self.water_light = scene.water_light;
         for (k, t) in &scene.textures {
@@ -1056,23 +1095,41 @@ impl Renderer {
                 self.sky_views.insert(*k, v);
             }
         }
-        let white = self.texture_view(&[255; 4], 1, 1, ao_scene::TextureSource::Generated);
-        let mut sky = SkyGpu::default();
-        let mut mat_of: HashMap<(Option<TextureKey>, bool, [u32; 20]), usize> = HashMap::new();
-        for (mi, mesh) in scene.meshes.iter().enumerate() {
-            let idx_total: usize = mesh.submeshes.iter().map(|s| s.indices.len()).sum();
-            if mesh.vertices.is_empty() || idx_total == 0 || !scene.sky.iter().any(|s| s.mesh == mi) {
-                sky.meshes.push(None);
-                continue;
-            }
-            let vb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&vertex_bytes(&mesh.vertices)),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        self.sky_white_view.get_or_init(|| self.texture_view(&[255; 4], 1, 1, ao_scene::TextureSource::Generated));
+        self.material_sampler(true); // force-initializes `clamp_sampler` before the disjoint-borrow loop below
+        let is_live = |mi: usize, mesh: &ao_scene::Mesh| {
+            !mesh.vertices.is_empty() && mesh.submeshes.iter().map(|s| s.indices.len()).sum::<usize>() > 0 && scene.sky.iter().any(|s| s.mesh == mi)
+        };
+        let eligible = self.sky.topology.len() == scene.meshes.len()
+            && self.sky.topology.iter().zip(scene.meshes.iter().enumerate()).zip(&self.sky.meshes).all(|(((nv, subs), (mi, mesh)), gpu)| {
+                *nv == mesh.vertices.len()
+                    && subs.len() == mesh.submeshes.len()
+                    && subs.iter().zip(&mesh.submeshes).all(|(a, b)| actors::same_material(a, b))
+                    && gpu.is_some() == is_live(mi, mesh)
             });
+        if !eligible {
+            self.sky.rebuilds += 1;
+            self.sky.meshes = vec![None; scene.meshes.len()];
+            self.sky.vertex_capacity = vec![0; scene.meshes.len()];
+            self.sky.index_capacity = vec![0; scene.meshes.len()];
+            self.sky.mat_of.clear();
+            self.sky.mats.clear();
+        }
+        let mut topology = Vec::with_capacity(scene.meshes.len());
+        let per_mesh: Vec<Vec<Draw>> = scene.meshes.iter().enumerate().map(|(mi, mesh)| {
+            topology.push((mesh.vertices.len(), mesh.submeshes.clone()));
+            if !is_live(mi, mesh) {
+                self.sky.meshes[mi] = None;
+                return Vec::new();
+            }
+            let (old_vb, old_ib) = self.sky.meshes[mi].take().map_or((None, None), |(a, b)| (Some(a), Some(b)));
+            let vbytes = vertex_bytes(&mesh.vertices);
+            let (vb, created) = ensure_buf(&self.device, old_vb, &mut self.sky.vertex_capacity[mi], (vbytes.len() * 4) as u64, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, "sky vertices");
+            self.sky.buffer_creates += created as u64;
+            self.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&vbytes));
             let nv = mesh.vertices.len() as u32;
-            let mut indices = Vec::with_capacity(idx_total);
-            let mut ranges = vec![];
+            let idx_total: usize = mesh.submeshes.iter().map(|s| s.indices.len()).sum();
+            let (mut indices, mut draws) = (Vec::with_capacity(idx_total), vec![]);
             for s in &mesh.submeshes {
                 let first = indices.len() as u32;
                 for t in s.indices.as_chunks::<3>().0 {
@@ -1086,51 +1143,58 @@ impl Renderer {
                 }
                 let key = s.texture.filter(|k| self.sky_views.contains_key(k));
                 let u = mat_uniform(s);
-                let mat = *mat_of.entry((key, s.texture_clamp, u.map(f32::to_bits))).or_insert_with(|| {
-                    let ub = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::bytes_of(&u), usage: wgpu::BufferUsages::UNIFORM });
-                    sky.mats.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                let samp = if s.texture_clamp { self.clamp_sampler.get().unwrap() } else { &self.sampler };
+                let mat = *self.sky.mat_of.entry((key, s.texture_clamp, u.map(f32::to_bits))).or_insert_with(|| {
+                    let ub = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::bytes_of(&u), usage: wgpu::BufferUsages::UNIFORM });
+                    self.sky.mats.push(self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
                         label: None,
                         layout: &self.tex_layout,
                         entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(key.map_or(&white, |k| &self.sky_views[&k])) },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(self.material_sampler(s.texture_clamp)) },
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(key.map_or(self.sky_white_view.get().unwrap(), |k| &self.sky_views[&k])) },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(samp) },
                             wgpu::BindGroupEntry { binding: 2, resource: ub.as_entire_binding() },
                         ],
                     }));
-                    sky.mats.len() - 1
+                    self.sky.mats.len() - 1
                 });
                 let pipe = if s.blend == Blend::SourceColorOne { SKY_GLOW_PIPE } else { SKY_PIPE + s.blend as usize };
-                ranges.push(Draw { mesh: mi, first_index: first, count, mat, pipe });
+                draws.push(Draw { mesh: mi, first_index: first, count, mat, pipe });
             }
-            let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&indices), usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST });
-            sky.meshes.push(Some((vb, ib)));
-            // draws are attached per instance below
-            for d in ranges {
-                sky.draws.push((d, u32::MAX));
-            }
-        }
+            let ibytes = (indices.len() * 4) as u64;
+            let (ib, created) = ensure_buf(&self.device, old_ib, &mut self.sky.index_capacity[mi], ibytes, wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST, "sky indices");
+            self.sky.buffer_creates += created as u64;
+            self.queue.write_buffer(&ib, 0, bytemuck::cast_slice(&indices));
+            self.sky.meshes[mi] = Some((vb, ib));
+            draws
+        }).collect();
+        self.sky.topology = topology;
         // one draw per (instance, submesh), in instance order
-        let per_mesh = std::mem::take(&mut sky.draws);
+        let mut draws = vec![];
+        let mut xf = vec![];
         for inst in &scene.sky {
-            for (d, _) in per_mesh.iter().filter(|(d, _)| d.mesh == inst.mesh) {
-                sky.draws.push((*d, sky.xf.len() as u32));
+            for d in per_mesh.get(inst.mesh).into_iter().flatten() {
+                draws.push((*d, xf.len() as u32));
             }
-            sky.xf.push(Mat4::from_cols_array_2d(&inst.transform));
+            xf.push(Mat4::from_cols_array_2d(&inst.transform));
         }
-        sky.spin = (0..sky.xf.len()).map(|i| scene.sky_spin.iter().find(|s| s.instance == i).copied()).collect();
-        sky.wave = scene.sky_wave_spin.clone();
-        sky.bufs = if sky.xf.is_empty() {
-            vec![]
-        } else {
-            (0..INST_RING)
-                .map(|_| self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("sky"), size: (sky.xf.len() * 64) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }))
-                .collect()
-        };
+        self.sky.draws = draws;
+        self.sky.spin = (0..xf.len()).map(|i| scene.sky_spin.iter().find(|s| s.instance == i).copied()).collect();
+        self.sky.wave = scene.sky_wave_spin.clone();
+        if xf.len() != self.sky.xf.len() {
+            self.sky.bufs = if xf.is_empty() {
+                vec![]
+            } else {
+                (0..INST_RING)
+                    .map(|_| self.device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("sky"), size: (xf.len() * 64) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }))
+                    .collect()
+            };
+        }
+        self.sky.xf = xf;
         // a live update keeps the running simulation of an identical aurora
-        sky.colors = scene
+        self.sky.colors = scene
             .sky_colors
             .iter()
-            .filter(|c| matches!(sky.meshes.get(c.mesh), Some(Some(_))))
+            .filter(|c| matches!(self.sky.meshes.get(c.mesh), Some(Some(_))))
             .map(|c| ColorAnim {
                 mesh: c.mesh,
                 sim: self.sky.colors.iter().find(|o| o.sim.params == c.sim.params).map_or_else(|| c.sim.clone(), |o| o.sim.clone()),
@@ -1139,7 +1203,7 @@ impl Renderer {
             })
             .collect();
         let mut old_clouds=std::mem::take(&mut self.sky.clouds);
-        sky.clouds=scene.single_clouds.iter().map(|layer| {
+        self.sky.clouds=scene.single_clouds.iter().map(|layer| {
             let mut run=old_clouds.iter().position(|old|old.layer.mesh==layer.mesh && old.layer.altitude==layer.altitude)
                 .map(|i|old_clouds.swap_remove(i)).unwrap_or_else(||CloudAnim {
                     layer:layer.clone(),sim:Default::default(),vertices:scene.meshes[layer.mesh].vertices.clone(),
@@ -1147,7 +1211,6 @@ impl Renderer {
                     indices:[ao_scene::cloud::Clouds::indices(2,0,30),ao_scene::cloud::Clouds::indices(10,0,30)],grid:0,time:self.time});
             run.layer=layer.clone();run.grid=0;run
         }).collect();
-        self.sky = sky;
         if let Some(env) = scene.environment {
             self.env = env;
         }
@@ -1159,6 +1222,15 @@ impl Renderer {
             self.fog = Some(model);
         }
     }
+
+    /// `set_sky` calls since the renderer started that fell through to a full rebuild, for leak regressions: in
+    /// steady state (a stable sky mesh/material set) this must stop climbing even as `LiveSky` keeps calling
+    /// `set_sky` with new per-tick vertex data.
+    pub fn sky_rebuilds(&self) -> u64 { self.sky.rebuilds }
+
+    /// Sky mesh vertex/index GPU buffers actually (re)created since the renderer started, for leak regressions:
+    /// converges once the sky's largest mesh has been seen and its material set is stable.
+    pub fn sky_buffer_creates(&self) -> u64 { self.sky.buffer_creates }
 
     /// Applies the client's statel zone LOD for a camera at scene `(x, z)`: re-evaluates the zone levels and, when one
     /// changed, which statels (and which of their meshes) are shown.
@@ -1227,10 +1299,10 @@ impl Renderer {
             .map(|(key,t)| (*key,self.texture_view(&t.rgba,t.width,t.height,t.source))).collect();
         for (mat,key,u) in &ground.texture_materials {
             let Some(view) = views.get(key).or_else(|| views.iter().find(|(k,_)| same(k,key)).map(|(_,v)| v)) else { continue; };
-            let uniform = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            let uniform = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                 label: Some("native ground material refresh"), contents: bytemuck::bytes_of(u), usage: wgpu::BufferUsages::UNIFORM,
             });
-            self.gpu.mats[*mat] = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            self.gpu.mats[*mat] = self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
                 label: Some("native ground texture family refresh"), layout: &self.tex_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
@@ -1648,6 +1720,22 @@ fn vertex_bytes(v: &[ao_scene::Vertex]) -> Vec<f32> {
         .collect()
 }
 
+/// `actors::ensure_capacity`, but also handles the "no buffer yet" case (a mesh slot just cleared by a full sky
+/// rebuild, or newly live): creates a fresh buffer at the first needed capacity instead of requiring one to grow.
+/// Returns whether a new buffer was actually created (vs. the existing one reused as-is), for leak regressions.
+fn ensure_buf(device: &wgpu::Device, buf: Option<wgpu::Buffer>, capacity: &mut u64, needed: u64, usage: wgpu::BufferUsages, label: &str) -> (wgpu::Buffer, bool) {
+    match buf {
+        Some(mut b) => {
+            let grew = actors::ensure_capacity(device, &mut b, capacity, needed, usage, label);
+            (b, grew)
+        }
+        None => {
+            *capacity = needed.next_power_of_two().max(1);
+            (device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some(label), size: *capacity, usage, mapped_at_creation: false }), true)
+        }
+    }
+}
+
 /// Renders `scene` offscreen and writes an sRGB PNG.
 pub fn render_to_png(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: u32, height: u32, path: &Path) -> Result<()> {
     render_to_png_at(scene, eye, look_at, width, height, path, 0.0)
@@ -1691,7 +1779,7 @@ fn render_to_png_effects(scene: &Scene, models: &[(u64, Scene)], actors: Vec<ao_
         }
     }
     let targets = Targets::new(&r, width, height);
-    let out = r.device.create_texture(&wgpu::TextureDescriptor {
+    let out = r.device.create_texture_tracked(&wgpu::TextureDescriptor {
         label: None,
         size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         mip_level_count: 1,
@@ -1701,7 +1789,7 @@ fn render_to_png_effects(scene: &Scene, models: &[(u64, Scene)], actors: Vec<ao_
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    r.render(&out.create_view(&Default::default()), &targets, &Camera::look_at(eye.into(), look_at.into()));
+    r.render(&out.create_view_tracked(&Default::default()), &targets, &Camera::look_at(eye.into(), look_at.into()));
 
     texture_to_png(&r, &out, width, height, path)
 }
@@ -1720,7 +1808,7 @@ pub(crate) fn texture_to_png(r: &Renderer, out: &wgpu::Texture, width: u32, heig
 /// visual-regression tests that diff pixels directly instead of round-tripping through a PNG file.
 pub(crate) fn texture_to_rgba(r: &Renderer, out: &wgpu::Texture, width: u32, height: u32) -> Result<Vec<u8>> {
     let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-    let buf = r.device.create_buffer(&wgpu::BufferDescriptor {
+    let buf = r.device.create_buffer_tracked(&wgpu::BufferDescriptor {
         label: None,
         size: (row * height) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
@@ -1746,7 +1834,7 @@ pub(crate) fn texture_to_rgba(r: &Renderer, out: &wgpu::Texture, width: u32, hei
 }
 
 fn storage<T: bytemuck::Pod>(device: &wgpu::Device, data: &[T]) -> wgpu::Buffer {
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(data), usage: wgpu::BufferUsages::STORAGE })
+    device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(data), usage: wgpu::BufferUsages::STORAGE })
 }
 
 /// Group 0: globals uniform + the static light grid (lights, cells, per-cell index lists).
@@ -1762,9 +1850,9 @@ fn gate_lights(base: &[[f32; 4]], zones: &[Option<u32>], levels: &[u8]) -> Vec<[
 }
 
 fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: &wgpu::Buffer, g: &LightGrid) -> (wgpu::BindGroup, wgpu::Buffer) {
-    let l = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&g.lights), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST });
+    let l = device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&g.lights), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST });
     let (c, i) = (storage(device, &g.cells), storage(device, &g.idx));
-    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
         label: None,
         layout,
         entries: &[
@@ -1856,6 +1944,34 @@ mod sky_tests {
         let s = scene([0.0; 2], None);
         let (Some(a), Some(b)) = (pixels(&s, 0.0, "still"), pixels(&s, 5.0, "still")) else { return };
         assert_eq!(a, b);
+    }
+
+    /// Leak regression: `LiveSky` calls `set_sky` about twice a second for the whole time a zone is outdoors, every
+    /// time with a scene holding the same sky mesh/material topology but new per-tick vertex data (sun/stars/clouds
+    /// moving) -- confirmed live at ICC (`AOMAC_GPU_STATS=1`) to be the dominant source of a steady, never-zero
+    /// per-second GPU buffer/bind-group churn even while otherwise idle. After warm-up, further ticks must stop
+    /// creating buffers or falling through to a full rebuild.
+    #[test]
+    fn live_sky_ticks_reuse_buffers_after_warmup() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("resource regression requires GPU");
+        let tick = |renderer: &mut Renderer, n: i32| {
+            let mut s = scene([0.5, 0.0], None);
+            for v in &mut s.meshes[0].vertices {
+                v.pos[2] -= f32::from(n as i16) * 0.01; // a moving sky: same topology/materials, new positions
+            }
+            renderer.set_sky(&s);
+        };
+        for n in 0..30 {
+            tick(&mut renderer, n);
+        }
+        let (rebuilds, creates) = (renderer.sky_rebuilds(), renderer.sky_buffer_creates());
+        assert!(rebuilds <= 1, "set_sky fell through to a full rebuild {rebuilds} times for an unchanged mesh/material set");
+        for n in 30..60 {
+            tick(&mut renderer, n);
+        }
+        assert_eq!(renderer.sky_rebuilds(), rebuilds, "steady-state live sky ticks triggered further full rebuilds");
+        assert_eq!(renderer.sky_buffer_creates(), creates, "steady-state live sky ticks created {} more GPU buffers instead of reusing them", renderer.sky_buffer_creates() - creates);
     }
 
     /// Red channel of the centre pixel of a PNG.
