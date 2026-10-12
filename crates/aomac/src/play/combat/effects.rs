@@ -407,6 +407,9 @@ impl Renderer {
         }
     }
     pub fn is_active(&self, handle: u32) -> bool { self.active.iter().any(|a| a.actor == handle) }
+    /// Resource counts for leak-regression assertions (active effects, per-source caches).
+    #[cfg(test)]
+    pub(crate) fn resource_counts(&self) -> (usize, usize, usize, usize) { (self.active.len(), self.anchors.len(), self.source_runtime.len(), self.buff_models.len()) }
     /// N3 GetBodyScale (+ac), breed, and resolved vehicle speed/GetDir.
     pub fn set_source_runtime(&mut self, identity:(u32,u32), body_scale:f32, breed:i32, vehicle_speed:Option<f32>, vehicle_direction:i32, visible:bool) {
         let old=self.source_runtime.get(&identity);

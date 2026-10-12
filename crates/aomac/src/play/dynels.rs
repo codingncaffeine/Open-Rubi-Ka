@@ -4669,4 +4669,42 @@ mod variant_tests {
         }
         assert_eq!(z.world.react_to_hit(leet, 4).1, 1.0);
     }
+
+    /// Leak regression (user report: "massive memory leak... had to hard reset"): replays a real capture (combat,
+    /// notes, NPC dynels) many times through a single long-lived `Dynels`, ticking the production `update_with_collision`
+    /// path every frame like the live client. Per-source/per-dynel caches (`chars`, `combat::effects::Renderer`'s
+    /// `active`/`anchors`/`source_runtime`/`buff_models`) must plateau once every dynel in the capture has appeared at
+    /// least once, not keep growing with the number of replays (frames, not wall-clock).
+    #[test]
+    fn replayed_capture_keeps_dynel_and_effect_caches_bounded() {
+        let Some(dir) = client() else { return };
+        let own = 25988;
+        let mut z = Zone::new(own as u32);
+        z.world.start(dir, own);
+        let rec = frames(include_str!("../../../../docs/captures/zone_ithaca.rec"));
+        let mut host = Host::headless();
+        let mut samples: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+        for rep in 0..300 {
+            for f in &rec {
+                z.on_frame(f);
+                let (eye, fwd) = z.own().map_or(([0.0; 3], [0.0, 0.0, -1.0]), |o| (scene_pos(o.pos), [0.0, 0.0, -1.0]));
+                z.world.update_with_collision(0.016, eye, fwd, &mut host, None, |_| None);
+                host.actors.clear();
+            }
+            let (active, anchors, source_runtime, buff_models) = z.world.effects.as_ref().map_or((0, 0, 0, 0), |e| e.resource_counts());
+            samples.push((z.world.chars.len(), active, anchors, source_runtime, buff_models));
+            // warm-up window: let every dynel in the capture appear at least once before measuring the plateau.
+            if rep == 19 {
+                let warm = samples.last().copied().unwrap();
+                samples.clear();
+                samples.push(warm);
+            }
+        }
+        let (first, last) = (samples[0], *samples.last().unwrap());
+        assert_eq!(first.0, last.0, "chars must not grow across replays: {first:?} -> {last:?}");
+        assert!(last.1 <= first.1 + 2, "active effects must plateau, not grow per replay: {first:?} -> {last:?}");
+        assert!(last.2 <= first.2 + 4, "effect anchors must plateau, not grow per replay: {first:?} -> {last:?}");
+        assert!(last.3 <= first.3 + 2, "source_runtime must plateau, not grow per replay: {first:?} -> {last:?}");
+        assert!(last.4 <= first.4 + 2, "buff_models must plateau, not grow per replay: {first:?} -> {last:?}");
+    }
 }

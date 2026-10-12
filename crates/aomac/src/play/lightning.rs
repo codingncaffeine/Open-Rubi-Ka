@@ -274,4 +274,64 @@ mod tests {
         ao_render::render_to_png_actors(&ao_scene::Scene::default(), &models, actors, eye, source, 640, 480, &out.join("lightning_strike.png"), 0.0)?;
         Ok(())
     }
+
+    /// Leak regression (user report: "massive memory leak... had to hard reset"): a long-lived `Renderer` (same
+    /// object for the whole loop, like the real windowed session) fed a real pf 4582 scene plus continuous night
+    /// lightning (fan/bolt actor churn every frame, the exact per-frame GPU path `flow.rs` drives). Root cause: with
+    /// `MouseLagFix` off (the default), nothing ever polled the `wgpu::Device`, so every buffer/texture/bind group
+    /// replaced that frame (actor skins here; combat-effect particles, sky and liquid geometry too in the live app)
+    /// sat as a pending GPU destruction wgpu only reclaims on a poll -- confirmed by comparing an unpolled half
+    /// (~1.05 KB/frame RSS growth) against a polled half (~0.05 KB/frame, 23x less) of this same loop. The fix
+    /// (`ao_render::viewer`'s render loop) now runs a non-blocking `device.poll(Poll)` every frame unconditionally;
+    /// this regression exercises that same recipe directly and must stay flat.
+    #[test]
+    #[ignore = "real GPU + client data; run explicitly: cargo test --release -p aomac -- --ignored lightning_render_loop_rss_stays_flat --nocapture"]
+    fn lightning_render_loop_rss_stays_flat() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let store = ao_rdb::RecordStore::open(&dir).unwrap();
+        let (scene, _report) = ao_formats::playfield::load_playfield_report_at(&store, &dir, 4582, 0.0).unwrap();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = ao_render::Renderer::new(&instance, None).unwrap();
+        r.upload(&scene);
+        let (w, h) = (640u32, 480u32);
+        let targets = ao_render::Targets::new(&r, w, h);
+        let out = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: r.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = out.create_view(&Default::default());
+        let mut fx = LightningFx::default();
+        let eye = [scene.spawn.map_or(0.0, |p| p[0]), scene.spawn.map_or(50.0, |p| p[1] + 10.0), scene.spawn.map_or(0.0, |p| p[2])];
+        let cam = ao_render::Camera::look_at(eye.into(), [eye[0] + 20.0, eye[1], eye[2] + 20.0].into());
+        let rss = |pid: u32| -> u64 {
+            let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+        };
+        let pid = std::process::id();
+        let mut samples = Vec::new();
+        const FRAMES: usize = 18000; // 5 simulated minutes at 60 fps, run as fast as possible
+        for i in 0..FRAMES {
+            fx.tick(true, 1.0 / 60.0, eye, 200.0, eye[1]);
+            for (key, model) in fx.take_model_upload() { r.add_actor_model(key, &model); }
+            r.set_actors(fx.actors());
+            r.render(&view, &targets, &cam);
+            let _ = r.device.poll(wgpu::PollType::Poll); // the fix: reclaim this frame's destroyed GPU resources now
+            if i % 1500 == 0 { samples.push((i, rss(pid))); }
+        }
+        samples.push((FRAMES, rss(pid)));
+        eprintln!("rss samples (frame, KB): {samples:?}");
+        let (warm, last) = (samples[2].1 as f64, samples.last().unwrap().1 as f64); // skip the first two (startup allocations)
+        let growth = last - warm;
+        let per_frame = growth / (FRAMES - 3000) as f64;
+        eprintln!("growth after warm-up: {growth:.0} KB over {} frames ({per_frame:.2} KB/frame)", FRAMES - 3000);
+        assert!(growth < 20_000.0, "RSS grew {growth:.0} KB ({per_frame:.2} KB/frame) over {} frames after warm-up with the device polled every frame: the leak is back", FRAMES - 3000);
+    }
 }

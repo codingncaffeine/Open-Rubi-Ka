@@ -658,6 +658,12 @@ impl State {
                     eprintln!("render: MouseLagFix GPU synchronization: {error}");
                 }
             }
+        } else {
+            // Without MouseLagFix nothing else polls the device: every buffer/texture/bind group replaced this frame
+            // (actor skins, lightning/combat-effect actors, sky/liquid geometry) sits as a pending GPU destruction
+            // that wgpu only reclaims on a poll. A frame of uncapped per-frame churn left unpolled for a whole
+            // session is the "massive memory leak" the user hit: a non-blocking maintain keeps it reclaimed live.
+            let _ = self.renderer.device.poll(wgpu::PollType::Poll);
         }
         self.previous_submission = Some(submission);
         let present_start = self.perf.then(Instant::now);
