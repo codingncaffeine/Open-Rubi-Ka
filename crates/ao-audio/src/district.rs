@@ -93,11 +93,25 @@ mod tests {
         let mut total = 0;
         for id in &ids {
             let blob = store.get(1000014, *id).unwrap().unwrap();
-            // UNRESOLVED: pf 953's hash spawn list desyncs after its first entry (rotation width 14389, a
-            // denormal z coordinate on entry 2) even though every field order above matches GD 0x100049be/
-            // 0x1000640f/0x1000a29a exactly (verified by decompile) and pf 111's identical structure parses
-            // correctly end to end. Needs further RE of HashSpawnPoint_t's flag-driven variable tail.
-            if *id == 953 { continue; }
+            if *id == 953 {
+                // RESOLVED (not a parser gap): every field position above was verified byte-exact against
+                // GD decompile of DistrictData_t::operator>> 0x100049be, HashSpawnPoint_t::ReadBlob
+                // 0x1000640f, RotationSpawnPoint_t::operator>> 0x1000a29a, SpawnPoint_t::operator>> 0x1000a464
+                // and ACGHash_t::operator>> 0x10001b23. pf 953's district ("Backyard") reads 99 well-formed
+                // plain spawn points, then its hash-spawn list (declared count 127) is corrupt placeholder
+                // content from the source data itself: entry 0 decodes hash=0x20202020 ("    "), rotation
+                // width=14389 (native requires <=360), min/max level 14640/18482 (native requires 1..=1000);
+                // entry 1 decodes hash=0x9f9f9f9f, chance=255 (native requires <=100) and a 255-element
+                // flag2 sub-list of identical zeroed RotationSpawnPoint_t entries. These are uninitialized/
+                // fill-pattern bytes, not a different field layout: native's own ReadBlob throws
+                // DataStreamException on the same fields (angle/width range, chance range, ACGHash_t::IsValid),
+                // so the retail client would reject this exact record too. Treated as the one genuine
+                // native-data defect among the 600 records; the client's ReadBlob caller does not crash on
+                // it, so neither does this parser (Err propagates, caller skips the playfield's extra data).
+                let e = Districts::parse(&blob).unwrap_err();
+                assert!(e.to_string().contains("rotation"), "pf 953 unexpectedly parsed or failed differently: {e}");
+                continue;
+            }
             total += Districts::parse(&blob).unwrap_or_else(|e| panic!("pf {id}: {e}")).districts.len();
         }
         assert_eq!(total, 4240); // 4241 minus pf 953's one skipped district (above)
