@@ -17,6 +17,22 @@ pub const FAN_MODEL: u64 = 0xfac3_0000_0000_0000;
 /// High `id` range for fan actors, distinct from `combat::effects`' `ACTOR_BASE` (`0xe000_0000`) and real dynel ids.
 const FAN_ACTOR_BASE: u32 = 0xd000_0000;
 
+/// Model key of the shared 4-vertex bolt-segment quad ([`bolt_model`]); every segment of every bolt reuses it with
+/// its own `skin`, like [`FAN_MODEL`].
+pub const BOLT_MODEL: u64 = 0xb017_0000_0000_0000;
+/// High `id` range for bolt-segment actors, distinct from [`FAN_ACTOR_BASE`] and `combat::effects`' `ACTOR_BASE`.
+const BOLT_ACTOR_BASE: u32 = 0xc000_0000;
+/// `bolt_segments`' quad corners, local order `(a - half, a + half, b - half, b + half)`.
+pub const BOLT_INDICES: [u32; 6] = [0, 1, 2, 1, 3, 2];
+
+/// The shared bolt-segment submesh: additive, untextured, two-sided, same reasoning as [`fan_model`].
+pub fn bolt_model() -> Scene {
+    let mut sub = Submesh::new(BOLT_INDICES.to_vec(), None);
+    sub.blend = Blend::Additive;
+    sub.two_sided = true;
+    Scene { meshes: vec![Mesh { vertices: vec![Vertex::default(); 4], submeshes: vec![sub] }], ..Default::default() }
+}
+
 /// The shared fan submesh ([`lightning::FAN_INDICES`]): additive, untextured, two-sided (the native fan is a flat
 /// quad meant to be seen from any angle while falling). Vertex positions are overridden per actor by [`LightningFx::actors`]'s `skin`.
 pub fn fan_model() -> Scene {
@@ -36,10 +52,21 @@ struct ActiveFan {
     life: f32,
 }
 
+struct ActiveBolt {
+    id: u32,
+    /// World-space quad corners: `(a - half, a + half, b - half, b + half)`.
+    verts: [[f32; 3]; 4],
+    /// Same lifetime budget as a fan ([`lightning::FAN_LIFETIME`]): no native lifetime constant was traced for
+    /// kind 9 (see the `ao_formats::lightning` module doc), so the port reuses the one decoded FX8/FX9 constant
+    /// rather than inventing a second one.
+    life: f32,
+}
+
 /// Per-zone lightning state: the native storm schedules plus the render/audio side this port adds.
 pub struct LightningFx {
     engine: Lightning,
     fans: Vec<ActiveFan>,
+    bolts: Vec<ActiveBolt>,
     /// Flicker/color RNG (`fan_color`/`flicker_alpha`'s own non-reproducible `CrtRand` draws, matching
     /// `lightning::additional_instance_fans`'s treatment of the same native non-determinism).
     rng: CrtRand,
@@ -47,11 +74,12 @@ pub struct LightningFx {
     elapsed: f64,
     next_id: u32,
     model_uploaded: bool,
+    bolt_model_uploaded: bool,
 }
 
 impl Default for LightningFx {
     fn default() -> Self {
-        LightningFx { engine: Lightning::default(), fans: Vec::new(), rng: CrtRand::default(), elapsed: 0.0, next_id: 0, model_uploaded: false }
+        LightningFx { engine: Lightning::default(), fans: Vec::new(), bolts: Vec::new(), rng: CrtRand::default(), elapsed: 0.0, next_id: 0, model_uploaded: false, bolt_model_uploaded: false }
     }
 }
 
@@ -70,43 +98,76 @@ impl LightningFx {
                 self.next_id = self.next_id.wrapping_add(1);
                 self.fans.push(ActiveFan { id, verts, color: lightning::fan_color(&mut self.rng), life: lightning::FAN_LIFETIME });
             }
+            for (source, ground) in strike.bolts() {
+                for seg in lightning::bolt_segments(source, ground, &mut self.rng) {
+                    let verts = [
+                        [seg.a[0] - seg.half_width, seg.a[1], seg.a[2]],
+                        [seg.a[0] + seg.half_width, seg.a[1], seg.a[2]],
+                        [seg.b[0] - seg.half_width, seg.b[1], seg.b[2]],
+                        [seg.b[0] + seg.half_width, seg.b[1], seg.b[2]],
+                    ];
+                    let id = BOLT_ACTOR_BASE | (self.next_id & 0x0fff_ffff);
+                    self.next_id = self.next_id.wrapping_add(1);
+                    self.bolts.push(ActiveBolt { id, verts, life: lightning::FAN_LIFETIME });
+                }
+            }
         }
         for fan in &mut self.fans {
             fan.life -= dt;
         }
+        for bolt in &mut self.bolts {
+            bolt.life -= dt;
+        }
         self.fans.retain(|f| !lightning::fan_expired(f.life));
+        self.bolts.retain(|b| !lightning::fan_expired(b.life));
         strikes
     }
 
-    /// This frame's actor model upload, once per [`LightningFx`] instance (reset on zone load, matching
+    /// This frame's actor model uploads, once per [`LightningFx`] instance (reset on zone load, matching
     /// `combat::effects`' own "upload once" `host.actor_models` precedent).
-    pub fn take_model_upload(&mut self) -> Option<(u64, Scene)> {
-        if self.model_uploaded {
-            None
-        } else {
+    pub fn take_model_upload(&mut self) -> Vec<(u64, Scene)> {
+        let mut uploads = Vec::new();
+        if !self.model_uploaded {
             self.model_uploaded = true;
-            Some((FAN_MODEL, fan_model()))
+            uploads.push((FAN_MODEL, fan_model()));
         }
+        if !self.bolt_model_uploaded {
+            self.bolt_model_uploaded = true;
+            uploads.push((BOLT_MODEL, bolt_model()));
+        }
+        uploads
     }
 
-    /// This frame's fan quads, ready to push into `host.actors` (model [`FAN_MODEL`]).
+    /// This frame's fan and bolt-segment quads, ready to push into `host.actors`.
     pub fn actors(&mut self) -> Vec<ActorFrame> {
-        let Self { fans, rng, .. } = self;
-        fans.iter()
-            .map(|fan| {
-                let alpha = lightning::flicker_alpha(rng);
-                let center = [f32::from(fan.color[0]) / 255.0, f32::from(fan.color[1]) / 255.0, f32::from(fan.color[2]) / 255.0, f32::from(alpha) / 255.0];
-                let verts: Vec<Vertex> =
-                    fan.verts.iter().enumerate().map(|(i, &pos)| Vertex { pos, color: if i == 4 { center } else { [0.0; 4] }, ..Default::default() }).collect();
-                ActorFrame { id: fan.id, model: FAN_MODEL, transform: IDENTITY, skin: Some(Arc::new(verts)), always: true, ..Default::default() }
-            })
-            .collect()
+        let Self { fans, bolts, rng, .. } = self;
+        let fan_actors = fans.iter().map(|fan| {
+            let alpha = lightning::flicker_alpha(rng);
+            let center = [f32::from(fan.color[0]) / 255.0, f32::from(fan.color[1]) / 255.0, f32::from(fan.color[2]) / 255.0, f32::from(alpha) / 255.0];
+            let verts: Vec<Vertex> =
+                fan.verts.iter().enumerate().map(|(i, &pos)| Vertex { pos, color: if i == 4 { center } else { [0.0; 4] }, ..Default::default() }).collect();
+            ActorFrame { id: fan.id, model: FAN_MODEL, transform: IDENTITY, skin: Some(Arc::new(verts)), always: true, ..Default::default() }
+        });
+        // No `SetFXColor` was traced for kind 9 (see the module doc); a plain bright white-blue flash, full alpha
+        // for its whole (short, reused-fan) lifetime rather than inventing an undecoded flicker curve.
+        const BOLT_COLOR: [f32; 4] = [0.7, 0.85, 1.0, 1.0];
+        let bolt_actors = bolts.iter().map(|bolt| {
+            let verts: Vec<Vertex> = bolt.verts.iter().map(|&pos| Vertex { pos, color: BOLT_COLOR, ..Default::default() }).collect();
+            ActorFrame { id: bolt.id, model: BOLT_MODEL, transform: IDENTITY, skin: Some(Arc::new(verts)), always: true, ..Default::default() }
+        });
+        fan_actors.chain(bolt_actors).collect()
     }
 
     /// Active fan count, for tests.
     #[cfg(test)]
     pub fn fan_count(&self) -> usize {
         self.fans.len()
+    }
+
+    /// Active bolt-segment count, for tests.
+    #[cfg(test)]
+    pub fn bolt_count(&self) -> usize {
+        self.bolts.len()
     }
 }
 
@@ -140,9 +201,14 @@ mod tests {
         assert_eq!(fx.fan_count(), strikes.iter().map(|s| s.fans.len()).sum::<usize>(), "anchor + 9 fans queued per strike, nothing expired yet");
         assert!(fx.fan_count() >= 10, "anchor + 9 fans per strike should be queued");
         let actors = fx.actors();
-        assert_eq!(actors.len(), fx.fan_count());
-        for actor in &actors {
-            assert_eq!(actor.model, FAN_MODEL);
+        let fan_actors: Vec<_> = actors.iter().filter(|a| a.model == FAN_MODEL).collect();
+        let bolt_actors: Vec<_> = actors.iter().filter(|a| a.model == BOLT_MODEL).collect();
+        assert_eq!(actors.len(), fan_actors.len() + bolt_actors.len(), "every actor is a fan or a bolt segment");
+        assert_eq!(fan_actors.len(), fx.fan_count());
+        assert_eq!(bolt_actors.len(), fx.bolt_count());
+        // every strike fires at least the main bolt (`BOLT_SEGMENTS - 1` segments), even with no companions.
+        assert!(bolt_actors.len() >= strikes.len() * (lightning::BOLT_SEGMENTS - 1), "the main bolt fires unconditionally per strike");
+        for actor in &fan_actors {
             let skin = actor.skin.as_ref().unwrap();
             assert_eq!(skin.len(), 5);
             // corners transparent, center carries the flicker alpha
@@ -150,6 +216,11 @@ mod tests {
                 assert_eq!(v.color, [0.0; 4]);
             }
             assert!(skin[4].color[3] >= 0.0 && skin[4].color[3] <= 1.0);
+        }
+        for actor in &bolt_actors {
+            let skin = actor.skin.as_ref().unwrap();
+            assert_eq!(skin.len(), 4, "a-left, a-right, b-left, b-right");
+            assert!(skin.iter().all(|v| v.color[3] > 0.0), "bolts render fully lit, not transparent");
         }
     }
 
@@ -169,9 +240,38 @@ mod tests {
     }
 
     #[test]
-    fn model_upload_happens_once() {
+    fn model_upload_happens_once_for_each_of_the_two_models() {
         let mut fx = LightningFx::default();
-        assert!(fx.take_model_upload().is_some());
-        assert!(fx.take_model_upload().is_none());
+        let first = fx.take_model_upload();
+        assert_eq!(first.len(), 2, "fan model + bolt model");
+        assert!(first.iter().any(|(k, _)| *k == FAN_MODEL));
+        assert!(first.iter().any(|(k, _)| *k == BOLT_MODEL));
+        assert!(fx.take_model_upload().is_empty());
+    }
+
+    /// Deterministic offscreen render of a fired strike's fans + bolts (main bolt always, companion bolts per
+    /// `Strike::companions`): `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac -- play::lightning::offscreen_strike_frame`
+    /// -> `lightning_strike.png`.
+    #[test]
+    fn offscreen_strike_frame() -> anyhow::Result<()> {
+        let Some(out) = std::env::var_os("AOMAC_SHOT_DIR").map(std::path::PathBuf::from) else { return Ok(()) };
+        std::fs::create_dir_all(&out)?;
+        let mut fx = LightningFx::default();
+        let mut strikes = Vec::new();
+        for _ in 0..2000 {
+            strikes.extend(fx.tick(true, 0.5, [0.0, 0.0, 0.0], 60.0, 5.0));
+            if !strikes.is_empty() {
+                break;
+            }
+        }
+        assert!(!strikes.is_empty(), "storm 1 never fired");
+        let models = fx.take_model_upload();
+        assert_eq!(models.len(), 2);
+        let actors = fx.actors();
+        assert!(!actors.is_empty());
+        let source = strikes[0].source;
+        let eye = [source[0] + 60.0, source[1] + 20.0, source[2] + 60.0];
+        ao_render::render_to_png_actors(&ao_scene::Scene::default(), &models, actors, eye, source, 640, 480, &out.join("lightning_strike.png"), 0.0)?;
+        Ok(())
     }
 }

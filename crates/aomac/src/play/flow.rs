@@ -1413,7 +1413,7 @@ impl Frontend for Play {
                 let extent = self.player.as_ref().and_then(|p| p.effect_surface()).and_then(|c| c.borrow().tile_size()).map(ao_formats::lightning::extent).unwrap_or(0.0);
                 let controlled = host.camera.pos.to_array();
                 let strikes = self.world_lightning.tick(enabled, dt, controlled, extent, controlled[1]);
-                if let Some((key, scene)) = self.world_lightning.take_model_upload() { host.actor_models.push((key, scene)); }
+                host.actor_models.extend(self.world_lightning.take_model_upload());
                 host.actors.extend(self.world_lightning.actors());
                 if let Some(audio) = &self.audio {
                     for strike in &strikes {
