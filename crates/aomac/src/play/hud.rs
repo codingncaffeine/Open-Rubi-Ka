@@ -2327,6 +2327,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// `Rollup::refresh_groups` records the automatic first-frame content-limit clamp's
+    /// `g.pin`/`g.frame` but must not mark the controller dirty from it: several idle frames
+    /// over a freshly opened, never-touched inventory must not write `DockAreas/DockArea0.xml`.
+    #[test]
+    fn fresh_inventory_never_touched_writes_no_dock_file() {
+        let tmp = std::env::temp_dir().join(format!("aomac-hud-freshdock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let size = (1280, 800);
+        let Some((mut s, mut o)) = shot(size) else { return };
+        s.hud.dvalues.open_user(&tmp, "acct", 7);
+        s.hud.prefs_loaded(&mut s.gui);
+        s.hud.open(&mut s.gui, WindowKind::Inventory);
+        for _ in 0..10 {
+            s.frame(0.016, size, &mut o.host);
+        }
+        s.hud.dvalues.save_user();
+        assert!(!tmp.join("acct/Char7/DockAreas/DockArea0.xml").exists(), "an automatic clamp must not persist an untouched dock");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn inventory_shortcut_drop_and_use() {
         let Some((mut s, _)) = shot((1280, 800)) else { return };

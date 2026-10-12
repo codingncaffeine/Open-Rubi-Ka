@@ -53,7 +53,7 @@ impl Rollup {
             let (w,h) = gui.gfx_id(art).map_or((15,15), |g| gui.gfx().size(GfxId(g)));
             format!("<CanvasView name=\"{name}\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\" layout_borders=\"Rect(2,2,2,2)\"/>")
         };
-        let src = format!("<root><View view_layout=\"vertical\" h_alignment=\"left\"><View name=\"rollup_header\" view_layout=\"stacked\" min_size=\"Point(-1,19)\" max_size=\"Point(16000,19)\"><CanvasView name=\"header_bg\"/><View view_layout=\"horizontal\">{}<TextView name=\"title\" value=\"{}\" layout_borders=\"Rect(8,2,0,2)\"/><HLayoutSpacer/>{}{}</View></View><View name=\"body\" view_layout=\"stacked\" min_size=\"Point(0,{height})\" max_size=\"Point(16000,16000)\"><CanvasView name=\"docked_body_bg\"/></View></View></root>", button("icon",ICON),esc(&title),button("arrow",COLLAPSE),button("close",CLOSE));
+        let src = format!("<root><View view_layout=\"vertical\" h_alignment=\"left\"><View name=\"rollup_header\" view_layout=\"stacked\" min_size=\"Point(-1,19)\" max_size=\"Point(16000,19)\"><CanvasView name=\"header_bg\"/><View view_layout=\"horizontal\">{}<TextView name=\"title\" value=\"{}\" layout_borders=\"Rect(8,2,0,2)\"/><HLayoutSpacer/>{}{}</View></View><View name=\"body\" view_layout=\"stacked\" max_size=\"Point(16000,16000)\"><CanvasView name=\"docked_body_bg\"/></View></View></root>", button("icon",ICON),esc(&title),button("arrow",COLLAPSE),button("close",CLOSE));
         gui.wrap_window_xml(window, &src, "body")?;
         for (name, art) in [("icon",ICON),("arrow",COLLAPSE),("close",CLOSE)] {
             if let Some(id) = gui.gfx_id(art) {
@@ -244,12 +244,12 @@ impl Rollup {
                 let pin = gui.window_pinned(p.window);
                 if pin != g.pin {
                     g.pin = pin;
-                    self.dirty = true;
+                    // Automatic pin sync is not a user gesture; explicit pin toggles mark dirty elsewhere.
                 }
                 if let Some(frame) = gui.window_outer_frame(p.window) {
                     if Some(frame) != g.frame {
                         g.frame = Some(frame);
-                        self.dirty = true;
+                        // Content-limit relayout is not a user gesture; WindowFrame marks real drags dirty.
                     }
                 }
             }

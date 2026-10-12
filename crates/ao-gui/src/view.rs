@@ -287,6 +287,8 @@ pub struct View {
     pub selector_pref_child: Option<ViewId>,
     pub stacked: bool,
     pub flags: u32,
+    /// `View::_ParentSized` 0x1014ad6c edge-follow mask.
+    pub resize_mask: u32,
     pub visible: bool,
     pub enabled: bool,
     /// `View::SetColor` (inherited by children, multiplicative) 0xRRGGBB or ColorID.
@@ -328,6 +330,7 @@ impl View {
             selector_pref_child: None,
             stacked: false,
             flags: 0,
+            resize_mask: 0,
             visible: true,
             enabled: true,
             color: 0xffffff,
@@ -495,6 +498,7 @@ impl BuildCtx<'_> {
 /// `View::View(TiXmlElement*, default_flags, load_children)` common attributes.
 fn apply_view_attrs(v: &mut View, e: &Element, default_flags: u32) {
     v.flags = attr_u32(e, "view_flags", default_flags);
+    v.resize_mask = attr_u32(e, "view_resize_mask", 0);
     v.name = e.attr("name").unwrap_or("").to_string();
     v.borders = attr_rect(e, "layout_borders", Rect::default());
     v.min_size = attr_point(e, "min_size", Point::new(-1.0, -1.0));
@@ -652,7 +656,11 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
         "CanvasView" => {
             let mut v = View::new(Kind::Canvas(CanvasData::default()));
             apply_view_attrs(&mut v, e, 0);
-            tree.add(v)
+            let id = tree.add(v);
+            if !e.children.is_empty() {
+                load_children(tree, ctx, id, e);
+            }
+            id
         }
         "PowerBar" => {
             let mut v = View::new(Kind::PowerBar(PowerBarData {
@@ -818,6 +826,9 @@ pub fn load_children(tree: &mut Tree, ctx: &mut BuildCtx, id: ViewId, e: &Elemen
     }
     for c in &e.children {
         if let Some(cid) = build(tree, ctx, c) {
+            if tree.views[id].stacked {
+                tree.views[cid].resize_mask = 0xf; // `LoadChildViews` overrides the XML mask.
+            }
             tree.append_child(id, cid);
         }
     }
@@ -966,6 +977,14 @@ pub const MULTI_HEADER_H: f32 = 12.0 + 3.0 + 3.0;
 #[cfg(test)]
 mod lifetime_tests {
     use super::*;
+
+    #[test]
+    fn shipped_trade_resize_mask_is_parsed() {
+        let mut v = View::new(Kind::View);
+        let e = crate::xml::parse("<View view_resize_mask=\"11\"/>").unwrap();
+        apply_view_attrs(&mut v, &e, 0);
+        assert_eq!(v.resize_mask, 11);
+    }
 
     #[test]
     fn subtree_slots_recycle_without_moving_live_nodes_or_reviving_handles() {

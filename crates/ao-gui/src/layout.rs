@@ -425,8 +425,63 @@ pub fn set_frame(env: &mut Env, tree: &mut Tree, id: ViewId, frame: Rect) {
         env.preferred.clear();
         env.groups.clear();
     }
+    let old = tree.views[id].frame;
+    let delta = Point::new(frame.width() - old.width(), frame.height() - old.height());
     tree.views[id].frame = frame;
+    if delta.x != 0.0 || delta.y != 0.0 {
+        for i in 0..tree.views[id].children.len() {
+            let child = tree.views[id].children[i];
+            let v = &tree.views[child];
+            let resized = parent_sized(v.frame, v.resize_mask, delta);
+            if resized != v.frame {
+                set_frame(env, tree, child, resized);
+            }
+        }
+    }
     layout(env, tree, id);
+}
+
+/// `View::_ParentSized` 0x1014ad6c; parent deltas are inclusive extents.
+fn parent_sized(mut frame: Rect, mask: u32, delta: Point) -> Rect {
+    if mask & 0x10 != 0 {
+        // Retail doubles at 0x101a8b90 (2) and 0x101a9140 (0.5).
+        if mask & 1 != 0 {
+            frame.r = (frame.r * 2.0 + delta.x + 1.0) * 0.5;
+        }
+        if mask & 2 != 0 {
+            frame.l = (frame.l * 2.0 + delta.x + 1.0) * 0.5;
+            frame.r += delta.x;
+        }
+    } else if mask & 2 != 0 {
+        if mask & 1 == 0 {
+            frame.l += delta.x;
+        }
+        frame.r += delta.x;
+    }
+    if mask & 8 != 0 {
+        if mask & 4 == 0 {
+            frame.t += delta.y;
+        }
+        frame.b += delta.y;
+    }
+    frame
+}
+
+#[cfg(test)]
+mod resize_mask_tests {
+    use super::*;
+
+    #[test]
+    fn retail_edge_masks_and_trade_mask_follow_parent_deltas() {
+        let f = Rect::new(10.0, 20.0, 39.0, 49.0);
+        let d = Point::new(8.0, 6.0);
+        assert_eq!(parent_sized(f, 0, d), f);
+        assert_eq!(parent_sized(f, 2, d), f.translate(8.0, 0.0));
+        assert_eq!(parent_sized(f, 8, d), f.translate(0.0, 6.0));
+        assert_eq!(parent_sized(f, 11, d), Rect::new(10.0, 26.0, 47.0, 55.0));
+        assert_eq!(parent_sized(f, 15, d), Rect::new(10.0, 20.0, 47.0, 55.0));
+        assert_eq!(parent_sized(f, 0x12, d), Rect::new(14.5, 20.0, 47.0, 49.0));
+    }
 }
 
 pub fn layout(env: &mut Env, tree: &mut Tree, id: ViewId) {

@@ -35,8 +35,8 @@ const HOURS: i32 = 2;
 const KNOWN: u32 = 0x7dcc5e;
 const OPEN: u32 = 0xffffff;
 const LOCKED: u32 = 0x888888;
-/// The window's client size: UNRESOLVED GUESS (`PerkWindowConfig` has no saved frame, the list widths come from `GetListViewWidths`).
-const CLIENT: (u32, u32) = (440, 320);
+/// `PerkWindow_c` 0x1006372d: client Rect(200,300,600,500), before MoveToCenter.
+const CLIENT: (u32, u32) = (401, 201);
 
 /// One catalogue record (`Perk_t`, 36 bytes little endian: `item, precursor, flags, profession mask, 5 more words`; `FUN_1002ba03` reads the first six).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,7 +165,6 @@ enum Ask {
 
 struct Win {
     window: WindowId,
-    tabs: ViewHandle,
     bottom: ViewHandle,
     /// What the list was last built from: `(tab, known, points)`; rebuilt when it changes.
     drawn: Option<(usize, Known, [i32; 4], bool)>,
@@ -180,6 +179,8 @@ pub(super) struct HudPerks {
     win: Option<Win>,
     /// `SelectedTab` of `PerkWindowConfig`.
     tab: usize,
+    /// Native line selection is retained independently in each of the three tabs (`0x10060702`).
+    selected: [Option<u32>; 3],
     /// The "Remove Perk" toggle (`UntrainPerk`): the next perk click untrains.
     untrain: bool,
     screen: (u32, u32),
@@ -199,6 +200,7 @@ impl HudPerks {
             known: Known::default(),
             win: None,
             tab: 0,
+            selected: [None; 3],
             untrain: false,
             screen,
             dialogs: Dialogs::default(),
@@ -263,31 +265,33 @@ impl HudPerks {
         if self.win.is_some() {
             return;
         }
+        // `PerkView` 0x100611dc: horizontal line-list and selected-line columns.
         let xml = "<root><View view_layout=\"vertical\" name=\"perk_root\">\
-                   <View view_layout=\"horizontal\" name=\"tabs\" layout_borders=\"Rect(5,5,5,0)\"/>\
-                   <View view_layout=\"vertical\" name=\"points\" layout_borders=\"Rect(5,5,5,0)\"/>\
-                   <BorderView name=\"lines_border\" layout_borders=\"Rect(5,5,5,5)\"><ScrollView name=\"lines_scroll\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" min_size=\"Point(1,1)\" max_size=\"Point(16000,16000)\">\
-                   <ScrollViewChild><View view_layout=\"vertical\" name=\"lines\"/></ScrollViewChild></ScrollView></BorderView>\
-                   <View view_layout=\"horizontal\" name=\"bottom\" layout_borders=\"Rect(5,0,5,5)\"/></View></root>";
+                   <View view_layout=\"horizontal\">\
+                   <View view_layout=\"vertical\"><TextView name=\"line_heading\" font=\"BOLD\" layout_borders=\"Rect(5,10,5,5)\"/>\
+                   <BorderView layout_borders=\"Rect(5,0,0,5)\"><ScrollView name=\"lines_scroll\" v_scrollbar_mode=\"always\" max_size=\"Point(16000,16000)\"><ScrollViewChild><View view_layout=\"vertical\" name=\"lines\"/></ScrollViewChild></ScrollView></BorderView></View>\
+                   <View view_layout=\"vertical\"><TextView name=\"selected_name\" font=\"BOLD\" layout_borders=\"Rect(5,10,5,5)\"/>\
+                   <BorderView layout_borders=\"Rect(5,0,5,5)\"><View name=\"ranks\" view_layout=\"horizontal\"/></BorderView>\
+                   <View view_layout=\"vertical\" name=\"points\"/>\
+                   <VLayoutSpacer min_size=\"Point(-1,5)\"/><View view_layout=\"horizontal\" name=\"bottom\" layout_borders=\"Rect(5,5,5,5)\"/></View>\
+                   </View></View></root>";
         let title = self.text("PerkWindow");
-        let pos = ((self.screen.0 as i32 - CLIENT.0 as i32) / 2, (self.screen.1 as i32 - CLIENT.1 as i32) / 2);
+        let pos = ((self.screen.0 as i32 - CLIENT.0 as i32 - 10) / 2, (self.screen.1 as i32 - CLIENT.1 as i32 - 31) / 2);
         match gui.open_tabbed_window_xml("PerkWindow", &title, xml, pos, WindowSize::Fixed(CLIENT.0, CLIENT.1)) {
             Ok(window) => {
-                let keys = ["ProfessionPerks", "GroupPerks", "GeneralPerks"];
-                let mut tabs = String::from("<root><View view_layout=\"horizontal\">");
-                for (i, k) in keys.iter().enumerate() {
-                    tabs += &format!("<TextButton name=\"tab{i}\" text=\"{}\" color=\"0xFFFFFF\" hover_color=\"TEXT_HOVER\" pressed_color=\"TEXT_SELECTED\" layout_borders=\"Rect(0,0,12,0)\"/>", self.text(k));
-                }
-                tabs += "</View></root>";
+                gui.set_window_preferred_size_limits(window, true);
+                let tabs = ["ProfessionPerks", "GroupPerks", "GeneralPerks"].map(|k| self.text(k));
+                gui.set_window_tabs(window, &tabs, self.tab);
+                gui.set_text(window, "line_heading", &self.text("PerkLines"));
                 // "Remove Perk" toggle (`FUN_100611dc`, tooltip `UntrainPerkInfo`) and the untrain timeout (`UntrainPerkTimeout`, `FUN_10060553`)
                 let bottom = format!(
-                    "<root><View view_layout=\"horizontal\"><TextButton name=\"untrain\" text=\"{}\" color=\"0xFFFFFF\" hover_color=\"TEXT_HOVER\" pressed_color=\"TEXT_SELECTED\"/><HLayoutSpacer/><TextView name=\"timeout\" value=\"--:--:--\"/></View></root>",
+                    "<root><View view_layout=\"horizontal\"><Button name=\"untrain\" label=\"{}\"/><TextView name=\"timeout\" value=\"--:--:--\" layout_borders=\"Rect(5,0,10,0)\"/></View></root>",
                     self.text("RemovePerk")
                 );
-                match (gui.add_view_xml(window, "tabs", "PerkTabs", &tabs), gui.add_view_xml(window, "bottom", "PerkBottom", &bottom)) {
-                    (Ok(tabs), Ok(bottom)) => self.win = Some(Win { window, tabs, bottom, drawn: None }),
-                    (a, b) => {
-                        eprintln!("hud: perk_window: {:?} {:?}", a.err(), b.err());
+                match gui.add_view_xml(window, "bottom", "PerkBottom", &bottom) {
+                    Ok(bottom) => self.win = Some(Win { window, bottom, drawn: None }),
+                    Err(e) => {
+                        eprintln!("hud: perk_window: {e:#}");
                         gui.close_window(window);
                     }
                 }
@@ -321,9 +325,6 @@ impl HudPerks {
             self.rebuild(gui, &mut w, zone, points, alien);
             w.drawn = Some(sig);
         }
-        for i in 0..3 {
-            gui.set_color_in(w.tabs, &format!("tab{i}"), if i == self.tab { 0xFFFFFF } else { 0x9999aa });
-        }
         gui.set_toggle_in(w.bottom, "untrain", true, self.untrain);
         // `FUN_10060553`: the time left until the next untrain is possible as `%02u:%02u:%02u`, `--:--:--` when it is free; the stat holds the last reset's time
         let timeout = self.timeout(zone);
@@ -348,22 +349,56 @@ impl HudPerks {
             labels.extend([("UsedAlienPerkPoints", points[2]), ("AvailableAlienPerkPoints", points[3])]);
         }
         for (k, v) in labels {
-            let src = format!("<root><TextView value=\"{}{}\" color=\"0xCCFFFF\"/></root>", self.text(k), v);
+            let top = if k.starts_with("Available") { 5 } else { 3 };
+            let src = format!("<root><TextView value=\"{}{}\" color=\"0xCCFFFF\" layout_borders=\"Rect(10,{top},10,0)\"/></root>", self.text(k), v);
             let _ = gui.add_view_xml(w.window, "points", "PerkPoints", &src);
         }
         let lines = self.db.lines(zone.skill_value(EXPANSION).unwrap_or(0), zone.stat(BREED).unwrap_or(0), zone.stat(PROFESSION).unwrap_or(0));
-        gui.remove_children(w.window, "lines");
-        for (k, line) in lines[self.tab.min(2)].clone().iter().enumerate() {
-            let mut src = format!("<root><View view_layout=\"horizontal\" name=\"line{k}\" layout_borders=\"Rect(3,2,3,2)\">");
-            for &id in line {
-                let known = self.known.0.contains_key(&(id as i32));
-                let precursor_known = self.db.get(id).is_some_and(|d| d.precursor == 0 || self.known.0.contains_key(&(d.precursor as i32)));
-                let color = if known { KNOWN } else if precursor_known { OPEN } else { LOCKED };
-                let name = self.name(id).replace('&', "&amp;").replace('<', "&lt;").replace('"', "&quot;");
-                src += &format!("<TextButton name=\"perk_{id}\" text=\"{name}\" color=\"{color:#08X}\" hover_color=\"TEXT_HOVER\" pressed_color=\"TEXT_SELECTED\" layout_borders=\"Rect(0,0,10,0)\"/>");
+        // `LoadPerks` 0x10062f21 measures all tabs: root labels and numbered rank labels,
+        // using normal-font string width + 35 (0x1005e320, double at 0x101b3300).
+        let mut widths = [1, 1];
+        for line in lines.iter().flatten() {
+            let name = self.name(line[0]);
+            let base = name.rsplit_once(' ').map_or(name.as_str(), |(base, _)| base);
+            widths[0] = widths[0].max(gui.fonts().font(ao_gui::FontId::Normal).text_width(base) + 36);
+            for n in 1..=line.len() {
+                widths[1] = widths[1].max(gui.fonts().font(ao_gui::FontId::Normal).text_width(&format!("{base} {n}")) + 36);
             }
-            src += "<HLayoutSpacer/></View></root>"; // left-aligned
+        }
+        let row_height = gui.fonts().font(ao_gui::FontId::Normal).height + 9;
+        gui.remove_children(w.window, "lines");
+        for (k, line) in lines[self.tab.min(2)].iter().enumerate() {
+            let name = self.name(line[0]);
+            let base = name.rsplit_once(' ').map_or(name.as_str(), |(base, _)| base);
+            let src = format!("<root><Button name=\"line{k}\" label=\"{}\" min_size=\"Point({},-1)\" max_size=\"Point(16000,-1)\" layout_borders=\"Rect(0,0,0,4)\"/></root>", super::hud_listview::esc(base), widths[0] - 1);
             let _ = gui.add_view_xml(w.window, "lines", "PerkLine", &src);
+        }
+        gui.set_view_pref_size(w.window, "lines_scroll", (widths[0] as f32 + 9.0, row_height as f32 + 3.0), (16000.0, 16000.0));
+        gui.remove_children(w.window, "ranks");
+        let selected = self.selected[self.tab].and_then(|id| lines[self.tab].iter().find(|line| line[0] == id));
+        let base = selected.map(|line| self.name(line[0])).unwrap_or_default();
+        let base = base.rsplit_once(' ').map_or(base.as_str(), |(base, _)| base);
+        gui.set_text(w.window, "selected_name", base);
+        // `PerkListView` 0x1005e4b1: fixed two columns / five rows; SetFrame 0x1005ec59
+        // places the first ceil(n/2) ranks in the left column, remaining ranks in the right.
+        let count = selected.map_or(0, Vec::len);
+        let split = count.div_ceil(2);
+        for col in 0..2 {
+            let mut src = format!("<root><View view_layout=\"vertical\" layout_borders=\"Rect(0,0,{},0)\">", if col == 0 { 5 } else { 0 });
+            for row in 0..5 {
+                let index = col * split + row;
+                if row < split && index < count {
+                    let id = selected.unwrap()[index];
+                    let known = self.known.0.contains_key(&(id as i32));
+                    let precursor_known = self.db.get(id).is_some_and(|d| d.precursor == 0 || self.known.0.contains_key(&(d.precursor as i32)));
+                    let color = if known { KNOWN } else if precursor_known { OPEN } else { LOCKED };
+                    src += &format!("<Button name=\"perk_{id}\" label=\"{} {}\" color=\"{color:#08X}\" min_size=\"Point({}, {})\" max_size=\"Point({}, {})\" layout_borders=\"Rect(0,0,0,{})\"/>", super::hud_listview::esc(base), index + 1, widths[1] - 1, row_height - 1, widths[1] - 1, row_height - 1, if row < 4 { 5 } else { 0 });
+                } else {
+                    src += &format!("<View min_size=\"Point({}, {})\" max_size=\"Point({}, {})\" layout_borders=\"Rect(0,0,0,{})\"/>", widths[1] - 1, row_height - 1, widths[1] - 1, row_height - 1, if row < 4 { 5 } else { 0 });
+                }
+            }
+            src += "</View></root>";
+            let _ = gui.add_view_xml(w.window, "ranks", "PerkRanks", &src);
         }
         gui.relayout_window(w.window);
     }
@@ -426,9 +461,17 @@ impl HudPerks {
                 self.closed = true;
                 true
             }
+            Event::TabSelected { window: x, index } if *x == window && *index < 3 => {
+                self.tab = *index;
+                true
+            }
             Event::Clicked { window: x, view, .. } if *x == window => {
-                if let Some(i) = view.strip_prefix("tab").and_then(|n| n.parse::<usize>().ok()).filter(|i| *i < 3) {
-                    self.tab = i;
+                if let Some(i) = view.strip_prefix("line").and_then(|n| n.parse::<usize>().ok()) {
+                    let lines = self.db.lines(zone.skill_value(EXPANSION).unwrap_or(0), zone.stat(BREED).unwrap_or(0), zone.stat(PROFESSION).unwrap_or(0));
+                    if let Some(line) = lines[self.tab].get(i) {
+                        self.selected[self.tab] = Some(line[0]);
+                        if let Some(w) = self.win.as_mut() { w.drawn = None; }
+                    }
                 } else if view == "untrain" {
                     self.untrain = !self.untrain;
                 } else if let Some(id) = view.strip_prefix("perk_").and_then(|n| n.parse::<u32>().ok()) {
@@ -477,6 +520,18 @@ mod tests {
         let w = h.win.as_ref().unwrap().window;
         let (a, b) = (gui.view_rect(w, "line0").unwrap(), gui.view_rect(w, "line1").unwrap());
         assert!(b.t > a.t + 5.0 && a.l == b.l, "{a:?} {b:?}");
+        let lines = h.db.lines(0xff, 1, 6);
+        let (index, line) = lines[0].iter().enumerate().find(|(_, line)| line.len() > 1).unwrap();
+        let ids = line.clone();
+        assert!(h.event(&mut gui, &Event::Clicked { window: w, view: format!("line{index}"), item: None }, &z));
+        h.update(&mut gui, &z);
+        let first = gui.view_rect(w, &format!("perk_{}", ids[0])).unwrap();
+        let second_column = gui.view_rect(w, &format!("perk_{}", ids[ids.len().div_ceil(2)])).unwrap();
+        assert!(second_column.l > first.r);
+        let frame = gui.window_outer_frame(w).unwrap();
+        gui.set_window_outer_frame(w, (frame.0, frame.1, frame.2 + 100, frame.3 + 80));
+        let grown = gui.view_rect(w, &format!("perk_{}", ids[0])).unwrap();
+        assert_eq!((grown.width(), grown.height()), (first.width(), first.height()), "rank grid stays preferred-sized while the line list absorbs resize");
     }
 
     #[test]

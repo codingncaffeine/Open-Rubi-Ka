@@ -28,9 +28,9 @@ use stat_view::StatView;
 use std::path::Path;
 
 /// `Window(Rect(200,180)..(850,700))` of `SkillWindow` (`FUN_100fc18e`: floats 0x101a959c = 200, 0x101a95a0 = 180, 0x101c10b0 = 850,
-/// 0x101a95a8 = 700). Rects are inclusive: 651 x 521 outer.
+/// 0x101a95a8 = 700). `WndBorder` 0x1015b44b passes this to SetClientFrame: 651 x 521 client.
 const SKILLS_POS: (i32, i32) = (200, 180);
-const SKILLS_OUTER: (u32, u32) = (651, 521);
+const SKILLS_CLIENT: (u32, u32) = (651, 521);
 /// Equipment body art (the baked three-tab strip is covered by the real four-tab strip).
 const WEAR_ART: (u32, u32) = (192, 320);
 /// `WearView_c` 0x100e2640/269c/26f2/2748: three localized titles and literal Social.
@@ -366,10 +366,8 @@ impl HudStats {
     // ------------------------------------------------------------------------------------------------------------ skills
 
     fn open_skills(&mut self, gui: &mut Gui) -> anyhow::Result<()> {
-        // The original window is `Window(Rect(200,180,850,700), "", "Skills", style 0, flags 0x1000)` with one tab "Skills": the style-0 frame with the
-        // tab strip (docs/gui.md §6.1, client insets 5, 26, 5, 5) of the same outer size.
-        let client = (SKILLS_OUTER.0 - 10, SKILLS_OUTER.1 - 31);
-        let w = gui.open_tabbed_window("Skills", "Skills", SKILLS_POS, WindowSize::Fixed(client.0, client.1))?;
+        // `Window` 0x101563ff / `WndBorder` 0x1015b44b interpret the constructor Rect as client bounds.
+        let w = gui.open_tabbed_window("Skills", "Skills", SKILLS_POS, WindowSize::Fixed(SKILLS_CLIENT.0, SKILLS_CLIENT.1))?;
         gui.set_window_help(w, Some("The Skill Window.html")); // `SkillWindow` ctor FUN_100fc18e: `Window::SetHelpFile` (string 0x101c2050)
         for g in &stats::SKILL_GROUPS {
             gui.set_text(w, g.prefix, &self.db.by_id(10010, g.label).unwrap_or_default());

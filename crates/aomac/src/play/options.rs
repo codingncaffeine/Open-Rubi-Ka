@@ -355,19 +355,14 @@ impl HudOptions {
             esc(&quit_login)
         );
         let [l, t, r, b] = cfg.frame;
-        let outer = ((r - l + 1.0).max(120.0) as u32, (b - t + 1.0).max(120.0) as u32);
-        let client = (outer.0.saturating_sub(CHROME.0).max(60), outer.1.saturating_sub(CHROME.1).max(40));
+        let outer = ((r - l + 1.0).max(1.0) as u32, (b - t + 1.0).max(1.0) as u32);
+        let client = (outer.0.saturating_sub(CHROME.0).max(1), outer.1.saturating_sub(CHROME.1).max(1));
         let (x, y) = (l as i32, t as i32);
         let id = match gui.open_tabbed_window_xml("OptionWindow", "Preferences", &src, (x, y), WindowSize::Fixed(client.0, client.1)) {
             Ok(w) => w,
             Err(e) => return eprintln!("hud: options window: {e:#}"),
         };
         gui.set_window_frame(id, true, true);
-        gui.set_window_size_limits(id, (200, 120), (0, 0));
-        // keep the window on the screen (`Window::MoveInsideScreen`)
-        let (ow, oh) = gui.outer_size(id);
-        let (px, py) = ((x.min(self.screen.0 as i32 - ow as i32)).max(0), (y.min(self.screen.1 as i32 - oh as i32)).max(0));
-        gui.set_window_outer_frame(id, (px, py, ow, oh));
 
         gui.batch_updates(|gui| {
         let mut controls = vec![];
@@ -435,6 +430,13 @@ impl HudOptions {
         });
         // OptionWindow_c 0x100c3c44 caps the category panel to its minimum preferred width.
         gui.fit_view_width(id, "categories");
+        gui.relayout_window(id);
+        gui.set_window_preferred_size_limits(id, true);
+        // Load the requested frame only after final content limits, then MoveInsideScreen.
+        gui.set_window_outer_frame(id, (x, y, outer.0, outer.1));
+        let (ow, oh) = gui.outer_size(id);
+        let (px, py) = ((x.min(self.screen.0 as i32 - ow as i32)).max(0), (y.min(self.screen.1 as i32 - oh as i32)).max(0));
+        gui.set_window_pos(id, (px, py));
     }
 
     /// `OptionWindow_c` dtor: the frame, open folders and selection go into `OptionWindowConfig` (the flow saves the DValue files).

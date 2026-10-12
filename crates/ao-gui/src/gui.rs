@@ -432,6 +432,32 @@ impl Gui {
         })
     }
 
+    /// Root preferred client sizes (`View::_Attached` 0x1014f10e); excludes window chrome.
+    pub fn window_preferred_size_limits(&mut self, w: WindowId) -> Option<((u32, u32), (u32, u32))> {
+        let root = self.windows.get(w)?.as_ref()?.root;
+        let mut env = Env { gfx: &self.gfx, fonts: &mut self.fonts, colors: &self.colors, groups: Default::default(), preferred: Default::default(), group_depth: 0 };
+        let min = layout::pref(&mut env, &self.tree, root, false);
+        let max = layout::pref(&mut env, &self.tree, root, true);
+        Some((((min.x + 1.0).max(0.0) as u32, (min.y + 1.0).max(0.0) as u32),
+              ((max.x + 1.0).max(0.0) as u32, (max.y + 1.0).max(0.0) as u32)))
+    }
+
+    /// Mirrors retail root size constraints and refreshes them when content changes.
+    pub fn set_window_preferred_size_limits(&mut self, w: WindowId, enabled: bool) {
+        if let Some(Some(win)) = self.windows.get_mut(w) {
+            win.fx.preferred_limits = enabled;
+        }
+        self.refresh_window_size_limits(w);
+    }
+
+    fn refresh_window_size_limits(&mut self, w: WindowId) {
+        if self.windows.get(w).and_then(Option::as_ref).is_some_and(|win| win.fx.preferred_limits) {
+            if let Some((min, max)) = self.window_preferred_size_limits(w) {
+                self.set_window_size_limits(w, min, max);
+            }
+        }
+    }
+
     pub fn resize_window(&mut self, w: WindowId, size: WindowSize) {
         let Some(Some(win)) = self.windows.get(w) else { return };
         let root = win.root;
@@ -444,6 +470,7 @@ impl Gui {
             }
         };
         self.relayout(root, Rect::new(0.0, 0.0, cw - 1.0, ch - 1.0));
+        self.refresh_window_size_limits(w);
     }
 
     fn relayout(&mut self, root: ViewId, frame: Rect) {
@@ -462,6 +489,7 @@ impl Gui {
         if let Some(Some(win)) = self.windows.get(w) {
             let (root, f) = (win.root, self.tree.views[win.root].frame);
             self.relayout(root, f);
+            self.refresh_window_size_limits(w);
         }
     }
 

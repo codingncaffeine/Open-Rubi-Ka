@@ -351,12 +351,17 @@ fn closing_and_reopening_restores_selection_and_frame() {
     let page = r.opt.win.as_ref().unwrap().selected;
     let id = r.win();
     r.gui.set_window_outer_frame(id, (50, 60, 500, 420));
+    let frame = r.gui.window_outer_frame(id).unwrap();
+    let (minimum, _) = r.gui.window_preferred_size_limits(id).unwrap();
+    assert!(r.gui.window_size(id).0 >= minimum.0 && r.gui.window_size(id).1 >= minimum.1);
     r.opt.close(&mut r.gui, &mut r.d);
+    let Some(Variant::Archive(archive)) = r.d.get(CONFIG) else { panic!("OptionWindowConfig not saved") };
+    assert_eq!(Config::parse(archive).unwrap().frame, [frame.0 as f32, frame.1 as f32, (frame.0 + frame.2 as i32 - 1) as f32, (frame.1 + frame.3 as i32 - 1) as f32]);
     assert!(r.opt.window().is_none());
     r.opt.open(&mut r.gui, &r.d);
     r.tick();
     assert_eq!(r.opt.win.as_ref().unwrap().selected, page);
-    assert_eq!(r.gui.window_outer_frame(r.win()), Some((50, 60, 500, 420)));
+    assert_eq!(r.gui.window_outer_frame(r.win()), Some(frame));
 }
 
 /// `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac -- options_shots`: the Preferences window on its first page, the control-centre page, and two others.

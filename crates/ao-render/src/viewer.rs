@@ -3,7 +3,7 @@ use anyhow::Result;
 use ao_scene::Scene;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -246,6 +246,10 @@ struct Gui {
     scale: u32,
 }
 
+fn gui_scale(scale_factor: f64) -> u32 {
+    (scale_factor.round() as u32).max(1)
+}
+
 /// winit -> GUI input. Cursor positions are physical pixels / `scale`; Cmd counts as Ctrl (macOS shortcuts).
 fn gui_input(ev: &WindowEvent, cursor: &mut (f32, f32), mods: &mut ao_gui::Modifiers, scale: u32) -> Option<ao_gui::InputEvent> {
     use ao_gui::{InputEvent as I, Key as K};
@@ -321,10 +325,16 @@ struct State {
     raw_mouse: raw_mouse::RawMouse,
     cursor_hidden: bool,
     last: Instant,
+    frame_deadline: Instant,
+    display_period: Option<Duration>,
     stat_t: Instant,
     stat_frames: u32,
     perf: bool,
     cpu: f32,
+    // PERF-only seconds: frame wall, acquisition, GUI/frame work, reconfigure, present.
+    perf_times: [f64; 5],
+    perf_frames: u32,
+    perf_gap: f64,
     gui: Option<Gui>,
     /// Seconds since start (drives `Submesh::uv_scroll`).
     clock: f32,
@@ -362,6 +372,21 @@ pub fn run_viewer_hooked(scene: Scene, live: Option<LiveSky>, hook: FrameHook) -
 /// Opens the window with `frontend` drawn over `scene` (free-fly off until the frontend enables it).
 pub fn run_frontend(scene: Scene, frontend: impl Frontend + 'static) -> Result<()> {
     run(scene, Some(Box::new(frontend)), None, None)
+}
+
+// Missing native refresh information falls back to GPU vsync, never a guessed Hz.
+fn display_period(rate_millihertz: Option<u32>) -> Option<Duration> {
+    rate_millihertz.filter(|rate| *rate != 0).map(|rate| Duration::from_secs_f64(1000.0 / f64::from(rate)))
+}
+
+fn frame_deadline(start: Instant, end: Instant, period: Duration) -> Instant {
+    let next = start + period;
+    next.max(end)
+}
+
+fn wait_for_frame(mode: wgpu::PresentMode, period: Option<Duration>, deadline: Instant, now: Instant) -> bool {
+    matches!(mode, wgpu::PresentMode::AutoVsync | wgpu::PresentMode::Fifo | wgpu::PresentMode::FifoRelaxed)
+        && period.is_some() && now < deadline
 }
 
 fn run(scene: Scene, frontend: Option<Box<dyn Frontend>>, live: Option<LiveSky>, hook: Option<FrameHook>) -> Result<()> {
@@ -402,10 +427,11 @@ impl State {
         let cam = Camera::look_at(eye, at);
         let gui = frontend.map(|frontend| {
             let renderer = crate::GuiRenderer::new(&renderer, frontend.gui());
-            Gui { renderer, frontend, host: Host { camera: cam, effect_sun_direction: scene.environment.map(|env| env.sun_dir.map(|v| -v)), ..Host::headless() }, cursor: (0.0, 0.0), mods: Default::default(), scale: (window.scale_factor().round() as u32).max(1) }
+            Gui { renderer, frontend, host: Host { camera: cam, effect_sun_direction: scene.environment.map(|env| env.sun_dir.map(|v| -v)), ..Host::headless() }, cursor: (0.0, 0.0), mods: Default::default(), scale: gui_scale(window.scale_factor()) }
         });
         let now = Instant::now();
         let focused = window.has_focus();
+        let display_period = display_period(window.current_monitor().and_then(|monitor| monitor.refresh_rate_millihertz()));
         Ok(Self {
             window,
             surface,
@@ -420,10 +446,15 @@ impl State {
             raw_mouse: raw_mouse::RawMouse::new(),
             cursor_hidden: false,
             last: now,
+            frame_deadline: now,
+            display_period,
             stat_t: now,
             stat_frames: 0,
             cpu: 0.0,
             perf: std::env::var_os("AOMAC_PERF").is_some(),
+            perf_times: [0.0; 5],
+            perf_frames: 0,
+            perf_gap: 0.0,
             gui,
             clock: 0.0,
             live: live.map(LiveRun::new),
@@ -490,9 +521,20 @@ impl State {
         g.renderer.draw(&self.renderer, view, (self.config.width, self.config.height), g.scale, g.frontend.gui(), &list);
     }
 
+    fn finish_perf_frame(&mut self, start: Instant) {
+        if self.perf {
+            self.perf_times[0] += start.elapsed().as_secs_f64();
+            self.perf_frames += 1;
+        }
+    }
+
     /// True = quit requested.
     fn frame(&mut self) -> bool {
         let now = Instant::now();
+        if self.perf {
+            self.perf_gap = self.perf_gap.max((now - self.last).as_secs_f64());
+        }
+        let work_start = self.perf.then(Instant::now);
         // Retail high-resolution Timer_t bounds elapsed time at 100 seconds, not 0.1.
         let dt = (now - self.last).as_secs_f32().min(100.0);
         self.last = now;
@@ -503,17 +545,22 @@ impl State {
         }
 
         // HiDPI/resize: follow the physical size every frame.
+        if let Some(t) = work_start { self.perf_times[2] += t.elapsed().as_secs_f64(); }
         let PhysicalSize { width, height } = self.window.inner_size();
         if width == 0 || height == 0 {
+            self.finish_perf_frame(now);
             return false;
         }
         if (width, height) != (self.config.width, self.config.height) {
+            let t = self.perf.then(Instant::now);
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.renderer.device, &self.config);
             self.targets = Targets::new(&self.renderer, width, height);
+            if let Some(t) = t { self.perf_times[3] += t.elapsed().as_secs_f64(); }
         }
 
+        let work_start = self.perf.then(Instant::now);
         if self.fly() {
             let k = |c| self.keys.contains(&c) as i32 as f32;
             let fast = if self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight) { 5.0 } else { 1.0 };
@@ -534,24 +581,39 @@ impl State {
             h(self.cam.pos, dt);
         }
 
-        let frame = match self.surface.get_current_texture() {
+        if let Some(t) = work_start { self.perf_times[2] += t.elapsed().as_secs_f64(); }
+        let acquire_start = self.perf.then(Instant::now);
+        let acquired = self.surface.get_current_texture();
+        if let Some(t) = acquire_start { self.perf_times[1] += t.elapsed().as_secs_f64(); }
+        let frame = match acquired {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                let t = self.perf.then(Instant::now);
                 self.surface.configure(&self.renderer.device, &self.config);
+                if let Some(t) = t { self.perf_times[3] += t.elapsed().as_secs_f64(); }
+                self.finish_perf_frame(now);
                 return quit;
             }
-            _ => return quit, // timeout / occluded: skip this frame
+            _ => {
+                self.finish_perf_frame(now);
+                return quit; // timeout / occluded: skip this frame
+            }
         };
         let view = frame.texture.create_view(&Default::default());
-        let t0 = Instant::now();
+        let t0 = self.perf.then(Instant::now);
         self.renderer.render(&view, &self.targets, &self.cam);
-        self.cpu += t0.elapsed().as_secs_f32();
+        if let Some(t) = t0 { self.cpu += t.elapsed().as_secs_f32(); }
         if let Some(list) = gui_out {
+            let t = self.perf.then(Instant::now);
             let gview = crate::GuiRenderer::view(&frame.texture);
             self.paint_gui(list, &gview);
+            if let Some(t) = t { self.perf_times[2] += t.elapsed().as_secs_f64(); }
         }
+        let present_start = self.perf.then(Instant::now);
         self.window.pre_present_notify();
         frame.present();
+        if let Some(t) = present_start { self.perf_times[4] += t.elapsed().as_secs_f64(); }
+        self.finish_perf_frame(now);
 
         self.stat_frames += 1;
         let el = self.stat_t.elapsed().as_secs_f32();
@@ -563,8 +625,12 @@ impl State {
             }
             if self.perf {
                 let st = self.renderer.stats;
-                eprintln!("{:.2} ms/frame ({fps:.0} fps), render() cpu {:.2} ms, {} instances, {} draws", 1000.0 / fps, 1000.0 * self.cpu / self.stat_frames as f32, st.instances, st.draw_calls);
+                let ms = self.perf_times.map(|t| 1000.0 * t / self.perf_frames as f64);
+                eprintln!("{:.2} ms/frame ({fps:.0} fps), render() cpu {:.2} ms, {} instances, {} draws; frame cpu wall {:.2} ms, acquire {:.2} ms, GUI/frame work {:.2} ms, resize/reconfigure {:.2} ms, present {:.2} ms, worst gap {:.2} ms, {} attempts/{} presented", 1000.0 / fps, 1000.0 * self.cpu / self.stat_frames as f32, st.instances, st.draw_calls, ms[0], ms[1], ms[2], ms[3], ms[4], 1000.0 * self.perf_gap, self.perf_frames, self.stat_frames);
                 self.cpu = 0.0;
+                self.perf_times = [0.0; 5];
+                self.perf_frames = 0;
+                self.perf_gap = 0.0;
             }
             self.stat_t = Instant::now();
             self.stat_frames = 0;
@@ -627,7 +693,22 @@ impl ApplicationHandler for App {
         }
         s.sync_cursor();
         match ev {
+            // Refresh pacing follows the current screen, not a "moving window" throttle.
+            WindowEvent::Moved(_) => {
+                s.display_period = display_period(s.window.current_monitor().and_then(|monitor| monitor.refresh_rate_millihertz()));
+            }
             WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                s.display_period = display_period(s.window.current_monitor().and_then(|monitor| monitor.refresh_rate_millihertz()));
+                if let Some(g) = &mut s.gui {
+                    // Preserve the cursor's physical position when logical GUI pixels change.
+                    let scale = gui_scale(scale_factor);
+                    let ratio = g.scale as f32 / scale as f32;
+                    g.cursor.0 *= ratio;
+                    g.cursor.1 *= ratio;
+                    g.scale = scale;
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if fly || s.gui.is_none() => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if event.state == ElementState::Pressed {
@@ -661,11 +742,14 @@ impl ApplicationHandler for App {
                 s.speed = (s.speed * 1.15f32.powf(y)).clamp(0.1, 100_000.0);
             }
             WindowEvent::RedrawRequested => {
+                let start = Instant::now();
                 if s.frame() {
                     el.exit();
                     return;
                 }
-                s.window.request_redraw();
+                if let Some(period) = s.display_period {
+                    s.frame_deadline = frame_deadline(start, Instant::now(), period);
+                }
             }
             _ => {}
         }
@@ -684,9 +768,16 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         if let Some(s) = &self.state {
-            s.window.request_redraw();
+            // Yield the AppKit runloop BEFORE the next drawable acquisition.
+            // Keep actual display synchronization enabled; profiling/no-vsync stays uncapped.
+            if cfg!(target_os = "macos") && wait_for_frame(s.config.present_mode, s.display_period, s.frame_deadline, Instant::now()) {
+                el.set_control_flow(ControlFlow::WaitUntil(s.frame_deadline));
+            } else {
+                el.set_control_flow(ControlFlow::Poll);
+                s.window.request_redraw();
+            }
         }
     }
 }
@@ -760,6 +851,32 @@ impl Offscreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_pacing_uses_refresh_and_does_not_catch_up_missed_frames() {
+        assert_eq!(display_period(None), None);
+        assert_eq!(display_period(Some(0)), None);
+        let period = display_period(Some(120_000)).unwrap();
+        assert!((period.as_secs_f64() - 1.0 / 120.0).abs() < 1e-9);
+        let start = Instant::now();
+        assert_eq!(frame_deadline(start, start + period / 2, period), start + period);
+        assert_eq!(frame_deadline(start, start + period * 3, period), start + period * 3);
+        let deadline = start + period;
+        assert!(wait_for_frame(wgpu::PresentMode::AutoVsync, Some(period), deadline, start));
+        assert!(!wait_for_frame(wgpu::PresentMode::AutoVsync, Some(period), deadline, deadline));
+        assert!(!wait_for_frame(wgpu::PresentMode::AutoVsync, None, deadline, start));
+        assert!(!wait_for_frame(wgpu::PresentMode::AutoNoVsync, Some(period), deadline, start));
+    }
+
+    #[test]
+    fn gui_scale_rounds_and_keeps_at_least_one_pixel() {
+        assert_eq!(gui_scale(1.0), 1);
+        assert_eq!(gui_scale(1.49), 1);
+        assert_eq!(gui_scale(1.5), 2);
+        assert_eq!(gui_scale(2.0), 2);
+        assert_eq!(gui_scale(0.0), 1);
+        assert_eq!(gui_scale(f64::NAN), 1);
+    }
+
     #[test]
     fn native_shadow_sun_uses_the_loaded_environment_ray_direction() {
         let mut host = Host::headless();

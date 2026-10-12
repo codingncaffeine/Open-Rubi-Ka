@@ -7,9 +7,6 @@
 
 use super::*;
 
-/// Outer-width floor of `DoSetFrame`: `+0x2ec - 1`, the width of the border buttons (`Layout`: each button adds 5 + (14 - 1) = 18 px, icon button left
-/// + close button right) minus 1 (extent). **GUESS** that the pin/help buttons are absent (chat windows are created with the default flags).
-pub const MIN_OUTER_EXTENT_W: f32 = 35.0;
 /// Pointer travel (px) before a pressed tab turns into a drag. **GUESS** (the `TabView` drag threshold was not found).
 const TAB_DRAG_START: f32 = 4.0;
 /// Bottom row of the move zone inside the window (`_DAT_101c894c` = 18.0, `Layout` +0x248); its top is the first row below the top border (7).
@@ -42,6 +39,7 @@ pub(super) struct WinFx {
     /// Client size limits in pixels (`WndBorder::SetSizeLimits`); a max of 0 = unlimited.
     pub min: (u32, u32),
     pub max: (u32, u32),
+    pub preferred_limits: bool,
 }
 
 pub(super) struct ViewTabs {
@@ -129,22 +127,22 @@ pub fn dragged_rect(start: Rect, hit: u8, d: Point) -> Rect {
 
 /// `DoSetFrame` 0x10159888: clamps the *client* size to the limits, then the outer width to the button row, keeping the edge opposite to the
 /// dragged one fixed (top edge moves for hit 3/6/7, left edge for 2/6/8). `insets` = client insets (l, t, r, b) of the frame.
-pub fn clamp_outer(mut o: Rect, hit: u8, insets: (i32, i32, i32, i32), min: (u32, u32), max: (u32, u32)) -> Rect {
+pub fn clamp_outer(mut o: Rect, hit: u8, insets: (i32, i32, i32, i32), min: (u32, u32), max: (u32, u32), button_row_width: f32) -> Rect {
     if hit == 1 {
         return o;
     }
     let (ih, iv) = ((insets.0 + insets.2) as f32, (insets.1 + insets.3) as f32);
     let mut cw = o.width() + 1.0 - ih;
     let mut ch = o.height() + 1.0 - iv;
-    cw = cw.max(min.0.max(1) as f32);
-    ch = ch.max(min.1.max(1) as f32);
+    cw = cw.max(min.0 as f32);
+    ch = ch.max(min.1 as f32);
     if max.0 > 0 {
         cw = cw.min(max.0 as f32);
     }
     if max.1 > 0 {
         ch = ch.min(max.1 as f32);
     }
-    let ow = (cw + ih).max(MIN_OUTER_EXTENT_W + 1.0);
+    let ow = (cw + ih).max(button_row_width);
     let oh = ch + iv;
     if matches!(hit, 2 | 6 | 8) {
         o.l = o.r - (ow - 1.0);
@@ -245,6 +243,19 @@ impl Gui {
             win.fx.min = min;
             win.fx.max = max;
         }
+        // Retail `SetSizeLimits` 0x1015902f reapplies the current frame immediately.
+        // Lay out directly: resize_window would refresh preferred limits recursively.
+        let Some(Some(win)) = self.windows.get(w) else { return };
+        let root = win.root;
+        let insets = if win.framed { self.insets(win) } else { (0, 0, 0, 0) };
+        let row = if win.framed { 18.0 * (2 + u32::from(win.bd.pin) + u32::from(win.bd.help.is_some())) as f32 } else { 0.0 };
+        let Some(outer) = self.outer_of(w) else { return };
+        let clamped = clamp_outer(outer, 9, insets, min, max, row);
+        let cw = (clamped.width() + 1.0 - (insets.0 + insets.2) as f32) as u32;
+        let ch = (clamped.height() + 1.0 - (insets.1 + insets.3) as f32) as u32;
+        if self.window_size(w) != (cw, ch) {
+            self.relayout(root, Rect::new(0.0, 0.0, cw as f32 - 1.0, ch as f32 - 1.0));
+        }
     }
 
     /// Right-clicks inside the window (frame included) raise [`Event::ContextMenu`].
@@ -286,7 +297,7 @@ impl Gui {
     pub fn set_window_outer_frame(&mut self, w: WindowId, f: (i32, i32, u32, u32)) {
         let Some(Some(win)) = self.windows.get(w) else { return };
         let i = if win.framed { self.insets(win) } else { (0, 0, 0, 0) };
-        let (cw, ch) = (f.2.saturating_sub((i.0 + i.2) as u32).max(1), f.3.saturating_sub((i.1 + i.3) as u32).max(1));
+        let (cw, ch) = (f.2.saturating_sub((i.0 + i.2) as u32), f.3.saturating_sub((i.1 + i.3) as u32));
         let resized = self.window_size(w) != (cw, ch);
         if let Some(Some(win)) = self.windows.get_mut(w) {
             win.pos = (f.0 + i.0, f.1 + i.1);
@@ -401,7 +412,9 @@ impl Gui {
             let (min, max) = (win.fx.min, win.fx.max);
             let insets = self.insets(win);
             let r = dragged_rect(start, hit, Point::new(x - m0.x, y - m0.y));
-            let r = clamp_outer(r, hit, insets, min, max);
+            // `Layout` 0x1015a1d9 sums an 18 px pitch for every existing border button.
+            let button_row_width = 18.0 * (2 + u32::from(win.bd.pin) + u32::from(win.bd.help.is_some())) as f32;
+            let r = clamp_outer(r, hit, insets, min, max, button_row_width);
             let new = (r.l as i32, r.t as i32, (r.width() + 1.0) as u32, (r.height() + 1.0) as u32);
             if self.window_outer_frame(wid) != Some(new) {
                 self.set_window_outer_frame(wid, new);
@@ -526,6 +539,60 @@ mod tests {
     }
 
     #[test]
+    fn zero_client_resize_application_keeps_opposite_edges_fixed() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let w = gui.open_window_xml("zero", "<root><View/></root>", (100, 200), WindowSize::Fixed(100, 100)).unwrap();
+        gui.frame_tabbed(w, "Zero");
+        let start = gui.outer_of(w).unwrap();
+        let win = gui.windows[w].as_ref().unwrap();
+        let insets = gui.insets(win);
+        let r = clamp_outer(dragged_rect(start, 6, Point::new(1000.0, 1000.0)), 6, insets, (0, 0), (0, 0), 54.0);
+        let frame = (r.l as i32, r.t as i32, (r.width() + 1.0) as u32, (r.height() + 1.0) as u32);
+        gui.set_window_outer_frame(w, frame);
+        assert_eq!(gui.window_outer_frame(w), Some(frame));
+        let applied = gui.outer_of(w).unwrap();
+        assert_eq!((applied.r, applied.b), (start.r, start.b));
+        assert_eq!(gui.window_size(w).1, 0);
+        gui.set_window_outer_frame(w, frame);
+        assert_eq!(gui.window_outer_frame(w), Some(frame));
+    }
+
+    #[test]
+    fn canvas_children_keep_horizontal_layout_geometry() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let w = gui.open_window_xml("canvas", "<root><CanvasView view_layout=\"horizontal\"><View name=\"left\" min_size=\"Point(9,9)\" max_size_limit=\"Point(9,9)\"/><View name=\"right\" min_size=\"Point(19,9)\" max_size_limit=\"Point(19,9)\"/></CanvasView></root>", (0, 0), WindowSize::Fixed(30, 10)).unwrap();
+        let left = gui.find(w, "left").unwrap();
+        let right = gui.find(w, "right").unwrap();
+        assert_eq!(gui.tree.views[left].frame, Rect::new(0.0, 0.0, 9.0, 9.0));
+        assert_eq!(gui.tree.views[right].frame, Rect::new(10.0, 0.0, 29.0, 9.0));
+    }
+
+    #[test]
+    fn preferred_client_limits_refresh_without_including_chrome() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        // `max_size` raises the preferred maximum; `max_size_limit` is its ceiling.
+        let w = gui.open_window_xml("limits", "<root><View min_size=\"Point(49,29)\" max_size=\"Point(99,79)\" max_size_limit=\"Point(99,79)\"/></root>", (0, 0), WindowSize::Fixed(70, 40)).unwrap();
+        assert_eq!(gui.window_preferred_size_limits(w), Some(((50, 30), (100, 80))));
+        gui.set_window_preferred_size_limits(w, true);
+        let root = gui.windows[w].as_ref().unwrap().root;
+        gui.tree.views[root].min_size = Point::new(79.0, 49.0);
+        gui.relayout_window(w);
+        let fx = &gui.windows[w].as_ref().unwrap().fx;
+        assert_eq!((fx.min, fx.max), ((80, 50), (100, 80)));
+        assert_eq!(gui.window_size(w), (80, 50));
+        assert_eq!(gui.window_pos(w), (0, 0));
+        gui.tree.views[root].max_limit = Point::new(89.0, 59.0);
+        gui.resize_window(w, WindowSize::Fixed(200, 200));
+        assert_eq!(gui.window_size(w), (90, 60));
+    }
+
+    #[test]
     fn frameless_hud_drag_moves_without_resizing_or_leaking_clicks() {
         let dir = crate::client_dir();
         if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
@@ -581,16 +648,27 @@ mod tests {
         assert_eq!(dragged_rect(o, 1, Point::new(10.0, -5.0)), o.translate(10.0, -5.0));
         let insets = (5, 26, 5, 5);
         // dragging the right edge left far past the minimum: width stops at the button-row floor, left edge stays
-        let r = clamp_outer(dragged_rect(o, 4, Point::new(-1000.0, 0.0)), 4, insets, (0, 0), (0, 0));
-        assert_eq!((r.l, r.width()), (100.0, MIN_OUTER_EXTENT_W));
+        let r = clamp_outer(dragged_rect(o, 4, Point::new(-1000.0, 0.0)), 4, insets, (0, 0), (0, 0), 36.0);
+        assert_eq!((r.l, r.width()), (100.0, 35.0));
         // dragging the left edge right: the right edge stays fixed
-        let r = clamp_outer(dragged_rect(o, 2, Point::new(1000.0, 0.0)), 2, insets, (0, 0), (0, 0));
-        assert_eq!((r.r, r.width()), (399.0, MIN_OUTER_EXTENT_W));
+        let r = clamp_outer(dragged_rect(o, 2, Point::new(1000.0, 0.0)), 2, insets, (0, 0), (0, 0), 36.0);
+        assert_eq!((r.r, r.width()), (399.0, 35.0));
         // top-left corner with client limits (min 100x80, max 250x120): growth and shrink clamp, bottom-right stays
-        let r = clamp_outer(dragged_rect(o, 6, Point::new(-500.0, -500.0)), 6, insets, (100, 80), (250, 120));
+        let r = clamp_outer(dragged_rect(o, 6, Point::new(-500.0, -500.0)), 6, insets, (100, 80), (250, 120), 36.0);
         assert_eq!((r.r, r.b, r.width() + 1.0 - 10.0, r.height() + 1.0 - 31.0), (399.0, 349.0, 250.0, 120.0));
-        let r = clamp_outer(dragged_rect(o, 9, Point::new(-500.0, -500.0)), 9, insets, (100, 80), (250, 120));
+        let r = clamp_outer(dragged_rect(o, 9, Point::new(-500.0, -500.0)), 9, insets, (100, 80), (250, 120), 36.0);
         assert_eq!((r.l, r.t, r.width() + 1.0 - 10.0, r.height() + 1.0 - 31.0), (100.0, 200.0, 100.0, 80.0));
+    }
+
+    #[test]
+    fn button_row_floor_and_zero_client_minima() {
+        for buttons in 2..=4 {
+            let row = buttons as f32 * 18.0;
+            let r = clamp_outer(Rect::new(100.0, 200.0, 99.0, 199.0), 9, (5, 26, 5, 5), (0, 0), (0, 0), row);
+            assert_eq!((r.l, r.t, r.width() + 1.0, r.height() + 1.0), (100.0, 200.0, row, 31.0));
+            let r = clamp_outer(Rect::new(400.0, 350.0, 399.0, 349.0), 6, (5, 26, 5, 5), (0, 0), (0, 0), row);
+            assert_eq!((r.r, r.b, r.width() + 1.0, r.height() + 1.0), (399.0, 349.0, row, 31.0));
+        }
     }
 
     #[test]

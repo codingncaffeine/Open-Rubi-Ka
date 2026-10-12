@@ -2,9 +2,6 @@
 
 use super::*;
 
-/// Client-size floor of a framed chat window (`WndBorder::SetSizeLimits`): the original sets none (`ChatWindow_c` never calls it; only `DoSetFrame`'s
-/// button-row width applies). **GUESS**: without a floor the input bar / text area layout collapses.
-pub(super) const MIN_CLIENT: (u32, u32) = (50, 60);
 /// Offset of a tab torn out of its window (`FUN_10097d0b`: `SetFrame(Bounds + Point)` then `MoveInsideScreen(true, true, true)`; the `Point` is not
 /// readable in the decompile): **GUESS** 20 px down-right.
 const TEAR_OFFSET: f32 = 20.0;
@@ -200,7 +197,8 @@ impl ChatWindows {
             gui.set_window_fade(id, false); // chat windows run their own `FadeTo` rule (docs/chat/gui.md §3), not the generic hover fade
             gui.set_window_tabs(id, &names, sel);
             gui.set_window_frame(id, true, true);
-            gui.set_window_size_limits(id, MIN_CLIENT, (0, 0));
+            // `ChatWindow_c` 0x10097ae3 uses flags 0, not the preferred-limit flag 0x1000.
+            gui.set_window_size_limits(id, (0, 0), (0, 0));
             id
         } else {
             gui.open_window_xml("ChatWindow", &src, (x, y), WindowSize::Fixed(w, h))?

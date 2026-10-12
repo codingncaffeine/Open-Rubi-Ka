@@ -127,6 +127,8 @@ impl HudPet {
                 }
             }
         }
+        // Buff rows and localized names affect preferred limits without replacing the saved frame.
+        gui.relayout_window(w);
     }
 
     pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone) -> bool {
