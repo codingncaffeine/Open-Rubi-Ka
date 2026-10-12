@@ -34,17 +34,24 @@ pub fn split_from(y: f32, view_h: u32) -> f32 {
 
 /// The view XML (both text views are `TextView_c(Rect, "", "", FontID 8 = LARGE, ..)`, `FUN_10058ed8`): `NPCChatView_c` is a vertical layout of the text view (fixed height from [`text_height`]), the splitter bitmap and the answer view.
 /// The splitter is a `CanvasView` (it needs the press / drag events; the bitmap itself is painted by [`NpcChat::paint_splitter`]).
+/// Retail's `TextView_c` is itself a self-clipping/self-scrolling widget (`v_scrollbar_mode` 2 = auto); the port has no bare-`TextView` scroll/clip
+/// primitive, so each text view is wrapped in the engine's `ScrollView`/`ScrollViewChild` pair (the idiom every other scrolling text window in this
+/// codebase already uses) so the transcript is clipped to [`text_height`] and scrolled instead of bleeding into the answer list below it.
 fn view_xml(h: u32, split: f32) -> String {
     let th = text_height(h, split);
     let tv = |name: &str, extra: &str| {
         format!(
-            "<TextView feature_flags=\"TVF_MULTILINE|TVF_WORD_WRAP|TVF_ACCEPT_MOUSE_INPUT|TVF_ALLOW_TEXT_SELECTION\" font=\"LARGE\" h_scrollbar_mode=\"NONE\" layout_borders=\"Rect({BORDER},{BORDER},{BORDER},{})\" name=\"{name}\" v_scrollbar_mode=\"AUTO\"{extra}/>",
+            "<ScrollView name=\"{name}_scroll\" v_scrollbar_mode=\"AUTO\" h_scrollbar_mode=\"NONE\"{extra}>\
+             <ScrollViewChild view_layout=\"vertical\" max_size=\"Point(16000,16000)\">\
+             <TextView feature_flags=\"TVF_MULTILINE|TVF_WORD_WRAP|TVF_ACCEPT_MOUSE_INPUT|TVF_ALLOW_TEXT_SELECTION\" font=\"LARGE\" \
+             layout_borders=\"Rect({BORDER},{BORDER},{BORDER},{})\" name=\"{name}\" max_size=\"Point(16000,-1)\"/>\
+             </ScrollViewChild></ScrollView>",
             if name == "npc_text" { 0 } else { BORDER }
         )
     };
     format!(
         "<root><View name=\"npcchat\" view_layout=\"vertical\">{}<CanvasView name=\"npc_split\" min_size=\"Point(0,2)\" max_size=\"Point(16000,2)\"/>{}</View></root>",
-        tv("npc_text", &format!(" max_size=\"Point(16000,{th})\" min_size=\"Point(0,{th})\"")),
+        tv("npc_text", &format!(" max_size=\"Point(16000,{th})\" max_size_limit=\"Point(16000,{th})\" min_size=\"Point(0,{th})\"")),
         tv("npc_answers", " max_size=\"Point(16000,16000)\" min_size=\"Point(0,0)\""),
     )
 }
@@ -286,10 +293,10 @@ impl NpcChat {
         }
     }
 
-    /// `FUN_1005824d`: min / max preferred size of the text part from the proportion.
+    /// `FUN_1005824d`: min / max preferred size of the text part from the proportion (the `ScrollView` box, not the transcript's own content size).
     fn apply_split(&mut self, gui: &mut Gui) {
         let th = text_height(self.view_h(gui), self.split) as f32;
-        gui.set_text_pref_size(self.win, "npc_text", (0.0, th), (16000.0, th));
+        gui.set_text_pref_size(self.win, "npc_text_scroll", (0.0, th), (16000.0, th));
         self.paint_splitter(gui);
     }
 
@@ -346,7 +353,7 @@ impl NpcChat {
     pub fn append(&mut self, gui: &mut Gui, text: &str, ty: i32, own: &str) {
         self.text.add(text, ty, &self.name, own, self.show_questions);
         gui.set_text(self.win, "npc_text", &self.text.html);
-        gui.scroll_to_bottom(self.win, "npc_text");
+        gui.scroll_to_bottom(self.win, "npc_text_scroll");
     }
 
     /// `KnubotAnswerList` -> `FUN_10058dc4`: the answer view is cleared and refilled.
@@ -590,7 +597,7 @@ mod tests {
         gui.frame(0.0);
         let th0 = w.text_part(&gui);
         assert_eq!(th0, 209);
-        let h0 = gui.view_rect(w.win, "npc_text").unwrap().height();
+        let h0 = gui.view_rect(w.win, "npc_text_scroll").unwrap().height();
         let sp = gui.view_rect(w.win, "npc_split").unwrap();
         let (x, y) = (sp.l + 50.0, sp.t + 1.0);
         // real pointer events: press on the splitter, drag 40 px up
@@ -606,8 +613,8 @@ mod tests {
         assert_eq!(w.text_part(&gui), 168);
         assert!((w.split - 169.0 / 300.0).abs() < 1e-5, "{}", w.split);
         gui.frame(0.0);
-        let h1 = gui.view_rect(w.win, "npc_text").unwrap().height();
-        assert!(h1 < h0 - 30.0, "text view shrank: {h0} -> {h1}");
+        let h1 = gui.view_rect(w.win, "npc_text_scroll").unwrap().height();
+        assert!(h1 < h0 - 30.0, "text scroll box shrank: {h0} -> {h1}");
         let evs = gui.input(InputEvent::MouseUp { x, y: y - 40.0, button: MouseButton::Left });
         for e in &evs {
             w.event(&mut gui, e, "Me");
@@ -620,6 +627,28 @@ mod tests {
         w.drag_by(&mut gui, 1000.0);
         assert_eq!(w.split, 0.9);
         w.drag_end();
+    }
+
+    /// Regression: a transcript taller than the text part's box must overflow into the `ScrollView`'s scrollable content (and
+    /// auto-scroll to the bottom), not be clamped to the box height and bleed into the answer rows below it.
+    #[test]
+    fn long_transcript_overflows_the_scroll_box_instead_of_bleeding_into_answers() {
+        let Some(mut gui) = rig() else { return };
+        let mut w = open_chat(&mut gui, BarFlags::default());
+        gui.frame(0.0);
+        for i in 0..40 {
+            w.append(&mut gui, &format!("Line {i} of a long dialogue that keeps going on and on."), kind::SPEECH, "Me");
+        }
+        w.set_answers(&mut gui, vec!["Medical supplies? Here?".into(), "All right. I'll be back with three monster parts for you in a bit.".into()]);
+        gui.frame(0.0);
+        let content_h = gui.view_rect(w.win, "npc_text").unwrap().height();
+        let box_h = gui.view_rect(w.win, "npc_text_scroll").unwrap().height();
+        assert!(content_h > box_h, "long transcript must overflow its box: content {content_h} vs box {box_h}");
+        assert!(gui.scroll_offset(w.win, "npc_text_scroll") > 0.0, "a long transcript must auto-scroll to the bottom");
+        // the answer list's box must start at or below the text box's bottom edge (no overlap between the two panes)
+        let text_box = gui.view_rect(w.win, "npc_text_scroll").unwrap();
+        let answers_box = gui.view_rect(w.win, "npc_answers_scroll").unwrap();
+        assert!(answers_box.t >= text_box.b, "answer box ({}) must not start above the text box's bottom ({})", answers_box.t, text_box.b);
     }
 
     #[test]

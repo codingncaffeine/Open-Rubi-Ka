@@ -869,14 +869,18 @@ impl Gui {
     }
     /// `TextRenderer_c::SetMinPreferredSize` / `SetMaxPreferredSize` of a `TextView` (`FUN_1005824d` for the NPC chat text part), then re-lays the window out.
     pub fn set_text_pref_size(&mut self, w: WindowId, name: &str, min: (f32, f32), max: (f32, f32)) {
-        if let Some(v) = self.find(w, name).and_then(|v| self.editor_of(v)) {
+        if let Some(v) = self.find(w, name) {
             if let Kind::Text(t) = &mut self.tree.views[v].kind {
                 t.min_pref = Point::new(min.0, min.1);
                 t.max_pref = Point::new(max.0, max.1);
             }
-            // the XML `min_size` / `max_size` clamp the view's own preferred size too (`View::UpdatePreferredSize`)
+            // the XML `min_size` / `max_size` clamp the view's own preferred size too (`View::UpdatePreferredSize`); this also
+            // pins a non-`TextView` box (e.g. the NPC chat text part's `ScrollView`) that only needs the box constraint.
+            // `max_size` is only a floor on the "max" preferred-size query (a view may always grow further); `max_limit`
+            // (`max_size_limit`) is the hard ceiling, so it must match `max` too or an oversized scroll child escapes the box.
             self.tree.views[v].min_size = Point::new(min.0, min.1);
             self.tree.views[v].max_size = Point::new(max.0, max.1);
+            self.tree.views[v].max_limit = Point::new(max.0, max.1);
         }
         self.relayout_window(w);
     }
