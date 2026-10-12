@@ -783,12 +783,19 @@ impl Hud {
         }
     }
 
+    /// The last mouse position, for callers that need to OR in another struct's own icon-hover check (`Interact::icon_hover_at`).
+    pub(super) fn mouse_pos(&self) -> (f32, f32) {
+        self.target.mouse_pos()
+    }
+
     /// The game's own mouse pointer over the world (`MousePointerModule_t`, hud_cursor.rs); appended to the frame's draw list.
-    pub(super) fn draw_cursor(&mut self, gui: &Gui, zone: &Zone, player: Option<&super::player::Player>, host: &mut ao_render::Host, list: &mut ao_gui::DrawList) {
+    /// `extra_item_hover`: the caller's own `MP_TradeItem_Icon` / `MP_ShopItem_Icon` check (`Interact::icon_hover_at`), ORed
+    /// into this `Hud`'s own icon categories (`Hud::icon_hover_at`) since `Interact` and `Hud` are separate fields of `Play`.
+    pub(super) fn draw_cursor(&mut self, gui: &Gui, zone: &Zone, player: Option<&super::player::Player>, host: &mut ao_render::Host, list: &mut ao_gui::DrawList, extra_item_hover: bool) {
         let mode = self.dvalues.get_i64("MouseCursorMode").unwrap_or(2);
         let dblclick = self.dvalues.get_i64("DoubleclickAction").is_none_or(|v| v != 0);
         let (mx, my) = self.target.mouse_pos();
-        let gui_item_hover = host.mods.shift && self.icon_hover_at(gui, zone, mx, my);
+        let gui_item_hover = host.mods.shift && (self.icon_hover_at(gui, zone, mx, my) || extra_item_hover);
         self.target.draw_cursor(gui, zone, player, host, list, self.size, mode, dblclick, self.help_button.help_mode(), gui_item_hover);
     }
 
@@ -1737,6 +1744,33 @@ mod tests {
         assert_eq!(hud.target.drain_tip_targets().count(),0);
         hud.target.select(&mut zone, Some(2));
         assert_eq!(hud.target.drain_tip_targets().count(),0,"unchanged target emits no event");
+    }
+
+    /// `extra_item_hover` (`Interact::icon_hover_at`, `MP_TradeItem_Icon`/`MP_ShopItem_Icon`) must OR into the same
+    /// shift-to-inspect cursor `Hud::icon_hover_at` (`MP_Item_Icon`..`MP_Action_Icon`) already drives.
+    #[test]
+    fn extra_item_hover_shows_the_lookat_cursor_over_a_gui_window() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut hud = Hud::new(&mut gui, &dir, (1280, 800)).unwrap();
+        let mut zone = Zone::new(1);
+        gui.open_window_xml("probe", "<root><CanvasView name=\"w\" min_size=\"Point(100,100)\" max_size=\"Point(100,100)\"/></root>", (380, 280), ao_gui::WindowSize::Fixed(100, 100)).unwrap();
+        hud.target.input(&gui, &mut zone, &InputEvent::MouseMove { x: 400.0, y: 300.0 });
+        assert!(gui.wants_mouse(400.0, 300.0));
+        let mut host = Host::headless();
+        host.mods.shift = true;
+        let mut list = DrawList::default();
+        hud.draw_cursor(&gui, &zone, None, &mut host, &mut list, true);
+        assert!(host.hide_cursor, "extra_item_hover=true must show the game's own cursor");
+        assert!(list.cmds.iter().any(|c| matches!(c, ao_gui::DrawCmd::Gfx { id: ao_gui::GfxId(0x148), .. })), "no LOOKAT sprite: {list:?}");
+
+        // without it (and nothing else under the mouse in a freshly-opened Hud) the OS cursor stays.
+        host.hide_cursor = false;
+        let mut list2 = DrawList::default();
+        hud.draw_cursor(&gui, &zone, None, &mut host, &mut list2, false);
+        assert!(!host.hide_cursor);
+        assert!(list2.cmds.is_empty());
     }
 
     #[test]

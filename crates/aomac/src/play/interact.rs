@@ -74,7 +74,6 @@ impl Interact {
 
     /// Shift-hover support (`MP_TradeItem_Icon`, `MP_ShopItem_Icon`): true when the screen point is over a filled icon
     /// slot of the vendor window, the player-to-player trade window or the NPC trade bar.
-    #[allow(dead_code)] // wired into the `gui_item_hover` OR at the `flow.rs` draw_cursor call site alongside `Hud::icon_hover_at` (cross-cutting integration commit)
     pub(super) fn icon_hover_at(&self, gui: &Gui, x: f32, y: f32) -> bool {
         self.shop.icon_hover_at(gui, x, y) || self.ptrade.icon_hover_at(gui, x, y) || self.trade.icon_hover_at(gui, x, y)
     }

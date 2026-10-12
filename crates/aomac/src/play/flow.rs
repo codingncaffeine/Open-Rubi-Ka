@@ -1678,7 +1678,9 @@ impl Frontend for Play {
             });
             self.fight_draw(host, &mut list);
             if let Some(h) = self.hud.as_mut() {
-                h.draw_cursor(&self.gui, &self.zone, self.player.as_ref(), host, &mut list);
+                let (mx, my) = h.mouse_pos();
+                let extra_item_hover = self.interact.as_ref().is_some_and(|i| i.icon_hover_at(&self.gui, mx, my));
+                h.draw_cursor(&self.gui, &self.zone, self.player.as_ref(), host, &mut list, extra_item_hover);
             }
             self.interact_pointer(host, &mut list);
         }
