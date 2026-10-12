@@ -641,6 +641,13 @@ fn layout_scroll(env: &mut Env, tree: &mut Tree, id: ViewId) {
         Kind::ScrollChild => {
             let Some(inner) = tree.views[id].children.first().copied() else { return };
             let size = b.size();
+            // `TextRenderer_c::CalculatePreferredSize` wraps multiline text against its view's *current* frame width; seed that
+            // frame to this pass's viewport width before measuring, else a resize leaves word-wrap pinned to the stale width
+            // (narrowing never re-wraps: the fallback below then re-picks that same stale `cmin.x`, a fixed point).
+            if tree.views[inner].frame.width() != size.x {
+                let h = tree.views[inner].frame.height().max(0.0);
+                set_frame(env, tree, inner, Rect::new(0.0, 0.0, size.x, h));
+            }
             let (cmin, cmax) = (pref(env, tree, inner, false), pref(env, tree, inner, true));
             let mut s = size;
             if cmin.x < s.x {
