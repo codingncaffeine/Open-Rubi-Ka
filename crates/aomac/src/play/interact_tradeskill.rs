@@ -103,6 +103,8 @@ fn slot_canvases(e: &mut Element) {
     if e.name == "ItemSlotView" {
         e.name = "CanvasView".into();
         // ItemSlotView_c 100420f5 loads gfx 0x11d: a 54x54 frame around a 48x48 icon.
+        // `Element::attr` returns the first match, so the template's own size attrs must go first.
+        e.attrs.retain(|(k, _)| k != "min_size" && k != "max_size");
         e.attrs.extend([("min_size".into(), "Point(54,54)".into()), ("max_size".into(), "Point(54,54)".into())]);
     }
     for c in &mut e.children { slot_canvases(c); }
