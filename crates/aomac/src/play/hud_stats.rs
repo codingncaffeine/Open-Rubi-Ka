@@ -253,6 +253,11 @@ impl HudStats {
         self.inventory.as_ref().map(|i| i.cols)
     }
 
+    #[cfg(test)]
+    pub(super) fn inventory_gap(&self) -> Option<(f32, f32)> {
+        self.inventory.as_ref().map(|i| i.gap)
+    }
+
     pub(super) fn is_open(&self, kind: WindowKind) -> bool {
         match kind {
             WindowKind::Skills => self.skills.is_some(),
