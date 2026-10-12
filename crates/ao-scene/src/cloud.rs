@@ -89,8 +89,8 @@ impl Clouds {
         let mut position=self.sheets[i].position;
         let mut random_x=all;let mut random_z=all;
         if !all {
-            if position[0]<=-1600.0 {position[0]=1500.0;random_z=true;} else if position[0]>=1600.0 {position[0]=-1500.0;random_z=true;}
-            if position[2]<=-1600.0 {position[2]=1500.0;random_x=true;random_z=false;} else if position[2]>=1600.0 {position[2]=-1500.0;random_x=true;random_z=false;}
+            if position[0]<=-1600.0 {position[0] = 1500.0;random_z=true;} else if position[0]>=1600.0 {position[0] = -1500.0;random_z=true;}
+            if position[2]<=-1600.0 {position[2] = 1500.0;random_x=true;random_z=false;} else if position[2]>=1600.0 {position[2] = -1500.0;random_x=true;random_z=false;}
         }
         position[1]=altitude;
         for _ in 0..10 {

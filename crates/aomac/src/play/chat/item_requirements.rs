@@ -95,8 +95,7 @@ fn retail_inner_keys_and_overequip() {
     let texts = TextDb::parse(b"MMDB\0\0\0\0".to_vec()).unwrap();
     assert_eq!(skills(&data, 3, false, &texts), "   (-2) ");
     assert_eq!(skills(&data, 12, true, &texts), " 25% ");
-    let mut zone = Zone::default();
-    zone.char_id = 1;
+    let mut zone = Zone { char_id: 1, ..Default::default() };
     zone.stats.insert(100, 75);
     assert_eq!(overequip(&data, Identity { kind: 101, instance: 6 }, &zone), 1);
     assert_eq!(overequip(&data, Identity { kind: 102, instance: 16 }, &zone), 3);

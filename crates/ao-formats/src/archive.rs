@@ -65,7 +65,7 @@ impl<'a> Archive<'a> {
         let anims = r.u32()? as usize;
         ensure!(anims <= 256, "implausible animation range count ({anims})");
         let mut animation_ranges = Vec::with_capacity(anims);
-        for range in r.take(anims * ANIM_RANGE_SIZE)?.chunks_exact(ANIM_RANGE_SIZE) {
+        for range in r.take(anims * ANIM_RANGE_SIZE)?.as_chunks::<ANIM_RANGE_SIZE>().0 {
             animation_ranges.push((i32::from_le_bytes(range[..4].try_into().unwrap()), &range[4..]));
         }
         r.take(8)?; // packed resource colour and archive word

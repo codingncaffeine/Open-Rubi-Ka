@@ -254,7 +254,7 @@ impl ActorRig {
             let mesh = &self.cat.submeshes[index];
             let offset = base;
             base += mesh.vertices.len();
-            mesh.indices.chunks_exact(3).map(move |triangle| {
+            mesh.indices.as_chunks::<3>().0.iter().map(move |triangle| {
                 [offset + triangle[0] as usize, offset + triangle[2] as usize, offset + triangle[1] as usize]
             })
         })

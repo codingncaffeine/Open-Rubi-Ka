@@ -228,8 +228,7 @@ mod tests {
     }
 
     fn zone() -> Zone {
-        let mut z = Zone::default();
-        z.char_id = 77;
+        let mut z = Zone { char_id: 77, ..Default::default() };
         z.stats.insert(STAT_OPTION_FLAGS, 0b01010);
         z.stats.insert(STAT_VISUAL_FLAGS, 31 | 1 << 7);
         z

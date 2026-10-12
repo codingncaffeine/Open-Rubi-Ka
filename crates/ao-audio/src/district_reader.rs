@@ -17,7 +17,7 @@ impl<'a> Reader<'a> {
     fn string(&mut self) -> Result<String> {
         let n = self.short()? as usize;
         ensure!(n < 0x8000, "invalid district string length");
-        Ok(String::from_utf8(self.take(n)?.to_vec()).context("invalid district string")?)
+        String::from_utf8(self.take(n)?.to_vec()).context("invalid district string")
     }
     fn spawn(&mut self, rotation: bool) -> Result<()> {
         let x = self.float()?; let y = self.float()?; let z = self.float()?; let radius = self.float()?;

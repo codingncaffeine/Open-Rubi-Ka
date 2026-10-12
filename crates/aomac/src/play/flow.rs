@@ -699,7 +699,7 @@ impl Play {
                         world.set_mesh_animation(mesh, models.boundaries(mesh), models.total_time(mesh).unwrap());
                     }
                     Ok((world, models))
-                })().map_err(|error| format!("{error:#}"));
+                })().map(Box::new).map_err(|error| format!("{error:#}"));
                 let _ = tx.send(Bg::Life(id, life));
                 // `PlayfieldInit` [GC 0x10016e2c] -> `SandyInterfaceModule_t::ActivateGameZone`: district music, ambience and statel emitters
                 let audio = want_audio.then(|| ao_audio::PlayfieldAudio::load(&store, id, &report.sounds).map_err(|e| eprintln!("playfield audio {id}: {e:#}")).ok()).flatten();
@@ -773,7 +773,8 @@ impl Play {
                 Bg::Weather(..) => {}
                 Bg::Life(id, result) if Some(id) == self.zone.playfield => {
                     match result {
-                        Ok((mut life, models)) => {
+                        Ok(boxed) => {
+                            let (mut life, models) = *boxed;
                             life.set_enabled(self.wildlife_enabled);
                             self.world_life = Some((life, models));
                         }

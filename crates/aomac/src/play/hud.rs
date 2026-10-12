@@ -1630,6 +1630,12 @@ pub(super) fn group(n: i32) -> String {
     }
     out
 }
+impl Hud {
+    pub(super) fn set_vehicle_motion_context(&mut self, dungeon: bool, grounded: Option<bool>) {
+        self.research_vehicle.guard.dungeon = Some(dungeon);
+        self.research_vehicle.guard.grounded = grounded;
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2636,9 +2642,3 @@ mod tests {
     }
 }
 
-impl Hud {
-    pub(super) fn set_vehicle_motion_context(&mut self, dungeon: bool, grounded: Option<bool>) {
-        self.research_vehicle.guard.dungeon = Some(dungeon);
-        self.research_vehicle.guard.grounded = grounded;
-    }
-}

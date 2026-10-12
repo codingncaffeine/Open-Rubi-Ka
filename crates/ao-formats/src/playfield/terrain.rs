@@ -56,7 +56,7 @@ fn tile_mip(texture: &ao_scene::Texture) -> [[u8; 4]; 64] {
         let mut sum = [0u32; 4];
         for sy in y0..y1 { for sx in x0..x1 {
             let p = (sy.min(texture.height as usize - 1) * texture.width as usize + sx.min(texture.width as usize - 1)) * 4;
-            for c in 0..4 { sum[c] += texture.rgba[p + c] as u32; }
+            for (c, s) in sum.iter_mut().enumerate() { *s += texture.rgba[p + c] as u32; }
         }}
         sum.map(|v| (v / ((x1 - x0) * (y1 - y0)) as u32) as u8)
     })
@@ -256,8 +256,8 @@ mod tests {
             [[1.0, 0.0], [0.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
             [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]],
         ];
-        for orientation in 0..4 {
-            assert_eq!(corners.map(|uv| tile_uv((orientation as u16) << 14 | 37, uv)), expected[orientation]);
+        for (orientation, expected) in expected.iter().enumerate() {
+            assert_eq!(corners.map(|uv| tile_uv((orientation as u16) << 14 | 37, uv)), *expected);
         }
         assert_eq!(tile_uv(0x4000, [0.25, 0.75]), [0.25, 0.75]);
     }
@@ -307,7 +307,7 @@ mod tests {
                 let (ex, ez) = (px + patch, pz + patch);
                 assert_eq!(mesh.vertices.len(), patch * patch * 4 + (patch + 1) * (patch + 1));
                 assert!(mesh.submeshes.iter().all(|s| s.blend != ao_scene::Blend::AlphaBlend && s.texture_clamp));
-                let quads: BTreeMap<_, _> = mesh.submeshes[..mesh.submeshes.len() - 1].iter().flat_map(|s| s.indices.chunks_exact(6).map(move |q| (q[0], (s.texture, q)))).collect();
+                let quads: BTreeMap<_, _> = mesh.submeshes[..mesh.submeshes.len() - 1].iter().flat_map(|s| s.indices.as_chunks::<6>().0.iter().map(move |q| (q[0], (s.texture, q)))).collect();
                 assert_eq!(quads.len(), (ex - px) * (ez - pz));
                 for z in pz..ez {
                     for x in px..ex {
@@ -325,7 +325,7 @@ mod tests {
                         let t = tm.tile_texture[tm.tile(x, z) as usize] as u32;
                         let (texture, indices) = quads.get(&b).unwrap();
                         assert_eq!(*texture, Some(TextureKey { rdb_type: 1_010_006, id: t }));
-                        assert_eq!(*indices, expected);
+                        assert_eq!(**indices, expected);
                     }
                 }
             }

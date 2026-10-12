@@ -432,7 +432,7 @@ impl HudTeam {
         if self.dialog.is_open() {
             return None;
         }
-        let Some((_, name)) = self.state.invite.clone() else { return None };
+        let (_, name) = self.state.invite.clone()?;
         let body = fmt(&self.text("Want2JoinXsTeam"), &[&name]);
         let buttons = [self.text("MsgBox_Yes"), self.text("MsgBox_No")];
         self.dialog.go(gui, self.screen, (), &body, &buttons);

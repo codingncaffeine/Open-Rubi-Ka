@@ -1422,7 +1422,7 @@ impl Renderer {
             run.sim.update(&run.layer,grid,cam.pos.to_array(),dt,far,&mut run.vertices);
             if let Some(Some((vb,ib)))=self.sky.meshes.get(run.layer.mesh) {
                 if grid!=0 {
-                    for (v,p) in run.vertices.iter().zip(run.packed.chunks_exact_mut(12)) {
+                    for (v,p) in run.vertices.iter().zip(run.packed.as_chunks_mut::<12>().0) {
                         p[..3].copy_from_slice(&v.pos);p[3..6].copy_from_slice(&v.normal);
                         p[6..8].copy_from_slice(&v.uv);p[8..].copy_from_slice(&v.color);
                     }

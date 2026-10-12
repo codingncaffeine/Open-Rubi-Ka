@@ -47,7 +47,7 @@ impl Encoding {
             Self::Rgb565 | Self::Rgba4444 => {
                 output.clear();
                 output.reserve(rgba.len());
-                for pixel in rgba.chunks_exact(4) {
+                for pixel in rgba.as_chunks::<4>().0 {
                     let expand = |v: u8, bits: u32| {
                         let q = v >> (8 - bits);
                         (q << (8 - bits)) | (q >> (2 * bits - 8))

@@ -218,20 +218,18 @@ impl HudWinB {
             WindowKind::Raid => {
                 // GUI10101558 ->101013f9 creates configured bars only after real
                 // RaidCreated/roster data; no bars are synthesized before that stage.
-                if self.raid.is_none() {
-                    if let Some(xml) = &self.raid_xml {
-                        match gui.open_tabbed_window_xml("Raid", "Raid", xml, (0, 0), WindowSize::Preferred) {
-                            Ok(w) => {
-                                let (width, height) = gui.window_size(w);
-                                gui.set_window_pos(w, (((self.screen.0 as i32 - width as i32) / 2).max(0), ((self.screen.1 as i32 - height as i32) / 2).max(0)));
-                                // GUI 10102b79: not in a team -> conversion disabled.
-                                gui.set_enabled(w, "CreateRaid", self.team.state.in_team() && !self.in_raid);
-                                self.raid = Some(w);
-                                self.raid_dirty = true;
-                            }
-                            Err(e) => eprintln!("hud: raid_window: {e:#}"),
-                        }
+                if self.raid.is_some() { return; }
+                let Some(xml) = &self.raid_xml else { return };
+                match gui.open_tabbed_window_xml("Raid", "Raid", xml, (0, 0), WindowSize::Preferred) {
+                    Ok(w) => {
+                        let (width, height) = gui.window_size(w);
+                        gui.set_window_pos(w, (((self.screen.0 as i32 - width as i32) / 2).max(0), ((self.screen.1 as i32 - height as i32) / 2).max(0)));
+                        // GUI 10102b79: not in a team -> conversion disabled.
+                        gui.set_enabled(w, "CreateRaid", self.team.state.in_team() && !self.in_raid);
+                        self.raid = Some(w);
+                        self.raid_dirty = true;
                     }
+                    Err(e) => eprintln!("hud: raid_window: {e:#}"),
                 }
             }
             _ => {}

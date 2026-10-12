@@ -196,6 +196,7 @@ impl HudResearchVehicle {
         format!("<View name=\"{name}\" view_layout=\"horizontal\" layout_borders=\"Rect(8,2,0,2)\"><PowerBar name=\"{name}_bar\" bg_gfx=\"GFX_GUI_HOR_BAR_SMALL_EMPTY\" full_gfx=\"GFX_GUI_HOR_BAR_SMALL_BLUE\" value=\"{}\" layout_borders=\"Rect(5,0,0,0)\"/><TextView name=\"{name}_label\" value=\"{}\" layout_borders=\"Rect(5,1,1,1)\"/><HLayoutSpacer max_size=\"Point(16000,-1)\"/></View>", self.progress(def, side), quote(label))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_row(&self, gui: &mut Gui, w: WindowId, parent: &str, def: &PerkDef, side: usize, name: &str, label: &str) -> anyhow::Result<()> {
         gui.add_view_xml(w, parent, name, &format!("<root>{}</root>", self.row_xml(def, side, name, label)))?;
         gui.set_view_mouse(w, name, true);

@@ -89,8 +89,7 @@ fn nano_damage_record_fixture() {
     let template = ItemTemplate { kind: 0xc76b, stats: vec![(8, 45000), (407, 11)], name: None, sounds: vec![] };
     let texts = TextDb::parse(b"MMDB\0\0\0\0".to_vec()).unwrap();
     let spells = super::template_spells::spells(&record, 0).unwrap();
-    let mut zone = Zone::default();
-    zone.char_id = 1;
+    let mut zone = Zone { char_id: 1, ..Default::default() };
     zone.stats.extend([(4, 3), (318, 10)]);
     let out = fields(&template, &spells, &zone, &texts).unwrap();
     assert_eq!(out.damage, "10-20");

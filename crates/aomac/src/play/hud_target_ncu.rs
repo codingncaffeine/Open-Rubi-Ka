@@ -8,6 +8,7 @@ const KEYS: [&str; 2] = ["ShowNanoTargetNCU", "ShowFightTargetNCU"];
 const CONFIGS: [&str; 2] = ["NanoTargetNCUWindowConfig", "FightTargetNCUWindowConfig"];
 const TITLES: [&str; 2] = ["Nano Target NCU", "Fight Target NCU"];
 
+#[allow(clippy::type_complexity)]
 pub(super) struct TargetNcu {
     db: NanoDb,
     texts: TextDb,

@@ -117,7 +117,7 @@ enum Bg {
     Sky(u32, Option<ao_formats::playfield::SkyClock>),
     /// Per-frame effect wind, loaded independently of the audio device.
     Weather(u32, Box<ao_formats::weather::Weather>),
-    Life(u32, Result<(native_life_spawn::LifeWorld, native_life_render::LifeModels), String>),
+    Life(u32, Result<Box<(native_life_spawn::LifeWorld, native_life_render::LifeModels)>, String>),
     /// The top-down ground image of playfield `id` for the Map window (`Report::ground` rendered by `topdown::render` from the scene
     /// the loader just built; `bool`: dungeon rooms), sent just before its [`Bg::World`].
     Ground(u32, Option<Box<WorldGround>>),

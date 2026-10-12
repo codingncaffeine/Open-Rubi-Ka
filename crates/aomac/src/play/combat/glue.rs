@@ -719,8 +719,7 @@ mod health_tests {
     #[test]
     fn npc_hit_and_authoritative_health_reach_all_zone_views() {
         let mut combat = Combat::new(Box::new(Fixed::new()));
-        let mut zone = crate::play::zone::Zone::default();
-        zone.char_id = 1;
+        let mut zone = crate::play::zone::Zone { char_id: 1, ..Default::default() };
         combat.add_test_char(1, "Player", false, 100);
         combat.add_test_char(2, "NPC", true, 50);
         zone.dynels.insert(2, crate::play::zone::DynelState {

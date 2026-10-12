@@ -125,6 +125,7 @@ impl LootUi {
 
     /// `InventoryUpdateIIR_t` for `container` [GC 0x100a040e]: the contents are replaced; with `u.flag` the container is opened (a window appears
     /// unless one is open already, `SlotContainerOpened`), without it only an open window is refreshed (`+0x8c`, container changed).
+    #[allow(clippy::too_many_arguments)]
     pub fn update(&mut self, gui: &mut Gui, dir: Option<&Path>, screen: (u32, u32), container: Identity, title: &str, u: &InventoryUpdate, owned: bool) {
         let slots = if container.kind == 0xdead { 0x66 } else { SLOTS };
         if self.items.is_none() {

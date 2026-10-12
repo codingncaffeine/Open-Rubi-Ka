@@ -128,7 +128,9 @@ impl Species {
                 if self.random()<0.005 {self.state=1-self.state;self.animate(self.state as usize,true);}
                 let x=self.random();let y=self.random();let z=self.random();
                 let mut v=c.environment.wind()*0.1+Vec3::new((x-0.5)*4.,(y-0.5)*4.,(z-0.5)*4.);
-                if v.x>2. {v.x=1.7;} else if v.x< -1.7 {v.x= -1.7;} if v.z>2. {v.z=1.7;} else if v.z< -1.7 {v.z= -1.7;} v.y-=0.5;
+                if v.x>2. {v.x=1.7;} else if v.x< -1.7 {v.x = -1.7;}
+                if v.z>2. {v.z=1.7;} else if v.z< -1.7 {v.z = -1.7;}
+                v.y-=0.5;
                 let mut force=Vec3::ZERO;self.accumulate(&mut force,v);Steering::Force(force*self.max_force)
             },
             LifeKind::Beetle|LifeKind::Cleanerbot=>{
@@ -138,12 +140,12 @@ impl Species {
                 if self.timer>0.5 {self.timer=0.;let probability=if self.kind==LifeKind::Beetle {if self.state==0 {0.08} else {0.06}} else {if self.state==0 {0.08} else {0.14}};
                     let water=c.environment.liquid(self.pos).is_some_and(|h|h>0.);
                     if !(self.kind==LifeKind::Beetle&&self.state==1&&water)&&self.random()<probability {self.state=1-self.state;self.animate(if self.kind==LifeKind::Beetle {self.state as usize} else {(1-self.state) as usize},false);if (self.kind==LifeKind::Beetle&&self.state==0)||(self.kind==LifeKind::Cleanerbot&&self.state==1) {self.halt();}}
-                    if self.kind==LifeKind::Beetle&&self.state==1 {if water {if !self.liquid_escape {self.liquid_escape=true;self.lifespan=10.;self.elapsed=0.;}self.wander=(self.target-self.pos).normalize_or_zero()*self.max_force;} else {self.liquid_escape=false;self.lifespan=-1.;self.elapsed=0.;self.target=self.pos;}}
+                    if self.kind==LifeKind::Beetle&&self.state==1 {if water {if !self.liquid_escape {self.liquid_escape=true;self.lifespan=10.;self.elapsed=0.;}self.wander=(self.target-self.pos).normalize_or_zero()*self.max_force;} else {self.liquid_escape=false;self.lifespan = -1.;self.elapsed=0.;self.target=self.pos;}}
                 }
                 let resting=if self.kind==LifeKind::Beetle {self.state==0} else {self.state==1};if resting||resting_before {return Steering::None;}
                 let mut force=Vec3::ZERO;
                 if self.kind==LifeKind::Cleanerbot&&self.counter>=5 {self.counter=0;if let Some(v)=self.obstacle(c) {self.wander=v; if self.accumulate(&mut force,v)>0.99 {return Steering::Force(force*self.max_force);}}}
-                if self.kind==LifeKind::Beetle&&self.liquid_escape {if self.accumulate(&mut force,self.wander)>0.99 {return Steering::Force(force*self.max_force);}}
+                if self.kind==LifeKind::Beetle&&self.liquid_escape&&self.accumulate(&mut force,self.wander)>0.99 {return Steering::Force(force*self.max_force);}
                 if let Some(v)=self.constrain_district(c) {self.wander=v*0.5;if self.accumulate(&mut force,v)>0.99 {return Steering::Force(force*self.max_force);}}
                 let forward=if self.kind==LifeKind::Beetle {1.2} else {1.};let v=self.wander2(5.,1.4,forward);self.accumulate(&mut force,v);Steering::Force(force*self.max_force)
             },

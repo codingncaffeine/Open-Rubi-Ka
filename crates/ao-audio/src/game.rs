@@ -233,6 +233,7 @@ impl Runtime {
     }
 
     /// SI PlaySoundCommand @100071ed: caller volume/radius/probability, material 0, size 1.
+    #[allow(clippy::too_many_arguments)]
     pub fn play_effect_at(&mut self, sh: &Shared, def: &SoundDef, d: f32, volume: f32, radius: f32, probability: i32, pos: [f32; 3]) -> Vec<u64> {
         if probability != 100 && (self.rng.next() % 200) as i32 >= probability { return Vec::new(); }
         let level = attenuation(d, def.min_dist, def.max_dist, Some(radius)) * volume;
@@ -678,6 +679,7 @@ pub fn variant_of(def: &SoundDef, material: i32, size: i32) -> Option<u32> {
 
 /// A one-shot non-positional sound definition (UI, children): probability gate, randomised volume, the file and
 /// its children per the definition's flags (`play_all`, or one `random_child`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn play_def(sh: &Shared, db: &SoundDb, def: &SoundDef, fx: f32, rng: &mut Rng, variant: Option<&SoundDef>, pos: [f32; 3], life_dangers: &mut Vec<([f32; 3], f32)>) -> Vec<u64> {
     if def.prob != 100 && rng.next() % 200 >= def.prob as u32 {
         return Vec::new();

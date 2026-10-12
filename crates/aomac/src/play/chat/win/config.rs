@@ -219,7 +219,7 @@ impl ChatWindows {
                 for (id,name,on,other,active) in &rows {
                     let folder = if *id >> 32 == 0 && (0x4200_0000..0x4200_001a).contains(id) { 2 } else if *id >> 32 == 0xe { 1 } else { 0 };
                     if self.config.hide_other && !on && *other { continue; }
-                    let mut row=ListItem::new(&group_ident(*id),name,0x117,0); row.selected=*on; row.hide_icon=!*on;
+                    let mut row=ListItem::new(&group_ident(*id),name,0x117,0); row.selected = *on; row.hide_icon = !*on;
                     row.color_a = if *active { 0xf4f4f4 } else { 0xf66666 }; row.color_b = row.color_a;
                     gui.list_add(win,"groups",Some(FOLDERS[folder]),row);
                 }

@@ -75,6 +75,7 @@ impl LifeWorld {
             self.species.clear(); self.ids.clear(); self.states.clear(); self.neighbors.clear();
         }
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn tick(&mut self, dt: f32, control: Vec3, surface: &Collision, characters: &[CharacterSensor], dangers: &[CharacterSensor], corpses: &[Vec3], wind: Vec3) {
         if !self.enabled { return; }
         if !self.prepared {
