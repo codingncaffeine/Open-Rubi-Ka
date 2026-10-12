@@ -3,7 +3,7 @@
 
 use ao_formats::character::{
     actor::{ActorAssets, ActorRig, PlayerLook},
-    head_table, CachedCharacter, CatAnim, ClothEntry, Role, Skin,
+    animation_blend, animation_fade_ms, head_table, CachedCharacter, CatAnim, ClothEntry, Role, Skin,
 };
 use ao_formats::screens::wire_breed_sex;
 use ao_net::n3::dynel::SimpleCharFullUpdate;
@@ -367,6 +367,14 @@ pub struct Avatar {
     stance: Option<i32>,
     /// Milliseconds into the current clip.
     ms: f32,
+    /// Body-layer crossfade (`VisualCATMesh_t::SetAnimation` DS 0x10073f23: `CATAnimBlend_t` anim1 = previous clip, anim2 =
+    /// new one, blended over `animation_fade_ms`): the role's previous clip, kept alive and blended under the new one while
+    /// `prev_fade_elapsed < prev_fade_ms`.
+    prev_clip: Option<Arc<CatAnim>>,
+    prev_ms: f32,
+    prev_rate: f32,
+    prev_fade_elapsed: f32,
+    prev_fade_ms: f32,
     transform: Mat4,
 }
 
@@ -378,7 +386,7 @@ impl Avatar {
         let heads = head_table(store, breed, gender, 2)?;
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
         let rig = ActorRig::player(store, &assets, &l.look, &l.attachments)?;
-        let mut a = Self { id, rig, current_skin: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, note_fired: 0, notes: Vec::new(), stance: None, ms: 0.0, transform: Mat4::IDENTITY };
+        let mut a = Self { id, rig, current_skin: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, note_fired: 0, notes: Vec::new(), stance: None, ms: 0.0, prev_clip: None, prev_ms: 0.0, prev_rate: 1.0, prev_fade_elapsed: 0.0, prev_fade_ms: 0.0, transform: Mat4::IDENTITY };
         a.set_pose(store, AvatarPose::default())?;
         a.set_transform([u.pos[0], u.pos[1], -u.pos[2]], u.yaw().map_or(0.0, |y| -y));
         Ok(a)
@@ -495,6 +503,9 @@ impl Avatar {
                     None => break (None, 0, 0),
                 }
             };
+            let old_ms = self.ms;
+            let old_rate = self.rate;
+            let old_clip = self.clip.clone();
             self.ms = match (&self.clip, &clip) {
                 (Some(old), Some(new)) if locomotion(&self.pose.role) && locomotion(&pose.role) && old.duration > 0.0 && new.duration > 0.0 => {
                     let (s, e) = loop_span(new).unwrap_or((0.0, new.duration));
@@ -502,6 +513,14 @@ impl Avatar {
                 }
                 _ => 0.0,
             };
+            // body-layer crossfade (DS 0x10073f23): keep the outgoing clip blended underneath while it fades.
+            if let Some(old) = old_clip {
+                self.prev_fade_ms = animation_fade_ms(old.duration, old_ms);
+                self.prev_fade_elapsed = 0.0;
+                self.prev_ms = old_ms;
+                self.prev_rate = old_rate;
+                self.prev_clip = Some(old);
+            }
             self.clip = clip;
             self.clip_id = id;
             self.calibration_id = calibration_id;
@@ -570,6 +589,13 @@ impl Avatar {
     pub fn update(&mut self, dt: f32) {
         self.sample_pose.set(true);
         self.ms += dt * 1000.0 * self.rate;
+        if self.prev_clip.is_some() {
+            self.prev_ms += dt * 1000.0 * self.prev_rate;
+            self.prev_fade_elapsed += dt * 1000.0;
+            if self.prev_fade_elapsed >= self.prev_fade_ms {
+                self.prev_clip = None;
+            }
+        }
         for action in &mut self.actions {
             action.ms += dt * 1000.0 * action.rate;
             self.notes.extend(action.take_notes());
@@ -588,10 +614,12 @@ impl Avatar {
 
     fn layers(&self) -> impl Clone + Iterator<Item = ao_formats::character::AnimLayer<'_>> {
         use ao_formats::character::AnimLayer;
-        let body = self.clip.as_ref().map(|a| AnimLayer { clip: a, ms: clip_time(a, self.ms, self.one_shot()), layers: self.body_layers, blend: 1.0 });
+        let prev_body = self.prev_clip.as_ref().map(|a| AnimLayer { clip: a, ms: clip_time(a, self.prev_ms, false), layers: self.body_layers, blend: 1.0 });
+        let body_blend = if self.prev_clip.is_some() { animation_blend(self.prev_fade_elapsed, self.prev_fade_ms, self.prev_fade_ms) } else { 1.0 };
+        let body = self.clip.as_ref().map(|a| AnimLayer { clip: a, ms: clip_time(a, self.ms, self.one_shot()), layers: self.body_layers, blend: body_blend });
         let at = self.actions.partition_point(|a| a.priority >= self.body_priority);
         let (before, after) = self.actions.split_at(at);
-        before.iter().map(ActionClip::sample).chain(body).chain(after.iter().map(ActionClip::sample))
+        before.iter().map(ActionClip::sample).chain(prev_body).chain(body).chain(after.iter().map(ActionClip::sample))
     }
 
     /// Own CAT mesh uses the same native camera-distance refresh policy as remote meshes.
@@ -837,6 +865,36 @@ pub(super) mod tests {
         avatar.update(0.0);
         assert_eq!(avatar.actions.len(), 1);
         assert_eq!(avatar.actions[0].layers, 2, "expiry does not reset the stored exclusion mask");
+    }
+
+    /// `VisualCATMesh_t::SetAnimation` (DS 0x10073f23) always blends the new clip in over 200..300 ms instead of popping
+    /// straight to it: a role change (e.g. idle -> run, the "starting run looks wonky" report) must keep the outgoing clip
+    /// blended underneath the incoming one until the fade completes, not switch body pose in a single frame.
+    #[test]
+    fn own_role_change_crossfades_body_pose_instead_of_popping() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let idle_clip = avatar.clip.clone().expect("retail idle clip resolves");
+        avatar.set_pose(&store, AvatarPose { role: Role::Run, speed: 5.0, ref_speed: 5.0 }).unwrap();
+        assert!(avatar.prev_clip.is_some(), "the outgoing idle clip must survive the role change to fade out");
+        assert_eq!(avatar.prev_clip.as_ref().unwrap().source_id, idle_clip.source_id);
+        assert!((200.0..=300.0).contains(&avatar.prev_fade_ms), "DS 0x100af8a0/0x100af89c clamp the fade to 200..300 ms");
+        let layers: Vec<_> = avatar.layers().collect();
+        assert_eq!(layers.len(), 2, "idle fading out under run fading in");
+        assert_eq!(layers[0].clip.source_id, idle_clip.source_id);
+        assert_eq!(layers[0].blend, 1.0, "the outgoing clip is the full base of the chain");
+        assert_eq!(layers[1].clip.source_id, avatar.clip.as_ref().unwrap().source_id);
+        assert_eq!(layers[1].blend, 0.0, "no pop: the new clip starts at zero weight, not full weight");
+        let half = avatar.prev_fade_ms / 2.0;
+        avatar.update(half / 1000.0);
+        let mid_blend = avatar.layers().last().unwrap().blend;
+        assert!(mid_blend > 0.0 && mid_blend < 1.0, "{mid_blend}: still ramping midway through the fade");
+        avatar.update(half / 1000.0 + 0.001);
+        assert!(avatar.prev_clip.is_none(), "the outgoing clip is dropped once the fade completes");
+        let layers: Vec<_> = avatar.layers().collect();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].blend, 1.0);
     }
 
     pub(in crate::play) fn own_update() -> SimpleCharFullUpdate {
