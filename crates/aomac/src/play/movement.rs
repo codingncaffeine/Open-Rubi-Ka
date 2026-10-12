@@ -585,6 +585,11 @@ pub struct Movement {
     surface_collision: bool,
     /// Stats written locally by transition `Apply`s, handed to the stat holder by [`Movement::take_stat_writes`].
     stat_writes: Vec<(u32, i32)>,
+    /// `CharFight_t::Update` [GC 0x1007bb81]: while the fight target's direction differs from the current facing, the
+    /// character locally turns to face it (`CharTurn_t`, GC 0x1007c366/0x1007c24a/0x1007c137) at the normal turn rate,
+    /// independent of key input and without a network message. Only applied while standing (`Vehicle_t` still faces its
+    /// velocity while actually moving forward, `step`'s `OrientationMode 0`); fed each frame by [`Movement::set_face_target`].
+    face_target: Option<[f32; 3]>,
     /// Nano-effect state of the own character (Features counters, crowd-control state, vehicle class): `movement/fx.rs`.
     fx: fx::Fx,
     outbox: Vec<CharMove>,
@@ -666,6 +671,7 @@ impl Movement {
             prev_pos: pos,
             surface_collision: true,
             stat_writes: Vec::new(),
+            face_target: None,
             fx: fx::Fx::default(),
             outbox: Vec::new(),
         };
@@ -1016,6 +1022,13 @@ impl Movement {
         if p.is_none() {
             self.chase = None;
         }
+    }
+
+    /// The live position of the own character's fight target (`Zone::fight_target`), fed every frame by the caller
+    /// (`Player::frame`, same pattern as [`Movement::set_chase_pos`]); `None` while not fighting or the target dynel is
+    /// gone. Consumed by `step`'s standing-turn branch.
+    pub fn set_face_target(&mut self, p: Option<[f32; 3]>) {
+        self.face_target = p;
     }
 
     /// `FUN_1006fe02(0, 2.0, 0)` without a path: the target is cleared (the per-frame Features / district gate of `FUN_10070fee`).
@@ -1669,6 +1682,18 @@ impl Movement {
                 let (s, c) = a.sin_cos();
                 self.vel = [self.vel[0] * c + self.vel[1] * s, -self.vel[0] * s + self.vel[1] * c];
             }
+        } else if self.vel == [0.0, 0.0] && !matches!(mode, mode::FROZEN | mode::SIT_GROUND | mode::SLEEP | mode::LOUNGE) {
+            // `CharFight_t::Update` [GC 0x1007bb81] + `CharTurn_t` [GC 0x1007c366/0x1007c24a/0x1007c137]: while fighting
+            // (or about to, the target is announced before the attack) and not already facing the fight target, the
+            // character locally turns towards it every tick at the normal turn rate - no key input, no network message.
+            if let Some(p) = self.face_target {
+                let d = [p[0] - self.pos[0], p[2] - self.pos[2]];
+                if d[0] != 0.0 || d[1] != 0.0 {
+                    let e = wrap(d[0].atan2(d[1]) - self.yaw);
+                    let step = self.turn_rate(1.0).abs() * h;
+                    self.yaw = wrap(self.yaw + e.clamp(-step, step));
+                }
+            }
         }
         self.align(old, world);
         self.prev_pos = old;
@@ -2212,6 +2237,30 @@ mod tests {
         assert!(m.pos()[2] > z + 5.0, "{:?}", m.pos());
         m.set_chase_pos(None);
         assert_eq!(m.chase_target(), None);
+    }
+
+    /// `CharFight_t::Update` [GC 0x1007bb81] + `CharTurn_t`: standing with a fight target behind/beside the character
+    /// turns to face it at the normal turn rate, with no key input; moving forward still faces the travel direction
+    /// (`OrientationMode 0`); clearing the target stops the turn where it is.
+    #[test]
+    fn standing_auto_faces_the_fight_target() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([0.0; 3], 0.0, 0); // facing +Z
+        m.set_face_target(Some([0.0, 0.0, -5.0])); // target directly behind
+        run(&mut m, &w, 3.0);
+        assert!(wrap(m.yaw() - std::f32::consts::PI).abs() < 0.05, "turned to face behind: yaw={}", m.yaw());
+        assert_eq!(m.pos(), [0.0, 0.0, 0.0], "facing only, no movement");
+        // moving forward overrides facing with the travel direction (retail still walks where it looks)
+        m.set_face_target(Some([5.0, 0.0, 0.0]));
+        m.action(id::FORWARD_START, 10.0);
+        run(&mut m, &w, 0.5);
+        assert!(wrap(m.yaw() - std::f32::consts::PI).abs() < 0.05, "forward movement keeps facing its own direction");
+        m.transition(id::FULL_STOP);
+        // clearing the target stops the turn where it is
+        m.set_face_target(None);
+        let y = m.yaw();
+        run(&mut m, &w, 1.0);
+        assert_eq!(m.yaw(), y, "no target: no turn");
     }
 
     #[test]

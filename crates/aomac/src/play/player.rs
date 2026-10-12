@@ -495,6 +495,13 @@ impl Player {
                 self.movement.set_chase_pos(p);
             }
         }
+        // `CharFight_t::Update` [GC 0x1007bb81]: the own character auto-faces its live fight target while standing
+        // (`Movement::set_face_target`, docs/zone/movement.md).
+        {
+            let t = zone.fight_target.get(&(self.char_id as i32)).copied();
+            let p = t.and_then(|t| if t == self.char_id as i32 { Some(self.movement.pos()) } else { zone.dynels.get(&t).map(|d| d.pos) });
+            self.movement.set_face_target(p);
+        }
         for (id, v) in self.movement.take_stat_writes() {
             zone.stats.insert(id, v);
         }
