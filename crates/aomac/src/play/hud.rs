@@ -638,6 +638,16 @@ impl Hud {
         self.ncu.first_point(gui)
     }
 
+    #[cfg(test)]
+    pub(super) fn nano_first_point(&self, gui: &Gui) -> (f32, f32) {
+        self.nano.first_point(gui)
+    }
+
+    #[cfg(test)]
+    pub(super) fn shortcut_slot_pos(&self, gui: &Gui, bar: usize, slot: usize) -> Option<(f32, f32)> {
+        Some(self.shortcuts.get(bar)?.slot_screen_pos(gui, slot))
+    }
+
     /// True while the pointer carries an inventory item.
     pub(super) fn item_dragging(&self) -> bool {
         self.stats.dragging_item()

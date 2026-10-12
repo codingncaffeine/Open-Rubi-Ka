@@ -611,6 +611,15 @@ impl ShortcutBar {
     }
 }
 
+#[cfg(test)]
+impl ShortcutBar {
+    /// Live harness: screen position of the centre of slot `n` of the current row.
+    pub(super) fn slot_screen_pos(&self, gui: &Gui, n: usize) -> (f32, f32) {
+        let (wx, wy) = gui.window_pos(self.window);
+        (wx as f32 + CHROME_W + PITCH * n as f32 + PITCH / 2.0, wy as f32 + BAR_H / 2.0)
+    }
+}
+
 fn archive_pair(value: Option<&str>, prefix: &str) -> anyhow::Result<[u32; 2]> {
     let body = value.and_then(|v| v.strip_prefix(prefix)).and_then(|v| v.strip_suffix(')')).ok_or_else(|| anyhow::anyhow!("invalid shortcut value"))?;
     let (a, b) = body.split_once(',').ok_or_else(|| anyhow::anyhow!("invalid shortcut pair"))?;

@@ -8,7 +8,8 @@
 //! `move=x:y` hover; `click`, `rightclick`, `doubleclick` take `[shift+|ctrl+|alt+]x:y` (prefixes may combine), through GUI mouse input.
 //! `clickdyn=<instance>` world click on a dynel, `mdrag=x1:y1:x2:y2` GUI drag, `watch=secs` own-stat changes.
 //! `rightclickitem=<slot hex>` real right-click on the bag/wear cell currently showing `inv`'s slot (bug 10 equip/unequip/use).
-//! `ncurightclick` real right-click on the NCU window's first row (bug 21 cancel).
+//! `ncurightclick` real right-click on the NCU window's first row (bug 21 cancel). `dragnano=<bar>:<slot>` drags the
+//! Programs window's first row onto a shortcut bar slot (bug 18).
 //! `nanos` prints learned program IDs; `buffs` prints running buffs and NCU usage.
 //! `down=KEY` / `up=KEY` hold across steps; `clickcorpse` / `rightcorpse` click a visible, GUI-unobscured corpse pick point.
 //! `focuslost` cancels held game input as the host's window-focus-loss event does.
@@ -987,10 +988,17 @@ fn live_walk() {
                 l.tick();
                 l.o.host.mods = mods;
             }
-            // `rightclickitem=<slot hex>`: real right-click (GUI mouse dispatch, not a direct command) at the screen cell
-            // currently showing the bag/wear item of `slot` (bug 10 right-click equip/unequip/use verification).
+            // `rightclickitem=<slot hex>` or `rightclickitem=item:<template id>`: real right-click (GUI mouse dispatch,
+            // not a direct command) at the screen cell currently showing the bag/wear item (bug 10 right-click
+            // equip/unequip/use verification). Template selection follows an item through an equip/unequip slot move.
             "rightclickitem" => {
-                let slot = u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+                let slot = if let Some(template) = v.strip_prefix("item:") {
+                    let template: i32 = template.parse().expect("rightclickitem item template id");
+                    l.p.zone.inventory.iter().filter(|(_, item)| item.item.low_id == template)
+                        .map(|(slot, _)| *slot).min().expect("rightclickitem item not in inventory")
+                } else {
+                    u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap()
+                };
                 let (x, y) = l.p.hud.as_ref().unwrap().item_screen_pos(&l.p.gui, slot).unwrap_or_else(|| panic!("slot {slot:#x} is not on screen"));
                 l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
                 for ev in [ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Right }, ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Right }] {
@@ -1011,6 +1019,24 @@ fn live_walk() {
                 }
                 l.tick();
                 eprintln!("ncurightclick at ({x},{y})");
+            }
+            // `dragnano=<bar>:<slot>`: real left-button drag (press, move past the 3 px threshold, release) from the
+            // Programs window's first row to shortcut bar `<bar>` slot `<slot>` (bug 18 drag-to-hotbar verification).
+            "dragnano" => {
+                let (bar, slot) = v.split_once(':').map(|(b, s)| (b.parse().unwrap(), s.parse().unwrap())).unwrap();
+                let (x, y) = l.p.hud.as_ref().unwrap().nano_first_point(&l.p.gui);
+                l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
+                l.tick();
+                l.p.input(ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                l.tick();
+                l.p.input(ao_gui::InputEvent::MouseMove { x: x + 20.0, y }, &mut l.o.host);
+                l.tick();
+                let (bx, by) = l.p.hud.as_ref().unwrap().shortcut_slot_pos(&l.p.gui, bar, slot).expect("shortcut bar/slot out of range");
+                l.p.input(ao_gui::InputEvent::MouseMove { x: bx, y: by }, &mut l.o.host);
+                l.tick();
+                l.p.input(ao_gui::InputEvent::MouseUp { x: bx, y: by, button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                l.tick();
+                eprintln!("dragnano to bar {bar} slot {slot} at ({bx},{by})");
             }
             // `clickdyn=[shift+|ctrl+]<instance>` / `hoverdyn=…`: left-click / hover the first screen point whose pick ray hits the dynel's box
             // with those modifiers held; `hoverdyn` prints the pointer sprites (GFX_GUI_POINTER* 0x135..0x14e) of the frame
