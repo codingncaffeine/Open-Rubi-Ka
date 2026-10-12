@@ -87,6 +87,9 @@ pub(super) struct Player {
     clip_scale: Option<f32>,
     /// The pose the movement role showed last frame (`None` before the first update).
     pose: Option<Pose>,
+    /// Whether the movement FSM was airborne last frame (`None` before the first update): the edge into grounded plays
+    /// the jump-landing clip once (`jump-land-{walk,run,idle}`, `combat::anim::ANIMS` 185..187; `FUN_10045069`'s `land` note).
+    was_airborne: Option<bool>,
     /// The AnimHolder's fight idle is on (`combat/glue.rs::stance`: set by the draw of a fight start, cleared by the holster of a fight stop); the
     /// character then stands in the weapon's fight idle, bare-handed in the fighting stance.
     pub fighting: bool,
@@ -164,6 +167,7 @@ impl Player {
                 cast_restart: false,
                 clip_scale: None,
                 pose: None,
+                was_airborne: None,
                 fighting: false,
                 fight,
                 zones,
@@ -533,6 +537,18 @@ impl Player {
                 self.play(Role::Clip(name.into()), false);
             }
         }
+        // the airborne->grounded edge plays the jump-landing clip once over the resuming movement pose (`jump-land-*`);
+        // the clip's own `land` note then plays the ground-material footstep thud (`FUN_10045069`).
+        let grounded = self.movement.grounded();
+        if self.was_airborne == Some(true) && grounded && self.cast_loop.is_none() {
+            let name = match role {
+                Role::Walk | Role::Sneak | Role::WalkBack | Role::WalkLeft | Role::WalkRight => "jump-land-walk",
+                Role::Run => "jump-land-run",
+                _ => "jump-land-idle",
+            };
+            self.play(Role::Clip(name.into()), false);
+        }
+        self.was_airborne = Some(!grounded);
         // emotes and swings end with their clip or when the character moves; a death clip holds until `stand`
         if self.cast_loop != Some(true) && !self.cast_restart && self.transient.as_ref().is_some_and(|(_, hold)| !hold && (self.avatar.finished() || (self.cast_loop.is_none() && moving))) {
             self.transient = None;

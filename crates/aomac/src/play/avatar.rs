@@ -362,6 +362,9 @@ pub struct Avatar {
     cast_loop: bool,
     /// Bit `i` = event `i` of the clip has fired its note (cleared when a clip starts).
     note_fired: u32,
+    /// Local clip time ([`clip_time`]) as of the last [`Avatar::update`], to detect a looping clip's wrap and re-arm
+    /// `note_fired` for its next cycle (the own walk/run/jump clip's own step/land notes, not just the swing overlays).
+    body_phase: f32,
     notes: Vec<super::combat::notes::FiredNote>,
     /// `AnimSet` of the wielded weapon ([`Avatar::set_stance`]).
     stance: Option<i32>,
@@ -386,7 +389,7 @@ impl Avatar {
         let heads = head_table(store, breed, gender, 2)?;
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
         let rig = ActorRig::player(store, &assets, &l.look, &l.attachments)?;
-        let mut a = Self { id, rig, current_skin: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, note_fired: 0, notes: Vec::new(), stance: None, ms: 0.0, prev_clip: None, prev_ms: 0.0, prev_rate: 1.0, prev_fade_elapsed: 0.0, prev_fade_ms: 0.0, transform: Mat4::IDENTITY };
+        let mut a = Self { id, rig, current_skin: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, note_fired: 0, body_phase: 0.0, notes: Vec::new(), stance: None, ms: 0.0, prev_clip: None, prev_ms: 0.0, prev_rate: 1.0, prev_fade_elapsed: 0.0, prev_fade_ms: 0.0, transform: Mat4::IDENTITY };
         a.set_pose(store, AvatarPose::default())?;
         a.set_transform([u.pos[0], u.pos[1], -u.pos[2]], u.yaw().map_or(0.0, |y| -y));
         Ok(a)
@@ -525,6 +528,7 @@ impl Avatar {
             self.clip_id = id;
             self.calibration_id = calibration_id;
             self.note_fired = 0;
+            self.body_phase = 0.0;
             self.body_layers = 3;
             self.refresh_masks();
         }
@@ -543,6 +547,7 @@ impl Avatar {
     pub fn restart_cast_clip(&mut self) {
         self.ms = 0.0;
         self.note_fired = 0;
+        self.body_phase = 0.0;
     }
 
 
@@ -604,6 +609,16 @@ impl Avatar {
             }
         }
         self.actions.retain(|a| a.ms <= a.clip.duration);
+        // the own walk/run/jump clip's own notes (`FUN_1003c036`'s per-frame holder walk, not just the swing overlays):
+        // `fire` needs the looping clip's current cycle position, and a wrap re-arms `note_fired` for the next cycle.
+        if let Some(clip) = self.clip.clone() {
+            let local = clip_time(&clip, self.ms, self.one_shot());
+            if local < self.body_phase {
+                self.note_fired = 0;
+            }
+            self.notes.extend(super::combat::notes::fire(&clip.events, local, &mut self.note_fired).filter_map(|id| attributed_note(id, -1)));
+            self.body_phase = local;
+        }
         // keep the counter bounded; looping clips wrap by themselves, one-shots stop at the end
         if let Some(a) = &self.clip {
             if !self.one_shot() && a.duration > 0.0 && self.ms > 4.0 * a.duration {
@@ -865,6 +880,30 @@ pub(super) mod tests {
         avatar.update(0.0);
         assert_eq!(avatar.actions.len(), 1);
         assert_eq!(avatar.actions[0].layers, 2, "expiry does not reset the stored exclusion mask");
+    }
+
+    /// `Avatar::update` must fire the base locomotion clip's own notes (`FUN_1003c036`'s per-frame holder walk), not just
+    /// the action overlays: a walk clip's `step` markers fire repeatedly as it loops, and the jump-landing clip's `land`
+    /// marker (`jump-land-idle`, played once by `Player` on the airborne->grounded edge) fires once.
+    #[test]
+    fn base_clip_reports_its_own_step_and_land_notes() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        avatar.set_pose(&store, AvatarPose { role: Role::Walk, speed: 1.5, ref_speed: 1.5 }).unwrap();
+        let mut steps = 0;
+        for _ in 0..200 {
+            avatar.update(0.05);
+            steps += avatar.take_notes().iter().filter(|n| n.id == super::super::combat::notes::id::STEP).count();
+        }
+        assert!(steps >= 2, "a 10 s walk must cross several step markers more than once (got {steps})");
+        avatar.set_pose(&store, AvatarPose::still(Role::Clip("jump-land-idle".into()))).unwrap();
+        let mut landed = 0;
+        while !avatar.finished() {
+            avatar.update(0.05);
+            landed += avatar.take_notes().iter().filter(|n| n.id == super::super::combat::notes::id::LAND).count();
+        }
+        assert_eq!(landed, 1, "the jump-landing clip's land marker fires exactly once");
     }
 
     /// `VisualCATMesh_t::SetAnimation` (DS 0x10073f23) always blends the new clip in over 200..300 ms instead of popping

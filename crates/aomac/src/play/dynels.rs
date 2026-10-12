@@ -610,6 +610,9 @@ pub struct Char {
     roll: Roll,
     /// Bit `i` = event `i` of the playing clip has fired its note (`piVar7[0xd]` of the holder's clip entry, `FUN_1003c036`).
     note_fired: u32,
+    /// Local clip time ([`super::avatar::clip_time`]) as of the last tick, to detect a looping clip's wrap and re-arm
+    /// `note_fired` for its next cycle (the base walk/run/jump clip's own step/land notes, not just the overlay actions).
+    body_phase: f32,
 }
 
 /// Authored action playback is independent of locomotion and its markers.
@@ -1143,6 +1146,7 @@ impl Dynels {
         if node.layer == canim::Layer::Body && c.special != Special::None {
             c.special = Special::None;
             c.note_fired = 0;
+            c.body_phase = 0.0;
         }
         c.actions.insert(at, node);
         if anim_id != ATTACK_KEY && !matches!(self.models.get(&c.key), Some(Model::Ready { built, .. }) if built.clips.contains_key(&anim_id))
@@ -1485,6 +1489,7 @@ impl Dynels {
         character.special = Special::None;
         character.clip_ms = 0.0;
         character.note_fired = 0;
+        character.body_phase = 0.0;
         character.roll.key = None;
         self.pending_clips.retain(|clip| clip.3 != who);
         self.replay.retain(|clip| clip.0 != who);
@@ -2245,6 +2250,7 @@ impl Dynels {
                         roll: Roll::default(),
                         next: None,
                         note_fired: 0,
+                        body_phase: 0.0,
                     },
                 );
             }
@@ -2582,6 +2588,7 @@ impl Dynels {
                 c.refresh_layers();
                 c.clip_ms = 0.0;
                 c.note_fired = 0;
+                c.body_phase = 0.0;
                 c.terminal_pose = false;
             }
             // GC 0x1006be27 / 0x1006fb56 set the rate once after Play, including idle.
@@ -2604,6 +2611,18 @@ impl Dynels {
                     )
                 } else { rate }
             });
+            // the base clip's own notes (`FUN_1003c036`'s per-frame holder walk, not just the overlay `c.actions`): a wrap
+            // of the looping clip's local cycle position re-arms `note_fired` for the step/land notes of its next cycle.
+            if let Some(a) = clip {
+                let once = !matches!(c.special, Special::None | Special::Cast(_));
+                let local = super::avatar::clip_time(a, c.clip_ms, once);
+                if local < c.body_phase {
+                    c.note_fired = 0;
+                }
+                let note_id = *id;
+                self.notes.extend(super::combat::notes::fire(&a.events, local, &mut c.note_fired).filter_map(|note| (note != super::combat::notes::id::ATTACK).then_some(super::combat::notes::FiredNote { id: note, slot: -1 })).map(|note| (note_id, note)));
+                c.body_phase = local;
+            }
             c.actions.retain_mut(|action| {
                 let Some(clips) = built.clips.get(&action.id).filter(|clips| !clips.is_empty()) else { return true };
                 let variant = *action.variant.get_or_insert_with(|| if clips.len() > 1 { self.rng.rand() as usize % clips.len() } else { 0 });
@@ -4582,6 +4601,9 @@ mod variant_tests {
             host.actors.clear();
             notes.extend(z.world.take_notes());
         }
+        // idle/walk clips legitimately repeat their locomotion notes (`0xf` idle) every loop now that the base clip fires
+        // notes too (`footstep_and_land_notes_...`); this test is about the attacking leet's own attack notes only.
+        notes.retain(|n| n.0 == leet && n.1.id != 0xf);
         eprintln!("leet attack clip notes: {notes:?}");
         let mut uniq = notes.clone();
         uniq.dedup();
