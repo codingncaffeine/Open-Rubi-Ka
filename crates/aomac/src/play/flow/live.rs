@@ -7,6 +7,8 @@
 //! `heading=server_yaw` rotates in place through right mouse input to the requested heading (radians), before idle/capture steps.
 //! `move=x:y` hover; `click`, `rightclick`, `doubleclick` take `[shift+|ctrl+|alt+]x:y` (prefixes may combine), through GUI mouse input.
 //! `clickdyn=<instance>` world click on a dynel, `mdrag=x1:y1:x2:y2` GUI drag, `watch=secs` own-stat changes.
+//! `rightclickitem=<slot hex>` real right-click on the bag/wear cell currently showing `inv`'s slot (bug 10 equip/unequip/use).
+//! `ncurightclick` real right-click on the NCU window's first row (bug 21 cancel).
 //! `nanos` prints learned program IDs; `buffs` prints running buffs and NCU usage.
 //! `down=KEY` / `up=KEY` hold across steps; `clickcorpse` / `rightcorpse` click a visible, GUI-unobscured corpse pick point.
 //! `focuslost` cancels held game input as the host's window-focus-loss event does.
@@ -977,6 +979,31 @@ fn live_walk() {
                 }
                 l.tick();
                 l.o.host.mods = mods;
+            }
+            // `rightclickitem=<slot hex>`: real right-click (GUI mouse dispatch, not a direct command) at the screen cell
+            // currently showing the bag/wear item of `slot` (bug 10 right-click equip/unequip/use verification).
+            "rightclickitem" => {
+                let slot = u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+                let (x, y) = l.p.hud.as_ref().unwrap().item_screen_pos(&l.p.gui, slot).unwrap_or_else(|| panic!("slot {slot:#x} is not on screen"));
+                l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
+                for ev in [ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Right }, ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Right }] {
+                    l.tick();
+                    l.p.input(ev, &mut l.o.host);
+                }
+                l.tick();
+                eprintln!("rightclickitem {slot:#x} at ({x},{y})");
+            }
+            // `ncurightclick`: real right-click (GUI mouse dispatch) on the first/only row of the NCU window
+            // (bug 21 NCU cancel verification; the harness has only ever needed the one active own nano).
+            "ncurightclick" => {
+                let (x, y) = l.p.hud.as_ref().unwrap().ncu_first_point(&l.p.gui).expect("NCU window not open or empty");
+                l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
+                for ev in [ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Right }, ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Right }] {
+                    l.tick();
+                    l.p.input(ev, &mut l.o.host);
+                }
+                l.tick();
+                eprintln!("ncurightclick at ({x},{y})");
             }
             // `clickdyn=[shift+|ctrl+]<instance>` / `hoverdyn=…`: left-click / hover the first screen point whose pick ray hits the dynel's box
             // with those modifiers held; `hoverdyn` prints the pointer sprites (GFX_GUI_POINTER* 0x135..0x14e) of the frame

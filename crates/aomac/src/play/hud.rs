@@ -628,6 +628,16 @@ impl Hud {
         self.outbox.extend(self.stats.take_outbox());
     }
 
+    #[cfg(test)]
+    pub(super) fn item_screen_pos(&self, gui: &Gui, slot: u32) -> Option<(f32, f32)> {
+        self.stats.item_screen_pos(gui, slot)
+    }
+
+    #[cfg(test)]
+    pub(super) fn ncu_first_point(&self, gui: &Gui) -> Option<(f32, f32)> {
+        self.ncu.first_point(gui)
+    }
+
     /// True while the pointer carries an inventory item.
     pub(super) fn item_dragging(&self) -> bool {
         self.stats.dragging_item()

@@ -235,6 +235,13 @@ impl HudNcu {
         self.win.as_ref().map(|w| w.view.rows().iter().map(|r| r.key).collect()).unwrap_or_default()
     }
 
+    /// Live harness: screen position of the first row's icon (the NCU window has no named per-row views).
+    pub(super) fn first_point(&self, gui: &Gui) -> Option<(f32, f32)> {
+        let win = self.win.as_ref()?;
+        let r = gui.view_rect(win.win, "grid")?;
+        Some((r.l + lv::BORDER + 16.0, r.t + lv::BORDER + 16.0))
+    }
+
     pub(super) fn title(&self) -> &str {
         &self.title
     }

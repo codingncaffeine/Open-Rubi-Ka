@@ -326,6 +326,24 @@ impl HudStats {
     pub(in crate::play) fn live_double_click(&mut self, zone: &Zone, slot: u32) {
         self.use_slot(zone, slot);
     }
+
+    /// Live harness: screen position of the centre of the cell showing `slot` (bag grid cell or the
+    /// currently selected wear tab), for driving a real mouse click through `Gui`/`Hud::input`.
+    pub(in crate::play) fn item_screen_pos(&self, gui: &Gui, slot: u32) -> Option<(f32, f32)> {
+        if let Some(w) = &self.wear {
+            if let Some(cell) = (0..15).find(|&cell| items::wear_slot(w.tab, cell) == Some(slot)) {
+                let r = gui.view_rect(w.window, "items")?;
+                let (c, row) = items::wear_cell(w.tab, cell);
+                let (ox, oy) = items::wear_origin(c, row);
+                return Some((r.l + ox + items::SLOT / 2.0, r.t + oy + items::SLOT / 2.0));
+            }
+        }
+        let i = self.inventory.as_ref()?;
+        let cell = i.positions.get(slot)?;
+        let r = gui.view_rect(i.window, "grid")?;
+        let (ox, oy) = inv_grid::cell_origin(cell.0, cell.1, i.gap);
+        Some((r.l + ox + inv_grid::ICON / 2.0, r.t + oy + inv_grid::ICON / 2.0))
+    }
 }
 
 #[cfg(test)]
