@@ -489,12 +489,36 @@ mod tests {
     }
 
     #[test]
-parking_lot = "0.12"
-texpresso = "2.0.2"
+    fn reset_closes_streams_and_cancels_pause_resume() {
+        let (mut mp, sh) = player("logout");
+        mp.signal(Some(0));
+        let voices = mp.streams.clone();
+        assert!(!voices.is_empty());
+        mp.resume = Some(1);
+        mp.state = State::Paused { left: 0.1 };
+        mp.reset();
+        assert!(voices.iter().all(|&id| !sh.mixer().is_playing(id)));
+        assert!(mp.streams.is_empty() && mp.resume.is_none() && mp.pause_layer.is_none());
+        run(&mut mp, &sh, 40.0);
+        assert!(mp.layer().is_none() && mp.now_playing.is_none());
+        mp.signal(Some(0));
+        assert!(mp.now_playing.is_some(), "the same layer can start in the next session");
+        mp.reset();
+        let _ = std::fs::remove_dir_all(&sh.root);
+    }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6"
-block2 = "0.6"
+    #[test]
+    fn device_reinitialization_restarts_the_unchanged_world_layer() {
+        let (mut mp, sh) = player("device-reinit");
+        mp.signal(Some(0));
+        run(&mut mp, &sh, 0.1);
+        sh.mixer().stop_all();
+        mp.restart_device();
+        assert_eq!(mp.layer(), Some(0));
+        assert!(matches!(mp.state, State::Idle));
+        run(&mut mp, &sh, 0.1);
+        assert!(matches!(mp.state, State::Playing(_)));
+        assert!(sh.mixer().voice_count() > 0);
         let _ = std::fs::remove_dir_all(&sh.root);
     }
 
