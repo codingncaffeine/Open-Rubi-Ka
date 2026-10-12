@@ -649,6 +649,11 @@ impl Hud {
     }
 
     #[cfg(test)]
+    pub(super) fn nano_set_page(&mut self, page: usize) {
+        self.nano.set_page(page);
+    }
+
+    #[cfg(test)]
     pub(super) fn bar_slot_names(&self, bar: usize) -> Vec<String> {
         self.shortcuts.get(bar).map(|b| b.slot_names()).unwrap_or_default()
     }

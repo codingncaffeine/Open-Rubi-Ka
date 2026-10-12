@@ -9,7 +9,7 @@
 //! `clickdyn=<instance>` world click on a dynel, `mdrag=x1:y1:x2:y2` GUI drag, `watch=secs` own-stat changes.
 //! `rightclickitem=<slot hex>` real right-click on the bag/wear cell currently showing `inv`'s slot (bug 10 equip/unequip/use).
 //! `ncurightclick` real right-click on the NCU window's first row (bug 21 cancel). `dragnano=<bar>:<slot>` drags the
-//! Programs window's first row onto a shortcut bar slot (bug 18). `barnames` prints bar 0's slot names, `clickslot=<bar>:<slot>` real-clicks one.
+//! Programs window's first row onto a shortcut bar slot (bug 18); `nanopage=<index>` selects its school tab first. `barnames` prints bar 0's slot names, `clickslot=<bar>:<slot>` real-clicks one.
 //! `nanos` prints learned program IDs; `buffs` prints running buffs and NCU usage.
 //! `down=KEY` / `up=KEY` hold across steps; `clickcorpse` / `rightcorpse` click a visible, GUI-unobscured corpse pick point.
 //! `focuslost` cancels held game input as the host's window-focus-loss event does.
@@ -1038,6 +1038,9 @@ fn live_walk() {
                 l.tick();
                 eprintln!("dragnano to bar {bar} slot {slot} at ({bx},{by})");
             }
+            // `nanopage=<index>`: selects the Programs window's school tab (0 Combat, 1 Medical, 2 Prot, 3 Psi, 4 Space, 5 Favorites)
+            // before `dragnano`/a point step, matching the `SchoolSelector_c` button the user would click.
+            "nanopage" => l.p.hud.as_mut().unwrap().nano_set_page(v.parse().unwrap()),
             // `barnames`: slot names of shortcut bar 0 (verifies a persisted nano/macro/action survives a relog).
             "barnames" => eprintln!("barnames {:?}", l.p.hud.as_ref().unwrap().bar_slot_names(0)),
             // `clickslot=<bar>:<slot>`: real left click (press/release, GUI mouse dispatch) activating a shortcut bar slot.
