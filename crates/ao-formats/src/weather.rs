@@ -170,12 +170,14 @@ struct Event {
     time: f32,
     seed: u32,
     floats: [f32; 16],
-    ints: [u32; 8],
+    ints: Vec<u32>,
     fi: usize,
     ii: usize,
 }
 
-/// `FUN_100b12c9` and its runtime state (`FUN_100b0d1f` ...).
+/// `FUN_100b12c9` and its runtime state (`FUN_100b0d1f` ...). Also reused by [`crate::lightning`]
+/// for the two single-seed lightning schedules (`FUN_100b104c`): one seed instead of three means
+/// `window == period`, i.e. a single-window schedule, the same loop unmodified.
 pub struct Schedule {
     period: f32,
     window: f32,
@@ -192,9 +194,12 @@ pub struct Schedule {
 }
 
 impl Schedule {
-    /// `FUN_100b12c9(seed0, seed1, seed2, period, gap_min, gap_max, 16, 8)`.
-    pub fn new(seeds: [u32; 3], period_arg: f32, gap_min: f32, gap_max: f32) -> Schedule {
-        let window = (period_arg as f64 / 3.0) as f32;
+    /// `FUN_100b12c9(seeds[0], seeds[1], seeds[2], period, gap_min, gap_max, 16, 8)` for the three-
+    /// window weather schedule (`seeds.len() == 3`), `FUN_100b104c(seed, period, gap_min, gap_max,
+    /// 16, 16)` for a lightning schedule (`seeds.len() == 1`, `n_ints == 16`): both are the same
+    /// per-window event-generation loop, `window = period / seeds.len()`.
+    pub fn new(seeds: &[u32], period_arg: f32, gap_min: f32, gap_max: f32, n_ints: usize) -> Schedule {
+        let window = (period_arg as f64 / seeds.len() as f64) as f32;
         let period = if (period_arg as f64) < 0.1 { 0.1 } else { period_arg };
         let mut events: Vec<Event> = Vec::new();
         if gap_min < gap_max {
@@ -206,7 +211,7 @@ impl Schedule {
                     loop {
                         t = (rng.next_f64() * (gap_max - gap_min) as f64 + gap_min as f64 + t as f64) as f32;
                         if t < window {
-                            events.push(Event { time: (n as f64 * window as f64 + t as f64) as f32, seed: 0, floats: [0.0; 16], ints: [0; 8], fi: 0, ii: 0 });
+                            events.push(Event { time: (n as f64 * window as f64 + t as f64) as f32, seed: 0, floats: [0.0; 16], ints: vec![0; n_ints], fi: 0, ii: 0 });
                         } else {
                             break;
                         }
@@ -256,8 +261,9 @@ impl Schedule {
         a - b
     }
 
-    /// `FUN_100b0d1f`: one step of the event cursor; `true` while an event fired.
-    fn step(&mut self, t: f32) -> bool {
+    /// `FUN_100b0d1f`: one step of the event cursor; `true` while an event fired. `pub(crate)` for
+    /// [`crate::lightning`], which drives it directly from real time (no day-time conversion).
+    pub(crate) fn step(&mut self, t: f32) -> bool {
         let n = self.events.len();
         if n != 0 && self.fired < n {
             if self.started {
@@ -319,7 +325,7 @@ impl Schedule {
     }
 
     /// `FUN_100b0e34`.
-    fn draw_f(&mut self) -> f32 {
+    pub(crate) fn draw_f(&mut self) -> f32 {
         match self.events.get_mut(self.active) {
             Some(e) => {
                 e.fi = (e.fi + 1) & 15;
@@ -330,10 +336,11 @@ impl Schedule {
     }
 
     /// `FUN_100b0e5e`.
-    fn draw_i(&mut self) -> u32 {
+    pub(crate) fn draw_i(&mut self) -> u32 {
         match self.events.get_mut(self.active) {
             Some(e) => {
-                e.ii = (e.ii + 1) & 7;
+                let mask = e.ints.len() - 1;
+                e.ii = (e.ii + 1) & mask;
                 e.ints[e.ii]
             }
             None => 0,
@@ -343,6 +350,16 @@ impl Schedule {
     /// `FUN_100b0e9d`.
     fn length(&self) -> f32 {
         if self.events.is_empty() { 1.0 } else { self.ev_len }
+    }
+
+    /// `pub(crate)` for [`crate::lightning`]: the period passed to [`Schedule::new`].
+    pub(crate) fn period(&self) -> f32 {
+        self.period
+    }
+
+    /// The active (just-fired) event's seed (`FUN_100b0e88`), `pub(crate)` for [`crate::lightning`].
+    pub(crate) fn active_seed(&self) -> u32 {
+        self.events.get(self.active).map_or(0, |e| e.seed)
     }
 }
 
@@ -388,7 +405,7 @@ impl Config {
     }
 
     fn schedule(&self, day: u32) -> Schedule {
-        Schedule::new([self.seed(day, u32::MAX), self.seed(day, 0), self.seed(day, 1)], PERIOD, GAP_MIN, GAP_MAX)
+        Schedule::new(&[self.seed(day, u32::MAX), self.seed(day, 0), self.seed(day, 1)], PERIOD, GAP_MIN, GAP_MAX, 8)
     }
 }
 

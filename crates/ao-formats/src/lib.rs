@@ -8,6 +8,7 @@ pub mod city;
 pub mod create;
 pub mod dynel_visual;
 pub mod landcontrol;
+pub mod lightning;
 pub mod map_areas;
 pub mod mesh;
 pub mod playfield;
