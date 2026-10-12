@@ -858,6 +858,34 @@ fn live_walk() {
                 v.sort();
                 eprintln!("stats {}", v.iter().map(|(k, x)| format!("{k}={x}")).collect::<Vec<_>>().join(" "));
             }
+            // `abilityraise=<stat>:<points>`: opens Skills, selects Abilities, clicks the real btn<stat> arrow canvas <points> times
+            // (right half = increase), then Accept, like a real GUI drag. Prints the server-confirmed stat before/after Save.
+            "abilityraise" => {
+                use super::super::hud::WindowKind;
+                let (stat_s, pts_s) = v.split_once(':').expect("abilityraise=<stat>:<points>");
+                let (stat, pts): (u32, i32) = (stat_s.parse().unwrap(), pts_s.parse().unwrap());
+                let before = l.p.zone.stat(stat);
+                l.p.hud.as_mut().unwrap().open(&mut l.p.gui, WindowKind::Skills);
+                l.tick();
+                let w = l.p.hud.as_ref().unwrap().stats_window(WindowKind::Skills).expect("skill window");
+                let ar = l.p.gui.view_rect(w, "abilities").expect("abilities tab");
+                let click = |l: &mut Live, x: f32, y: f32| {
+                    l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
+                    l.p.input(ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                    l.p.input(ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                    l.tick();
+                };
+                click(&mut l, ar.l + ar.width() / 2.0, ar.t + ar.height() / 2.0);
+                for _ in 0..pts.max(0) {
+                    let br = l.p.gui.view_rect(w, &format!("btn{stat}")).expect("btn canvas for stat");
+                    click(&mut l, br.l + br.width() * 0.75, br.t + br.height() / 2.0); // right half = increase
+                }
+                let sr = l.p.gui.view_rect(w, "Accept").expect("Accept button");
+                click(&mut l, sr.l + sr.width() / 2.0, sr.t + sr.height() / 2.0);
+                l.wait(3.0);
+                let after = l.p.zone.stat(stat);
+                eprintln!("abilityraise {stat}: before={before:?} after_server_confirmed={after:?}");
+            }
             "buffs" => eprintln!("buffs time={} ncu={} entries={:?}", l.p.zone.nanos.time, l.p.zone.nanos.buffs.iter().map(|b| b.ncu_cost).sum::<i32>(), l.p.zone.nanos.buffs),
             "nanos" => eprintln!("nanos {:?}", l.p.zone.nanos.programs),
             // the spells running on the own character (docs/gui.md §11.14) and the maps they fill
