@@ -9,7 +9,7 @@
 use anyhow::Context;
 use ao_formats::character::actor::{attractor_list, npc_part_layers, npc_part_textures, ActorAssets, ActorRig, PlayerLook};
 use ao_formats::dynel_visual::{blob_stats, corpse_visual, default_mesh, effective_stats, item_template, placed_dynels, static_instance, visual, PlacedDynel};
-use ao_formats::character::{load_cat_mesh, AnimLayer, CatAnim, ClothPart, CrtRand, Equipment, NpcRecord, TextureOverride, CHAR_MESH_TYPE};
+use ao_formats::character::{load_cat_mesh, AnimLayer, CatAnim, ClothPart, CrtRand, Equipment, NameTable, NpcRecord, TextureOverride, CHAR_MESH_TYPE};
 use ao_gui::Gui;
 use ao_net::n3::dynel::{Dynel, SimpleCharFullUpdate};
 use ao_net::n3::misc::Misc;
@@ -258,17 +258,24 @@ struct Worker {
 }
 
 impl Worker {
-    fn start(dir: PathBuf) -> Worker {
+    fn start(dir: PathBuf, names: Option<Arc<NameTable>>) -> Worker {
         let (tx, req_rx) = channel::<Req>();
         let (resp_tx, rx) = channel();
         std::thread::spawn(move || {
-            let (store, mut assets) = match RecordStore::open(&dir).and_then(|s| Ok((ActorAssets::new(&s)?, s))) {
-                Ok((a, s)) => (s, a),
-                Err(e) => {
-                    eprintln!("dynels: rdb: {e:#}");
-                    return;
-                }
+            let store = match RecordStore::open(&dir) {
+                Ok(store) => store,
+                Err(e) => { eprintln!("dynels: rdb: {e:#}"); return; }
             };
+            // Reuses `Dynels::start`'s already-loaded name table when available instead of parsing rdb
+            // 1000010 a second time; only a fresh session with a failed earlier load re-parses it here.
+            let names = match names {
+                Some(names) => names,
+                None => match NameTable::load(&store) {
+                    Ok(names) => Arc::new(names),
+                    Err(e) => { eprintln!("dynels: rdb: {e:#}"); return; }
+                },
+            };
+            let mut assets = ActorAssets::with_names(names);
             for r in req_rx {
                 let resp = match r {
                     Req::Model { key, look, texture_quality } => {
@@ -734,6 +741,9 @@ const PROP_ID_BASE: u32 = 0x4000_0000;
 
 pub struct Dynels {
     dir: Option<PathBuf>,
+    /// Shared with `effects::Renderer` and the model-building worker, loaded once per [`Dynels::start`]
+    /// (both used to each parse rdb 1000010 independently, retaining two copies of the ~8MB name table).
+    names: Option<Arc<NameTable>>,
     worker: Option<Worker>,
     texture_quality: i32,
     own: i32,
@@ -873,6 +883,7 @@ impl Default for Dynels {
     fn default() -> Self {
         Self {
             dir: None,
+            names: None,
             worker: None,
             texture_quality: 3,
             own: 0,
@@ -1020,10 +1031,16 @@ impl Dynels {
             Err(error) => { eprintln!("nano templates: {error:#}"); None }
         };
         self.nano_templates.clear();
-        self.effects = match super::combat::effects::Renderer::open(&dir) {
-            Ok(renderer) => Some(renderer),
-            Err(error) => { eprintln!("weapon effects: {error:#}"); None }
-        };
+        // Loaded once and shared with `effects::Renderer` and the model-building worker's `ActorAssets`,
+        // instead of each independently parsing rdb 1000010 (a ~8MB name table) into its own copy.
+        self.names = self.nano_store.as_ref().and_then(|store| match NameTable::load(store) {
+            Ok(names) => Some(Arc::new(names)),
+            Err(error) => { eprintln!("name table: {error:#}"); None }
+        });
+        self.effects = match &self.names {
+            Some(names) => super::combat::effects::Renderer::open_with_names(&dir, names.clone()),
+            None => super::combat::effects::Renderer::open(&dir),
+        }.map_err(|error| eprintln!("weapon effects: {error:#}")).ok();
         self.dir = Some(dir);
     }
 
@@ -2399,7 +2416,7 @@ impl Dynels {
             if let Some(effects) = &mut self.effects { effects.frame(dt, host, collision); }
             return;
         };
-        let worker = self.worker.take().unwrap_or_else(|| Worker::start(dir));
+        let worker = self.worker.take().unwrap_or_else(|| Worker::start(dir, self.names.clone()));
         if let Some(pf) = self.want_placed.take() {
             let _ = worker.tx.send(Req::Placed(pf));
         }

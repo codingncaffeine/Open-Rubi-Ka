@@ -171,6 +171,7 @@ use ao_formats::weather::R250;
 use ao_rdb::RecordStore;
 use ao_scene::{ActorFrame, Blend, Mesh, Scene, Submesh, TextureKey, Vertex, IDENTITY};
 use glam::{Mat4, Vec3};
+use std::sync::Arc;
 
 const MODEL_BASE: u64 = 0xfac0_0000_0000_0000;
 const ACTOR_BASE: u32 = 0xe000_0000;
@@ -298,7 +299,7 @@ struct SourceRuntime {
 pub struct Renderer {
     templates: Templates,
     store: RecordStore,
-    names: NameTable,
+    names: Arc<NameTable>,
     models: HashMap<u64, EffectModel>,
     active: Vec<Active>,
     rng: CrtRand,
@@ -346,7 +347,18 @@ impl Renderer {
 
     pub fn open(dir: &Path) -> Result<Self> {
         let store = super::super::open_texture_store(dir)?;
-        let names = NameTable::load(&store)?;
+        let names = Arc::new(NameTable::load(&store)?);
+        Self::from_store(dir, store, names)
+    }
+
+    /// Shares an already-loaded name table instead of parsing rdb 1000010 again (`Dynels::start` loads it
+    /// once and passes the same `Arc` to the model-building worker's `ActorAssets`).
+    pub fn open_with_names(dir: &Path, names: Arc<NameTable>) -> Result<Self> {
+        let store = super::super::open_texture_store(dir)?;
+        Self::from_store(dir, store, names)
+    }
+
+    fn from_store(dir: &Path, store: RecordStore, names: Arc<NameTable>) -> Result<Self> {
         let templates = Templates::open(dir)?;
         let mut anchor_ids: Vec<_> = templates.by_id.values().filter_map(|t| t.words.get(7).map(|v| *v as i32)).chain(1000..=1018).chain(2000..=2023).chain([0,3000,3001]).collect();
         anchor_ids.sort_unstable();

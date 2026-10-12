@@ -14,7 +14,7 @@ use std::cell::RefCell;
 
 /// Shared caches of the loaders: the name table, per-model clip tables and parsed clips.
 pub struct ActorAssets {
-    pub names: NameTable,
+    pub names: Arc<NameTable>,
     clips: HashMap<u32, Arc<Vec<(String, u32)>>>,
     anims: HashMap<u32, Arc<CatAnim>>,
     rest: RefCell<HashMap<(u32, u32), Arc<CatAnim>>>,
@@ -22,7 +22,13 @@ pub struct ActorAssets {
 
 impl ActorAssets {
     pub fn new(store: &RecordStore) -> Result<Self> {
-        Ok(Self { names: NameTable::load(store)?, clips: HashMap::new(), anims: HashMap::new(), rest: RefCell::new(HashMap::new()) })
+        Ok(Self::with_names(Arc::new(NameTable::load(store)?)))
+    }
+
+    /// Shares an already-loaded name table instead of parsing rdb 1000010 again (`combat::effects::Renderer`
+    /// loads its own copy once per session; the model-building worker reuses it rather than a second copy).
+    pub fn with_names(names: Arc<NameTable>) -> Self {
+        Self { names, clips: HashMap::new(), anims: HashMap::new(), rest: RefCell::new(HashMap::new()) }
     }
 
     /// Rest selection depends on the model's fitted bind frames, not just its skeleton signature.
