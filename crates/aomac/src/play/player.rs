@@ -588,9 +588,10 @@ impl Player {
         out
     }
 
-    /// `MovementChanged(0x1e)` of `N3Msg_StartCamping`.
-    pub fn sit_ground(&mut self) {
+    /// `MovementChanged(0x1e)` of `N3Msg_StartCamping`: drain immediately, before the caller queues stop-attack / camping.
+    pub fn sit_ground(&mut self) -> Vec<ao_net::n3::outgoing::CharMove> {
         self.movement.action(mv::SWITCH_SIT_GROUND, self.clock);
+        self.movement.take_outgoing()
     }
 
     /// Server messages for the own dynel (docs/zone/movement.md §10), in arrival order.

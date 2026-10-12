@@ -160,6 +160,8 @@ The char's `UnarmedTemplateInstance` (stat 418) is 0 for the own char in the cap
   idle's own layer (also 0) with no delay. `VisualCATMesh_t::SetAnimation` [DS 0x10073f23] keeps one active animation per layer (`CATAnimBlend_t` anim1 / anim2, new clip fades in over 200..300 ms,
   floats at DS 0x100af89c / 0x100af8a0), so the draw clip of `[3]` is replaced within the frame; **[INFERENCE]** it is never seen (the delayed idle of `[1]` exists precisely to show the draw), unverified
   live. The unwear's `[3]` (list 0x28 `rifle-stop-2h` 0x420 then 0x78) is replaced the same way. Nothing is played for them.
+* **Seated stance-pair gate, not key-3 suppression** [CODE `FUN_1003c930`, GC 0x1003c930]: after checking fighting field `+0x3c < 1`, the holder's wield-pair method requires movement FSM mode **not 8 and not 9** before applying the list-0x27 / 0x29 or list-0x28 / 0x78 pair. This is distinct from the key-3 equipment gesture: `FUN_10081e74(char, 3)` calls holder vtable `+0x14` (**Play**) unconditionally after its crawl / WaitState check. The stance-pair guard does not justify suppressing the key-3 gesture while seated.
+  **Correction — no guessed equip refusal:** `N3Msg_IsItemPossibleToWear` (GC 0x10026adb / 0x1004959a / 0x10081815) has no explicit sitting guard in the inspected paths. Do not infer a seated equipment prohibition from the holder's animation gate; equipment processing and sound remain unchanged.
 * **Wield gesture 0x6d**: `FUN_1006a857` (action 0x61) calls `FUN_10081e74(char, 3)` after the unwield (the character's own anim list 3, else 0x6d = the first `wield` entry, `<set>_wield_01_01.ani`;
   `Play(id, 1.0, count 1, layer 0)`); a fight then runs `[1]` through `FUN_1006a772`, which replaces it in the same frame. Out of a fight the gesture is the only thing the unwear shows
   (`combat/module.rs`: `Module::take_anims`, queued only for an occupied hand slot of a character that is not fighting). `FUN_1006ad94` (action 0x83, the same wear / unwear moment,
@@ -168,7 +170,7 @@ The char's `UnarmedTemplateInstance` (stat 418) is 0 for the own char in the cap
   **Wired**: `Module::on_frame` (0x61 -> gesture 0x6d), `glue.rs::stance` (`FightStarted` / `FightStopped` -> `draw_clip` / `holster_clip` + the fight idle flag: `Dynels::set_fighting`, `Player::fighting`;
   a weapon that resolves during a fight runs the draw again: `Dynels::take_wielded`), `combat::anim::{peace_idle, fight_idle, wield_walk_run, draw_clip, holster_clip}`, `Avatar::set_stance`
   (own: idle / fight idle / walk / run), `Dynels::update_with_collision` (others, same). Not wired: the martial-arts item's lists 0x1a / 0x1b / 0x10 (bare hands; record layout not decoded, §3.1), the crawl
-  variants, char state 4 / 8 / 9 gates and `char+0x80` / `FUN_10059ac4` (assumed 0 / false for a live character).
+  variants, char state 4 / movement-mode 8 / 9 stance-pair gates and `char+0x80` / `FUN_10059ac4` (assumed 0 / false for a live character).
   Stance ids per weapon type: section 3.1 (`blade-start/idle-blade/blade-stop` 1000-1002, `smallarms` 1010-1012, `rifle` 1020-1022,
   `unarmed` 1030-1032, `2h` 1055/1054/1056, `bow` 0xb5-0xb8).
 * **Being hit** (`CharacterActionIIR_t` action **0xd1**, `FUN_1005d0d8` case 0x5b [GC 0x1005eada]): if `identity_a.instance` and `identity_b.instance` (the handler's two `Identity*` arguments; `param` is not read) are both `> 0`, play the hit sound at the

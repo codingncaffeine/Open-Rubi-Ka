@@ -121,8 +121,9 @@ Note 0x16 (sync) is refused in Frozen, SitGround, Sleep, Lounge (and mode 5 pass
 
 GUI slots (`FlowControlModule_t::SlotMovement*` [GUI 0x10027ec1..0x10028077]) call `N3InterfaceModule_t::N3Msg_MovementChanged(action, &f)` [IF 0x1000902e],
 which forwards `(action, f, 0.0, **true**)` (asm 0x10009040: `PUSH 1`). The 4th argument is therefore always true. Slot polarity: `b == false`
-= start (`Forward(b) = b+1`, `StrafeLeft(b) = 7+b`, `Right(b) = 9+2b`, `Left(b) = 0xC+2b`); Forward/Back/StrafeLeft slots fire AFCM
-event (0xA, 0xE3) first when mode == 8 (sit-to-stand request).
+= start (`Forward(b) = b+1`, `StrafeLeft(b) = 7+b`, `Right(b) = 9+2b`, `Left(b) = 0xC+2b`); Forward/Back/StrafeLeft/StrafeRight slots fire AFCM
+event (0xA, 0xE3) first when mode == 8. Handler GUI 0x10027d5b only calls `TipSystem_t::Event`, not stand; W/S/Z/C and Space remain
+seated under the FSM permissions, A/D turn while seated, and X leaves sitting. Offscreen live verification on 2026-10-07 observed each.
 
 Order of events inside (all must hold, otherwise nothing happens, **nothing is sent**):
 
@@ -296,7 +297,48 @@ JumpForward}` from the FSM (the original picks anim ids in the Apply functions: 
 
 Code: `Movement::{sit_input, set_pos, impulse, follow_place, follow_target, stop_if_moving, take_stat_writes}`, `Player::{sit, sit_ground, apply_own_events}`,
 `Zone::own_events` (`OwnEvent`), `ao_net::n3::server_move` (decoders). Tests: `cargo test --release -p aomac movement` / `own_server_moves`, `-p ao-net server_move`.
-No capture contains any of these messages (checked `docs/captures/*.rec`), so the tests use hand-built frames.
+The server-driven movement decoder tests use hand-built frames; the camp ordering regression below uses the captured login/world flow.
+
+**Camp wire ordering.** `N3Msg_StartCamping` [GC 0x1001c93d] calls `MovementChanged(0x1e)` synchronously before the following stop-attack and
+`CharacterActionIIR_t` START_CAMPING (`0x78`). The pre-fix native capture `/tmp/Posture/window.rec` instead had outgoing `0x78` at 92536 ms and
+sit movement `0x1e` at 92638 ms (+102 ms): HUD dispatch left the move queued until `Player::frame`, while the action entered the fight outbox
+immediately. `Player::sit_ground` now drains the existing `Movement::take_outgoing` queue; `Play::send_outgoing` puts those move payloads into
+the same fight outbox before processing StopAttack / START_CAMPING. Draining consumes the move, so the next player frame cannot resend it.
+Regression `camp_queues_sit_movement_before_start_camping_without_next_frame_duplicate` drives the captured Arrival Hall flow through `Play::camp`,
+decodes the ordered outgoing frames (`0x1e`, then `0x78`), and checks the next player frame for duplicate sit movement. Both this regression and
+`full_update_restores_logout_posture_and_can_stand` passed in the release workspace run. Offscreen live verification on 2026-10-07 sent sit at
+28298 ms before camping at 28400 ms and rendered sitting under the logout bar. The next login nevertheless received FSM mode 3,
+CurrentMovementMode 173 = 3 and WaitState 430 = 0 from PRK and rendered standing. The client cannot faithfully restore a sitting pose from
+those authoritative standing values; no WaitState-derived override or cached local posture was added.
+
+**Full logout sequence RE'd, not just the camp ordering (2026-10-12, fresh Ghidra import of the actual client DLLs, not the shared
+partially-wiped project cache).** Full decompile of `N3Msg_StartCamping` [GC 0x1001c93d] confirms the entire function body: fighting-field
+check (feedback `Feedback_CantLogOutInAFight`), then (if movement mode is not 8/9) the sitting-permission vtable call and
+`N3Msg_MovementChanged(0x1e)`, then `N3Msg_IsAttacking`/`N3Msg_StopAttack`, then one `n3InfoItemRemote_t` built with action `0x78` and sent via
+`n3Dynel_t::SendIIRToObservers`, then (own char only) two local calls (`FUN_10058816`/`FUN_10042da4`, UI-local, not network). No further
+network message exists in this function: our fix (drain `sit_ground`'s queued move before the fight outbox sends StopAttack/`0x78`) now
+reproduces the full outgoing sequence exactly, with nothing left to add. `FUN_10079c53` / `FUN_10079e6c` (`StartLogoutIIR_t` /
+`StopLogoutIIR_t` handlers) decompile to a `__RTDynamicCast` validity check only (`ClearToBePassedOn` on a failed cast) — confirmed, not
+inferred: no position/pose/FSM write of any kind. `FlowControlModule_t::ActivateGameClosing` [GUI 0x10028194] (both the quit-to-login state 2
+and the quit-to-system/connection-lost states) decompiles to local work only: delete the camp timer, `SaveUserConfig`, fire two
+`GlobalSignals_c` local events, clear the screen, flip `m_bIsReturningToLogin`/`m_nCloseFrames`; the quit-to-system branch additionally sends
+two `AFCM::Send` (the internal client event bus, not a network message) and may call `BugReport_t::ReportDisconnect`. `ServerLostMessage`
+[GUI 0x10028d50] and `CampStartedMessage` [GUI 0x10029d38] (the 40 s `TimerBar_c` id, `LDBformat::Feed(0x1e)` = 30 matching `CAMP_SECONDS`)
+likewise touch no network state. Conclusion: retail's client never sends a final position/pose-save message, and never waits for a server
+acknowledgement, before tearing down the zone connection — the camp countdown is a pure local timer and the TCP teardown that follows is a
+plain local reset (`ResetConnectionAndConfig`, matched by `Play::show_login`'s `self.session = None`). There is no missing or
+misordered client message left to find for bug 15: the standing pose PRK returns on the next login is outside what the client sends, and
+adding a client-side override to force a remembered pose would be exactly the fabricated-pose shortcut the port rules forbid.
+
+**Bug 14 (seated equip) extended live check (2026-10-12).** With `ClickLand2`'s right-click equip/unequip landed, a second offscreen session
+(`Aomacvolk`) sent `/camp` (own FSM mode 8, confirmed seated), right-clicked the Right Hand wear slot (screen rect read via
+`Gui::view_rect` on the open Wear window, `1124,185`), then pressed `X` (`ACTION_SIT`'s stand toggle): FSM mode went 8 -> 3 and the chat
+log carried no refusal; the character was not stuck. (The zone connection closed shortly after standing, independent of the click — most
+likely an account-session edge unrelated to this input path; it does not change the stand result, which happened first.) Combined with the
+prior session's double-click wear/unwear round trip (also seated, also recovered) and the decompiled `N3Msg_MoveItemToInventory` [GC
+0x10027a30] / `N3Msg_IsItemPossibleToWear` [GC 0x10026adb] bodies (no sitting guard), drag-to-slot and right-click equip exercise the exact
+same `Action::Move` -> `N3Msg_MoveItemToInventory` path as a mouse drag drop (`item_dnd.rs`); there is nothing seat-specific left to guess at
+for that code path. No client-side change was made for bug 14: retail has no seated-equip refusal, and this client matches it.
 
 **Sit / stand.** Triggers: key `ACTION_SIT` (`Cmd::Sit`), hotbar special actions 0x4c / 0x4d (`FUN_1004256c`), camping 0x51 (`N3Msg_StartCamping`); the client has no `/sit`
 text command (only `/camp` is in GUI.dll's command strings; emotes `sleep` / `lounge` need sitting). `N3Msg_SitToggle` = `action::sit_toggle(Movement::sit_input())`:

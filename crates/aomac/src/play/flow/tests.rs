@@ -455,6 +455,29 @@ fn teleport_iir_starts_the_zone_change_only_with_a_destination() {
     assert!(r.p.teleporting);
 }
 
+#[test]
+fn camp_queues_sit_movement_before_start_camping_without_next_frame_duplicate() {
+    use ao_net::n3::{dynel::Dynel, world::World, N3};
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    r.enter();
+    r.p.fight.as_mut().unwrap().take_outbox();
+    r.p.camp();
+    let sent = r.p.fight.as_mut().unwrap().take_outbox();
+    let ordered = sent.iter().filter_map(|f| match ao_net::n3::decode(f).unwrap().body {
+        N3::Dynel(Dynel::CharDCMove(m)) => Some((false, i32::from(m.move_type))),
+        N3::World(World::CharacterAction(a)) => Some((true, a.action)),
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(ordered, [(false, 0x1e), (true, 0x78)]);
+    let movement = r.p.player.as_mut().unwrap().frame(0.016, &mut r.host, &mut r.p.zone, false);
+    assert!(!movement.iter().any(|f| matches!(
+        ao_net::n3::decode(f).unwrap().body,
+        N3::Dynel(Dynel::CharDCMove(m)) if m.move_type == 0x1e
+    )));
+}
+
 /// The own character on the captured Arrival Hall start: the avatar is built, the login window's focus is gone (it blocked every key),
 /// holding W walks it along its heading at about the client's run speed, and the position is the movement state's, not the server's.
 #[test]

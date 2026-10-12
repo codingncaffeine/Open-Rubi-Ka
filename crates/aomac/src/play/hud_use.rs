@@ -270,8 +270,10 @@ impl Play {
         for o in out {
             match o {
                 Outgoing::Move(action::mv::SWITCH_TO_SIT_GROUND) => {
-                    if let Some(p) = self.player.as_mut() {
-                        p.sit_ground();
+                    if let (Some(p), Some(m)) = (self.player.as_mut(), self.fight.as_mut()) {
+                        for movement in p.sit_ground() {
+                            m.push(ao_net::n3::outgoing::char_dc_move(self.zone.char_id as i32, &movement));
+                        }
                     }
                 }
                 Outgoing::Move(m) => eprintln!("hud: movement {m:#x} has no sender here"),
