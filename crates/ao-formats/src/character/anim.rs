@@ -48,6 +48,45 @@ pub struct AnimLayer<'a> {
     pub blend: f32,
 }
 
+/// CAT skeleton refresh countdown (`RCATMesh_t+0x218`, randy31 0x1005798b/0x10055d52).
+#[derive(Clone, Copy, Debug)]
+pub struct AnimationCadence(i32);
+
+impl Default for AnimationCadence {
+    fn default() -> Self { Self(-1) }
+}
+
+impl AnimationCadence {
+    /// `SmoothAnimations` changes refresh cadence, never clip clocks or authored blending.
+    pub fn sample(&mut self, smooth: bool, distance_sq: f32, radius: f32, previously_visible: bool) -> bool {
+        let normalized = distance_sq / (radius * radius);
+        let skip = if !smooth && normalized >= 256.0 { if normalized >= 2304.0 { 6 } else if normalized >= 1024.0 { 3 } else { 1 } } else { 0 };
+        if previously_visible {
+            self.0 -= 1;
+            if self.0 < 0 { self.0 = skip; }
+        }
+        if self.0 < 0 { self.0 = 0; }
+        self.0 == 0
+    }
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    #[test]
+    fn native_distance_bands_and_visibility_countdown() {
+        for (distance, interval) in [(255.0, 1), (256.0, 2), (1024.0, 4), (2304.0, 7)] {
+            let mut cadence = super::AnimationCadence::default();
+            assert!(cadence.sample(false, distance, 1.0, false));
+            for frame in 1..=interval {
+                assert_eq!(cadence.sample(false, distance, 1.0, true), frame == interval);
+            }
+            assert!(cadence.sample(false, distance, 1.0, false), "invisible frames do not decrement");
+        }
+        let mut cadence = super::AnimationCadence::default();
+        for _ in 0..10 { assert!(cadence.sample(true, 10000.0, 1.0, true)); }
+    }
+}
+
 /// DS 0x10073f23: remaining time of the preceding same-priority animation, clamped by
 /// 0x100af8a0 (0x43480000 = 200 ms) and 0x100af89c (0x43960000 = 300 ms).
 pub fn animation_fade_ms(previous_duration: f32, previous_ms: f32) -> f32 {

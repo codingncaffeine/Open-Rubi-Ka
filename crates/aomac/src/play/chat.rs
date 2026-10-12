@@ -19,7 +19,9 @@ mod zone;
 mod zonecmd;
 
 pub(super) use cmd::WindowOp;
-pub(crate) use info::item_template_spells;
+pub(crate) use info::{item_is_shield_disabler, item_template_spells};
+pub(super) use info::{item_html, shop_item_html, ItemRequest};
+pub(super) use info::extract_section;
 
 use super::zone::Zone;
 use ao_formats::screens::TextDb;
@@ -57,6 +59,8 @@ pub(super) enum GameAction {
     /// Yes in the "StartPvP" dialog (`GuiSystem_c::StartPvPFightResult`, GUI 0x1002f789): `N3Msg_StartPvP(target)`.
     StartPvp(ao_net::msg::Identity),
     BankClose,
+    /// `N3Msg_FlashHead`: authored effect 11507 on this character.
+    FlashHead(u32),
 }
 
 /// Results of chat commands that other layers apply (taken once per frame by the flow with [`Chat::take_requests`]).
@@ -93,6 +97,10 @@ pub(super) struct Chat {
     net: net::ChatNet,
     /// `ChatGUIModule_c::SetAFK` message while AFK.
     afk: Option<String>,
+    auto_afk: bool,
+    idle_seconds: f32,
+    afk_started: std::time::SystemTime,
+    chat_indicator: bool,
     /// Head of the reply list: sender of the last tell.
     last_tell_from: Option<String>,
     /// `IgnoreSystem_t` (local, not persisted yet).
@@ -101,6 +109,8 @@ pub(super) struct Chat {
     outbox: Vec<Frame>,
     /// Shop references resolve against the interaction module's authoritative stock and prices.
     shop_info_urls: Vec<(String, Identity, Identity)>,
+    /// Native GUI callbacks, drained into the HUD TipSystem by the flow.
+    tip_events: Vec<(&'static str, String)>,
     /// Running pet scripts (`NpcHolder_t::m_pScripts`, Gamecode 0x10052230 / 0x100522c9); each frame advances them.
     pet_scripts: Vec<ao_net::n3::textcmd::PetScript>,
     /// Actions of the game layer (`/<emote>`, `/assist`): taken by the flow ([`Chat::take_game`]).
@@ -134,6 +144,8 @@ pub(super) struct Chat {
     /// `TextMacroSystem_t` (`TextMacro.bin`).
     macros: macros::TextMacros,
     voice_prefs: VoicePrefs,
+    warn_unsub: bool,
+    invite_action: social::InviteAction,
     voice_throttle: voice::Throttle,
     /// Own stat `Expansion` (0x185), kept from the zone frames (the voice feature needs bit 0).
     expansion: i32,
@@ -160,7 +172,9 @@ impl Chat {
     pub fn new() -> Self {
         let mut net = net::ChatNet::default();
         net.set_trace(std::env::var_os("AOMAC_CHAT_TRACE").map(Into::into));
-        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], shop_info_urls: vec![], pet_scripts: vec![], game: vec![], swallow: None, social_counter: 0, own_id: 0, info: info::InfoView::new(&ao_gui::client_dir()), dialogs: dialog::Dialogs::default(), tip: -1, windows: vec![], dvalue_cmds: vec![], quit: false, screen: (0, 0), social: social::Social::default(), swin: social_win::SocialWin::new((0, 0)), tell_log: Default::default(), pg_windows: Default::default(), filter: filter::FilterState::load(), macros: macros::TextMacros::open(), voice_prefs: VoicePrefs::default(), voice_throttle: voice::Throttle::default(), expansion: 0, last_out_group: None, bug: None, requests: Requests::default() }
+        let warn_unsub = true;
+        let invite_action = social::InviteAction::Dialog;
+        Self { win: None, backlog: vec![], net, afk: None, auto_afk: true, idle_seconds: 0.0, afk_started: std::time::SystemTime::now(), chat_indicator: true, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], shop_info_urls: vec![], tip_events: vec![], pet_scripts: vec![], game: vec![], swallow: None, social_counter: 0, own_id: 0, info: info::InfoView::new(&ao_gui::client_dir()), dialogs: dialog::Dialogs::default(), tip: -1, windows: vec![], dvalue_cmds: vec![], quit: false, screen: (0, 0), social: social::Social::default(), swin: social_win::SocialWin::new((0, 0)), tell_log: Default::default(), pg_windows: Default::default(), filter: filter::FilterState::load(), macros: macros::TextMacros::open(), voice_prefs: VoicePrefs::default(), warn_unsub, invite_action, voice_throttle: voice::Throttle::default(), expansion: 0, last_out_group: None, bug: None, requests: Requests::default() }
     }
 
     /// The chat windows (`ChatGUIModule_c::Initialize`), once the world is shown.
@@ -201,6 +215,11 @@ impl Chat {
         LOCAL_GROUPS.iter().find(|g| g.0 == class).map(|g| g.1.to_owned()).or_else(|| self.net.groups.get(&class).cloned())
     }
     fn msg(&mut self, gui: &mut Gui, m: line::ChatMsg) {
+        let accepted = (m.flags & 1 != 0 || !self.ignored.contains(&m.from_id)) && (!m.tell || m.from_id != self.own_id);
+        if !accepted { return; }
+        if self.chat_indicator && ((m.tell && m.kind == 0) || (!m.tell && self.win.as_ref().is_some_and(|w| w.group_visible(gui, m.group)))) {
+            self.game.push(GameAction::FlashHead(m.from_id));
+        }
         // `FUN_10084f9e`: a message matching a rule of an enabled filter never reaches the windows
         if self.filter.drops(&m.text) {
             return;
@@ -343,10 +362,58 @@ impl Chat {
         self.voice_prefs = p;
     }
 
-    /// Chat window DValues (`ChatShowOGrpInTitleBar`, `ChatShowOGrpInInputBar`, `ChatFont*`) from the registry, applied live.
-    pub fn set_window_prefs(&mut self, gui: &mut Gui, p: &win::WinPrefs) {
+    /// Root.xml chat preferences, applied before processing chat input and invitations.
+    pub fn set_prefs(&mut self, gui: &mut Gui, d: &mut super::dvalue::DValues) {
+        self.warn_unsub = d.get_i64("ChatWarnWhenSpeakingToUnsubGroups").unwrap_or(1) != 0;
+        self.invite_action = social::InviteAction::from_pref(d.get_i64("ChatPGInviteAction").unwrap_or(1) as i32);
+        self.auto_afk = d.flag("AutoAFK");
+        self.chat_indicator = d.prefs.get_int("ChatIndicator", super::dvalue::Kind::Login).unwrap_or(1) != 0;
         if let Some(w) = &mut self.win {
-            w.set_prefs(gui, p);
+            w.config_own_id(self.own_id);
+            w.set_prefs(gui, &win::WinPrefs::from_dvalues(d));
+            w.sync_config(gui, d);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn assert_option_prefs(&self, d: &super::dvalue::DValues) {
+        assert_eq!(self.warn_unsub, d.get_i64("ChatWarnWhenSpeakingToUnsubGroups").unwrap_or(1) != 0);
+        assert_eq!(self.invite_action, social::InviteAction::from_pref(d.get_i64("ChatPGInviteAction").unwrap_or(1) as i32));
+        if let Some(w) = &self.win { w.assert_option_prefs(d); }
+    }
+    /// InputConfig 0x1001acd6 restarts the three-minute timer on user input.
+    pub fn afk_activity(&mut self, gui: &mut Gui, zone: &Zone, texts: &TextDb, sneak: bool) {
+        self.idle_seconds = 0.0;
+        if self.dialogs.afk_input_active() { return; }
+        if self.auto_afk && zone.stat(0xd7).unwrap_or(0) == 0 && self.afk.take().is_some() {
+            let text = texts.by_key(10001, "ChatCmdFeedback_AFK_AFKOff").unwrap_or_default();
+            self.system_line(gui, &text, 0x52);
+            self.afk_announce(zone, texts, "ChatCmdFeedback_AFK_IsBack", sneak);
+        }
+    }
+
+    /// EnableUserInput 0x10019ce8: 180000000 microseconds; SlotAutoAFK 0x10086b7d.
+    pub fn afk_frame(&mut self, gui: &mut Gui, dt: f32, zone: &Zone, texts: &TextDb, sneak: bool) {
+        let before = self.idle_seconds;
+        self.idle_seconds += dt;
+        if before >= 180.0 || self.idle_seconds < 180.0 || zone.stat(0xd7).unwrap_or(0) != 0 { return; }
+        if self.auto_afk && self.afk.is_none() {
+            self.afk = Some("Auto-away".into());
+            self.afk_started = std::time::SystemTime::now();
+            self.afk_announce(zone, texts, "ChatCmdFeedback_AFK_IsAFK", sneak);
+        }
+        // N3 0x1000c5fa: this is the playfield identity range, not character's battlestation-side stat.
+        if zone.playfield.is_some_and(|id| (0x111c..0x1125).contains(&id)) {
+            let text = texts.by_key(10001, "AutoAFKOn").unwrap_or_default();
+            self.system_line(gui, &text, 0x52);
+            self.outbox.push(ao_net::n3::outgoing::n3_frame(0, zone.char_id, ao_net::n3::outgoing::leave_battle(zone.char_id as i32)));
+        }
+    }
+
+    fn afk_announce(&mut self, zone: &Zone, texts: &TextDb, key: &str, sneak: bool) {
+        if !sneak {
+            let text = texts.by_key(10001, key).unwrap_or_default();
+            self.speak(zone, texts, zone::Speech::Emote, &text);
         }
     }
 
@@ -385,30 +452,34 @@ impl Chat {
         }
     }
 
+    pub fn configure_escape(&mut self, values: &DValues) {
+        self.info.configure_escape(values);
+        self.dialogs.configure_escape(values);
+    }
+
+    pub fn info_view_open(&self) -> bool { self.info.window().is_some() }
     /// True while a dialog box or the InfoView is open: Esc closes those first (`DialogBox_c::SlotEscPressed`, `esc_dialogs` / `esc_infoview` default true).
     pub fn esc_closes(&self) -> bool {
-        self.dialogs.is_open() || self.info.window().is_some()
+        self.dialogs.esc_closes() || self.info.esc_closes()
     }
 
-    /// `InfoViewMode` selects the close-only Escape command independently of the captured close option.
-    pub fn info_view_open(&self) -> bool {
-        self.info.window().is_some()
-    }
-
-    /// Esc key: closes the topmost dialog / the InfoView; `true` when something was closed.
+    /// Broadcast Esc to the dialogs and InfoView connected when they opened.
     pub fn escape(&mut self, gui: &mut Gui, zone: &Zone, texts: &TextDb) -> bool {
-        if let Some(w) = self.dialogs.windows().last() {
+        let count = self.dialogs.windows().count();
+        let mut closed = false;
+        for index in (0..count).rev() {
+            let Some(w) = self.dialogs.windows().nth(index) else { continue };
             let (_, a) = self.dialogs.event(gui, &Event::Escape { window: w });
             if let Some(a) = a {
                 self.answer(gui, a, Some(zone), texts);
+                closed = true;
             }
-            return true;
         }
-        if self.info.window().is_some() {
+        if self.info.esc_closes() {
             self.info.close(gui);
             return true;
         }
-        false
+        closed
     }
 
     /// Frames to send to the zone server.
@@ -503,9 +574,18 @@ impl Chat {
         for o in self.net.update(dt) {
             match o {
                 Out::Msg(m) => {
-                    if m.tell {
+                    if m.tell && m.kind == 0 && m.from_id != self.own_id && (m.flags & 1 != 0 || !self.ignored.contains(&m.from_id)) {
                         self.last_tell_from = Some(m.from_name.clone());
                         self.social_tell_in(gui, m.from_id, &m.from_name, &m.text, m.flags & 1 != 0, texts);
+                        if let Some(message) = &self.afk {
+                            let template = texts.by_key(10001, "ChatCmdFeedback_AFKReplyText").unwrap_or_default();
+                            let seconds = self.afk_started.elapsed().unwrap_or_default().as_secs().min(i32::MAX as u64) as i32;
+                            let reply = log::ldb_format(&template, &[
+                                log::Arg::S(self.net.name_of(self.own_id).unwrap_or_default().into()),
+                                log::Arg::N(seconds / 3600), log::Arg::N((seconds / 60) % 60), log::Arg::S(message.clone()),
+                            ]);
+                            self.net.send(ao_net::chat::ChatCmd::TellAutoReply { to: m.from_id, text: reply });
+                        }
                     }
                     self.hear_voice(&m);
                     self.msg(gui, m);
@@ -613,8 +693,9 @@ impl Chat {
             return true;
         }
         let Some(w) = &mut self.win else { return false };
+        let handled = w.owns(ev);
         let outs = w.event(gui, ev);
-        let handled = !outs.is_empty() || w.owns(ev);
+        let handled = handled || !outs.is_empty();
         for o in outs {
             match o {
                 WinOut::Submit { text, window_group } => self.submit(gui, &text, window_group.as_deref().and_then(ident_id), zone, texts),
@@ -622,6 +703,12 @@ impl Chat {
                 WinOut::OpenTell(name) => self.open_tell_named(gui, &name, texts),
                 // user-link menu "IgnoreUser" (`FUN_1008dd24`): the `/ignore <nick>` path
                 WinOut::IgnoreUser(name) => self.run_line(gui, &format!("/ignore {name}"), zone, texts),
+                WinOut::DisbandGroup => {
+                    self.net.send(ao_net::chat::ChatCmd::PrivDisband);
+                    self.net.groups.remove(&(0xe_0000_0000 | u64::from(self.own_id)));
+                    if let Some(w) = &mut self.win { w.remove_group(0xe_0000_0000 | u64::from(self.own_id)); }
+                }
+                WinOut::LeaveGroup(id) => self.net.send(ao_net::chat::ChatCmd::PrivPart(id)),
                 // Retail references use ShowItemRefLink (GUI 0x10085cb5). The requested command/browser
                 // links share the InfoView dispatcher and the existing /start platform opener.
                 WinOut::LinkClicked(href) => self.show_url(gui, zone, texts, &href),
@@ -638,6 +725,10 @@ impl Chat {
     pub fn take_shop_info_urls(&mut self) -> Vec<(String, Identity, Identity)> {
         std::mem::take(&mut self.shop_info_urls)
     }
+    pub(super) fn take_tip_events(&mut self) -> Vec<(&'static str, String)> {
+        std::mem::take(&mut self.tip_events)
+    }
+
 
     pub fn shop_item_page(&mut self, gui: &mut Gui, zone: &Zone, texts: &TextDb, url: &str, item: ao_net::n3::world::AcgItem, price: i32) {
         match info::shop_item_html(zone, item, price, texts) {
@@ -663,6 +754,15 @@ impl Chat {
                 }
                 info::InfoOut::Item { url, request: info::ItemRequest::Identity { id, shop: true, container } } => {
                     self.shop_info_urls.push((url, id, container));
+                },
+                info::InfoOut::Item { url, request: request @ info::ItemRequest::Identity { .. } } => match info::item_page(zone, &request, texts) {
+                    Ok(Some((html, name))) => {
+                        self.info.item_page(gui, &url, html);
+                        // GUI 100ee05c: actual looked-at item's N3Msg_GetName.
+                        self.tip_events.push(("OnLookatItem", name));
+                    },
+                    Ok(None) => {},
+                    Err(error) => self.system_line(gui, &format!("Item info failed: {error:#}"), 12),
                 },
                 info::InfoOut::Item { url, request } => match info::item_html(zone, &request, texts) {
                     Ok(Some(html)) => self.info.item_page(gui, &url, html),
@@ -808,14 +908,15 @@ impl Chat {
     }
 
     fn groups(&self) -> Vec<GroupInfo> {
-        let mut v = vec![GroupInfo { name: "Vicinity".into(), kind: GroupKind::Vicinity, read_only: false, active: true, subscribed: true }];
+        let subscribed = |key| self.win.as_ref().is_some_and(|w| w.active_group_subscribed(key));
+        let mut v = vec![GroupInfo { name: "Vicinity".into(), kind: GroupKind::Vicinity, read_only: false, active: true, subscribed: subscribed(G_VICINITY) }];
         for (&key, name) in &self.net.groups {
             let kind = match (key >> 32) as u8 {
                 3 => GroupKind::Org,
                 0x82 => GroupKind::Team,
                 _ => GroupKind::Other,
             };
-            v.push(GroupInfo { name: name.clone(), kind, read_only: false, active: true, subscribed: true });
+            v.push(GroupInfo { name: name.clone(), kind, read_only: false, active: true, subscribed: subscribed(key) });
         }
         v
     }
@@ -840,7 +941,7 @@ impl Chat {
             }),
             fight_target: None,
             gm_level: 0,
-            warn_unsub: true,
+            warn_unsub: self.warn_unsub,
             chat_connected: self.net.logged_in(),
             lft_on: self.social.lft.on,
             script_exists: None,
@@ -1002,6 +1103,7 @@ impl Chat {
         let text = zone::expand_chat_text_args(text, &ctx);
         if let Some(f) = zone::frame(0, zone.char_id, speech, &text, Self::target_identity(zone)) {
             self.outbox.push(f);
+            if self.chat_indicator { self.game.push(GameAction::FlashHead(zone.char_id)); }
         }
     }
 
@@ -1013,6 +1115,7 @@ impl Chat {
                     self.open_tell_named(gui, &to, texts);
                 } else {
                     self.net.tell(&to, &text);
+                    if self.chat_indicator { self.game.push(GameAction::FlashHead(zone.char_id)); }
                     // outgoing tell echo: text-db template "To [%s]: " (cat 10001 key ChatTellMsgToField, text.mdb line 6574) + text
                     let head = texts.by_key(10001, "ChatTellMsgToField").unwrap_or_else(|| "To [%s]: ".into()).replacen("%s", &to, 1);
                     self.line(gui, ChatLine::new(ChatKind::TellOut, format!("{head}{text}")));
@@ -1023,7 +1126,9 @@ impl Chat {
             ChatAction::Shout(t) => self.speak(zone, texts, zone::Speech::Shout, &t),
             ChatAction::Emote(t) => self.speak(zone, texts, zone::Speech::Emote, &t),
             ChatAction::Group { group, text } => match self.net.group_by_name(&group) {
-                Some(k) if self.net.say(k, &text) => {}
+                Some(k) if self.net.say(k, &text) => {
+                    if self.chat_indicator { self.game.push(GameAction::FlashHead(zone.char_id)); }
+                }
                 _ => self.line(gui, ChatLine::new(ChatKind::Error, format!("Chat group {group} is currently not available."))),
             },
             ChatAction::SetInputTarget(name) => {
@@ -1032,7 +1137,10 @@ impl Chat {
                     w.set_output_group(id);
                 }
             }
-            ChatAction::SetAfk(m) => self.afk = m,
+            ChatAction::SetAfk(m) => {
+                if self.afk.is_none() { self.afk_started = std::time::SystemTime::now(); }
+                self.afk = m;
+            }
             ChatAction::IgnoreToggle { id, name } => {
                 let now = self.ignored.insert(id) || !self.ignored.remove(&id);
                 let _ = (now, name); // feedback text needs the TextDb: see IgnoreList; persistence is not ported
@@ -1096,6 +1204,47 @@ impl Chat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn auto_afk_three_minute_timer_and_indicator_pref_are_live() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&client, None).unwrap();
+        let texts = TextDb::load(&client).unwrap();
+        let zone = Zone::default();
+        let mut c = Chat::new();
+        c.afk_frame(&mut gui, 179.0, &zone, &texts, true);
+        assert!(c.afk.is_none());
+        c.afk_frame(&mut gui, 1.0, &zone, &texts, true);
+        assert_eq!(c.afk.as_deref(), Some("Auto-away"));
+        assert!(c.outbox.is_empty(), "sneaking does not announce AFK");
+        c.dialog(&mut gui, dialog::Kind::Afk, "AFK message".into(), vec!["Ok".into()], Some("Auto-away".into()));
+        c.afk_activity(&mut gui, &zone, &texts, true);
+        assert_eq!(c.afk.as_deref(), Some("Auto-away"), "editing the AFK message ignores activity");
+        c.dialogs.close_all(&mut gui);
+        c.afk_activity(&mut gui, &zone, &texts, true);
+        assert!(c.afk.is_none());
+        assert_eq!(c.idle_seconds, 0.0);
+        c.auto_afk = false;
+        c.afk_frame(&mut gui, 180.0, &zone, &texts, true);
+        assert!(c.afk.is_none());
+        let battle = Zone { playfield: Some(0x111c), char_id: 7, ..Default::default() };
+        c.afk_activity(&mut gui, &battle, &texts, true);
+        c.afk_frame(&mut gui, 180.0, &battle, &texts, true);
+        assert_eq!(c.outbox.len(), 1, "idle battlestation kick is independent of AutoAFK");
+        assert!(c.afk.is_none());
+        c.afk_frame(&mut gui, 180.0, &battle, &texts, true);
+        assert_eq!(c.outbox.len(), 1, "idle transition fires once");
+        let tell = line::ChatMsg { tell: true, from_id: 42, text: "hello".into(), ..Default::default() };
+        c.msg(&mut gui, tell.clone());
+        assert_eq!(c.take_game(), vec![GameAction::FlashHead(42)]);
+        c.chat_indicator = false;
+        c.msg(&mut gui, tell.clone());
+        assert!(c.take_game().is_empty());
+        c.chat_indicator = true;
+        c.ignored.insert(42);
+        c.msg(&mut gui, tell);
+        assert!(c.take_game().is_empty());
+    }
 
     /// text.mdb 10001 `ChatTellMsgToField` is the client's own outgoing-tell template (pool offset 269621, preceded by " joined the group.").
     /// The chat start keys are the fixed keys `KEY_COMMAND_START_CHAT_INPUT` / `_CMD_INPUT` / `_REPLY_INPUT`: the `Login.cfg` ints rebind them (the extra

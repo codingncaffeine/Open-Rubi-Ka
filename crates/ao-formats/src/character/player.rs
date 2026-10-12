@@ -435,7 +435,7 @@ pub fn overlay_on_skin(skin: &Texture, cloth: &Texture) -> Texture {
     if !cloth.rgba.as_chunks::<4>().0.iter().any(|c| is_key(c)) {
         return cloth.clone();
     }
-    let mut out = Texture { width: cloth.width, height: cloth.height, rgba: Vec::with_capacity(cloth.rgba.len()) };
+    let mut out = Texture { source: cloth.source, width: cloth.width, height: cloth.height, rgba: Vec::with_capacity(cloth.rgba.len()) };
     for (i, c) in cloth.rgba.as_chunks::<4>().0.iter().enumerate() {
         if is_key(c) {
             let (x, y) = (i as u32 % cloth.width, i as u32 / cloth.width);
@@ -659,7 +659,7 @@ mod tests {
     }
 
     fn tex(w: u32, h: u32, px: &[[u8; 4]]) -> Texture {
-        Texture { width: w, height: h, rgba: px.iter().flatten().copied().collect() }
+        Texture { source: Default::default(), width: w, height: h, rgba: px.iter().flatten().copied().collect() }
     }
 
     #[test]

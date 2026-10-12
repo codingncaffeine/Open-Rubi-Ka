@@ -276,7 +276,7 @@ mod tests {
     #[test]
     #[ignore = "requires installed retail gfxtweak and offscreen GPU rendering"]
     fn retail_particle_dependency_frames()->Result<()> {
-        use super::super::{Binding, Renderer, MODEL_BASE};
+        use super::super::{Binding, Renderer};
         let templates=super::super::Templates::open(&ao_gui::client_dir())?;
         let mut gc=R250::new(0xe6f1);let mut ds=R250::new(0xe6f1);let mut crt=CrtRand::new(1);
         let ids:Vec<_>=templates.by_id.iter().filter_map(|(&id,t)|(t.kind==3028).then_some(id)).collect();
@@ -318,7 +318,7 @@ mod tests {
                 let mut terrain=|p:Vec3|Some((Vec3::new(p.x,0.0,p.z),Vec3::Y));
                 renderer.frame(0.01, &mut host, Some(&mut terrain));
                 let vertices: Vec<_> = host.actors.iter().filter_map(|a| a.skin.as_ref())
-                    .flatten().filter(|v| v.color[3]>0.0).collect();
+                    .flat_map(|vertices| vertices.iter()).filter(|v| v.color[3]>0.0).collect();
                 if vertices.is_empty() || (rendered && ![11,21,51,81].contains(&step)) { continue; }
                 let mut min = Vec3::splat(f32::INFINITY);
                 let mut max = Vec3::splat(f32::NEG_INFINITY);
@@ -333,8 +333,7 @@ mod tests {
                 let center = (min+max)*0.5;
                 let eye = center + Vec3::new(2.0,2.0,5.0).normalize()
                     * ((max-min).length()*1.5).max(0.1);
-                let models: Vec<_> = renderer.models.iter()
-                    .map(|(&id,m)| (MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();
+                let models: Vec<_> = renderer.models.iter().map(|(&id,m)| (id,m.scene.clone())).collect();
                 let time = (step-1) as f32*0.01;
                 let checkpoint=[1,2,3,6,11,21,51,81].contains(&step) || step==steps;
                 // Probe every eligible birth frame, but overwrite one scratch pair

@@ -15,7 +15,7 @@
 //!   candidate-plane test; an origin inside the box hits at distance 0), the distance `|hit − origin|` is **in model units** and a hit
 //!   beyond the line length (`GetLengthOfViewcone`) is rejected. The box is `FUN_1005470d` over the **skinned vertices of the current
 //!   pose** of the mesh's own parts (body; mounted heads and weapons are other meshes), refreshed when the pose version changes
-//!   (`FUN_10055c1c` / `FUN_10055a23`). Without the flag the original tests every triangle instead (not ported: the pref is true).
+//!   (`FUN_10055c1c` / `FUN_10055a23`). Without the flag it tests the posed indexed body triangles, returning the first front-facing hit.
 //! * The hits are collected as `(vehicle, distance)` pairs and `std::sort`ed ascending by that distance (`FUN_1000fc8d` →
 //!   `FUN_1000f8e5`, compare on the float at +4), then copied to the camera's hit list `+0x244`.
 //! * Not ported, UNRESOLVED: an early-out sphere before the box (`RCATMesh_t` +0x1cc / +0x1d0 and the mesh data's `+0x5c→+0x14`
@@ -91,6 +91,11 @@ impl PickBody {
     /// The ray's entry distance into this body's box in **model units** (what the original sorts by); `max_len` is the line
     /// length in scene units (`GetLengthOfViewcone`).
     pub fn hit(&self, origin: Vec3, dir: Vec3, max_len: f32) -> Option<f32> {
+        let (o, d, length) = self.model_ray(origin, dir, max_len)?;
+        ray_box(o.into(), d.into(), self.bounds.0, self.bounds.1, length)
+    }
+
+    fn model_ray(&self, origin: Vec3, dir: Vec3, max_len: f32) -> Option<(Vec3, Vec3, f32)> {
         let k = self.scale.max(f32::EPSILON);
         let (s, c) = self.yaw.sin_cos();
         // inverse of `ActorFrame::transform`: columns (c, 0, -s)·k, (0, 1, 0)·k, (s, 0, c)·k and the position
@@ -102,10 +107,36 @@ impl PickBody {
             return None;
         }
         // the original normalises the model-space direction and compares with the model-space line length
-        ray_box(o, d.map(|x| x / len), self.bounds.0, self.bounds.1, max_len / k)
+        Some((o.into(), Vec3::from(d) / len, max_len / k))
+    }
+
+    /// randy31 0x10056786: bounds broad phase, then the first front-facing triangle
+    /// in native index order. Mounted heads/weapons are separate meshes, not body triangles.
+    pub fn hit_triangles(&self, origin: Vec3, dir: Vec3, max_len: f32, vertices: &[ao_scene::Vertex], triangles: impl IntoIterator<Item = [usize; 3]>) -> Option<f32> {
+        self.hit(origin, dir, max_len)?;
+        let (origin, dir, length) = self.model_ray(origin, dir, max_len)?;
+        for indices in triangles {
+            let a = Vec3::from(vertices.get(indices[0])?.pos);
+            let b = Vec3::from(vertices.get(indices[1])?.pos);
+            let c = Vec3::from(vertices.get(indices[2])?.pos);
+            let normal = (b - a).cross(c - b);
+            let denominator = normal.dot(dir);
+            if denominator >= 0.0 || !denominator.is_finite() { continue; }
+            let distance = normal.dot(a - origin) / denominator;
+            let point = origin + dir * distance;
+            let first = (b - a).cross(point - a);
+            let second = (c - b).cross(point - b);
+            let third = (a - c).cross(point - c);
+            // Native edge-product threshold _DAT_1009fda8 is exactly float zero.
+            if first.dot(second) >= 0.0 && first.dot(third) >= 0.0 && distance <= length {
+                return Some(distance);
+            }
+        }
+        None
     }
 }
 
+#[cfg(test)]
 /// Every body hit by the line `origin + dir · [0, max_len]`, nearest (model-space distance) first; ties by id (the original's
 /// `std::sort` is unstable there).
 pub fn hits(bodies: &[PickBody], origin: Vec3, dir: Vec3, max_len: f32) -> Vec<i32> {
@@ -117,6 +148,30 @@ pub fn hits(bodies: &[PickBody], origin: Vec3, dir: Vec3, max_len: f32) -> Vec<i
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn triangle_targeting_rejects_empty_box_space_and_tracks_pose() {
+        let b = PickBody { id: 1, bounds: ([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]), pos: [0.0; 3], yaw: 0.0, scale: 1.0 };
+        let mut vertices: Vec<_> = [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [-1.0, 1.0, 0.0]]
+            .into_iter().map(|pos| ao_scene::Vertex { pos, ..Default::default() }).collect();
+        let triangles = [[0, 1, 2]];
+        let empty = Vec3::new(0.75, 0.75, 5.0);
+        assert!(b.hit(empty, -Vec3::Z, 10.0).is_some());
+        assert_eq!(b.hit_triangles(empty, -Vec3::Z, 10.0, &vertices, triangles), None);
+        let aim = Vec3::new(-0.5, -0.5, 5.0);
+        assert_eq!(b.hit_triangles(aim, -Vec3::Z, 10.0, &vertices, triangles), Some(5.0));
+        assert_eq!(b.hit_triangles(Vec3::new(-0.5, -0.5, -5.0), Vec3::Z, 10.0, &vertices, triangles), None, "back faces do not target");
+        for vertex in &mut vertices { vertex.pos[2] = 0.5; }
+        assert_eq!(b.hit_triangles(aim, -Vec3::Z, 10.0, &vertices, triangles), Some(4.5));
+        assert_eq!(b.hit_triangles(aim, -Vec3::Z, 4.25, &vertices, triangles), None);
+        let scaled = PickBody { scale: 2.0, ..b };
+        assert_eq!(scaled.hit_triangles(Vec3::new(-1.0, -1.0, 10.0), -Vec3::Z, 20.0, &vertices, triangles), Some(4.5));
+        let mut nearer = vertices.clone();
+        for vertex in &mut nearer { vertex.pos[2] = 0.75; }
+        vertices.extend(nearer);
+        assert_eq!(b.hit_triangles(aim, -Vec3::Z, 10.0, &vertices, [[0, 1, 2], [3, 4, 5]]), Some(4.5), "native returns first, not nearest triangle");
+        assert_eq!(b.hit_triangles(aim, -Vec3::Z, 10.0, &vertices, [[3, 4, 5], [0, 1, 2]]), Some(4.25));
+    }
+
 
     const LO: [f32; 3] = [-0.4, 0.0, -0.3];
     const HI: [f32; 3] = [0.4, 1.8, 0.3];

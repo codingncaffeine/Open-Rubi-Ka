@@ -42,6 +42,15 @@ impl FightLevels {
         Some(Self { districts, zones, changes: Vec::new() })
     }
 
+    /// GC 0x101295f3: own-position district, then GC 0x100797d3 checks its
+    /// land-control maximum/minimum (+0x48/+0x44). This is not tower ownership.
+    pub fn own_lca(&self, pos: [f32; 3]) -> Option<bool> {
+        let zone = self.zones.zone_at([pos[0], pos[1], -pos[2]])?;
+        let idx = *self.districts.zone_to_district.get(zone)?;
+        let d = self.districts.districts.get(idx as usize)?;
+        Some(d.lc_lvl.0 != 0 && d.lc_lvl.1 != 0)
+    }
+
     /// `FUN_1003e1d0` for a character standing at `pos` (server coordinates).
     pub fn level(&self, pos: [f32; 3]) -> i32 {
         let Some(zone) = self.zones.zone_at([pos[0], pos[1], -pos[2]]) else { return DEFAULT_LEVEL };
@@ -110,6 +119,13 @@ mod tests {
             let at = [d0.centre[0], d0.centre[1], d0.centre[2]];
             let base = f.level(at);
             assert!((0..=4).contains(&base));
+            // The vehicle gate uses the mapped district, never a centre radius
+            // or the fight-mode update list.
+            let expected = f.zones.zone_at([at[0], at[1], -at[2]])
+                .and_then(|z| f.districts.zone_to_district.get(z))
+                .and_then(|&i| f.districts.districts.get(i as usize))
+                .map(|d| d.lc_lvl.0 != 0 && d.lc_lvl.1 != 0);
+            assert_eq!(f.own_lca(at), expected);
             // a missing district name drops the whole update
             let bad = FightModeUpdate { playfield: Default::default(), changes: vec![FightModeChange { district: "nonexistent".into(), ..change(1, true, false, false, 1) }] };
             assert!(!f.update(&bad) && f.changes.is_empty());

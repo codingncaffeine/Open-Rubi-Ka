@@ -215,7 +215,6 @@ mod tests {
     #[test]
     #[ignore="installed retail assets and offscreen Metal rendering"]
     fn retail_vein3014_frames()->Result<()> {
-        use super::super::MODEL_BASE;
         let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(||"/tmp/FxClasses/frames".into());std::fs::create_dir_all(&out)?;
         let mut renderer=Renderer::open(&ao_gui::client_dir())?;
         let origin=Vec3::new(5000.0,10.0,5000.0);
@@ -229,7 +228,7 @@ mod tests {
                 host.actors.clear();let mut terrain=|p:Vec3|Some((Vec3::new(p.x,origin.y,p.z),Vec3::Y));
                 renderer.frame(1.0/60.0,&mut host,Some(&mut terrain));
                 if [1,15,30,60,120].contains(&frame) {
-                    let models:Vec<_>=renderer.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();
+                    let models:Vec<_>=renderer.models.iter().map(|(&id,m)| (id,m.scene.clone())).collect();
                     ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),target.to_array(),640,480,&out.join(format!("vein3014_{id}_{frame}.png")),frame as f32/60.0)?;
                 }
             }

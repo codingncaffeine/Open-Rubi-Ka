@@ -174,7 +174,7 @@ mod tests {
     #[test]
     #[ignore="installed retail records and offscreen GPU"]
     fn all_authored_lavaball_frames()->Result<()> {
-        use super::super::{Binding,Creation,Renderer,Templates,MODEL_BASE};
+        use super::super::{Binding,Creation,Renderer,Templates};
         let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).context("set AOMAC_EFFECT_FRAMES")?;
         std::fs::create_dir_all(&out)?;
         let table=Templates::open(&ao_gui::client_dir())?;let mut renderer=Renderer::open(&ao_gui::client_dir())?;let mut host=ao_render::Host::headless();
@@ -186,7 +186,7 @@ mod tests {
                 let mut terrain=|p:Vec3|Some((Vec3::new(p.x,0.0,p.z),Vec3::Y));
                 host.actors.clear();renderer.frame(1.0/60.0,&mut host,Some(&mut terrain));
                 if ![60,120,300,600,1200].contains(&frame) {continue;}
-                let models:Vec<_>=renderer.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();
+                let models:Vec<_>=renderer.models.iter().map(|(&id,m)| (id,m.scene.clone())).collect();
                 ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),target.to_array(),640,480,&out.join(format!("lavaball3015_{id}_{frame}.png")),frame as f32/60.0)?;
             }
         }

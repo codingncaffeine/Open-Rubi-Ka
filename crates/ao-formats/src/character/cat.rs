@@ -120,6 +120,11 @@ fn count(r: &mut Rd, what: &str) -> Result<usize> {
 }
 
 impl CatMesh {
+    /// Resource sphere (randy31 `CalcBoundingVolume` 0x10052f16 / 0x10029b7e).
+    pub fn bounding_radius(&self) -> f32 {
+        native_bounding_radius(self.submeshes.iter().flat_map(|s| s.vertices.iter().map(|v| v.bind)))
+    }
+
     pub fn parse(d: &[u8]) -> Result<Self> {
         let mut r = Rd::new(d);
         let root = r.name32()?;
@@ -264,5 +269,51 @@ impl CatMesh {
             stack.extend(self.bones[b].children.iter().rev().map(|&c| c as usize));
         }
         order
+    }
+}
+
+fn native_bounding_radius(points: impl Iterator<Item = [f32; 3]> + Clone) -> f32 {
+    let Some(first) = points.clone().next() else { return 0.0 };
+    let (mut low, mut high) = ([first; 3], [first; 3]);
+    for p in points.clone().skip(1) {
+        if p[0] < low[0][0] { low[0] = p; }
+        if high[0][0] < p[0] { high[0] = p; }
+        // Native 0x10029a70 compares X for the second minimum, and Y for the third.
+        if p[0] < low[1][0] { low[1] = p; }
+        if high[1][1] < p[1] { high[1] = p; }
+        if p[1] < low[2][1] { low[2] = p; }
+        if high[2][2] < p[2] { high[2] = p; }
+    }
+    let distance_sq = |a: [f32; 3], b: [f32; 3]| {
+        let d = std::array::from_fn::<_, 3, _>(|i| a[i] - b[i]);
+        d[2] * d[2] + d[0] * d[0] + d[1] * d[1]
+    };
+    let mut axis = 0;
+    if distance_sq(low[0], high[0]) < distance_sq(low[1], high[1]) { axis = 1; }
+    if distance_sq(low[axis], high[axis]) < distance_sq(low[2], high[2]) { axis = 2; }
+    let mut centre = std::array::from_fn(|i| (low[axis][i] + high[axis][i]) / 2.0);
+    let mut radius_sq = distance_sq(high[axis], centre);
+    let mut radius = radius_sq.sqrt();
+    for p in points {
+        let d = distance_sq(p, centre);
+        if radius_sq < d {
+            let distance = d.sqrt();
+            radius = (radius + distance) * 0.5;
+            radius_sq = radius * radius;
+            let delta = distance - radius;
+            centre = std::array::from_fn(|i| (radius * centre[i] + delta * p[i]) / distance);
+        }
+    }
+    radius
+}
+
+#[cfg(test)]
+mod bounding_tests {
+    #[test]
+    fn native_resource_sphere_expands_in_authored_order() {
+        assert_eq!(super::native_bounding_radius([[-2.0, 0.0, 0.0], [2.0, 0.0, 0.0]].into_iter()), 2.0);
+        assert_eq!(super::native_bounding_radius([[0.0; 3]].into_iter()), 0.0);
+        let radius = super::native_bounding_radius([[-2.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 3.0, 0.0]].into_iter());
+        assert_eq!(radius, 2.5);
     }
 }

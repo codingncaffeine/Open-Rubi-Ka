@@ -20,6 +20,7 @@ pub mod nametag;
 pub mod outgoing;
 pub mod pet;
 pub mod quest;
+pub mod research;
 pub mod server_move;
 pub mod shop;
 pub mod spells;

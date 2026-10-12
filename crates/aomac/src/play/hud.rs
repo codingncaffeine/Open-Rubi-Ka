@@ -46,8 +46,11 @@ pub enum WindowKind {
     Mission,
     Friends,
     Team,
+    Raid,
     Perks,
     Faction,
+    Research,
+    Vehicle,
     Pet,
     /// `stat_window` (`StatView_c`)
     Stat,
@@ -58,7 +61,7 @@ pub enum WindowKind {
 }
 
 impl WindowKind {
-    pub const ALL: [WindowKind; 17] = [
+    pub const ALL: [WindowKind; 20] = [
         WindowKind::Skills,
         WindowKind::Inventory,
         WindowKind::Character,
@@ -70,8 +73,11 @@ impl WindowKind {
         WindowKind::Mission,
         WindowKind::Friends,
         WindowKind::Team,
+        WindowKind::Raid,
         WindowKind::Perks,
         WindowKind::Faction,
+        WindowKind::Research,
+        WindowKind::Vehicle,
         WindowKind::Pet,
         WindowKind::Actions,
         WindowKind::Stat,
@@ -92,8 +98,11 @@ impl WindowKind {
             WindowKind::Mission => "mission_window",
             WindowKind::Friends => "friends_window",
             WindowKind::Team => "team_view",
+            WindowKind::Raid => "raid_window",
             WindowKind::Perks => "perk_window",
             WindowKind::Faction => "faction_window",
+            WindowKind::Research => "research_window",
+            WindowKind::Vehicle => "mechselect_window",
             WindowKind::Pet => "pet_window",
             WindowKind::Actions => "specialaction_window",
             WindowKind::Stat => "stat_window",
@@ -326,6 +335,8 @@ pub(super) struct Hud {
     /// The distributed-value store (`play/dvalue.rs`): window flags, prefs, `/option` `/dvalue` (docs/chat/dvalue.md).
     pub(super) dvalues: DValues,
     level_notice: super::level_notice::LevelNotice,
+    help_button: super::hud_help::HelpButton,
+    tips: super::hud_tips::Tips,
     /// Tooltip titles of the health / nano / XP / alien XP bars (text.mdb category 0x2710).
     bar_titles: [String; 4],
     bars: Vec<Bar>,
@@ -341,6 +352,8 @@ pub(super) struct Hud {
     /// Programs and NCU windows (`hud_nano.rs`, `hud_ncu.rs`).
     nano: HudNano,
     ncu: HudNcu,
+    target_ncu: super::hud_target_ncu::TargetNcu,
+    notifications: super::hud_notification::Notifications,
     /// The options window (`options.rs`).
     options: HudOptions,
     /// `file://` pages the `?` buttons of window frames asked for (`WndBorder::SlotHelpButton`; the flow shows them in the InfoView).
@@ -353,6 +366,7 @@ pub(super) struct Hud {
     map: HudMap,
     /// Team, Perks and Faction windows (`hud_winb.rs`).
     winb: HudWinB,
+    research_vehicle: super::hud_research_vehicle::HudResearchVehicle,
     /// Target docks, health-bar windows and click-to-select (`hud_target.rs`).
     target: HudTarget,
     /// Shortcut bars (`hud_bar.rs`).
@@ -404,7 +418,7 @@ impl Hud {
         let texts = ao_formats::screens::TextDb::load(dir)?;
         let bar_titles = ["Health", "Nano", "Experience", "AlienExperience"].map(|k| texts.by_key(ao_formats::screens::CAT_GUI, k).unwrap_or_else(|| k.to_string()));
         let compass = Compass::new(gui, size).map_err(|e| eprintln!("hud: compass: {e:#}")).ok();
-        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), level_notice: Default::default(), bars: vec![], bar_titles, menu_roots, popup: None, menu_scripts: vec![], menu_camera: None, open: vec![], stats: HudStats::new(dir, size)?, rollup: Rollup::new(dir, size), nano: HudNano::new(dir, size)?, ncu: HudNcu::new(dir, size)?, options: HudOptions::new(dir, size)?, help_urls: vec![], mission: HudMission::new(dir, size)?, system_lines: vec![], map: HudMap::new(dir), winb: HudWinB::new(dir, size), target, shortcuts: vec![], actions: HudActions::new(dir), actwin: HudActionWin::new(dir, size), keys: KeyMap::default(), keys_src: String::new(), bindings: Bindings::default(), fixed: FixedKeys::default(), compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None, wincfg: super::hud_wincfg::WinCfgs::new(dir) };
+        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), level_notice: Default::default(), help_button: Default::default(), tips: super::hud_tips::Tips::new(dir)?, bars: vec![], bar_titles, menu_roots, popup: None, menu_scripts: vec![], menu_camera: None, open: vec![], stats: HudStats::new(dir, size)?, rollup: Rollup::new(dir, size), nano: HudNano::new(dir, size)?, ncu: HudNcu::new(dir, size)?, target_ncu: super::hud_target_ncu::TargetNcu::new(dir)?, notifications: super::hud_notification::Notifications::new(dir)?, options: HudOptions::new(dir, size)?, help_urls: vec![], mission: HudMission::new(dir, size)?, system_lines: vec![], map: HudMap::new(dir), winb: HudWinB::new(dir, size), research_vehicle: super::hud_research_vehicle::HudResearchVehicle::new(dir)?, target, shortcuts: vec![], actions: HudActions::new(dir), actwin: HudActionWin::new(dir, size), keys: KeyMap::default(), keys_src: String::new(), bindings: Bindings::default(), fixed: FixedKeys::default(), compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None, wincfg: super::hud_wincfg::WinCfgs::new(dir) };
         hud.target.targets_target = hud.dvalues.flag("Targetstarget");
         hud.rollup.restore_docks(gui, &hud.wincfg.load_docks(&hud.dvalues));
         hud.fill_docks(gui);
@@ -590,6 +604,10 @@ impl Hud {
         std::mem::take(&mut self.system_lines)
     }
 
+    pub(super) fn take_equipment_feedback(&mut self) -> Option<&'static str> {
+        self.stats.take_equipment_feedback()
+    }
+
     /// Programs the nano window cast (`N3Msg_CastNanoSpell`): the chat prints their "Executing Nano Program" lines.
     pub(super) fn take_casts(&mut self) -> Vec<String> {
         self.nano.take_casts()
@@ -601,14 +619,34 @@ impl Hud {
     }
 
     /// Every zone frame: team members / invitations, the own perk map and perk updates (`hud_winb.rs`).
-    pub(super) fn on_zone_frame(&mut self, f: &Frame, own: i32) {
+    pub(super) fn on_zone_frame(&mut self, gui: &mut Gui, f: &Frame, own: i32, ignored: impl Fn(u32) -> bool) {
         self.winb.on_zone_frame(f, own);
-        self.mission.on_frame(f, own);
+        for (event, data) in self.mission.on_frame(f, own) {
+            self.trigger_tip(gui, event, data);
+        }
+        // TeamViewModule_c::SlotJoinTeamRequest 1007a1f6 rejects ignored senders
+        // before opening the dialog; only the dialog branch emits the empty tip.
+        if f.ptype == ao_net::frame::PT_N3
+            && f.payload.get(..4) == Some(ao_net::n3::team::TEAM_INVITE.to_be_bytes().as_slice())
+        {
+            let Some((from, _)) = &self.winb.team.state.invite else { return };
+            if ignored(from.instance as u32) {
+                let payload = ao_net::n3::team::request_reply(own, *from, false);
+                self.outbox.push(ao_net::n3::outgoing::n3_frame(0, own as u32, payload));
+                self.winb.team.state.invite = None;
+            } else if let Some((event, data)) = self.winb.team.invite_dialog(gui) {
+                self.trigger_tip(gui, event, data);
+            }
+        }
     }
 
     /// Zone frames produced by the HUD since the last call.
     pub(super) fn take_outbox(&mut self) -> Vec<Frame> {
         std::mem::take(&mut self.outbox)
+    }
+
+    pub(super) fn take_tower_uses(&mut self) -> Vec<ao_net::msg::Identity> {
+        self.stats.take_tower_uses()
     }
 
     #[cfg(test)]
@@ -682,19 +720,43 @@ impl Hud {
         self.target.info.take()
     }
 
+    #[cfg(test)]
+    pub(super) fn live_option_inputs(&mut self, gui: &mut Gui, name: &str, value: f64) -> Vec<InputEvent> {
+        self.options.probe_inputs(gui, &mut self.dvalues, name, value)
+    }
+
+    #[cfg(test)]
+    pub(super) fn live_option_value(&self, name: &str) -> f64 {
+        self.options.probe_value(&self.dvalues, name)
+    }
+
+    #[cfg(test)]
+    pub(super) fn live_option_restored_value(&self, d: &DValues, name: &str) -> f64 {
+        self.options.probe_value(d, name)
+    }
+
     /// InfoView pages the Mission window asked for (`hud_mission.rs`).
     pub(super) fn take_info_urls(&mut self) -> Vec<String> {
         let mut v = self.mission.take_urls();
         v.append(&mut self.help_urls);
         v.extend(self.stats.take_info_urls());
+        v.extend(self.notifications.take_urls());
+        v.extend(self.target_ncu.take_urls());
         v
+    }
+    /// Native TipSystem event producer; parameters come from each retail callback.
+    pub(super) fn trigger_tip(&mut self, gui: &mut Gui, event: &str, data: &str) {
+        self.tips.trigger(gui, &mut self.dvalues, self.size, event, data);
+        if let Some(window) = self.tips.window() {
+            if let Err(e) = self.register_dock(gui, "tip_window", window) { eprintln!("hud: tip dock: {e:#}"); }
+        }
     }
 
     /// The game's own mouse pointer over the world (`MousePointerModule_t`, hud_cursor.rs); appended to the frame's draw list.
-    pub(super) fn draw_cursor(&mut self, gui: &Gui, zone: &Zone, host: &mut ao_render::Host, list: &mut ao_gui::DrawList) {
+    pub(super) fn draw_cursor(&mut self, gui: &Gui, zone: &Zone, player: Option<&super::player::Player>, host: &mut ao_render::Host, list: &mut ao_gui::DrawList) {
         let mode = self.dvalues.get_i64("MouseCursorMode").unwrap_or(2);
         let dblclick = self.dvalues.get_i64("DoubleclickAction").is_none_or(|v| v != 0);
-        self.target.draw_cursor(gui, zone, host, list, self.size, mode, dblclick);
+        self.target.draw_cursor(gui, zone, player, host, list, self.size, mode, dblclick, self.help_button.help_mode());
     }
 
     pub(super) fn take_uses(&mut self) -> Vec<SlotUse> {
@@ -737,11 +799,26 @@ impl Hud {
                 }
             }
         }
+        // ShortcutBarWindow_c visibility follows its module DValue, without deleting the saved contents.
+        let visible = self.dvalues.flag("shortcutbar_window");
+        if let Some((event, data)) = self.shortcut_visibility(gui, visible) {
+            self.trigger_tip(gui, event, data);
+        }
+    }
+
+    /// ControlCenterModule_c::SlotShortcutBarActivated 1006a779.
+    fn shortcut_visibility(&mut self, gui: &mut Gui, visible: bool) -> Option<(&'static str, &'static str)> {
+        let hiding = !visible && self.shortcuts.iter().any(|bar| gui.window_visible(bar.window));
+        for bar in &self.shortcuts {
+            gui.set_window_visible(bar.window, visible);
+        }
+        hiding.then_some(("OnHidingToolbar", ""))
     }
 
     /// Re-evaluates criteria and refreshes every value-driven widget.
     fn refresh(&mut self, gui: &mut Gui, zone: &Zone) {
         self.level_notice.update(gui, &mut self.dvalues, self.size);
+        self.help_button.update(gui, &self.dvalues, &mut self.wincfg, self.size);
         let res = self.res(zone);
         gui.apply_criteria(self.cc, &res);
         for b in &self.bars {
@@ -776,8 +853,29 @@ impl Hud {
 
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &mut Zone, _dt: f32) {
         self.refresh(gui, zone);
-        self.options.apply(&mut self.dvalues, zone, &mut self.outbox);
+        if let Some(line) = self.options.apply(&mut self.dvalues, zone, &mut self.outbox) {
+            self.system_lines.push(line);
+        }
         self.options.update(gui, &self.dvalues, &resolver(&self.dvalues, zone));
+        self.tips.update(gui, &mut self.dvalues, self.size, _dt);
+        // GUI SetTarget100257b0; GC IsNpc1001666c considers non-character dynels NPCs.
+        for id in self.target.drain_tip_targets() {
+            let name = if id.kind == 50000 {
+                if id.instance == zone.char_id as i32 { continue }
+                let Some(dynel) = zone.dynels.get(&id.instance) else { continue };
+                if !dynel.npc && !zone.tip_npc_state.get(&id.instance).copied().unwrap_or(false) {
+                    self.tips.trigger(gui, &mut self.dvalues, self.size, "OnSelectingPlayer", "");
+                    continue;
+                }
+                dynel.name.as_str()
+            } else {
+                zone.world.name_of(id.kind, id.instance).unwrap_or_default()
+            };
+            self.tips.trigger(gui, &mut self.dvalues, self.size, if id.kind == 50000 { "OnSelectingNPC" } else { "OnSelecting" }, name);
+        }
+        if let Some(window) = self.tips.window() {
+            if let Err(e) = self.register_dock(gui, "tip_window", window) { eprintln!("hud: tip dock: {e:#}"); }
+        }
         self.sync_options(gui);
         self.apply_fades(gui);
         self.stats.configure_stat(&self.dvalues);
@@ -822,6 +920,8 @@ impl Hud {
         }
         self.nano.update(gui, zone, _dt);
         self.ncu.update(gui, zone, _dt);
+        self.target_ncu.update(gui, &mut self.dvalues, &mut self.wincfg, zone, self.size, _dt);
+        self.notifications.update(gui, &mut self.dvalues, &mut self.wincfg, self.size, _dt);
         self.outbox.extend(self.nano.take_outbox());
         self.outbox.extend(self.ncu.take_outbox());
         self.system_lines.extend(self.ncu.take_lines());
@@ -832,6 +932,11 @@ impl Hud {
         }
         self.map.update(gui, zone, _dt);
         self.winb.update(gui, zone, _dt);
+        self.research_vehicle.update(gui, zone, &mut self.winb.perks);
+        self.outbox.append(&mut self.research_vehicle.outbox);
+        self.system_lines.append(&mut self.research_vehicle.lines);
+        for kind in self.research_vehicle.take_closed() { self.close_kind(gui, kind); }
+        self.winb.update_raid(gui, zone, &mut self.dvalues);
         self.outbox.extend(self.winb.take_outbox());
         self.system_lines.extend(self.winb.take_lines());
         self.target.update(gui, zone, _dt);
@@ -856,10 +961,21 @@ impl Hud {
         let changes = self.actions.list.take_changes();
         let locked = self.dvalues.flag("LockHotbars");
         let timers = (self.dvalues.flag("IconTimers"), self.dvalues.flag("IconTimerText"));
+        let hold_delay = self.dvalues.get_f32("MouseButtonHoldDelay");
+        let new_mouse = self.dvalues.flag("UseNewMouseFunc");
+        let long_tips = !self.dvalues.flag("ShortcutShortTooltips") && self.dvalues.flag("ItemDescriptionTooltips");
+        self.actwin.hold_delay = hold_delay;
+        self.actwin.new_mouse = new_mouse;
         for s in &mut self.shortcuts {
+            s.hold_delay = hold_delay;
+            s.new_mouse = new_mouse;
             s.update(gui, _dt, &self.actions.list, &changes, locked, timers);
+            s.update_tooltip(gui, zone, &self.stats, long_tips);
         }
         self.actwin.update(gui, &self.actions.list, _dt, timers.0);
+        let descriptions = self.dvalues.flag("ItemDescriptionTooltips");
+        self.nano.update_item_tooltip(gui, zone, &self.stats, descriptions);
+        self.actwin.update_item_tooltip(gui, zone, &self.stats, descriptions);
         self.wincfg.update(gui, &mut self.dvalues);
         self.rollup.refresh_groups(gui);
         self.save_rollup(gui);
@@ -873,7 +989,10 @@ impl Hud {
     }
 
     /// Mouse-down outside an open sub menu closes it (the original's popup menus lose focus).
-    pub(super) fn input(&mut self, gui: &mut Gui, zone: &mut Zone, ev: &InputEvent, cam: &ao_render::Camera, lens: &ao_scene::Lens, mods: ao_gui::Modifiers) {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn input(&mut self, gui: &mut Gui, zone: &mut Zone, player: Option<&super::player::Player>, ev: &InputEvent, cam: &ao_render::Camera, lens: &ao_scene::Lens, mods: ao_gui::Modifiers) {
+        self.target_ncu.input(gui, ev, mods);
+        self.winb.raid_bar_input(gui, ev, &self.dvalues);
         for s in &mut self.shortcuts {
             s.input(gui, ev, &self.actions.list, mods);
             self.uses.extend(s.take_uses());
@@ -891,7 +1010,7 @@ impl Hud {
             }
         }
         self.stats.requeue_drops(unclaimed);
-        self.rollup.input(gui, ev);
+        self.rollup.input(gui, ev, self.dvalues.get_i64("MouseWheel").unwrap_or(0));
         self.options.input(gui, &mut self.dvalues, ev);
         // Esc closes the windows whose `esc_*` option was set when they opened (`esc_inventory`, `esc_wear`, `esc_nano`, `esc_perkwindow`, `esc_planetmap`, `esc_optionpanel`)
         if matches!(ev, InputEvent::Key { key: ao_gui::Key::Escape, pressed: true, .. }) && !gui.text_focused() {
@@ -899,6 +1018,7 @@ impl Hud {
             // StopAllActionsMessage 0x10027de4 sends RemoveTargetMessage (0x1e/0x112).
             // Do not consume the signal: the armed window listeners below hear it too.
             self.target.select(zone, None);
+            self.tips.escape(gui, &mut self.dvalues);
             for k in self.options.take_esc() {
                 self.close_kind(gui, k);
             }
@@ -912,7 +1032,7 @@ impl Hud {
         }
         // target docks, world click-to-select (hud_target.rs) and the Tab target keys
         if let Some(pos) = self.target.input(gui, zone, ev) {
-            match self.target.world_click(zone, cam, lens, self.size, pos, mods) {
+            match self.target.world_click(zone, player, cam, lens, self.size, pos, mods) {
                 Some(super::hud_target::WorldClick::Select(id)) => self.click = Some(id),
                 Some(super::hud_target::WorldClick::Info(id)) => self.target.info = Some(id),
                 Some(super::hud_target::WorldClick::ObjectInfo(id)) => self.help_urls.push(format!("itemid://{}/{}", id.kind, id.instance)),
@@ -990,6 +1110,7 @@ impl Hud {
         for k in self.keys.lookup(input) {
             match k {
                 HudKey::Window(kind) => self.toggle(gui, kind),
+                HudKey::SocialWindow(name) => self.toggle_dvalue(gui, name),
                 HudKey::BarActive(n) => {
                     if let Some(s) = self.shortcuts.iter_mut().find(|s| s.is_active()) {
                         s.use_slot(n, &self.actions.list);
@@ -1028,6 +1149,24 @@ impl Hud {
 
     /// `true` when the event was consumed by the HUD.
     pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone) -> bool {
+        if self.research_vehicle.event(gui, ev, zone, &mut self.winb.perks, &mut self.dvalues) {
+            self.outbox.append(&mut self.research_vehicle.outbox);
+            self.system_lines.append(&mut self.research_vehicle.lines);
+            for kind in self.research_vehicle.take_closed() { self.close_kind(gui, kind); }
+            return true;
+        }
+        if let Some(activate) = self.help_button.event(gui, &mut self.dvalues, ev) {
+            if activate { self.help_urls.push("file://What 's-This General Help.html".into()); }
+            return true;
+        }
+        let (hit,url) = self.tips.event(gui, &mut self.dvalues, self.size, ev);
+        if let Some(url) = url { self.help_urls.push(url); }
+        if hit { return true; }
+        if self.target_ncu.event(gui, &mut self.dvalues, ev, zone.char_id as i32) {
+            if let Some(nano) = self.target_ncu.take_remove() { self.ncu.remove(gui, zone, nano); }
+            return true;
+        }
+        if self.notifications.event(gui, &mut self.dvalues, ev, self.size) { return true; }
         if let Some(target) = self.level_notice.event(ev) {
             self.dvalues.set_i64(target, 1);
             if let Some(kind) = WindowKind::from_dvalue(target) { self.open(gui, kind); }
@@ -1054,6 +1193,9 @@ impl Hud {
                 if key.is_empty() { return false; } // transient view's owner handles close/abort
                 if let Some(k) = WindowKind::from_dvalue(&key) {
                     self.close_kind(gui, k);
+                } else {
+                    // External owners (social/interaction views) close through their DValue synchronizer.
+                    self.set_dvalue(gui, &key, false);
                 }
                 return true;
             }
@@ -1301,6 +1443,7 @@ impl Hud {
         }
         self.map.open(gui, &mut self.rollup, kind);
         self.winb.open(gui, kind);
+        self.research_vehicle.open(gui, kind, self.size);
         if !self.open.contains(&kind) {
             self.open.push(kind);
             self.options.arm_esc(kind, &self.dvalues);
@@ -1343,6 +1486,7 @@ impl Hud {
         }
         self.map.close(gui, &mut self.rollup, kind);
         self.winb.close(gui, kind);
+        self.research_vehicle.close(gui, kind);
         self.open.retain(|k| *k != kind);
         self.options.disarm_esc(kind);
     }
@@ -1363,6 +1507,10 @@ impl Hud {
         if let Some(c) = &mut self.compass {
             c.set_waypoint(marker.map(|(playfield, [x, z])| super::hud_compass::Waypoint { playfield, pos: [x, 0.0, z] }));
         }
+    }
+    /// Retail Team Search disables Invite for a non-leader in a team.
+    pub(super) fn lft_invite_blocked(&self) -> bool {
+        self.winb.team.state.in_team() && !self.winb.team.state.is_leader()
     }
 
     #[cfg(test)]
@@ -1422,6 +1570,8 @@ impl Hud {
     pub(super) fn close(mut self, gui: &mut Gui) {
         self.wincfg.detach_all(gui, &mut self.dvalues);
         self.wincfg.save_docks(&mut self.dvalues, &self.rollup.dock_states(gui));
+        self.target_ncu.close(gui);
+        self.notifications.close(gui);
         if let Some(p) = &self.popup {
             gui.close_window(p.window);
         }
@@ -1433,6 +1583,8 @@ impl Hud {
         self.nano.close(gui, &mut self.rollup);
         self.ncu.close(gui);
         self.options.close(gui, &mut self.dvalues);
+        self.research_vehicle.close(gui, WindowKind::Research);
+        self.research_vehicle.close(gui, WindowKind::Vehicle);
         // the windows' final states (`SaveWndConfig` of the dtors) reach the character's prefs files
         if !self.dvalues.take_changed().is_empty() {
             self.dvalues.save_user();
@@ -1490,6 +1642,39 @@ mod tests {
         assert_eq!(group(0), "0");
         assert_eq!(group(1234567), "1,234,567");
         assert_eq!(group(-1000), "-1,000");
+    }
+    #[test]
+    fn accepted_player_selection_opens_authored_tutorial_tip() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/text/tips/TipHeader.xml").exists() { return }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut hud = Hud::new(&mut gui, &dir, (1280,800)).unwrap();
+        let mut zone = Zone::new(1);
+        zone.dynels.insert(2, super::super::zone::DynelState { name: "Another player".into(), pos: [0.0,0.0,0.0], yaw: None, npc: false, side: 1, level: 5, health: 30, max_health: 60 });
+        hud.dvalues.set_i64("IsTipEnabled",1);
+        hud.target.select(&mut zone, Some(2));
+        hud.update(&mut gui, &mut zone, 0.0);
+        let window = hud.tips.window().unwrap();
+        assert!(gui.text(window,"BrowserView").contains("invite this player"));
+        assert_eq!(gui.window_size(window),(400,300));
+        assert_eq!(hud.target.drain_tip_targets().count(),0);
+        hud.target.select(&mut zone, Some(2));
+        assert_eq!(hud.target.drain_tip_targets().count(),0,"unchanged target emits no event");
+    }
+
+    #[test]
+    fn native_dynel_state_prevents_player_tip_classification() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/text/tips/TipHeader.xml").exists() { return }
+        let mut gui = Gui::new(&dir,None).unwrap();
+        let mut hud = Hud::new(&mut gui,&dir,(1280,800)).unwrap();
+        let mut zone = Zone::new(1);
+        zone.dynels.insert(2, super::super::zone::DynelState { name:"Another player".into(),pos:[0.0;3],yaw:None,npc:false,side:1,level:5,health:30,max_health:60 });
+        zone.tip_npc_state.insert(2,true);
+        hud.dvalues.set_i64("IsTipEnabled",1);
+        hud.target.select(&mut zone,Some(2));
+        hud.update(&mut gui,&mut zone,0.0);
+        assert!(!hud.tips.window().is_some_and(|w| gui.text(w,"BrowserView").contains("invite this player")));
     }
 
     #[test]
@@ -1752,7 +1937,7 @@ mod tests {
             &self.gui
         }
         fn input(&mut self, ev: InputEvent, host: &mut Host) {
-            self.hud.input(&mut self.gui, &mut self.zone, &ev, &host.camera, &host.lens.unwrap_or_default(), host.mods);
+            self.hud.input(&mut self.gui, &mut self.zone, None, &ev, &host.camera, &host.lens.unwrap_or_default(), host.mods);
             for e in self.gui.input(ev) {
                 self.hud.event(&mut self.gui, &e, &self.zone);
             }
@@ -1907,6 +2092,42 @@ mod tests {
         assert_eq!(s.gui.text(w, "buffed"), "<div align=\"right\">8</div>");
         assert_eq!(s.gui.text(w, "remaining_ip"), "1480");
         assert!(s.hud.take_outbox().is_empty());
+    #[test]
+    fn toolbar_native_tip_only_when_hiding_a_visible_window() {
+        let Some((mut s, _)) = shot((1280, 800)) else { return };
+        assert_eq!(s.hud.shortcut_visibility(&mut s.gui, true), None);
+        assert_eq!(s.hud.shortcut_visibility(&mut s.gui, false), Some(("OnHidingToolbar", "")));
+        assert_eq!(s.hud.shortcut_visibility(&mut s.gui, false), None);
+        assert_eq!(s.hud.shortcut_visibility(&mut s.gui, true), None);
+        for bar in s.hud.shortcuts.drain(..) { bar.close(&mut s.gui); }
+        assert_eq!(s.hud.shortcut_visibility(&mut s.gui, false), None);
+    }
+
+    #[test]
+    fn ignored_team_invitation_replies_no_without_opening_dialog() {
+        let Some((mut s, _)) = shot((1280, 800)) else { return };
+        let own = s.zone.char_id as i32;
+        let from = ao_net::msg::Identity { kind: 50000, instance: 9 };
+        let invitation = ao_net::n3::team::TeamInvite { from, flag: 0, name: "Inviter".into(), refusal: None };
+        let frame = ao_net::n3::outgoing::n3_frame(0, own as u32, ao_net::n3::team::team_invite(ao_net::msg::Identity { kind: 50000, instance: own }, &invitation));
+        s.hud.on_zone_frame(&mut s.gui, &frame, own, |id| id == 9);
+        assert!(s.hud.winb.team.state.invite.is_none());
+        assert_eq!(s.hud.winb.team.invite_dialog(&mut s.gui), None);
+        let reply = s.hud.take_outbox();
+        assert!(reply.iter().any(|f| f.payload == ao_net::n3::team::request_reply(own, from, false)));
+    }
+
+    #[test]
+    fn shortcut_visibility_changes_without_losing_contents() {
+        let Some((mut s, _)) = shot((1280, 800)) else { return };
+        let windows: Vec<_> = s.hud.shortcuts.iter().map(|b| b.window).collect();
+        s.hud.dvalues.set_i64("shortcutbar_window", 0);
+        s.hud.sync_options(&mut s.gui);
+        assert!(windows.iter().all(|&w| !s.gui.window_visible(w)));
+        s.hud.dvalues.set_i64("shortcutbar_window", 1);
+        s.hud.sync_options(&mut s.gui);
+        assert_eq!(s.hud.shortcuts.iter().map(|b| b.window).collect::<Vec<_>>(), windows);
+        assert!(windows.iter().all(|&w| s.gui.window_visible(w)));
     }
 
     /// The bar tooltip titles are `LDBface::GetText(0x2710, key)` of the keys in `FUN_100666b6`…`FUN_100669f7`, `Targetstarget` is read from `LoginPrefs.xml`.
@@ -2090,7 +2311,7 @@ mod tests {
     /// One input event through the HUD and the GUI, like `Shot::input`.
     fn send(s: &mut Shot, ev: InputEvent) {
         let cam = ao_render::Camera::look_at(glam::Vec3::ZERO, -glam::Vec3::Z);
-        s.hud.input(&mut s.gui, &mut s.zone, &ev, &cam, &ao_scene::Lens::default(), Default::default());
+        s.hud.input(&mut s.gui, &mut s.zone, None, &ev, &cam, &ao_scene::Lens::default(), Default::default());
         for e in s.gui.input(ev) {
             s.hud.event(&mut s.gui, &e, &s.zone);
         }
@@ -2410,5 +2631,12 @@ mod tests {
         send(&mut s, InputEvent::MouseUp { x: x6, y: y + 300.0, button: MouseButton::Left });
         assert!(!s.hud.shortcuts[0].slot_names().contains(&"Gone".to_string()));
         assert_eq!(s.hud.shortcuts[0].slot_names()[6], "Hi");
+    }
+}
+
+impl Hud {
+    pub(super) fn set_vehicle_motion_context(&mut self, dungeon: bool, grounded: Option<bool>) {
+        self.research_vehicle.guard.dungeon = Some(dungeon);
+        self.research_vehicle.guard.grounded = grounded;
     }
 }

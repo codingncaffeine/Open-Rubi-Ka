@@ -122,13 +122,15 @@ pub struct Prefs {
     pub fx: f32,
     pub music_on: bool,
     pub music: f32,
+    pub voice_on: bool,
+    pub voice: f32,
     /// `BattlemusicMode` 0..=3 (0 = no combat music; default 3, `MainPrefs.xml`).
     pub battlemusic_mode: i32,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { sound_on: true, master: 1.0, fx_on: true, fx: 1.0, music_on: true, music: 1.0, battlemusic_mode: 3 }
+        Prefs { sound_on: true, master: 1.0, fx_on: true, fx: 1.0, music_on: true, music: 1.0, voice_on: true, voice: 1.0, battlemusic_mode: 3 }
     }
 }
 
@@ -217,11 +219,33 @@ impl Audio {
     /// Applies the client's sound prefs (`SoundOptionsMonitor_c`, GUI @0x100c4ace): `Total_FX = master * FX * mutes`,
     /// `Total_Music = master * Music * mutes`.
     pub fn set_prefs(&self, p: &Prefs) {
+        let restart = {
+            let mut m = self.sh.mixer();
+            let restart = !m.sound_on && p.sound_on;
+            if m.sound_on && !p.sound_on { m.stop_all(); }
+            if !m.sound_on && p.sound_on { m.player_prefs = None; }
+            m.sound_on = p.sound_on;
+            m.fx = if p.sound_on && p.fx_on { p.master * p.fx } else { 0.0 };
+            m.music = if p.sound_on && p.music_on { p.master * p.music } else { 0.0 };
+            // SI 0x10006dfa/0x10006e4c recompute the player total on voice preference
+            // changes. SetMasterVolume 0x10006d37 does not recompute that total.
+            if m.player_prefs != Some((p.voice_on, p.voice)) {
+                m.player = if p.voice_on { p.master * p.voice } else { 0.0 };
+                m.player_prefs = Some((p.voice_on, p.voice));
+            }
+            restart
+        };
         if let Some(rt) = self.rt().as_mut() {
-            rt.fx = if p.sound_on && p.fx_on { p.master * p.fx } else { 0.0 };
-            rt.music.volume = if p.sound_on && p.music_on { p.master * p.music } else { 0.0 };
+            if restart { rt.restart_device(); }
             rt.combat.set_pref(p.battlemusic_mode);
         }
+    }
+
+    /// Effective preference gains of the running mixer, in FX/music/player order.
+    /// Player gain retains Sandy's last voice-callback master snapshot.
+    pub fn preference_gains(&self) -> [f32; 3] {
+        let m = self.sh.mixer();
+        if m.sound_on { [m.fx, m.music, m.player] } else { [0.0; 3] }
     }
 
     /// Weather state s0..s6 (rain, fog, cloud, wind, sand, fallout R/G storms): selects the fog/rain/storm music slot.
@@ -284,6 +308,7 @@ impl Audio {
 
     /// Per frame: `cam` = camera = listener position (scene space), `day_time` = the viewer clock (0..6480 s).
     pub fn update(&self, dt: f32, cam: [f32; 3], day_time: f32) {
+        if !self.sh.mixer().sound_on { return; }
         if let Some(rt) = self.rt().as_mut() {
             static LOG: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("AOMAC_AUDIO_LOG").is_some());
             let log = *LOG;
@@ -431,10 +456,14 @@ impl Audio {
         rt.effect_sound(&self.sh, crate::game::EffectSound { id, pos, velocity, parameters, probability }, listener)
     }
 
-    /// Plays a file below `cd_image/sound` (e.g. `sfx/gui/click`) once, centred. Returns the voice id (0 = not played).
+    /// Plays a player voice file below `cd_image/sound` once, centred. Sandy's player-FX
+    /// volume is separate from ordinary sound effects. Returns the voice id (0 = not played).
     pub fn play_sfx(&self, rel: &str, gain: f32) -> u64 {
         match self.sh.resolve(rel) {
-            Some(p) => self.sh.play_sample(&p, gain, false, 1),
+            Some(p) => {
+                let Some(pcm) = self.sh.load(&p) else { return 0 };
+                self.sh.mixer().play(VoiceDesc { gain, player: true, ..VoiceDesc::new(Source::Sample(pcm)) })
+            }
             None => {
                 eprintln!("audio: no sound file for '{rel}'");
                 0
@@ -473,6 +502,60 @@ fn write_frames<T: Copy + Default>(sh: &Shared, scratch: &mut Vec<f32>, out: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn player_volume_recomputes_only_when_retail_voice_callbacks_fire() {
+        let audio = Audio::offline(Path::new(""), 44100);
+        let mut p = Prefs { master: 0.5, voice: 0.8, ..Prefs::default() };
+        audio.set_prefs(&p);
+        assert_eq!(audio.sh.mixer().player, 0.4);
+        p.master = 0.25;
+        audio.set_prefs(&p);
+        assert_eq!(audio.sh.mixer().player, 0.4, "SetMasterVolume does not update the player total");
+        p.voice = 0.4;
+        audio.set_prefs(&p);
+        assert_eq!(audio.sh.mixer().player, 0.1);
+    }
+
+    #[test]
+    fn sound_preferences_update_existing_voices_without_restarting() {
+        let audio = Audio::offline(Path::new(""), 44100);
+        let pcm = Arc::new(Pcm { rate: 44100, channels: 1, samples: vec![0.1; 32] });
+        let mut ids = Vec::new();
+        for (priority, player) in [(Some(1), false), (None, false), (Some(1), true)] {
+            ids.push(audio.sh.mixer().play(VoiceDesc {
+                looping: true, priority, player, ..VoiceDesc::new(Source::Sample(pcm.clone()))
+            }));
+        }
+        let mut out = [0.0; 32];
+        let mut p = Prefs { master: 0.5, fx: 0.4, music: 0.6, voice: 0.8, ..Prefs::default() };
+        audio.set_prefs(&p);
+        audio.render(&mut out);
+        assert!(out.iter().all(|s| (*s - 0.09).abs() < 1e-6));
+        p.fx_on = false;
+        p.music_on = false;
+        audio.set_prefs(&p);
+        audio.render(&mut out);
+        assert!(out.iter().all(|s| (*s - 0.04).abs() < 1e-6));
+        p.voice_on = false;
+        audio.set_prefs(&p);
+        audio.render(&mut out);
+        assert!(out.iter().all(|s| *s == 0.0));
+        p = Prefs::default();
+        audio.set_prefs(&p);
+        audio.render(&mut out);
+        assert!(out.iter().all(|s| (*s - 0.3).abs() < 1e-6));
+        assert!(ids.iter().all(|id| audio.sh.mixer().is_playing(*id)));
+        p.sound_on = false;
+        audio.set_prefs(&p);
+        audio.render(&mut out);
+        assert!(out.iter().all(|s| *s == 0.0));
+        assert!(ids.into_iter().all(|id| !audio.sh.mixer().is_playing(id)));
+        assert_eq!(audio.sh.mixer().play(VoiceDesc::new(Source::Sample(pcm.clone()))), 0);
+        p.sound_on = true;
+        audio.set_prefs(&p);
+        assert_ne!(audio.sh.mixer().play(VoiceDesc::new(Source::Sample(pcm))), 0);
+    }
 
     #[test]
     fn zero_xyz_game_sound_is_non_positional_for_a_distant_listener() {

@@ -340,6 +340,33 @@ Note on names: the id of the 4 ids first not matched by an `IIR_t` string scan w
 | `7F4B3108` | `OrgClientIIR_c` | C→S | [GC 0x1000e1ea] | [GC 0x1000bbc3] |  | `N3Msg_OrgDisbandConfirmed` 0x1001a611, `N3Msg_LeavePayTaxConfirmed` 0x1001a6a0, `N3Msg_TaxChangeLeaveConfirmed` 0x1001a732 (+6) |
 | `7F544905` | `VendingMachineFullUpdateIIR_t` | S→C | [GC 0x100105d0] | [GC 0x1000cef4] | 1 |  |
 
+### Global research and vehicle requests
+
+`ao-net::n3::research` implements native `ResearchUpdateIIR` (`253D0240`,
+vtable GC `10156078`): reader `1003a58d` consumes a version byte (without
+branching on it), then nonzero `i32` research ids, each followed by three
+`i32` remaining values for side indices 0–2, terminated by an `i32` zero.
+Writer `1003a679` emits version 1, catalog entries with flag `0x80`, and
+`-1` when a side entry is absent. Parser rejects truncation and trailing
+bytes before applying any state. Zone merges entries by id, matching
+`1002bea2`; the update is global and is not gated on character identity.
+
+Global available goals (`1002bd06`) require flag `0x80`, a present side
+entry with positive remaining research, and either no precursor or a
+present precursor with zero remaining. Catalog total is word `+0x18`
+(`1002bc1a`); side entry remaining is `+0x1c` (`1002bc59`).
+Catalog loader `1002ba03` multiplies raw total word 5 by 1000 for flag
+`0x80` (GC `101be908` contains integer 1000). Progress getter `100276a3`
+returns `(scaled_total - remaining) / scaled_total`; personal flag `0x40`
+uses the unscaled total and personal known-perk timer.
+
+`ResearchRequestIIR` constructor `1002cd6a`, vtable `10158b50`, clears
+pass-on and has no body (`100793e8`). Sender `1002bd7a` targets the
+character identity and sends to server. `SpawnMechIIR_t` (`464D000A`)
+constructor `1007980e` also clears pass-on; writer `100796f4` writes
+one `i32` vehicle id. Regression bytes are explicitly RE-derived native
+field sequences, not server captures; no live verification was performed.
+
 ## 9. Unresolved
 
 * Direction `?` for 86 registry rows (see §8) — only client-side senders could be enumerated, not server behaviour.

@@ -93,7 +93,16 @@ pub const TELEPORT_TIMEOUT: f32 = 30.0;
 pub struct Zone {
     pub char_id: u32,
     pub playfield: Option<u32>,
+    /// Global research side timers, merged by id as in GC 1002bea2.
+    pub research: std::collections::BTreeMap<i32, [i32; 3]>,
+    /// Native Locks_t vector, FullCharacter +0x28; unknown until its server snapshot.
+    skill_locks: Option<Vec<ao_net::n3::world::GroupEntry>>,
+    lock_second: f32,
+    /// Inverse Root BoundingBoxTargeting Variant; native default true means triangles default off.
+    pub triangle_targeting: bool,
     pub dynels: HashMap<i32, DynelState>,
+    /// GC1007846e maps full-update bit18 to dynel state0x800000; GC1001666c includes it in IsNpc.
+    pub tip_npc_state: HashMap<i32, bool>,
     /// Frames per message id (`u32` key; system messages and pings are not counted), for diagnostics.
     pub counts: BTreeMap<u32, u32>,
     pub frames: u32,
@@ -152,6 +161,9 @@ pub struct Zone {
     /// District fight-mode level of the own character (`FUN_1003e1d0`, `fightmode.rs`), written by the player each frame; `None` until then
     /// (the original's no-data default is [`super::fightmode::DEFAULT_LEVEL`]). `/follow` reads it.
     pub fight_level: Option<i32>,
+    /// GC 0x101295f3 own-position district has nonzero LC minimum and maximum.
+    /// `None` means the authored district/zone query is unavailable, not refusal.
+    pub own_lca: Option<bool>,
     /// `RelocateDynelsIIR_t`: `(child, parent)` links (`n3Dynel_t::RelocateDynel`), cleared with the playfield.
     pub parents: Vec<(Identity, Identity)>,
     /// Position and heading of each parented character relative to its parent (the vehicle's `+0x58` / `+0x80`).
@@ -273,6 +285,17 @@ impl Zone {
     /// `GameTime_t::RunFunction` [GC 0x1000b214]: the clock runs `TimeSpeed` (15) game seconds per real second, i.e. one
     /// `GameDayTime` second per real second.
     pub fn tick(&mut self, dt: f32) {
+        self.lock_second += dt;
+        // GC1000b214 emits at most one pulse per frame, strictly after one second.
+        if self.lock_second > 1.0 {
+            self.lock_second = 0.0;
+            if let Some(locks) = &mut self.skill_locks {
+                locks.retain_mut(|lock| {
+                    lock.b = lock.b.wrapping_sub(1);
+                    lock.b > 0
+                });
+            }
+        }
         let delta = self.nanos.tick(dt);
         self.adjust_ncu(delta);
         if let Some(t) = &mut self.server_unix {
@@ -285,6 +308,12 @@ impl Zone {
 
     pub fn server_now(&self) -> Option<u32> {
         self.server_unix.map(|t| t.max(0.0) as u32)
+    }
+
+    /// GC10063be4 tests stat membership, not the timer. GC10064495 removes
+    /// entries after decrementing +0xc on GameTime_t's second pulse (1005b016).
+    pub fn skill_locked(&self, skill: i32) -> Option<bool> {
+        self.skill_locks.as_ref().map(|locks| locks.iter().any(|lock| lock.id.instance == skill))
     }
 
     /// `n3EngineClientAnarchy_t::StartTeleportTry` [GC 0x10018f9a] after the movement sync: creates the `TeleportTrier_t` (its constructor gets
@@ -372,12 +401,16 @@ impl Zone {
         if let N3::World(World::Corpse(c)) = &m.body {
             if c.owner.kind == CHAR_KIND {
                 self.dynels.remove(&c.owner.instance);
+                self.tip_npc_state.remove(&c.owner.instance);
                 self.character_stats.remove(&c.owner.instance);
                 self.fight_target.remove(&c.owner.instance);
             }
         }
         if who.kind == CHAR_KIND {
             match &m.body {
+                N3::World(World::Appearance(a)) => {
+                    self.character_stats.entry(who.instance).or_default().insert(0x2a1, i32::from(a.visual_flags));
+                }
                 N3::Dynel(Dynel::Stat(u)) => {
                     self.character_stats.entry(who.instance).or_default().extend(u.stats.iter().filter(|s| s.1 != ao_formats::stats::INVALID).map(|s| (s.0 as u32, s.1)));
                 }
@@ -386,6 +419,10 @@ impl Zone {
                     self.character_stats.entry(who.instance).or_default().extend(u.stats.iter().map(|s| (s.0 as u32, s.1)));
                 }
                 N3::Dynel(Dynel::SimpleCharFullUpdate(u)) => {
+                    // Full-update target restores the same fight controller as AttackIIR_t.
+                    if let Some(target) = u.target.filter(|t| t.kind == CHAR_KIND) {
+                        self.fight_target.insert(who.instance, target.instance);
+                    }
                     let s = self.character_stats.entry(who.instance).or_default();
                     s.extend([(0, u.flags2 as i32), (1, u.max_health), (4, u.breed as i32), (0x1b, u.health), (0x21, u.side as i32), (0x36, u.level as i32), (0x3b, u.sex as i32), (0x185, u.expansion as i32), (0x294, u.account_flags as i32), (0x2a1, u.visual_flags as i32)]);
                     s.extend([(0x2f, i32::from(u.fatness)), (0x168, i32::from(u.monster_scale))]);
@@ -393,6 +430,11 @@ impl Zone {
                         s.extend([(0x184, n.tower_type as i32), (0x1c7, n.npc_family as i32), (0x200, n.pet_type as i32)]);
                         // NPC-only dialogue flag (`SimpleChar+0x21c`, GC 0x1007850f–0x10078539).
                         s.insert(0x300, i32::from(u.flags & (1 << 27) != 0));
+                    }
+                    if let ao_net::n3::dynel::CharClass::Pc(pc) = &u.class {
+                        if let Some((Some(clan), _)) = &pc.extra {
+                            s.insert(5, *clan);
+                        }
                     }
                     if let Some(master) = u.pet_master {
                         s.insert(0xc4, master);
@@ -499,6 +541,8 @@ impl Zone {
                 return ZoneEvent::Time;
             }
             N3::World(World::FullCharacter(c)) if who.instance == self.char_id as i32 => {
+                // GC10073a2f appends +0x28 into the skill controller's Locks_t vector.
+                self.skill_locks.get_or_insert_with(Vec::new).extend_from_slice(&c.groups[0].entries);
                 self.apply_stats(c.stats_a.iter().chain(&c.stats_b).copied());
                 self.apply_stats(c.stats_u8.iter().map(|s| (s.0 as u32, s.1 as i32)));
                 self.apply_stats(c.stats_i16.iter().map(|s| (s.0 as u32, s.1 as i32)));
@@ -533,6 +577,7 @@ impl Zone {
                 }
             }
             N3::Dynel(Dynel::SimpleCharFullUpdate(u)) if who.kind == CHAR_KIND => {
+                self.tip_npc_state.insert(who.instance, u.flags & (1 << 18) != 0);
                 if who.instance == self.char_id as i32 {
                     self.own_update = Some(u.clone());
                     self.stats.insert(ao_formats::stats::HEALTH, u.health);
@@ -579,6 +624,9 @@ impl Zone {
             }
             // Keep the full-update snapshot current as well as applying the live appearance delta.
             N3::World(World::Appearance(a)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
+                // AppearanceUpdateIIR_c::Activate (GC 0x10071679) writes VisualFlags,
+                // so the settings DValue must follow the server-selected appearance.
+                self.apply_stats([(0x2a1, i32::from(a.visual_flags))]);
                 if let Some(u) = self.own_update.as_mut() {
                     for c in &a.cloth {
                         u.cloth.retain(|old| old.page != c.c || old.part() != c.id);
@@ -607,6 +655,19 @@ impl Zone {
                         self.world.sound_id_at_position(sound, [0.0; 3]);
                     }
                 }
+                if a.action == 0xaa && self.skill_locked(a.identity_b.kind) != Some(true) {
+                    let skill = a.identity_b.kind;
+                    let modifier = if matches!(skill, 142 | 144 | 146..=148 | 150 | 151 | 167 | 579 | 673) {
+                        0
+                    } else {
+                        // Native GetSkill(382, 0), not the buff-adjusted mode-2 projection.
+                        self.stats.get(&382).copied().unwrap_or(ao_formats::stats::INVALID).max(-50)
+                    };
+                    let duration = (modifier.wrapping_mul(a.identity_b.instance) as f64 / 100.0 + a.identity_b.instance as f64 + 0.5) as i32;
+                    self.skill_locks.get_or_insert_with(Vec::new).push(ao_net::n3::world::GroupEntry {
+                        ignored: 0, id: Identity { kind: 0, instance: skill }, a: duration, b: duration,
+                    });
+                }
                 if a.action == 0x14 {
                     self.recharge_feed.push((a.identity_b.kind, a.identity_b.instance));
                 }
@@ -623,6 +684,16 @@ impl Zone {
             N3::Misc(Misc::CharInPlay) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
                 self.stats.insert(IN_PLAY_STAT, 1);
                 return ZoneEvent::Alive;
+            }
+            N3::Unknown(body) if m.header.msg_type == ao_net::n3::research::UPDATE => {
+                match ao_net::n3::research::parse_update(&body) {
+                    Ok(update) => {
+                        for goal in update.goals {
+                            self.research.insert(goal.id, goal.remaining);
+                        }
+                    }
+                    Err(e) => eprintln!("zone: ResearchUpdate: {e:#}"),
+                }
             }
             N3::Unknown(body) if matches!(m.header.msg_type, ao_net::n3::spells::APPLY_SPELLS | server_move::RELOCATE | server_move::FIGHT_MODE_UPDATE) => {
                 self.on_world_message(m.header.msg_type, who, &body)
@@ -649,6 +720,7 @@ impl Zone {
             }
             N3::Misc(Misc::ToClientQuit) if who.kind == CHAR_KIND => {
                 self.dynels.remove(&who.instance);
+                self.tip_npc_state.remove(&who.instance);
                 self.character_stats.remove(&who.instance);
                 self.fight_target.remove(&who.instance);
             }
@@ -836,6 +908,29 @@ mod tests {
     }
 
 
+    #[test]
+    fn native_skill_locks_membership_and_second_pulse() {
+        let mut zone = Zone::new(42);
+        assert_eq!(zone.skill_locked(662), None);
+        zone.skill_locks = Some(vec![ao_net::n3::world::GroupEntry {
+            ignored: 1, id: Identity { kind: 0, instance: 662 }, a: 60, b: 2,
+        }]);
+        assert_eq!(zone.skill_locked(662), Some(true));
+        assert_eq!(zone.skill_locked(142), Some(false));
+        zone.tick(1.0);
+        assert_eq!(zone.skill_locks.as_ref().unwrap()[0].b, 2);
+        zone.tick(0.01);
+        assert_eq!(zone.skill_locks.as_ref().unwrap()[0].b, 1);
+        zone.tick(5.0); // native emits only one pulse, not five catch-up decrements
+        assert_eq!(zone.skill_locked(662), Some(false));
+        zone.skill_locks.as_mut().unwrap().push(ao_net::n3::world::GroupEntry {
+            id: Identity { kind: 0, instance: 662 }, b: 0, ..Default::default()
+        });
+        assert_eq!(zone.skill_locked(662), Some(true)); // predicate never compares expiry
+        zone.tick(1.01);
+        assert_eq!(zone.skill_locked(662), Some(false));
+    }
+
     fn frames(rec: &str) -> Vec<Frame> {
         rec.lines()
             .filter_map(|l| {
@@ -867,6 +962,41 @@ mod tests {
         for reply in &replies { foreign.on_frame(reply); }
         assert_eq!((foreign.stat(16), foreign.stat(17), foreign.stat(53)), (Some(6), Some(6), Some(1500)));
         assert_eq!(foreign.character_stats[&0x8334][&53], 9462);
+    }
+
+    #[test]
+    fn full_update_preserves_native_tip_npc_state_bit() {
+        let mut frame = frames(include_str!("../../../../docs/captures/zone_enter_ithaca.rec")).into_iter().find(|f| {
+            matches!(ao_net::n3::decode(f).map(|m| m.body), Ok(N3::Dynel(Dynel::SimpleCharFullUpdate(u))) if !u.is_npc())
+        }).unwrap();
+        let message = ao_net::n3::decode(&frame).unwrap();
+        let id = message.header.target.instance;
+        let mut zone = Zone::new(0);
+        zone.on_frame(&frame);
+        assert_eq!(zone.tip_npc_state.get(&id),Some(&false));
+        // N3 header13, version1, flags4: bit18 has no optional payload.
+        let flags = u32::from_be_bytes(frame.payload[14..18].try_into().unwrap()) | (1 << 18);
+        frame.payload[14..18].copy_from_slice(&flags.to_be_bytes());
+        zone.on_frame(&frame);
+        assert_eq!(zone.tip_npc_state.get(&id),Some(&true));
+        assert!(!zone.dynels[&id].npc,"native character class is unchanged");
+    }
+
+    #[test]
+    fn appearance_echo_updates_authoritative_visual_stat() {
+        let mut seen = 0;
+        for frame in frames(include_str!("../../../../docs/captures/zone_wear_rifle_borealis.rec")) {
+            let Ok(message) = n3::decode(&frame) else { continue };
+            let N3::World(World::Appearance(a)) = message.body else { continue };
+            let id = message.header.target.instance;
+            let mut zone = Zone::new(id as u32);
+            zone.stats.insert(0x2a1, 0);
+            zone.on_frame(&frame);
+            assert_eq!(zone.stat(0x2a1), Some(i32::from(a.visual_flags)));
+            assert_eq!(zone.character_stats[&id][&0x2a1], i32::from(a.visual_flags));
+            seen += 1;
+        }
+        assert!(seen > 0);
     }
 
     /// Actual capture: three nano-add/removal pairs on Bergdoktor, not the capturing player.

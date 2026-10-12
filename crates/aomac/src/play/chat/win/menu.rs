@@ -31,6 +31,10 @@ pub(super) const OP_SUBSCRIBE: u32 = 12;
 pub(super) const OP_IGNORE: u32 = 13;
 pub(super) const OP_OPEN_CHAT: u32 = 14;
 pub(super) const OP_SEND_TELL: u32 = 15;
+pub(super) const OP_CONFIG: u32 = 16;
+pub(super) const OP_RENAME: u32 = 17;
+pub(super) const OP_DELETE: u32 = 18;
+pub(super) const OP_NEW: u32 = 19;
 
 fn id(op: u32, arg: u32) -> u32 {
     op << 16 | arg
@@ -76,6 +80,7 @@ impl ChatWindows {
     /// Opens the right-click / icon menu of frame `window` at `at`; a `user://NAME` link gives the user menu instead.
     pub(super) fn open_menu(&mut self, gui: &mut Gui, window: WindowId, at: (i32, i32), link: Option<&str>) {
         let Some(fi) = self.frame_of(window) else { return };
+        self.config_clear_menu();
         let d = self.sel_doc(fi);
         let groups = self.menu_groups();
         let user = link.and_then(|l| l.strip_prefix("user://")).map(str::to_string);
@@ -97,6 +102,12 @@ impl ChatWindows {
                 MenuItem::submenu(&self.label("ChatWindowMenu_TalkToChannel"), talk),
                 MenuItem::submenu(&self.label("ChatWindowMenu_ChannelSubscribeMenu"), subscribe),
                 MenuItem::check(id(OP_AUTOSUB, 0), &self.label("ChatWindowMenu_AutoSubscribeChannels"), c.autosubscribe),
+                MenuItem::separator(),
+                MenuItem::check(id(OP_CONFIG, 0), &self.label("ChatConfiguration"), self.config.window.is_some()),
+                MenuItem::separator(),
+                MenuItem::entry(id(OP_RENAME, 0), &self.label("RenameWindow")),
+                MenuItem::entry(id(OP_DELETE, 0), &self.label("DeleteWindow")),
+                MenuItem::entry(id(OP_NEW, 0), &self.label("NewWindow")),
             ]
         };
         self.menu = Some(Ctx { frame: fi, groups, user });
@@ -120,6 +131,10 @@ impl ChatWindows {
         let d = self.sel_doc(fi);
         self.dirty = true;
         match op {
+            OP_CONFIG => self.config.open_request = Some(self.config.window.is_none()),
+            OP_RENAME => self.config_operation(gui, d, "RenameWindow"),
+            OP_DELETE => self.config_operation(gui, d, "DeleteWindow"),
+            OP_NEW => self.config_operation(gui, d, "NewWindow"),
             OP_MODE => {
                 let mode = arg as i32;
                 if self.wins[d].cfg.visual_mode != mode {

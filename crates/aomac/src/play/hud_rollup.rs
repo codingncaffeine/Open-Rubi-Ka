@@ -14,7 +14,7 @@
 //!
 //! Shared clipping is traced in `View::_CallRender` 0x1014d2e3: inherited/screen rect intersection, recursive propagation,
 //! flag 0x1 viewport application and restoration. Rollup-area parenting / clip-flag setup remains [INFERENCE].
-//! UNRESOLVED: controller scrolling (`scroll_offset`, mouse wheel) is ours; the header's popup menu (`FUN_10048736`: one entry of `LDBface::GetText(0x2710, ..)`
+//! UNRESOLVED: the header's popup menu (`FUN_10048736`: one entry of `LDBface::GetText(0x2710, ..)`
 //! whose key is not decompiled) and the header art colours. Header reorder/undock and free-window tab grouping live in `docks.rs`.
 
 use ao_gui::{CanvasItem, Event, GfxId, Gui, InputEvent, WindowId, WindowSize};
@@ -34,8 +34,8 @@ const BODY_TOP: u32 = 3;
 const BODY_BOTTOM: u32 = 5;
 /// Gap between two pages / under a collapsed page (`_DAT_101a87e8` = 1.0 as a double).
 const GAP: i32 = 1;
-/// Wheel step of the scrolling (UNRESOLVED, ours).
-const WHEEL_STEP: f32 = 30.0;
+/// GUI 0x100480f7: wheel delta times double `_DAT_101b0bd8` = 40.
+const WHEEL_STEP: f32 = 40.0;
 
 const ICON: &str = "GFX_GUI_WINDOW_ICON_I";
 const EXPAND: &str = "GFX_GUI_ROLLUP_EXPAND_STATE1";
@@ -345,12 +345,12 @@ impl Rollup {
         }
     }
 
-    /// Mouse wheel over the area scrolls the column.
-    pub fn input(&mut self, gui: &mut Gui, ev: &InputEvent) {
+    /// The hovered area scrolls normally; MouseWheel=1 also connects the global wheel signal (GUI 0x1004816f).
+    pub fn input(&mut self, gui: &mut Gui, ev: &InputEvent, mouse_wheel: i64) {
         self.drag_input(gui, ev);
         if let InputEvent::Wheel { x, y, dy } = *ev {
             let (left, top, bottom) = self.area();
-            if x >= left as f32 && y >= top as f32 && y < bottom as f32 && !self.pages.is_empty() {
+            if (mouse_wheel == 1 || (x >= left as f32 && y >= top as f32 && y < bottom as f32)) && !self.pages.is_empty() {
                 self.scroll -= dy * WHEEL_STEP;
                 self.layout(gui);
                 self.dirty = true;
@@ -402,6 +402,22 @@ fn inner_xml(src: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mouse_wheel_one_scrolls_sidebar_from_the_world() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut rollup = Rollup::new(&dir, (1280, 600));
+        rollup.open_page(&mut gui, "wheel_a", "A", "<root><View/></root>", 400.0).unwrap();
+        rollup.open_page(&mut gui, "wheel_b", "B", "<root><View/></root>", 400.0).unwrap();
+        let wheel = InputEvent::Wheel { x: 100.0, y: 100.0, dy: -1.0 };
+        rollup.input(&mut gui, &wheel, 0);
+        assert_eq!(rollup.scroll, 0.0);
+        rollup.input(&mut gui, &wheel, 1);
+        assert_eq!(rollup.scroll, 40.0);
+        rollup.input(&mut gui, &wheel, 2);
+        assert_eq!(rollup.scroll, 40.0);
+    }
 
     #[test]
     fn mini_toolbar_and_rollup_share_the_xml_boundary() {

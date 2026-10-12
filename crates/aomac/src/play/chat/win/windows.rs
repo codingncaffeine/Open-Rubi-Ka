@@ -47,7 +47,7 @@ impl ChatWindows {
         Self::new_with_prefs(gui, screen, Some(character.to_path_buf()))
     }
 
-    fn new_with_prefs(gui: &mut Gui, screen: (u32, u32), prefs: Option<PathBuf>) -> Result<Self> {
+    pub(super) fn new_with_prefs(gui: &mut Gui, screen: (u32, u32), prefs: Option<PathBuf>) -> Result<Self> {
         let client = ao_gui::client_dir();
         let mut cfgs = prefs.as_deref().map(read_windows).unwrap_or_default();
         if cfgs.is_empty() {
@@ -66,6 +66,7 @@ impl ChatWindows {
             frames: vec![],
             screen,
             groups: LOCAL_GROUPS.iter().map(|(i, n)| (*i, n.to_string())).collect(),
+            inactive_groups: Default::default(),
             text: TextDb::load(&client).ok(),
             prefs,
             last_active: String::new(),
@@ -73,6 +74,10 @@ impl ChatWindows {
             dirty: false,
             menu: None,
             pw: WinPrefs::default(),
+            config: Default::default(),
+            config_ops: None,
+            config_logs: HashMap::new(),
+            config_log_files: HashMap::new(),
         };
         s.last_active = cfgs.iter().find(|c| c.startup).or(cfgs.first()).map(|c| c.window_name.clone()).unwrap_or_default();
         for c in cfgs {
@@ -84,7 +89,7 @@ impl ChatWindows {
         for d in 0..s.wins.len() {
             let c = &s.wins[d].cfg;
             if c.visual_mode == 0 && (c.frame.is_some() || c.template) {
-                if let Some(g) = groups.iter_mut().find(|g| s.wins[g[0]].cfg.visual_mode == 0 && s.wins[g[0]].cfg.frame == c.frame) {
+                if let Some(g) = groups.iter_mut().find(|g| s.wins[g[0]].cfg.visual_mode == 0 && s.wins[g[0]].cfg.frame == c.frame && s.wins[g[0]].cfg.open == c.open) {
                     g.push(d);
                     continue;
                 }
@@ -99,7 +104,7 @@ impl ChatWindows {
         Ok(s)
     }
 
-    fn add_doc(&mut self, cfg: Cfg) -> usize {
+    pub(super) fn add_doc(&mut self, cfg: Cfg) -> usize {
         let n = self.next_n;
         self.next_n += 1;
         let alpha = alpha_of(&cfg, false);
@@ -108,7 +113,7 @@ impl ChatWindows {
     }
 
     /// Registers a frame holding `docs` and opens its GUI window.
-    fn add_frame(&mut self, gui: &mut Gui, docs: Vec<usize>, outer: (i32, i32, u32, u32)) -> Result<usize> {
+    pub(super) fn add_frame(&mut self, gui: &mut Gui, docs: Vec<usize>, outer: (i32, i32, u32, u32)) -> Result<usize> {
         let fi = self.frames.len();
         for &d in &docs {
             self.wins[d].frame = fi;
@@ -206,7 +211,7 @@ impl ChatWindows {
             gui.open_window_xml("ChatWindow", &src, (x, y), WindowSize::Fixed(w, h))?
         };
         gui.set_window_context(id, true);
-        gui.set_text_shadow_offset(1, 1); // `ChatTextShadowOffset` pref default 1 (CharPrefs.xml), `FUN_1008d673`
+        gui.set_text_shadow_offset(self.pw.shadow_offset, self.pw.shadow_offset);
         for (i, &d) in docs.iter().enumerate() {
             self.wins[d].id = id;
             self.wins[d].fade = None; // new GUI views: `update` re-applies `is_message_fading_enabled`
@@ -277,11 +282,12 @@ impl ChatWindows {
     /// `ChatGUIModule_c::AddGroup` (0x10085f91): a group the chat server announced (windows that do not exclude it show it).
     pub fn add_group(&mut self, id: u64, name: &str) {
         self.groups.insert(id, name.to_string());
+        self.inactive_groups.remove(&id);
     }
 
     pub fn remove_group(&mut self, id: u64) {
         if id >> 32 != 0 {
-            self.groups.remove(&id);
+            self.inactive_groups.insert(id);
         }
     }
 
@@ -315,6 +321,10 @@ impl ChatWindows {
             }
         }
     }
+    /// GUI 0x10084f33: at least one open chat document subscribes to the group.
+    pub fn group_visible(&self, gui: &Gui, group: u64) -> bool {
+        self.wins.iter().any(|w| w.cfg.open && w.cfg.shows(group) && gui.window_visible(w.id))
+    }
 
     /// A message of the chat server / zone chat (`FUN_10084f9e` -> `FUN_1009b4cf`).
     pub fn push_msg(&mut self, gui: &mut Gui, m: &ChatMsg) {
@@ -331,6 +341,9 @@ impl ChatWindows {
         let whispers = db.and_then(|d| d.by_key(10001, "Whispers")).unwrap_or_else(|| " whispers: ".into());
         let shouts = db.and_then(|d| d.by_key(10001, "Shouts")).unwrap_or_else(|| " shouts: ".into());
         self.deliver(gui, m.group, |stamp| format_line(&m, &name, color, stamp, &whispers, &shouts));
+        for i in 0..self.wins.len() {
+            if self.wins[i].cfg.shows(m.group) { self.config_log_message(gui, i, &m, &name); }
+        }
     }
 
     /// A line the client itself generates (errors, command feedback, system, combat feedback).
@@ -350,6 +363,9 @@ impl ChatWindows {
 
     /// The event comes from one of the chat windows (the app must not handle it again).
     pub fn owns(&self, ev: &Event) -> bool {
+        if self.config_owns(ev) || self.config_ops_owns(ev) {
+            return true;
+        }
         let w = match ev {
             Event::EnterPressed { window, .. }
             | Event::Escape { window }
@@ -372,6 +388,9 @@ impl ChatWindows {
     }
 
     pub fn event(&mut self, gui: &mut Gui, ev: &Event) -> Vec<WinOut> {
+        if self.config_ops_event(gui, ev) || self.config_event(gui, ev) {
+            return self.config_take_outputs();
+        }
         if !self.owns(ev) {
             return vec![];
         }
@@ -459,7 +478,7 @@ impl ChatWindows {
         self.dirty = true;
     }
 
-    fn reindex(&mut self) {
+    pub(super) fn reindex(&mut self) {
         for (fi, f) in self.frames.iter().enumerate() {
             for &d in &f.docs {
                 self.wins[d].frame = fi;
@@ -551,6 +570,7 @@ impl ChatWindows {
         }
         let font_changed = p.font != self.pw.font;
         self.pw = p.clone();
+        gui.set_text_shadow_offset(p.shadow_offset, p.shadow_offset);
         if font_changed && gui.set_chat_font(&p.font.0, &p.font.1, p.font.2) {
             for fi in 0..self.frames.len() {
                 self.rebuild_frame(gui, fi);
@@ -562,7 +582,7 @@ impl ChatWindows {
     }
 
     /// What follows from the output groups and `ChatShowOGrpIn*`: the tab titles and the input prompt (`FUN_100ab980`, `FUN_10090f0b`).
-    fn sync_decor(&mut self, gui: &mut Gui) {
+    pub(super) fn sync_decor(&mut self, gui: &mut Gui) {
         for fi in 0..self.frames.len() {
             let id = self.frames[fi].id;
             if self.wins[self.frames[fi].docs[0]].cfg.visual_mode == 0 {
@@ -592,6 +612,7 @@ impl ChatWindows {
     /// `window_transparency_active`, fade 0.2 s), all others fade to `window_transparency_inactive` over 1 s. Pending changes are written once the
     /// pointer is idle (the original writes at shutdown, `FUN_10094a28`; the port has no shutdown hook).
     pub fn update(&mut self, gui: &mut Gui, dt: f32) {
+        self.config_ops_update(gui,dt);
         self.sync_decor(gui);
         let focused = gui.focused_view();
         let hide = |w: &Win, active: bool| w.cfg.hide_input_when_inactive && !active;

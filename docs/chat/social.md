@@ -5,6 +5,14 @@ tell windows, dialogs, LFT window), `social_hub.rs` (routing into the hub). Addr
 Dumps used (not committed): `ppj::Client_c` dispatcher `FUN_1016d6dc`, `ChatGUIModule_c::HandlePPJActions` 0x10087fd4 and its handlers,
 `FUN_100a5e11..100a9c58` (friend list), `FUN_100ef8ac..100f03fb` (LFT window).
 
+`esc_lft` is captured when the existing native `LFTView.xml` window is constructed (`LFTWindow_c`, GUI `FUN_100f03fb`).
+Changing the setting while Team Search is open does not change that window's Escape behavior; closing/reopening captures the new value.
+Escape uses the normal close/save path and clears `lft_window`, without turning off the player's LFT flag.
+Regression: `lft_escape_preference_is_captured_on_creation`; no real-window acceptance performed (user using Mac).
+The existing `WINDOW_LFT` key-binding provider now toggles that same social window.
+Invite availability reads the HUD's authoritative replicated team membership/leader
+state (`N3Msg_IsInTeam && !IsTeamLeader`), rather than the former hardcoded not-in-team value.
+
 ## 1. How the original is built
 
 `ppj::Client_c` turns every chat-server packet into an `Action_t` (kind at `+4`); `ChatGUIModule_c::HandlePPJActions` [0x10087fd4] routes them:
@@ -82,7 +90,7 @@ C2S: `0x28 I D` (D = 1 menu "Befriend", 0 temporary entry created when a tell wi
 * Invitation (`FUN_100a72c7(true)`, node `+0x39`): inviter ignored -> `0x35` silently. Pref `ChatPGInviteAction` (OptionPanel radio group; CharPrefs.xml default **1**):
   **0** always decline: line `ChatInviteAutoDeclined` ("Chat group invitation from %s was auto declined.") + `0x35`; **1** "DisplayInviteDialog": dialog (`FUN_100a700a`: title `PrivateGroupInvitation`
   "Private Group Invitation", body `ChatFriendList_InvitedToPrivateGroupDialogText`, buttons `MsgBox_Yes` / `MsgBox_No`) + flashing node + line `ChatInvitePending` ("You were invited
-  to a private chat group by %s."); **2** "FlashUserIn..." only the flashing node and the line. The pref store (option panel) is not ported: the default 1 is used.
+  to a private chat group by %s."); **2** "FlashUserIn..." only the flashing node and the line. `Chat::set_prefs` reads the character DValue before dispatch; saved `Prefs.xml` overrides and live option changes select all three native paths.
 * Dialog answer (`FUN_100a6e0c`): Yes = `0x34 I` + the group (kind 0xE, id) is created and assigned to the chat windows selected in the dialog (the dialog lists the chat windows as
   check boxes; `FUN_1009d129` / `FUN_1009ce7b` per selected window), No = `0x35 I`. Port: Yes/No send the packets; the group appears with its `PRIVGRP_JOINED` and the
   windows' own subscription rule (autosubscribe windows) applies. **GAP**: the per-window assignment check boxes (needs `ChatWindows::subscribe_group`, ChatWinFrame).
@@ -122,7 +130,7 @@ C2S: `0x28 I D` (D = 1 menu "Befriend", 0 temporary entry created when a tell wi
   (`FUN_100a9b4b`: `FUN_100a75e8(1 - is_open)`, 0 closes it); a click on a chat-window item (show / hide that chat window, `FUN_1009adae`, and its menu `FUN_100a83ac`) is not ported.
   UNRESOLVED left in the widgets: the horizontal scroll-bar art, the popup menu skin (shared `PopupMenu_c`), `ResizeColumnToFit` (fits the widest cell), a sort marker in the header.
 * Friends window initial position (centred fallback until dock registration), tell window layout, tell routing preferences (section 4), the "Chat Windows" folder content (needs `ChatWindows` names), chat window
-  assignment check boxes (section 5), `ChatPGInviteAction` pref store, Mail entry, LFT reset at `FUN_1007850a`, team state for the LFT Invite button (port has no team state yet).
+  assignment check boxes (section 5), Mail entry, LFT reset at `FUN_1007850a`.
 * Kick: the original queues `GroupAction(part)` before the "left private group" text (order delivered to a removed group is unknown); the port prints the text first.
 
 ## 8. Verification

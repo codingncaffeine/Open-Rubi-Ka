@@ -171,6 +171,8 @@ struct LftWin {
     win: WindowId,
     /// `lft.results` index of the selected candidate row (`MultiListViewItem_c::Select`).
     selected: Option<usize>,
+    /// Constructor-captured `esc_lft` (GUI `FUN_100f03fb`).
+    escape_closes: bool,
 }
 
 #[derive(Default)]
@@ -430,7 +432,6 @@ impl SocialWin {
         );
         let k = self.tells.len() as i32;
         let Ok(win) = gui.open_tabbed_window_xml("TellWindow", name, &src, (220 + 24 * k, 160 + 24 * k), WindowSize::Fixed(300, 170)) else { return };
-        gui.set_text_shadow_offset(1, 1);
         gui.focus(win, "input");
         self.tells.push(TellWin { id, name: name.to_owned(), win, lines: vec![] });
     }
@@ -513,7 +514,7 @@ impl SocialWin {
     // -------------------------------------------------------------------------------------------- LFT
 
     /// `FUN_100f03fb`: the window from `Views/LFTView.xml`, tab "Team Search" (`GetText(100, "Team Search")`), config `LFTWindowConfig`.
-    pub fn open_lft(&mut self, gui: &mut Gui, lft: &Lft, tx: &Texts, in_team_blocked: bool) {
+    pub fn open_lft(&mut self, gui: &mut Gui, lft: &Lft, tx: &Texts, in_team_blocked: bool, escape_closes: bool) {
         if let Some(l) = &self.lft {
             gui.set_window_visible(l.win, true);
             return;
@@ -572,7 +573,7 @@ impl SocialWin {
         }
         gui.set_default_button(win, "Search");
         self.pf_names = ao_formats::screens::pfnr_names(&ao_gui::client_dir()).unwrap_or_default();
-        self.lft = Some(LftWin { win, selected: None });
+        self.lft = Some(LftWin { win, selected: None, escape_closes });
         self.lft_rows(gui, lft, tx);
     }
 
@@ -621,6 +622,11 @@ impl SocialWin {
                 } else {
                     vec![]
                 }
+            }
+            Event::Escape { window } if *window == win && l.escape_closes => {
+                self.close_lft(gui, tx);
+                self.closed.push("lft_window");
+                vec![]
             }
             Event::CloseRequested { window } if *window == win => {
                 self.close_lft(gui, tx);
@@ -815,7 +821,7 @@ mod tests {
         let friends = windows.friends.as_ref().unwrap().win;
         gui.set_window_outer_frame(friends, (30, 50, 250, 300));
         gui.set_window_pinned(friends, true);
-        windows.open_lft(&mut gui, &Lft::default(), &tx, false);
+        windows.open_lft(&mut gui, &Lft::default(), &tx, false, false);
         let lft = windows.lft_window().unwrap();
         gui.set_window_outer_frame(lft, (300, 100, 700, 550));
         windows.close_all(&mut gui, &tx);
@@ -823,7 +829,7 @@ mod tests {
         let friends = windows.friends.as_ref().unwrap().win;
         assert_eq!(gui.window_outer_frame(friends), Some((30, 50, 250, 300)));
         assert!(gui.window_pinned(friends));
-        windows.open_lft(&mut gui, &Lft::default(), &tx, false);
+        windows.open_lft(&mut gui, &Lft::default(), &tx, false, false);
         assert_eq!(gui.window_outer_frame(windows.lft_window().unwrap()), Some((300, 100, 700, 550)));
         assert!(character.join("FriendsWindowConfig.xml").is_file());
         assert!(!root.join("FriendsWindowConfig.xml").exists());
@@ -981,13 +987,33 @@ mod tests {
     }
 
     #[test]
+    fn lft_escape_preference_is_captured_on_creation() {
+        let Some((mut gui, db)) = rig() else { return };
+        let tx = Texts(&db);
+        let lft = Lft::default();
+        let mut w = SocialWin::new((1280, 800));
+        w.open_lft(&mut gui, &lft, &tx, false, false);
+        let win = w.lft_window().unwrap();
+        w.open_lft(&mut gui, &lft, &tx, false, true);
+        w.lft_event(&mut gui, &Event::Escape { window: win }, &lft, &tx);
+        assert_eq!(w.lft_window(), Some(win));
+        w.close_lft(&mut gui, &tx);
+        w.open_lft(&mut gui, &lft, &tx, false, true);
+        let win = w.lft_window().unwrap();
+        w.open_lft(&mut gui, &lft, &tx, false, false);
+        w.lft_event(&mut gui, &Event::Escape { window: win }, &lft, &tx);
+        assert!(w.lft_window().is_none());
+        assert_eq!(w.closed, ["lft_window"]);
+    }
+
+    #[test]
     fn lft_window_searches_and_lists() {
         let Some((mut gui, db)) = rig() else { return };
         let tx = Texts(&db);
         let soc = Social::default();
         let mut lft = Lft::default();
         let mut w = SocialWin::new((1280, 800));
-        w.open_lft(&mut gui, &lft, &tx, false);
+        w.open_lft(&mut gui, &lft, &tx, false, false);
         let win = w.lft.as_ref().unwrap().win;
         // the client's own LFTView.xml
         for v in ["Side", "Location", "Profession", "Search", "Invite", "Tell", "LFT", "Description", "CandidateView", "candidates"] {
@@ -1059,7 +1085,7 @@ mod tests {
         w.close_lft(&mut gui, &tx);
         let mut lft2 = Lft::default();
         lft2.set(true, "");
-        w.open_lft(&mut gui, &lft2, &tx, true);
+        w.open_lft(&mut gui, &lft2, &tx, true, false);
         let win = w.lft.as_ref().unwrap().win;
         assert_eq!(gui.text(win, "Description"), "raid ubs");
         assert!(gui.checked(win, "LFT") && !gui.is_enabled(win, "Invite"));
@@ -1080,7 +1106,7 @@ mod tests {
         }
         let mut w = SocialWin::new((1280, 828));
         w.set_friends(&mut gui, true, &soc, &tx, &["Default Window".into(), "Combat".into()]);
-        w.open_lft(&mut gui, &lft, &tx, false);
+        w.open_lft(&mut gui, &lft, &tx, false, false);
         let fw = w.friends.as_ref().unwrap().win;
         gui.set_window_pos(fw, (20, 200));
         w.open_tell(&mut gui, 5, "Bob");

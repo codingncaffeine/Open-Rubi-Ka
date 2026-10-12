@@ -126,20 +126,35 @@ impl HudMission {
     }
 
     /// The own quest list and the server clock.
-    pub(super) fn on_frame(&mut self, f: &Frame, own: i32) {
-        let Ok(m) = n3::decode(f) else { return };
+    pub(super) fn on_frame(&mut self, f: &Frame, own: i32) -> std::iter::RepeatN<(&'static str, &'static str)> {
+        let Ok(m) = n3::decode(f) else { return std::iter::repeat_n(("OnReceiveMission", ""), 0) };
+        self.on_message(&m, own)
+    }
+
+    fn on_message(&mut self, m: &n3::Message, own: i32) -> std::iter::RepeatN<(&'static str, &'static str)> {
         match &m.body {
-            N3::World(World::Quests(q)) if m.header.target.instance == own => {
-                if q.quests.len() == q.quest_count {
-                    self.quests = q.quests.clone();
-                    self.serial += 1;
-                } else {
-                    eprintln!("mission: QuestFullUpdate of {} quests could not be decoded", q.quest_count);
-                }
+            N3::World(World::Quests(q)) if m.header.target.kind == outgoing::DYNEL_CHAR && m.header.target.instance == own => self.on_quests(q),
+            N3::World(World::GameTime(t)) => {
+                self.sync = Some((i64::from(t.arg4), self.clock));
+                std::iter::repeat_n(("OnReceiveMission", ""), 0)
             }
-            N3::World(World::GameTime(t)) => self.sync = Some((i64::from(t.arg4), self.clock)),
-            _ => {}
+            _ => std::iter::repeat_n(("OnReceiveMission", ""), 0),
         }
+    }
+
+    /// GC100aca88 ->10056796 emits GlobalSignals+0x154 for each quest only
+    /// with the message's trailing flag and the main-character byte+0x140
+    /// (SetMainDynel10019f77). GUI100c69e2 forwards an empty tip payload.
+    fn on_quests(&mut self, q: &n3::world::QuestFullUpdate) -> std::iter::RepeatN<(&'static str, &'static str)> {
+        let count = if q.quests.len() == q.quest_count {
+            self.quests = q.quests.clone();
+            self.serial += 1;
+            if q.flag != 0 { q.quests.len() } else { 0 }
+        } else {
+            eprintln!("mission: QuestFullUpdate of {} quests could not be decoded", q.quest_count);
+            0
+        };
+        std::iter::repeat_n(("OnReceiveMission", ""), count)
     }
 
     /// `GameTime_t+0xb4`: the server's unix time now.
@@ -331,6 +346,27 @@ mod tests {
     fn quest(instance: i32, name: &str, flags: i32, deadline: i32) -> Quest {
         let action = quest::QuestAction { id: 1, identities: [Identity::default(); 8], floats: [0.0; 8], ints: [deadline, 0], pos: quest::WorldPos { playfield: Identity { kind: 0xC79C, instance: 4605 }, x: 1500, z: 2500, local: [0.0; 3] } };
         Quest { id: Identity { kind: quest::QUEST_KIND, instance }, name: name.into(), value_a4: flags, actions: vec![action], ..Default::default() }
+    }
+
+    #[test]
+    fn received_mission_native_flag_emits_one_empty_event_per_quest() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/text").exists() { return; }
+        let mut m = HudMission::new(&dir, (1024, 768)).unwrap();
+        let mut update = n3::world::QuestFullUpdate { quest_count: 2, quests: vec![quest(1, "First", 0, 0), quest(2, "Second", 0, 0)], flag: 0, rest: vec![] };
+        assert_eq!(m.on_quests(&update).count(), 0, "initial list has no new-mission flag");
+        update.flag = 1;
+        assert_eq!(m.on_quests(&update).collect::<Vec<_>>(), vec![("OnReceiveMission", ""), ("OnReceiveMission", "")]);
+        let mut message = n3::Message { header: n3::N3Header { msg_type: n3::world::QUEST_FULL_UPDATE, target: Identity { kind: outgoing::DYNEL_CHAR, instance: 7 }, flag: 0 }, sender: 0, body: N3::World(World::Quests(update.clone())) };
+        assert_eq!(m.on_message(&message, 7).collect::<Vec<_>>(), vec![("OnReceiveMission", ""), ("OnReceiveMission", "")]);
+        message.header.target.instance = 9;
+        assert_eq!(m.on_message(&message, 7).count(), 0, "other characters have no main-dynel signal");
+        message.header.target = Identity { kind: 0xC79C, instance: 7 };
+        assert_eq!(m.on_message(&message, 7).count(), 0, "matching instance is not enough without character kind");
+        update.quests.clear();
+        assert_eq!(m.on_quests(&update).count(), 0, "undecoded records must not produce a tip");
+        update.quest_count = 0;
+        assert_eq!(m.on_quests(&update).count(), 0, "empty flagged list emits no quest signal");
     }
 
     /// The window lists the quests with their remaining time and the popup sends / uploads what the original does.

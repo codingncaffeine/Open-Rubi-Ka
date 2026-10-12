@@ -157,3 +157,28 @@ Release handler `FUN_1002c469` (event 1 = left, 2 = right) [RE]:
 * Meaning of `controller+0x38` / the condition map keys `0x3d`/`0x3f` in the opening gate of `can_attack`.
 * Sub-code → text pairing of `FormatFeedback` category `0x23`; whether categories `0x26` / `0x31` have fixed texts beyond `Feedback_StartingAttackFailed`.
 * Movement mode 7 meaning (falling is inferred).
+
+## 7. Retained skill locks (vehicle skill 662)
+
+`Locks_t` is not a separate invented message: `FullCharacterIIR_t+0x28`
+(`FullCharacter.groups[0]`) carries it. Reader GC1003bb2d consumes a discarded
+record version, Identity, original duration and remaining duration; group reader
+GC1003bbad consumes version/count. Existing bounded 20-byte group parsing is reused.
+GC10073a2f appends this group to the skill controller's native 16-byte vector;
+GC1007434f performs that insertion. `Zone::skill_locked` mirrors GC10063be4:
+compare only Identity.instance (Stat_e), including zero-duration entries.
+
+GC10064495 decrements remaining duration and removes entries <=0 on each
+GameTime second pulse, called by SimpleChar Run GC1005b016. GC1000b214 emits
+one pulse per frame only when elapsed >1 second, resets its second origin to
+the current time, and does not catch up multiple seconds after a long frame.
+Own CharacterAction 0xaa (case0x3c, GC1005e350) calls GC10064a6e to insert only
+when absent; GC1006389c applies SkillLockModifier (382), minimum -50%, except
+skills 142,144,146–148,150–151,167,579,673. Action0x14 is the separate action
+recharge feed and is not treated as a skill lock.
+
+Unexecuted regressions: `native_skill_lock_snapshot_bytes_are_bounded` uses
+literal RE-derived skill662 bytes in the captured full-update envelope, checks
+truncation/oversized count; `native_skill_locks_membership_and_second_pulse`
+checks unknown versus known-empty state, strict pulse boundary, long-frame
+behavior and zero-duration membership. No server capture of skill662 claimed.

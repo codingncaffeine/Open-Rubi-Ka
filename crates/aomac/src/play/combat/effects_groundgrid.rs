@@ -107,7 +107,7 @@ mod tests {
         for id in [71222,71303,71370] {
             assert_ne!(renderer.templates.by_id[&id].words[0]&0x10000,0,"authored clamp flag {id}");
             renderer.spawn(Binding {group:0,attractor:0,effect:id,note:0,color:0},Creation::Vector,Mat4::IDENTITY,Vec3::ZERO).unwrap();
-            let model=&renderer.models[&id].scene;
+            let model=&renderer.models[&super::super::texture_model_key(id,renderer.store.other_texture_quality())].scene;
             assert!(model.meshes.iter().any(|m|!m.submeshes.is_empty()),"missing authored groundgrid material {id}");
             assert!(model.meshes.iter().flat_map(|m|&m.submeshes).all(|s|s.texture_clamp),"DS10016961 clamp state must reach actual resource materials {id}");
             renderer.clear();
@@ -116,7 +116,7 @@ mod tests {
     #[test]
     #[ignore = "retail assets and offscreen Metal rendering"]
     fn retail_groundgrid_frames() {
-        use super::super::{Binding,Creation,Renderer,MODEL_BASE};
+        use super::super::{Binding,Creation,Renderer};
         let dir=ao_gui::client_dir();
         let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).expect("AOMAC_EFFECT_FRAMES output directory");
         std::fs::create_dir_all(&out).unwrap();
@@ -129,12 +129,12 @@ mod tests {
             let mut grid=GroundGrid::new(&renderer.templates.by_id[&id],Mat4::IDENTITY,EffectConfig::default(),&mut rng).unwrap();
             // Explicit test terrain isolates the native grid from playfield loading.
             let mut terrain=|p:Vec3|Some((Vec3::new(p.x,p.x*0.01,p.z),Vec3::Y));
-            let models:Vec<_>=renderer.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();
+            let models:Vec<_>=renderer.models.iter().map(|(&id,m)| (id,m.scene.clone())).collect();
             let mut wrapped=models.clone();
             for (_,model) in &mut wrapped {for mesh in &mut model.meshes {for sub in &mut mesh.submeshes {sub.texture_clamp=false;}}}
             for time in [0.25,1.0,2.0] {
                 let skin=grid.vertices(time,&mut terrain).unwrap().unwrap().remove(0);
-                let actor=ao_scene::ActorFrame {id:1,model:MODEL_BASE|id as u32 as u64,skin:Some(skin),always:true,..Default::default()};
+                let actor=ao_scene::ActorFrame { id:1,model:super::super::texture_model_key(id,renderer.store.other_texture_quality()), skin: Some(std::sync::Arc::new(skin)), always:true,..Default::default() };
                 let path=out.join(format!("groundgrid_{id}_{time:.2}.png"));
                 ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,vec![actor.clone()],[30.0,40.0,30.0],[0.0,0.0,0.0],640,480,&path,time).unwrap();
                 if [71222,71303,71370].contains(&id) {

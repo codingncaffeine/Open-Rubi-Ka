@@ -18,6 +18,9 @@ use ao_net::n3::action;
 use ao_render::Host;
 
 
+// DS 1005fd60 registers BuffsFX/EnvironmentFX at EnvPrefs+8/+12; GC 100ce1fa
+// packs them as bits 1/16, but no native spawning caller selects either category.
+// Active nano buffs select category 4 (GC 100512af), not the unused BuffsFX bit.
 fn effect_categories(values: &crate::play::dvalue::DValues) -> (u32, u32) {
     use crate::play::dvalue::Kind;
     let enabled = |name| u32::from(values.prefs.get_int(name, Kind::Login).is_some_and(|value| value != 0));
@@ -38,6 +41,10 @@ fn effect_categories_read_independent_login_preferences() {
         values.prefs.set_int(name, 0, Kind::Login);
         assert_eq!(effect_categories(&values), expected);
         values.prefs.set_int(name, 1, Kind::Login);
+    }
+    for name in ["BuffsFX", "EnvironmentFX"] {
+        values.prefs.set_int(name, 0, Kind::Login);
+        assert_eq!(effect_categories(&values), (10, 36), "native active callers do not select the dormant category");
     }
 }
 #[cfg(test)]
@@ -119,6 +126,9 @@ impl Play {
         let acts = self.chat.as_mut().map(|c| c.take_game()).unwrap_or_default();
         for a in acts {
             match a {
+                GameAction::FlashHead(who) => {
+                    if let Err(error) = self.zone.world.flash_head(who) { eprintln!("chat head flash: {error:#}"); }
+                }
                 GameAction::Social(id) => {
                     if let Some(m) = self.fight.as_mut() {
                         m.social(id as i32, mode);

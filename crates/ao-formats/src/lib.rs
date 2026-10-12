@@ -17,3 +17,4 @@ pub mod stats;
 pub mod texture;
 pub mod topdown;
 pub mod weather;
+pub mod wildlife;

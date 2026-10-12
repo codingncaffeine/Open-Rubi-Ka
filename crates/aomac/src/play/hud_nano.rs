@@ -218,6 +218,12 @@ impl HudNano {
         self.db.info(gui, id).map(|info| (info.name.clone(), info.icon))
     }
 
+    pub(super) fn update_item_tooltip(&mut self, gui: &mut Gui, zone: &Zone, stats: &super::hud_stats::HudStats, descriptions: bool) {
+        if let Some(w) = &mut self.win {
+            w.w.view.update_item_tooltip(gui, w.w.win, lv::ICON_32, descriptions, |id| stats.tooltip_body(zone, ao_net::msg::Identity { kind: 0xcf1b, instance: id }));
+        }
+    }
+
     /// GlobalSignals +0x110: `FUN_100d4319` / `FUN_100d435b` select the uploaded program's page.
     pub(super) fn select_learned(&mut self, gui: &mut Gui, id: i32) {
         if self.win.is_none() {

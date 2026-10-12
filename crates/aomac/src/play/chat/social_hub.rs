@@ -3,7 +3,7 @@
 //! [`super::social_win`]. Evidence: docs/chat/social.md.
 
 use super::line::{ChatKind, ChatLine};
-use super::social::{self, InviteAction, SocialOut};
+use super::social::{self, SocialOut};
 use super::social_win::{Req, Texts};
 use super::Chat;
 use crate::play::zone::Zone;
@@ -11,10 +11,6 @@ use ao_formats::screens::TextDb;
 use ao_gui::{Event, Gui};
 use ao_net::chat::{ChatCmd, ChatEvent};
 
-/// `ChatPGInviteAction` (CharPrefs.xml default 1 = "Display invite dialog"; the option panel pref store is not ported).
-fn invite_pref() -> InviteAction {
-    InviteAction::from_pref(1)
-}
 /// Lines kept per tell partner while its window is closed (the window keeps 100 as well).
 const TELL_LOG: usize = 100;
 
@@ -24,7 +20,7 @@ impl Chat {
         let names = |id: u32| self.net.name_of(id).unwrap_or_default().to_owned();
         let text = |k: &str| texts.by_key(10001, k).unwrap_or_default();
         let ign = |id: u32| self.ignored.contains(&id);
-        let env = social::Env { own_id: self.own_id, connected: self.net.logged_in(), name_of: &names, text: &text, invite_pref: invite_pref(), ignored: &ign };
+        let env = social::Env { own_id: self.own_id, connected: self.net.logged_in(), name_of: &names, text: &text, invite_pref: self.invite_action, ignored: &ign };
         f(&mut self.social, &env)
     }
 
@@ -114,6 +110,10 @@ impl Chat {
         }
         let outs = self.with_social(texts, |s, env| s.tell_in(id, name, text, gm, env));
         self.apply_social(gui, outs, texts);
+        if id != self.own_id && (gm || !self.ignored.contains(&id)) {
+            // GUI 1008792e: no sender/text payload, never a sent-tell echo.
+            self.tip_events.push(("OnReceiveTellMessage", String::new()));
+        }
     }
 
     /// `OpenTellWindow(name, id)` 0x10085df8.
@@ -156,18 +156,18 @@ impl Chat {
     }
 
     /// The HUD's `friends_window` / `lft_window` dvalues (`SlotFriendWindowActivated`; the Team Search entry of the right menu).
-    pub fn sync_windows(&mut self, gui: &mut Gui, friends: bool, lft: bool, texts: &TextDb) {
+    pub fn sync_windows(&mut self, gui: &mut Gui, friends: bool, lft: bool, esc_lft: bool, blocked: bool, texts: &TextDb) {
         if self.win.is_none() {
             return;
         }
         let names = self.window_names();
         self.swin.set_friends(gui, friends, &self.social, &Texts(texts), &names);
         if lft && self.swin.lft_window().is_none() {
-            let blocked = false; // `N3Msg_IsInTeam && !IsTeamLeader`: no team state in the port yet (zonecmd `in_team: false`)
-            self.swin.open_lft(gui, &self.social.lft.clone(), &Texts(texts), blocked);
+            self.swin.open_lft(gui, &self.social.lft.clone(), &Texts(texts), blocked, esc_lft);
         } else if !lft && self.swin.lft_window().is_some() {
             self.swin.close_lft(gui, &Texts(texts));
         }
+        if let Some(win) = self.swin.lft_window() { gui.set_enabled(win, "Invite", !blocked); }
     }
 
     /// Dvalues of social windows closed by the user since the last call (the HUD button pops out).
@@ -342,9 +342,30 @@ mod tests {
         assert_eq!(c.social.nodes[&5].unread, 1);
         assert!(!c.swin.tell_is_open(5));
         assert_eq!(c.tell_log[&5].len(), 1);
+        assert_eq!(c.take_tip_events(), [("OnReceiveTellMessage", String::new())]);
+        c.social_tell_in(&mut gui, 1, "Me", "self echo", false, &db);
+        assert!(c.take_tip_events().is_empty());
         c.open_tell_window(&mut gui, 5, "Bob", &db);
         assert!(c.swin.tell_is_open(5) && c.social.nodes[&5].unread == 0 && c.social.nodes[&5].window_open);
         // the earlier line is replayed into the window
+        let mut values = crate::play::dvalue::DValues::new(&ao_gui::client_dir());
+        values.set_i64("IsTipEnabled", 1);
+        let mut tips = crate::play::hud_tips::Tips::new(&ao_gui::client_dir()).unwrap();
+        feed(&mut c, &mut gui, &db, vec![ChatEvent::Tell { from: 5, text: "again".into(), data: vec![0] }]);
+        for (event, data) in c.take_tip_events() {
+            tips.trigger(&mut gui, &mut values, (1280, 828), event, &data);
+        }
+        assert!(tips.window().is_some(), "native incoming tell reaches the authored tip registry");
+        let zone = crate::play::zone::Zone::new(1);
+        c.show_url(&mut gui, &zone, &db, "itemid://1000020/49573");
+        let events = c.take_tip_events();
+        let store = ao_rdb::RecordStore::open(&ao_gui::client_dir()).unwrap();
+        let record = store.get(ao_formats::dynel_visual::ITEM_TEMPLATE_TYPE, 49573).unwrap().unwrap();
+        let item = ao_formats::dynel_visual::parse_item_template(&record).unwrap();
+        assert_eq!(events, [("OnLookatItem", item.name)]);
+        for (event, data) in events {
+            tips.trigger(&mut gui, &mut values, (1280, 828), event, &data);
+        }
         let w = c.swin.tell_window_for_test(5).unwrap();
         assert!(gui.text(w, "text").contains("psst"));
     }

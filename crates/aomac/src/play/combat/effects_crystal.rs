@@ -121,7 +121,7 @@ mod tests {
     #[test]
     #[ignore="installed authored assets and offscreen GPU regression"]
     fn retail_crystal_authored_modes_frames()->Result<()> {
-        use super::super::{Binding,Renderer,MODEL_BASE};
+        use super::super::{Binding,Renderer};
         let out=std::env::var_os("AOMAC_EFFECT_FRAMES").context("AOMAC_EFFECT_FRAMES required")?;
         let out=std::path::PathBuf::from(out);std::fs::create_dir_all(&out)?;
         let mut renderer=Renderer::open(&ao_gui::client_dir())?;
@@ -144,7 +144,7 @@ mod tests {
             host.camera=ao_render::Camera::look_at(eye,origin);
             renderer.spawn(Binding {group:0,attractor:0,effect:id,note:0,color:0},super::super::Creation::Vector,Mat4::from_translation(origin),origin+Vec3::X)?;
             for frame in 1..=60 {host.actors.clear();let mut ground=|p:Vec3|Some((Vec3::new(p.x,10.0,p.z),Vec3::Y));renderer.frame(1.0/60.0,&mut host,Some(&mut ground));
-                if [1,6,15,30,45,60].contains(&frame) {let models:Vec<_>=renderer.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();
+                if [1,6,15,30,45,60].contains(&frame) {let models:Vec<_>=renderer.models.iter().map(|(&id,m)| (id,m.scene.clone())).collect();
                     ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("crystal3031_{id}_{frame}.png")),frame as f32/60.0)?;
                 }
             }

@@ -19,7 +19,7 @@ pub use names::NameTable;
 pub use npc::*;
 pub use player::*;
 pub use viewer_cache::{CachedCharacter, ClothEntry, MeshEntry, ViewerCache};
-pub use anim::{animation_blend, animation_fade_ms, animation_layer_mask, animation_layers, AnimLayer, CatAnim, Track};
+pub use anim::{animation_blend, animation_fade_ms, animation_layer_mask, animation_layers, AnimationCadence, AnimLayer, CatAnim, Track};
 pub use cat::{Attractor, Bone, CatMesh, ColSphere, Material, Part, SkinVertex, SubMesh};
 
 use crate::texture::load_texture;
@@ -820,7 +820,7 @@ mod tests {
     fn material_blend_follows_flags_and_alpha() {
         let mut m = CatMesh::parse(&mesh_record()).unwrap().materials.remove(0);
         let key = TextureKey { rdb_type: TEXTURE_TYPE, id: 1 };
-        let tex = |alphas: &[u8]| ao_scene::Texture { width: alphas.len() as u32, height: 1, rgba: alphas.iter().flat_map(|&a| [9, 9, 9, a]).collect() };
+        let tex = |alphas: &[u8]| ao_scene::Texture { source: Default::default(), width: alphas.len() as u32, height: 1, rgba: alphas.iter().flat_map(|&a| [9, 9, 9, a]).collect() };
         let sub = |m: &Material, t: &ao_scene::Texture| submesh_for(m, Some((key, t)), None);
         let blend = |m: &Material, t: &ao_scene::Texture| sub(m, t).blend;
         // flags & 8 (alpha is not transparency): the constructor's mode 5, the texture alpha is a glow mask, opaque
@@ -860,7 +860,7 @@ mod tests {
     fn explicit_alpha_mode_overrides_the_material_default() {
         let m = CatMesh::parse(&mesh_record()).unwrap().materials.remove(0); // flags & 8: default glow
         let key = TextureKey { rdb_type: TEXTURE_TYPE, id: 1 };
-        let t = ao_scene::Texture { width: 2, height: 1, rgba: vec![9, 9, 9, 0, 9, 9, 9, 255] };
+        let t = ao_scene::Texture { source: Default::default(), width: 2, height: 1, rgba: vec![9, 9, 9, 0, 9, 9, 9, 255] };
         let s = |mode| submesh_for(&m, Some((key, &t)), mode);
         assert!(s(None).glow_mask);
         assert_eq!(s(Some(4)).blend, Blend::Additive);

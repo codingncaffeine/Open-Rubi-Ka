@@ -224,6 +224,8 @@ Object Integrator
         // Tweak_Spaceship_RubiKa_Traffic_Transporters_Newland: 7 waypoints, 54 s loop
         let m = scene.movers.iter().find(|m| m.waypoints.len() == 7 && m.counter.rate == 120.0).expect("Newland transporter");
         assert!(scene.instances[m.instance].mesh < scene.meshes.len());
+        assert!(scene.spaceships.contains(&m.instance), "native GameShowSpaceship gates authored traffic");
+        assert_eq!(scene.spaceships, (0..scene.instances.len()).collect::<Vec<_>>(), "all authored distant scenery shares the native visibility gate");
         let s = MoverState::settled(m, 2648.69, 1.0);
         assert!((0..3).all(|k| (s.pos[k] - m.target(2648.69)[k]).abs() < 50.0), "{:?} {:?}", s.pos, m.target(2648.69));
     }

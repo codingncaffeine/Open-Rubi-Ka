@@ -47,6 +47,15 @@ impl Items {
         Self { store: RecordStore::open(dir).ok(), cache: HashMap::new(), shop_cache: HashMap::new() }
     }
 
+    /// Interfaces 1000a707: tower type or use-event criterion action 0x53.
+    pub fn is_tower_item(&self, low_id: i32) -> anyhow::Result<bool> {
+        let Some(store) = self.store.as_ref() else { return Ok(false) };
+        let Some(template) = item_template(store, u32::try_from(low_id)?)? else { return Ok(false) };
+        if template.stat(0x184).is_some_and(|value| value != 0 && value != 0x499602d2) { return Ok(true); }
+        let Some(record) = store.get(ao_formats::dynel_visual::ITEM_TEMPLATE_TYPE, low_id as u32)? else { return Ok(false) };
+        crate::play::chat::item_is_shield_disabler(&record)
+    }
+
     /// The record of an item (`None` without rdb or record). Icon textures are created once per item.
     pub fn info(&mut self, gui: &mut Gui, low_id: i32) -> Option<&Info> {
         if !self.cache.contains_key(&low_id) {

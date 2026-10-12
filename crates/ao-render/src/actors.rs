@@ -44,6 +44,7 @@ struct ActorGpu {
     seen: u64,
     /// Model key of the last submitted frame (a replaced model only invalidates its own actors' buffers).
     model: u64,
+    skin: Option<std::sync::Arc<Vec<ao_scene::Vertex>>>,
 }
 
 /// One visible (actor, model mesh) with its slot in the instance buffer.
@@ -120,14 +121,14 @@ impl Renderer {
     fn upload_actor_model(&mut self, key: u64, scene: &Scene, retain_textures: bool) {
         let old = if retain_textures { self.act.models.remove(&key) } else { None };
         let (mut views, mut view_of) = old.map_or_else(
-            || (vec![self.texture_view(&[255; 4], 1, 1)], HashMap::new()),
+            || (vec![self.texture_view(&[255; 4], 1, 1, ao_scene::TextureSource::Generated)], HashMap::new()),
             |model| (model.views, model.view_of),
         );
         for (k, t) in &scene.textures {
             if view_of.contains_key(k) { continue; }
             if t.width > 0 && t.height > 0 && t.rgba.len() == (t.width * t.height * 4) as usize {
                 view_of.insert(*k, views.len());
-                views.push(self.texture_view(&t.rgba, t.width, t.height));
+                views.push(self.texture_view(&t.rgba, t.width, t.height, t.source));
             }
         }
         let holo = [0x28022, 0x28023].map(|id| view_of.iter().find(|(key, _)| key.id == id).map(|(_, &view)| view));
@@ -212,6 +213,7 @@ impl Renderer {
         // actors of a replaced model rebuild their body buffer at the next pose
         for a in self.act.actors.values_mut().filter(|a| a.model == key) {
             a.vb = None;
+            a.skin = None;
         }
     }
 
@@ -234,10 +236,12 @@ impl Renderer {
         let tick = self.act.tick;
         for f in &mut frames {
             let Some(body) = self.act.models.get(&f.model).and_then(|m| m.meshes.first()).and_then(Option::as_ref) else { continue };
-            let a = self.act.actors.entry(f.id).or_insert(ActorGpu { vb: None, seen: tick, model: f.model });
+            let a = self.act.actors.entry(f.id).or_insert(ActorGpu { vb: None, seen: tick, model: f.model, skin: None });
             a.seen = tick;
+            if a.model != f.model { a.vb = None; a.skin = None; }
             a.model = f.model;
             if let Some(skin) = f.skin.take().filter(|s| s.len() == body.nverts) {
+                if a.skin.as_ref().is_some_and(|previous| std::sync::Arc::ptr_eq(previous, &skin)) { continue; }
                 let bytes = bytemuck::cast_slice(&vertex_bytes(&skin)).to_vec();
                 match &a.vb {
                     Some(vb) => self.queue.write_buffer(vb, 0, &bytes),
@@ -249,10 +253,17 @@ impl Renderer {
                         }));
                     }
                 }
+                a.skin = Some(skin);
             }
         }
         self.act.actors.retain(|_, a| a.seen == tick);
         self.act.frames = frames;
+    }
+
+    /// Previous rasterization's body visibility feeds native CAT animation refresh counters.
+    pub fn visible_actor_ids(&self, out: &mut std::collections::HashSet<u32>) {
+        out.clear();
+        out.extend(self.act.items.iter().filter(|item| item.mesh == 0).map(|item| item.actor));
     }
 
     /// Frustum-culls the submitted actors, fills the instance buffer; called by `render` before the pass.
@@ -448,7 +459,7 @@ mod tests {
         let mut renderer = Renderer::new(&instance, None).expect("resource regression requires GPU");
         let key = TextureKey { rdb_type: 1010004, id: 1 };
         let mut scene = Scene::default();
-        scene.textures.insert(key, ao_scene::Texture { width: 1, height: 1, rgba: vec![255; 4] });
+        scene.textures.insert(key, ao_scene::Texture { source: Default::default(), width: 1, height: 1, rgba: vec![255; 4] });
         scene.meshes.push(ao_scene::Mesh {
             vertices: vec![ao_scene::Vertex::default(); 3],
             submeshes: vec![ao_scene::Submesh::new(vec![0, 1, 2], Some(key))],
@@ -562,7 +573,7 @@ mod tests {
         for (id, model) in [(1, 7), (2, 8), (3, 7)] {
             layer.models.entry(model).or_insert_with(|| Model { meshes: vec![], mats: vec![], holo: None, views: vec![], view_of: HashMap::new(), topology: vec![], vertex_scratch: vec![] });
             layer.actors.insert(id, ActorGpu { vb: None, seen: 1, model });
-            layer.frames.push(ActorFrame { id, model, skin: Some(vec![ao_scene::Vertex::default()]), ..Default::default() });
+            layer.frames.push(ActorFrame { id, model, skin: Some(std::sync::Arc::new(vec![ao_scene::Vertex::default()])), ..Default::default() });
             layer.items.push(Item { actor: id, model, mesh: 0, bucket: 0, faded: false, rendering_effect: 0, priority: None });
         }
         for key in [7, 7, 99] {

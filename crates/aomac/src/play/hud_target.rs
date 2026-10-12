@@ -326,6 +326,8 @@ pub(super) struct HudTarget {
     pub(super) attack: bool,
     /// A Shift + click asked the info page of this character (`InfoViewModule_c::ShowURL("charid://50000/<id>")`), taken by the HUD.
     pub(super) info: Option<i32>,
+    /// Accepted SetTarget transitions, for native TipSystem callbacks100257b0.
+    tip_targets: Vec<Identity>,
 }
 
 fn esc(s: &str) -> String {
@@ -335,7 +337,7 @@ fn esc(s: &str) -> String {
 impl HudTarget {
     /// Creates the two health-bar windows (`CCFriendlyHealthBar` / `CCHostileHealthBar`) and fills the control-centre target docks.
     pub(super) fn new(gui: &mut Gui, cc: WindowId, size: (u32, u32)) -> anyhow::Result<Self> {
-        let mut t = HudTarget { cc, size, bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], in_attack_range: false, last: None, mouse: (-1.0, -1.0), pressed: None, world_down: None, targets_target: false, bars_enabled: [true; 2], tot: None, tot_down: false, attack: false, info: None };
+        let mut t = HudTarget { cc, size, bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], in_attack_range: false, last: None, mouse: (-1.0, -1.0), pressed: None, world_down: None, targets_target: false, bars_enabled: [true; 2], tot: None, tot_down: false, attack: false, info: None, tip_targets: vec![] };
         t.create_bars(gui)?;
         // `TargetHeader_c` 0x10073884 measures all four captions before clearing the initial text.
         let cap = ["Selection", "Nano Target", "Fighting Target", "Nano / Fighting", "Target"]
@@ -448,7 +450,11 @@ impl HudTarget {
                 self.last = Some(old);
             }
             zone.set_target(id);
+            if let Some(id) = id { self.tip_targets.push(id); }
         }
+    }
+    pub(super) fn drain_tip_targets(&mut self) -> impl Iterator<Item = Identity> + '_ {
+        self.tip_targets.drain(..)
     }
 
     /// `TargetingModule_t::SelectSelf` 0x100259b1: no target → select self; target is self → back to the previous target.
@@ -472,9 +478,10 @@ impl HudTarget {
     /// itself is selected, not the next one in the list, and the caller attacks it (`N3Msg_SwitchTarget` = `DefaultAttack(target,
     /// true)`, `flow.rs` via `Hud::take_click`). The right button and the double click (`N3Msg_DefaultActionOnDynel`) are
     /// `interact_play.rs`.
-    pub(super) fn world_click(&mut self, zone: &mut Zone, cam: &Camera, lens: &Lens, vp: (u32, u32), mouse: (f32, f32), mods: ao_gui::Modifiers) -> Option<WorldClick> {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn world_click(&mut self, zone: &mut Zone, player: Option<&super::player::Player>, cam: &Camera, lens: &Lens, vp: (u32, u32), mouse: (f32, f32), mods: ao_gui::Modifiers) -> Option<WorldClick> {
         let ray = pick_ray(cam, lens, (vp.0 as f32, vp.1 as f32), mouse);
-        let list = super::interact_use::pick_objects(&ray, zone);
+        let list = super::interact_use::pick_objects(&ray, zone, player);
         self.click_identities(zone, &list, mods)
     }
 
@@ -605,14 +612,20 @@ impl HudTarget {
     /// `CheckObjectUnderMouse`), appended to `list`, and the request to hide the OS cursor. The pointer is the game's own only over
     /// the world (not while the camera looks and not over a GUI window), where the OS cursor stays hidden.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn draw_cursor(&self, gui: &Gui, zone: &Zone, host: &mut ao_render::Host, list: &mut ao_gui::DrawList, vp: (u32, u32), mode: i64, dblclick: bool) {
+    pub(super) fn draw_cursor(&self, gui: &Gui, zone: &Zone, player: Option<&super::player::Player>, host: &mut ao_render::Host, list: &mut ao_gui::DrawList, vp: (u32, u32), mode: i64, dblclick: bool, help_mode: bool) {
         let (x, y) = self.mouse;
         host.hide_cursor = false;
         if x < 0.0 || y < 0.0 || host.look || gui.wants_mouse(x, y) {
             return;
         }
+        // `CheckObjectUnderMouse` 10019f00 and `FrameProcess` 1001ae14 suppress dynel/Shift cursor changes in static mode 0x39.
+        if help_mode {
+            super::hud_cursor::draw(|g| gui.gfx().size(g), mode, (x, y), Default::default(), list);
+            host.hide_cursor = true;
+            return;
+        }
         let ray = pick_ray(&host.camera, &host.lens.unwrap_or_default(), (vp.0 as f32, vp.1 as f32), (x, y));
-        let hits = super::interact_use::pick_objects(&ray, zone);
+        let hits = super::interact_use::pick_objects(&ray, zone, player);
         let target = zone.selected_target();
         let mouse = target.filter(|id| hits.contains(id)).or_else(|| hits.first().copied()).and_then(|id| {
             if id.kind != ao_net::n3::outgoing::DYNEL_CHAR {
@@ -1226,11 +1239,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn help_mode_keeps_standard_cursor_without_shift_details() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let gui = Gui::new(&dir, None).unwrap();
+        let target = HudTargetLite::default().0;
+        let mut host = ao_render::Host::headless();
+        host.mods.shift = true;
+        let mut list = ao_gui::DrawList::default();
+        target.draw_cursor(&gui, &Zone::default(), None, &mut host, &mut list, (1280, 800), 2, true, true);
+        assert!(host.hide_cursor);
+        assert_eq!(list.cmds.len(), 1);
+        assert!(matches!(list.cmds[0], ao_gui::DrawCmd::Gfx { id: ao_gui::GfxId(0x135), .. }));
+    }
+
     /// `HudTarget` without windows, for the state-machine tests.
     struct HudTargetLite(HudTarget);
     impl Default for HudTargetLite {
         fn default() -> Self {
-            HudTargetLite(HudTarget { cc: 0, size: (0, 0), bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], in_attack_range: false, last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, bars_enabled: [true; 2], tot: None, tot_down: false, attack: false, info: None })
+            HudTargetLite(HudTarget { cc: 0, size: (0, 0), bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], in_attack_range: false, last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, bars_enabled: [true; 2], tot: None, tot_down: false, attack: false, info: None, tip_targets: vec![] })
         }
     }
 }

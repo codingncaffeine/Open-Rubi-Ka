@@ -4,7 +4,7 @@
 //! `SpecialActions.xml`'s `item_position_map` (the default `IconPositionSystem` map type 5), view 167 x 167 (`_DAT_101bd710`), docked in the
 //! `RollupArea`. The items are the entries of the own special-action list ([`SpecialList`], docs/gui.md §10.5) showing their current action; a click
 //! (the release of a short press, as on the hotbar `FUN_10040a17`) is `N3Msg_PerformSpecialAction`, a press held for the mouse hold delay
-//! (0.3 s) drags the action (its `FUN_100410a0` / `FUN_1004173a`) and a drop on a hotbar slot puts it there (`FUN_100d8047`).
+//! (default 0.3 s, left button in new mouse mode / right in legacy mode) drags the action (`FUN_100410a0` / `FUN_1004173a`); dropping on a hotbar slot puts it there (`FUN_100d8047`).
 //! Hosted by [`ListWindow`] / [`Rollup::open_page`](super::hud_rollup::Rollup::open_page).
 //!
 //! UNRESOLVED / not ported: the saved `item_position_map` (free rearranging by drag inside the window; the icons stay in list order), the info
@@ -34,11 +34,14 @@ const HOLD_DELAY: f32 = 0.3;
 struct Press {
     key: i32,
     held: f32,
+    button: MouseButton,
+    delay: Option<f32>,
 }
 
 struct Drag {
     instance: u32,
     ghost: ao_gui::WindowId,
+    button: MouseButton,
 }
 
 pub(super) struct HudActionWin {
@@ -53,11 +56,13 @@ pub(super) struct HudActionWin {
     drag: Option<Drag>,
     mouse: (f32, f32),
     uses: Vec<SlotUse>,
+    pub(super) hold_delay: f32,
+    pub(super) new_mouse: bool,
 }
 
 impl HudActionWin {
     pub(super) fn new(dir: &Path, screen: (u32, u32)) -> Self {
-        Self { store: ao_rdb::RecordStore::open(dir).ok(), screen, win: None, cache: HashMap::new(), built: None, press: None, drag: None, mouse: (0.0, 0.0), uses: vec![] }
+        Self { store: ao_rdb::RecordStore::open(dir).ok(), screen, win: None, cache: HashMap::new(), built: None, press: None, drag: None, mouse: (0.0, 0.0), uses: vec![], hold_delay: HOLD_DELAY, new_mouse: true }
     }
 
     pub(super) fn handles(kind: WindowKind) -> bool {
@@ -112,10 +117,10 @@ impl HudActionWin {
         let mouse = self.mouse;
         if let Some(p) = &mut self.press {
             p.held += dt;
-            if p.held >= HOLD_DELAY {
-                let key = p.key;
+            if p.delay.is_some_and(|delay| p.held >= delay) {
+                let (key, button) = (p.key, p.button);
                 self.press = None;
-                self.begin_drag(gui, key as u32, mouse);
+                self.begin_drag(gui, key as u32, mouse, button);
             }
         }
         if self.win.is_none() {
@@ -151,14 +156,20 @@ impl HudActionWin {
         self.built = Some(sig);
     }
 
-    fn begin_drag(&mut self, gui: &mut Gui, instance: u32, (x, y): (f32, f32)) {
+    pub(super) fn update_item_tooltip(&mut self, gui: &mut Gui, zone: &super::zone::Zone, stats: &super::hud_stats::HudStats, descriptions: bool) {
+        if let Some(w) = &mut self.win {
+            w.view.update_item_tooltip(gui, w.win, lv::ICON_32, descriptions, |id| stats.tooltip_body(zone, ao_net::msg::Identity { kind: 0xdeb0, instance: id }));
+        }
+    }
+
+    fn begin_drag(&mut self, gui: &mut Gui, instance: u32, (x, y): (f32, f32), button: MouseButton) {
         let icon = self.cache.get(&instance).and_then(|s| s.icon);
         let src = "<root><CanvasView name=\"icon\" min_size=\"Point(31,31)\" max_size=\"Point(31,31)\"/></root>";
         let Ok(ghost) = gui.open_window_xml("ActionDrag", src, (x as i32 - 16, y as i32 - 16), WindowSize::Preferred) else { return };
         if let Some((g, w, h)) = icon {
             gui.set_canvas(ghost, "icon", vec![CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [0.0, 0.0, lv::ICON_32, lv::ICON_32], alpha: 1.0 }]);
         }
-        self.drag = Some(Drag { instance, ghost });
+        self.drag = Some(Drag { instance, ghost, button });
     }
 
     /// The action icon under a screen point, inside the window.
@@ -175,9 +186,10 @@ impl HudActionWin {
     /// Press / hold / release of the grid; a drop on a hotbar slot goes to `bars`.
     pub(super) fn input(&mut self, gui: &mut Gui, ev: &InputEvent, list: &SpecialList, mods: ao_gui::Modifiers, bars: &mut [ShortcutBar]) {
         match *ev {
-            InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
+            InputEvent::MouseDown { x, y, button: button @ (MouseButton::Left | MouseButton::Right) } => {
                 self.mouse = (x, y);
-                self.press = self.row_at(gui, x, y).map(|key| Press { key, held: 0.0 });
+                let drag_button = if self.new_mouse { MouseButton::Left } else { MouseButton::Right };
+                self.press = self.row_at(gui, x, y).map(|key| Press { key, held: 0.0, button, delay: (button == drag_button).then_some(self.hold_delay) });
             }
             InputEvent::MouseMove { x, y } => {
                 self.mouse = (x, y);
@@ -185,7 +197,8 @@ impl HudActionWin {
                     gui.set_window_pos(d.ghost, (x as i32 - 16, y as i32 - 16));
                 }
             }
-            InputEvent::MouseUp { x, y, button: MouseButton::Left } => {
+            InputEvent::MouseUp { x, y, button: button @ (MouseButton::Left | MouseButton::Right) } => {
+                if self.drag.as_ref().is_some_and(|d| d.button != button) || self.press.as_ref().is_some_and(|p| p.button != button) { return; }
                 if let Some(d) = self.drag.take() {
                     gui.close_window(d.ghost);
                     for b in bars.iter_mut() {
@@ -194,7 +207,7 @@ impl HudActionWin {
                         }
                     }
                 } else if let Some(p) = self.press.take() {
-                    if self.row_at(gui, x, y) == Some(p.key) && !(mods.shift || mods.ctrl) {
+                    if button == MouseButton::Left && self.row_at(gui, x, y) == Some(p.key) && !(mods.shift || mods.ctrl) {
                         // `N3Msg_PerformSpecialAction(identity)`: not listed = `Feedback_ActionIsNotAvailable`, else the action the entry shows
                         self.uses.push(list.find(p.key as u32).map_or(SlotUse::Unavailable, |e| SlotUse::SpecialAction(e.shown)));
                     }

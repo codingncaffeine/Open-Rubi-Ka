@@ -105,6 +105,8 @@ pub struct Record {
     pub tilemap: u32,
     /// Native `RDBPlayfield_t +0x50` flags (version >8); constructor zero for older records.
     pub flags: u32,
+    /// Native +0x58 word; its high byte (+0x5b) bit 0 forbids vehicles.
+    pub vehicle_flags: u32,
     /// Zone edge length in tiles.
     pub zone_size: u32,
     /// Number of zones (outdoor) or rooms (dungeon) = number of offsets in the statel file.
@@ -120,6 +122,10 @@ impl Record {
     pub fn is_outdoor(&self) -> bool {
         self.tilemap == self.id
     }
+
+    pub fn vehicles_allowed(&self) -> bool {
+        self.vehicle_flags & 0x0100_0000 == 0 && self.flags & 2 == 0
+    }
 }
 
 pub fn parse(d: &[u8]) -> Result<Record> {
@@ -131,11 +137,13 @@ pub fn parse(d: &[u8]) -> Result<Record> {
     let zone_size = r.u32()?;
     let count = r.u32()?;
     ensure!(version >= 7, "playfield {id}: unsupported data format version {version}");
-    let flags = if version > 8 {
+    let (flags, vehicle_flags) = if version > 8 {
         let flags = r.u32()?;
-        r.skip(4 * 4 + 0x18)?;
-        flags
-    } else { 0 };
+        r.skip(4)?; // native +0x54
+        let vehicle_flags = r.u32()?; // native +0x58
+        r.skip(2 * 4 + 0x18)?;
+        (flags, vehicle_flags)
+    } else { (0, 0) };
     let mut rooms = Vec::new();
     let mut attractors = Vec::new();
     if tilemap != id {
@@ -149,7 +157,7 @@ pub fn parse(d: &[u8]) -> Result<Record> {
             attractors.push(camera_attractors(&mut r, version)?);
         }
     }
-    Ok(Record { version, id, name, tilemap, flags, zone_size, count, rooms, attractors, tail: r.o })
+    Ok(Record { version, id, name, tilemap, flags, vehicle_flags, zone_size, count, rooms, attractors, tail: r.o })
 }
 
 /// `u32 n` (client limit: `n < 1000`), n x { pos, quat, target (version >= 6, else = pos), range }; version <= 4 has none.
@@ -246,6 +254,19 @@ mod tests {
         assert_eq!((record.id, record.tilemap, record.flags), (5000, 153, 0x1234_5678));
         assert_eq!(record.tail, data.len());
         assert_eq!(parse(&header(8, 566, 566, 0)).unwrap().flags, 0);
+    }
+
+    #[test]
+    fn native_vehicle_resource_and_shadowland_refusals() {
+        for (flags, vehicle_flags, allowed) in [(0, 0, true), (2, 0, false), (0, 0x0100_0000, false), (0, 1, true)] {
+            let mut data = header(9, 566, 566, 0);
+            for word in [flags, 0, vehicle_flags, 0, 0] { data.extend(u32::to_le_bytes(word)); }
+            data.extend([0; 0x18]);
+            let record = parse(&data).unwrap();
+            assert_eq!(record.vehicle_flags, vehicle_flags);
+            assert_eq!(record.vehicles_allowed(), allowed);
+        }
+        assert!(parse(&header(8, 566, 566, 0)).unwrap().vehicles_allowed());
     }
 
 

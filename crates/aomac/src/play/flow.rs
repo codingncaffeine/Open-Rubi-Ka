@@ -298,7 +298,17 @@ impl Play {
         e.status & 1 != 0
     }
 
+    fn apply_login_audio_prefs(&self) {
+        if let Some(audio) = &self.audio {
+            let root = super::prefs::dir();
+            let account = self.prefs.accounts.get(self.prefs.selected_account).map(String::as_str);
+            audio.set_prefs(&super::options::login_audio_prefs(&self.dir, root.as_deref(), account));
+        }
+    }
+
     pub(super) fn show_characters(&mut self, list: CharacterList, host: &mut Host) {
+        // Account preferences are available before character creation starts playing sounds.
+        self.apply_login_audio_prefs();
         self.char_list = list.clone();
         self.hide_login();
         for w in [self.progress_w.take(), self.char_w.take()].into_iter().flatten() {
@@ -546,6 +556,7 @@ impl Play {
     /// The hand-off (`LoginEvent::ZoneHandoff`): loading screen plus `CharacterLoggedInMessage` -> `PlayStartupMusic`.
     pub(super) fn start_loading(&mut self, host: &mut Host) {
         self.show_loading(host);
+        self.apply_login_audio_prefs();
         if let Some(a) = &self.audio {
             a.play_startup_music(); // CharacterLoggedInMessage -> PlayStartupMusic (timing here: at the hand-off)
         }
@@ -573,6 +584,9 @@ impl Play {
         self.world_frames = 0;
         self.world_scene = None;
         self.world_ground = None;
+        self.ground_texture_patches.clear();
+        self.ground_texture_serial = self.ground_texture_serial.wrapping_add(1);
+        host.ground_textures = None;
         self.fade = Fade::Hold;
     }
 
@@ -661,14 +675,32 @@ impl Play {
     fn start_world_load(&mut self, id: u32) {
         self.world_sky = None;
         self.world_weather = None;
+        self.world_life = None;
+        self.life_dangers.clear();
         let (dir, tx, want_audio) = (self.dir.clone(), self.tx.clone(), self.audio.is_some());
+        let (texture_quality, ground_texture_quality) = (self.texture_quality, self.ground_texture_quality);
         // the zone clock and game day (`GameTimeIIR_t`) when the burst reached the playfield message; later `GameTime`s resync the live sky
         let (day_time, day) = (self.zone.day_time(), self.zone.game_day as u32);
         std::thread::spawn(move || {
             let mut r = RecordStore::open(&dir).and_then(|store| {
+                store.set_other_texture_quality(texture_quality);
+                store.set_ground_texture_quality(ground_texture_quality);
                 let (scene, report) = ao_formats::playfield::load_playfield_report_on_day(&store, &dir, id, day_time, day)?;
                 let weather = ao_formats::playfield::open_weather(&store, id)?;
                 let _ = tx.send(Bg::Weather(id, Box::new(weather)));
+                let life = (|| -> anyhow::Result<_> {
+                    let mut world = native_life_spawn::LifeWorld::load(&store, id)?;
+                    let mut models = native_life_render::LifeModels::default();
+                    for index in 0..world.catalog.len() {
+                        if !world.catalog_used(index) { continue; }
+                        let mesh = world.catalog[index].mesh;
+                        models.load(&store, mesh)?;
+                        world.set_mesh_height(mesh, models.height(mesh).unwrap());
+                        world.set_mesh_animation(mesh, models.boundaries(mesh), models.total_time(mesh).unwrap());
+                    }
+                    Ok((world, models))
+                })().map_err(|error| format!("{error:#}"));
+                let _ = tx.send(Bg::Life(id, life));
                 // `PlayfieldInit` [GC 0x10016e2c] -> `SandyInterfaceModule_t::ActivateGameZone`: district music, ambience and statel emitters
                 let audio = want_audio.then(|| ao_audio::PlayfieldAudio::load(&store, id, &report.sounds).map_err(|e| eprintln!("playfield audio {id}: {e:#}")).ok()).flatten();
                 Ok((scene, report, audio))
@@ -681,10 +713,29 @@ impl Play {
             }
             let r = r.map(|(scene, ..)| Box::new(scene)).map_err(|e| format!("{e:#}"));
             match ao_formats::playfield::SkyClock::open(&dir, id) {
-                Ok(c) => drop(tx.send(Bg::Sky(id, c))),
+                Ok(mut clock) => {
+                    if let Some(clock) = &mut clock { clock.set_texture_quality(texture_quality); }
+                    drop(tx.send(Bg::Sky(id, clock)));
+                }
                 Err(e) => eprintln!("live sky of playfield {id}: {e:#}"),
             }
-            let _ = tx.send(Bg::World(id, r));
+            let _ = tx.send(Bg::World(id, ground_texture_quality, r));
+        });
+    }
+
+    fn refresh_ground_quality(&mut self) {
+        if self.screen != Screen::InWorld || self.ground_texture_patches.is_empty() || self.ground_texture_installed_quality == self.ground_texture_quality { return }
+        let Some(id) = self.zone.playfield else { return };
+        self.ground_texture_installed_quality = self.ground_texture_quality;
+        self.ground_texture_serial = self.ground_texture_serial.wrapping_add(1);
+        let (serial, quality) = (self.ground_texture_serial, self.ground_texture_quality);
+        let (dir, tx, patches) = (self.dir.clone(), self.tx.clone(), self.ground_texture_patches.clone());
+        std::thread::spawn(move || {
+            let result = super::open_texture_store(&dir).and_then(|store| {
+                store.set_ground_texture_quality(quality);
+                ao_formats::playfield::refresh_ground_textures(&store, id, &patches)
+            }).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Bg::GroundTextures(serial, result));
         });
     }
 
@@ -720,6 +771,16 @@ impl Play {
                 Bg::Sky(..) => {}
                 Bg::Weather(id, w) if Some(id) == self.zone.playfield => self.world_weather = Some(*w),
                 Bg::Weather(..) => {}
+                Bg::Life(id, result) if Some(id) == self.zone.playfield => {
+                    match result {
+                        Ok((mut life, models)) => {
+                            life.set_enabled(self.wildlife_enabled);
+                            self.world_life = Some((life, models));
+                        }
+                        Err(error) => eprintln!("wildlife {id}: {error}"),
+                    }
+                }
+                Bg::Life(..) => {}
                 Bg::Ground(id, g) if Some(id) == self.zone.playfield => self.world_ground = g.map(|g| (id, g)),
                 Bg::Ground(..) => {}
                 Bg::Info(id, dungeon, audio) if Some(id) == self.zone.playfield => {
@@ -728,16 +789,22 @@ impl Play {
                 }
                 Bg::Info(..) => {}
                 // a load that the server has since replaced by another playfield is dropped
-                Bg::World(id, _) if Some(id) != self.zone.playfield => {}
-                Bg::World(id, Ok(scene)) => {
+                Bg::World(id, _, _) if Some(id) != self.zone.playfield => {}
+                Bg::World(id, quality, Ok(scene)) => {
                     eprintln!("playfield {id} loaded");
+                    self.ground_texture_installed_quality = quality;
                     self.world_scene = Some(scene);
                     self.world_ready = true;
                 }
-                Bg::World(id, Err(e)) => {
+                Bg::World(id, _, Err(e)) => {
                     self.show_login(host);
                     self.message_box(&format!("Zone connected, but playfield {id} failed to load: {e}"));
                 }
+                Bg::GroundTextures(serial, result) if serial == self.ground_texture_serial && self.screen == Screen::InWorld => match result {
+                    Ok(textures) => host.ground_textures = Some(textures),
+                    Err(e) => eprintln!("ground texture quality refresh: {e}"),
+                },
+                Bg::GroundTextures(..) => {}
             }
         }
         while let Some(ev) = self.fake_events.pop_front().or_else(|| self.session.as_ref().and_then(|s| s.poll())) {
@@ -796,16 +863,24 @@ impl Play {
                     self.interact_zone_frame(&f);
                     if hud::Hud::wants_zone_frame(&f) {
                         match self.hud.as_mut() {
-                            Some(h) => h.on_zone_frame(&f, self.zone.char_id as i32),
+                            Some(h) => h.on_zone_frame(&mut self.gui, &f, self.zone.char_id as i32, |id| self.chat.as_ref().is_some_and(|chat| chat.is_ignored(id))),
                             None => self.hud_pending.push(f.clone()),
                         }
                     }
                     // Stat feedback needs the old values; InfoPacket pages need the applied values.
                     if let Some(c) = self.chat.as_mut() {
+                        if let Some(hud) = self.hud.as_ref() { c.configure_escape(&hud.dvalues); }
                         c.on_zone_frame(&mut self.gui, &f, &self.zone, &self.text);
                     }
                     let nano_serial = self.zone.nanos.serial;
+                    let own_events_before = self.zone.own_events.len();
                     let zone_event = self.zone.on_frame(&f);
+                    // GUI 0x10027d47: only the own, successfully decoded resurrection message.
+                    if self.zone.own_events.get(own_events_before..).is_some_and(|events| events.iter().any(|event| matches!(event, zone::OwnEvent::Resurrected))) {
+                        if let Some(hud) = self.hud.as_mut() {
+                            hud.trigger_tip(&mut self.gui, "OnResurrect", "");
+                        }
+                    }
                     if self.zone.nanos.serial != nano_serial {
                         if let Some(hud) = self.hud.as_mut() {
                             if let Some(health) = hud.nano_stats_changed(&mut self.zone) {
@@ -976,6 +1051,16 @@ impl Frontend for Play {
     }
 
     fn input(&mut self, ev: InputEvent, host: &mut Host) {
+        if let Some(hud) = self.hud.as_ref() {
+            if let Some(chat) = self.chat.as_mut() { chat.configure_escape(&hud.dvalues); }
+            if let Some(interact) = self.interact.as_mut() { interact.configure_escape(&hud.dvalues); }
+        }
+        if self.screen == Screen::InWorld && matches!(ev, InputEvent::Key { .. } | InputEvent::Text(_) | InputEvent::MouseDown { .. } | InputEvent::MouseUp { .. } | InputEvent::MouseMove { .. } | InputEvent::Wheel { .. }) {
+            if let Some(c) = self.chat.as_mut() {
+                let sneak = self.player.as_ref().is_some_and(|p| p.mode() == 6);
+                c.afk_activity(&mut self.gui, &self.zone, &self.text, sneak);
+            }
+        }
         let open = self.game_input_open();
         if let (Screen::InWorld, Some(p)) = (self.screen, self.player.as_mut()) {
             if let InputEvent::MouseDown { x, y, .. } | InputEvent::MouseUp { x, y, .. } | InputEvent::Wheel { x, y, .. } = ev {
@@ -1022,7 +1107,7 @@ impl Frontend for Play {
             return;
         }
         if let Some(h) = self.hud.as_mut() {
-            h.input(&mut self.gui, &mut self.zone, &ev, &host.camera, &host.lens.unwrap_or_default(), host.mods);
+            h.input(&mut self.gui, &mut self.zone, self.player.as_ref(), &ev, &host.camera, &host.lens.unwrap_or_default(), host.mods);
             // CTRL / ALT + left click on a character: select (done) and `N3Msg_SwitchTarget` (`FUN_1002c469`)
             let clicked = h.take_click();
             if let (Some(id), Some(p)) = (clicked, self.player.as_ref()) {
@@ -1056,6 +1141,11 @@ impl Frontend for Play {
 
     fn game_input(&mut self, ev: ao_render::GameInput, host: &mut Host) {
         let open = self.game_input_open();
+        if open && self.screen == Screen::InWorld {
+            if let Some(chat) = self.chat.as_mut() {
+                chat.afk_activity(&mut self.gui, &self.zone, &self.text, self.player.as_ref().is_some_and(|p| p.mode() == 6));
+            }
+        }
         // the window / hotbar hot keys and the options window's key capture read the physical key (any key can be bound, `options/keys.rs`)
         if let (Screen::InWorld, ao_render::GameInput::Key { code, pressed: true, repeat }, Some(h)) = (self.screen, ev, self.hud.as_mut()) {
             if let Some(key) = super::controls::key_id(code) {
@@ -1074,12 +1164,41 @@ impl Frontend for Play {
         }
         if let (Screen::InWorld, Some(p)) = (self.screen, self.player.as_mut()) {
             if open || matches!(ev, ao_render::GameInput::Key { pressed: false, .. } | ao_render::GameInput::FocusLost) {
+                let first_person = p.camera_mode() == 0;
                 p.game_input(ev);
+                // GUI 0x10027c9f: ToggleCameraView, not next/previous camera vehicle slots.
+                if first_person != (p.camera_mode() == 0) {
+                    if let Some(hud) = self.hud.as_mut() {
+                        hud.trigger_tip(&mut self.gui, "OnChangeCameraMode", "");
+                    }
+                }
             }
         }
     }
 
     fn frame(&mut self, dt: f32, size: (u32, u32), host: &mut Host) -> DrawList {
+        if let Some(hud) = self.hud.as_ref() {
+            self.texture_quality = hud.dvalues.get_i64("DisplayOtherTextureQuality").unwrap_or(3) as i32;
+            self.texture_compressed = hud.dvalues.flag("DisplayCompressedTextures");
+            self.ground_texture_quality = hud.dvalues.get_i64("GroundTextureQuality").unwrap_or(2) as i32;
+            self.wildlife_enabled = hud.dvalues.flag("Wildlife");
+        }
+        if let Some((life, models)) = &mut self.world_life {
+            life.set_enabled(self.wildlife_enabled);
+            if !self.wildlife_enabled { models.clear(); }
+        }
+        self.refresh_ground_quality();
+        // Ground invalidates current materials; ordinary callbacks affect resource uploads.
+        // Colour depth remains startup-only.
+        host.texture_policy = Some((self.texture_resolution, self.texture_compressed));
+        self.zone.world.set_texture_quality(self.texture_quality);
+        if let Some(player) = self.player.as_ref() {
+            player.set_texture_quality(self.texture_quality);
+        }
+        if let Some(hud) = self.hud.as_ref() {
+            if let Some(chat) = self.chat.as_mut() { chat.configure_escape(&hud.dvalues); }
+            if let Some(interact) = self.interact.as_mut() { interact.configure_escape(&hud.dvalues); }
+        }
         self.time += dt;
         if size != self.size {
             let first = self.size == (0, 0);
@@ -1136,6 +1255,9 @@ impl Frontend for Play {
                         _ => ao_render::default_view(&s),
                     };
                     self.zone.world.lens = s.lens.unwrap_or_default();
+                    self.ground_texture_serial = self.ground_texture_serial.wrapping_add(1);
+                    self.ground_texture_patches = s.ground_detail.iter().map(|patch| (patch.mesh, patch.origin, patch.cells)).collect();
+                    host.ground_textures = None;
                     host.set_scene(*s);
                     // the live sky follows the server's `GameTime` from here on (1 `GameDayTime` second per real second)
                     let sky = self.world_sky.take().map(|c| c.on_day(self.zone.game_day as u32));
@@ -1156,22 +1278,27 @@ impl Frontend for Play {
                             Ok(h) => self.hud = Some(h),
                             Err(e) => eprintln!("hud: {e:#}"),
                         }
-                        if let Some(h) = self.hud.as_mut() {
-                            for f in std::mem::take(&mut self.hud_pending) {
-                                h.on_zone_frame(&f, self.zone.char_id as i32);
-                            }
-                        }
                         // `LoadUserConfig` (GUI 0x1006bacd): the account's / character's prefs files over the template defaults
                         if let (Some(h), Some(d), Some(a)) = (self.hud.as_mut(), super::prefs::dir(), self.prefs.accounts.get(self.prefs.selected_account)) {
                             h.dvalues.open_user(&d, a, self.zone.char_id);
                             h.prefs_loaded(&mut self.gui);
                         }
+                        if let Some(h) = self.hud.as_mut() {
+                            for f in std::mem::take(&mut self.hud_pending) {
+                                h.on_zone_frame(&mut self.gui, &f, self.zone.char_id as i32, |id| self.chat.as_ref().is_some_and(|chat| chat.is_ignored(id)));
+                            }
+                        }
+                    }
+                    // GUI 0x10027d26 passes GetPFName, including named dungeon playfields.
+                    if let (Some(hud), Some(name)) = (self.hud.as_mut(), self.zone.playfield.and_then(|id| self.pf_names.get(&id))) {
+                        hud.trigger_tip(&mut self.gui, "OnEnteringPlayfield", name);
                     }
                     if let (Some(h), Some((id, g))) = (self.hud.as_mut(), self.world_ground.take()) {
                         h.provide_ground(id, g.0, g.1);
                     }
                     // after the HUD: the chat windows draw above its bar windows (as in the original, whose bar windows are backmost)
                     if let (Some(c), false) = (self.chat.as_mut(), teleported) {
+                        if let Some(hud) = self.hud.as_ref() { c.configure_escape(&hud.dvalues); }
                         let char_dir = self.hud.as_ref().and_then(|h| h.dvalues.char_dir());
                         if let Err(e) = c.open(&mut self.gui, self.size, char_dir) {
                             eprintln!("chat: {e:#}");
@@ -1235,9 +1362,25 @@ impl Frontend for Play {
                     p.set_fade(super::avatar::Fade::from_prefs(&h.dvalues.prefs));
                 }
                 self.zone.world.char_view_distance = h.dvalues.char_view_distance();
-                self.zone.world.show_all_names = h.dvalues.flag("ShowAllNames");
+                self.zone.world.set_name_prefs(&h.dvalues);
+                self.zone.triangle_targeting = h.dvalues.get_i64("BoundingBoxTargeting").unwrap_or(1) == 0;
+                host.spaceships_shown = h.dvalues.prefs.get_int("IsSpaceShipsShown", super::dvalue::Kind::Char).unwrap_or(1) != 0;
+                host.smooth_animations = h.dvalues.prefs.get_int("SmoothAnimations", super::dvalue::Kind::Login).unwrap_or(1) != 0;
+                host.realistic_water = h.dvalues.prefs.get_int("RealisticWater", super::dvalue::Kind::Login).unwrap_or(1) != 0;
+                host.cloud_preferences = Some((
+                    h.dvalues.prefs.get_int("RealisticClouds", super::dvalue::Kind::Login).unwrap_or(1) != 0,
+                    h.dvalues.prefs.get_int("SimpleClouds", super::dvalue::Kind::Login).unwrap_or(1) != 0,
+                ));
+                self.zone.world.set_shadows(h.dvalues.prefs.get_int("Shadows", super::dvalue::Kind::Login).unwrap_or(1) != 0);
                 // Actual preference changes invoke native SetFogMode, not per-frame resets.
                 host.set_native_fog_preference(h.dvalues.prefs.get_int("FogMode", super::dvalue::Kind::Login).unwrap_or(3));
+                host.wait_for_vert_sync = Some(h.dvalues.prefs.get_int("WaitForVertSync", super::dvalue::Kind::Char).unwrap_or(0) != 0);
+                host.mouse_lag_fix = h.dvalues.prefs.get_int("MouseLagFix", super::dvalue::Kind::Char).unwrap_or(0) != 0;
+                host.ground_detail = Some((
+                    h.dvalues.get_i64("DisplayGroundQuality").unwrap_or(200).clamp(100, 200) as i32,
+                    h.dvalues.get_i64("DisplayGroundFullQualityRadius").unwrap_or(44).clamp(7, 44) as i32,
+                ));
+                host.ground_rendering = h.dvalues.prefs.get_int("GroundRendering", super::dvalue::Kind::Login).unwrap_or(3).clamp(0, 3);
             }
             if let Some(p) = self.player.as_mut() {
                 for f in p.frame(dt, host, &mut self.zone, self.gui.text_focused()) {
@@ -1299,6 +1442,22 @@ impl Frontend for Play {
             self.zone.world.update_with_collision(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host, query, |id| {
                 player?.effect_anchor(id).map(|matrix| glam::Mat4::from_cols_array_2d(&matrix))
             });
+            if let (Some(control), Some(surface), Some((life, models))) = (
+                self.zone.own().map(|own| glam::Vec3::from_array(own.pos)),
+                self.player.as_ref().and_then(|player| player.effect_surface()),
+                self.world_life.as_mut(),
+            ) {
+                self.zone.world.life_sensors(control, &mut self.life_characters, &mut self.life_dead);
+                life.tick(dt, control, &surface.borrow(), &self.life_characters, &self.life_dangers, &self.life_dead, glam::Vec3::from_array(host.effect_wind));
+                self.life_dangers.clear(); // GC100b85a3, after the complete Life::Run pass
+                models.retain(&life.ids);
+                for (&id, species) in life.ids.iter().zip(&life.species) {
+                    let mesh = life.catalog[species.catalog_index].mesh;
+                    models.update(id, mesh, species.pos, species.rotation, species.animation_time, species.visible);
+                }
+                models.upload(host);
+                host.actors.extend(models.frames().cloned());
+            }
             match self.zone.world.effect_camera_offset(host.camera.pos) {
                 Ok(offset) => super::camera::apply_ground_shake(&mut host.camera, offset),
                 Err(error) => eprintln!("effect camera: {error:#}"),
@@ -1354,6 +1513,11 @@ impl Frontend for Play {
         if let Some(c) = self.chat.as_mut() {
             c.resize(&mut self.gui, size);
             c.update(&mut self.gui, dt, &self.text);
+            if let Some(hud) = self.hud.as_mut() {
+                for (event, data) in c.take_tip_events() {
+                    hud.trigger_tip(&mut self.gui, event, &data);
+                }
+            }
             if let Some(s) = &self.session {
                 for f in c.take_outbox() {
                     s.send_zone(f);
@@ -1381,6 +1545,13 @@ impl Frontend for Play {
                         WindowOp::Close => h.close_kind(&mut self.gui, k),
                         WindowOp::Toggle => h.toggle(&mut self.gui, k),
                     }
+                } else if h.dvalues.exists(dv) {
+                    let value = match op {
+                        WindowOp::Open => true,
+                        WindowOp::Close => false,
+                        WindowOp::Toggle => !h.dvalues.flag(dv),
+                    };
+                    h.dvalues.set(dv, super::dvalue::Variant::Bool(value));
                 }
             }
         }
@@ -1409,8 +1580,11 @@ impl Frontend for Play {
                 hear_team: d.flag("VoiceSndFxHearTeamOn"),
             });
         }
-        if let (Some(c), Some(h)) = (self.chat.as_mut(), self.hud.as_ref()) {
-            c.set_window_prefs(&mut self.gui, &super::chat::win::WinPrefs::from_dvalues(&h.dvalues));
+        if let (Some(c), Some(h)) = (self.chat.as_mut(), self.hud.as_mut()) {
+            c.set_prefs(&mut self.gui, &mut h.dvalues);
+            if self.screen == Screen::InWorld {
+                c.afk_frame(&mut self.gui, dt, &self.zone, &self.text, self.player.as_ref().is_some_and(|p| p.mode() == 6));
+            }
         }
         if let Some(rq) = self.chat.as_mut().map(|c| c.take_requests()) {
             if let (Some(w), Some(h)) = (rq.waypoint, self.hud.as_mut()) {
@@ -1421,7 +1595,7 @@ impl Frontend for Play {
             }
             if let Some(a) = &self.audio {
                 // `SetMasterPlayerFXMute` / `SetMasterPlayerFXVolume` (`VoiceSndFxOn` / `VoiceSndFxVolume`, SoundOptionsMonitor_c 0x100c487a / 0x100c489b)
-                let gain = self.hud.as_ref().map_or(1.0, |h| super::options::voice_gain(&h.dvalues));
+                let gain = 1.0;
                 for s in &rq.sounds {
                     a.play_sfx(s, gain);
                 }
@@ -1429,7 +1603,7 @@ impl Frontend for Play {
         }
         // Friends / Team Search windows follow the HUD's `friends_window` / `lft_window` dvalues (docs/chat/social.md)
         if let (Some(c), Some(h)) = (self.chat.as_mut(), self.hud.as_mut()) {
-            c.sync_windows(&mut self.gui, h.dvalue("friends_window"), h.dvalue("lft_window"), &self.text);
+            c.sync_windows(&mut self.gui, h.dvalue("friends_window"), h.dvalue("lft_window"), h.dvalue("esc_lft"), h.lft_invite_blocked(), &self.text);
             for (key, window) in c.dock_windows() {
                 if let Err(e) = h.register_dock(&mut self.gui, key, window) {
                     eprintln!("dock {key}: {e:#}");
@@ -1442,6 +1616,7 @@ impl Frontend for Play {
         if let Some(h) = self.hud.as_mut() {
             h.resize(&mut self.gui, size);
             h.set_attack_range(super::hud_target::in_attack_range(&self.zone));
+            h.set_vehicle_motion_context(self.dungeon, self.player.as_ref().map(super::player::Player::grounded));
             h.update(&mut self.gui, &mut self.zone, dt);
             if let Some(s) = &self.session {
                 for f in h.take_outbox() {
@@ -1454,6 +1629,9 @@ impl Frontend for Play {
         }
         // the NCU / team windows' System-window lines, and the Shift + click character info page (`ShowURL("charid://50000/<id>")`)
         if let (Some(h), Some(c)) = (self.hud.as_mut(), self.chat.as_mut()) {
+            if let Some(key) = h.take_equipment_feedback() {
+                c.feedback(&mut self.gui, key, &self.text);
+            }
             for l in h.take_system_lines() {
                 c.system_line(&mut self.gui, &l, 12);
             }
@@ -1475,10 +1653,14 @@ impl Frontend for Play {
         if self.screen == Screen::InWorld {
             let own = self.zone.own().map_or(host.camera.pos.to_array(), |d| zone::scene_pos(d.pos));
             let indicators = super::tags::indicators(&self.zone);
-            self.zone.world.name_tags(dt, &mut self.gui, host, own, &indicators);
+            let stats = &self.zone.character_stats;
+            let org_names = &self.zone.org_names;
+            self.zone.world.name_tags(dt, &mut self.gui, host, own, &indicators, |id| {
+                stats.get(&id).and_then(|s| s.get(&5)).and_then(|org| org_names.get(org)).cloned()
+            });
             self.fight_draw(host, &mut list);
             if let Some(h) = self.hud.as_mut() {
-                h.draw_cursor(&self.gui, &self.zone, host, &mut list);
+                h.draw_cursor(&self.gui, &self.zone, self.player.as_ref(), host, &mut list);
             }
             self.interact_pointer(host, &mut list);
         }

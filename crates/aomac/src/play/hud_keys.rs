@@ -13,6 +13,8 @@ use super::options::keys::{Bindings, FixedKeys};
 pub(super) enum HudKey {
     /// `WINDOW_*`: toggles the window.
     Window(WindowKind),
+    /// A window owned by the social module rather than Hud.
+    SocialWindow(&'static str),
     /// `SHORTUCT_BAR_ACTIVE_n` (default: the digit keys): use slot `n` of the active bar (`FUN_100d7cef`).
     BarActive(usize),
     /// `SHORTUCT_BAR_ROW_n` (default Shift + digit): show row `n` of the active bar (`FUN_100d85fb`).
@@ -23,7 +25,7 @@ pub(super) enum HudKey {
     BarSlot(usize, usize),
 }
 
-/// The window providers of `SetupProviders` that have a window here; `WINDOW_KNOWLEDGE`, `WINDOW_RAID`, ... have none (their keys are ignored).
+/// The window providers of `SetupProviders` with native window consumers.
 const WINDOW_PROVIDERS: &[(&str, WindowKind)] = &[
     ("WINDOW_INVENTORY", WindowKind::Inventory),
     ("WINDOW_OPTIONS", WindowKind::Options),
@@ -33,6 +35,7 @@ const WINDOW_PROVIDERS: &[(&str, WindowKind)] = &[
     ("WINDOW_SPECIALACTION", WindowKind::Actions),
     ("WINDOW_MISSION", WindowKind::Mission),
     ("WINDOW_TEAM", WindowKind::Team),
+    ("WINDOW_RAID", WindowKind::Raid),
     ("WINDOW_MAP", WindowKind::Map),
     ("WINDOW_FRIENDS", WindowKind::Friends),
     ("WINDOW_NANO", WindowKind::Nano),
@@ -46,6 +49,7 @@ const SLOTS: usize = 10;
 /// Provider hash -> what the HUD does.
 fn providers() -> Vec<(u32, HudKey)> {
     let mut v: Vec<(u32, HudKey)> = WINDOW_PROVIDERS.iter().map(|(n, k)| (provider_hash(n), HudKey::Window(*k))).collect();
+    v.push((provider_hash("WINDOW_LFT"), HudKey::SocialWindow("lft_window")));
     for b in 0..BARS {
         v.push((provider_hash(&format!("SHORTUCT_BAR_ACTIVE_{b}")), HudKey::BarActive(b)));
         v.push((provider_hash(&format!("SHORTUCT_BAR_ROW_{b}")), HudKey::BarRow(b)));
@@ -115,6 +119,16 @@ mod tests {
         assert_eq!(m.lookup(k('4', id::SHIFT)), [HudKey::BarRow(3)]);
         assert_eq!(m.lookup(k('5', id::ALT)), [HudKey::BarSelect(4)]);
         assert_eq!(m.lookup(k('q', 0)), [], "movement / combat keys belong to controls.rs");
+    }
+
+    #[test]
+    fn raid_provider_resolves_to_native_window() {
+        assert_eq!(providers().into_iter().find(|(p, _)| *p == provider_hash("WINDOW_RAID")).map(|(_, key)| key), Some(HudKey::Window(WindowKind::Raid)));
+    }
+
+    #[test]
+    fn lft_provider_resolves_to_existing_social_window() {
+        assert_eq!(providers().into_iter().find(|(p, _)| *p == provider_hash("WINDOW_LFT")).map(|(_, key)| key), Some(HudKey::SocialWindow("lft_window")));
     }
 
     /// A saved archive rebinding the Inventory window to J and a hotbar slot to F5 replaces the defaults it names (any key, not only letters); unknown providers are ignored.

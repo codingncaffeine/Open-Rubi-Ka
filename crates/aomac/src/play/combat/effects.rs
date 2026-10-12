@@ -176,6 +176,11 @@ const MODEL_BASE: u64 = 0xfac0_0000_0000_0000;
 const ACTOR_BASE: u32 = 0xe000_0000;
 const MESH_MODEL_BASE: u64 = 0xfac1_0000_0000_0000;
 
+fn texture_model_key(effect: i32, quality: i32) -> u64 {
+    let family = match quality { 1 => 1, 2 => 2, _ => 3 };
+    MODEL_BASE | (family << 32) | u64::from(effect as u32)
+}
+
 impl Template {
     fn word(&self, i: usize) -> Result<u32> {
         // GC10106872: CMSBlock access beyond the authored payload returns zero.
@@ -208,6 +213,7 @@ struct Active {
     enabled: bool,
     native_terminated: bool,
     effect: i32,
+    model_key: u64,
     raw_source: Mat4,
     source: Mat4,
     target: Vec3,
@@ -293,7 +299,7 @@ pub struct Renderer {
     templates: Templates,
     store: RecordStore,
     names: NameTable,
-    models: HashMap<i32, EffectModel>,
+    models: HashMap<u64, EffectModel>,
     active: Vec<Active>,
     rng: CrtRand,
     next_actor: u32,
@@ -329,19 +335,28 @@ pub struct Renderer {
     mesh_attr_cache: HashMap<u32,Vec<ao_formats::mesh::MeshEffectAttr>>,
     mesh_children: HashMap<u32,(u32,meshattrs::MeshChildren)>,
     retired_screens: Vec<(Option<global::GlobalEffect>,Option<nightvision::NightVision>)>,
+    shadows: bool,
 }
 
 impl Renderer {
+    /// Native ordinary-texture preference affects future resource loads, not cached visuals.
+    pub fn set_texture_quality(&self, quality: i32) {
+        self.store.set_other_texture_quality(quality);
+    }
+
     pub fn open(dir: &Path) -> Result<Self> {
-        let store = RecordStore::open(dir)?;
+        let store = super::super::open_texture_store(dir)?;
         let names = NameTable::load(&store)?;
         let templates = Templates::open(dir)?;
         let mut anchor_ids: Vec<_> = templates.by_id.values().filter_map(|t| t.words.get(7).map(|v| *v as i32)).chain(1000..=1018).chain(2000..=2023).chain([0,3000,3001]).collect();
         anchor_ids.sort_unstable();
         anchor_ids.dedup();
-        Ok(Self { templates, store, names, models: HashMap::new(), active: vec![], rng: CrtRand::new(1), next_actor: ACTOR_BASE, generation: u64::MAX, beam_state:beams::BeamState::default(),bph_last:HashMap::new(),elapsed:0.0,smoke_wind:Vec3::ZERO,spawning:vec![],anchors:HashMap::new(),source_runtime:HashMap::new(),collision:None,anchor_ids,control_work:vec![],composition_work:vec![],native_work:vec![],buff_work:vec![],buff_models:HashMap::new(),retired_buff_models:vec![],random:R250::new(0xe6f1),display_random:R250::new(0xe6f1),mesh_resources:HashMap::new(),mesh_uploaded:HashMap::new(),aux_sounds:vec![],vulcan_sequence:0,screen_resources:HashMap::new(),screen_uploaded:false,nano2_state:nano2::Nano2State::default(),hit_locations:hitlocation::HitLocations::default(),source_torso_factor:HashMap::new(),hit_clock_ms:0,native_fog:std::rc::Rc::new(std::cell::Cell::new(ao_render::NativeFog::default())),mesh_attr_cache:HashMap::new(),mesh_children:HashMap::new(),retired_screens:Vec::new() })
+        Ok(Self { templates, store, names, models: HashMap::new(), active: vec![], rng: CrtRand::new(1), next_actor: ACTOR_BASE, generation: u64::MAX, beam_state:beams::BeamState::default(),bph_last:HashMap::new(),elapsed:0.0,smoke_wind:Vec3::ZERO,spawning:vec![],anchors:HashMap::new(),source_runtime:HashMap::new(),collision:None,anchor_ids,control_work:vec![],composition_work:vec![],native_work:vec![],buff_work:vec![],buff_models:HashMap::new(),retired_buff_models:vec![],random:R250::new(0xe6f1),display_random:R250::new(0xe6f1),mesh_resources:HashMap::new(),mesh_uploaded:HashMap::new(),aux_sounds:vec![],vulcan_sequence:0,screen_resources:HashMap::new(),screen_uploaded:false,nano2_state:nano2::Nano2State::default(),hit_locations:hitlocation::HitLocations::default(),source_torso_factor:HashMap::new(),hit_clock_ms:0,native_fog:std::rc::Rc::new(std::cell::Cell::new(ao_render::NativeFog::default())),mesh_attr_cache:HashMap::new(),mesh_children:HashMap::new(),retired_screens:Vec::new(),shadows:true })
     }
     pub fn shared_native_fog(&self)->ao_render::SharedNativeFog {self.native_fog.clone()}
+    /// GC100ece3a/100ecb5a/100ecee4: Shadows controls the CAT shadow visual,
+    /// not the baked ground lightmap. Keep the control alive so re-enabling recreates its visual.
+    pub fn set_shadows(&mut self, enabled: bool) { self.shadows = enabled; }
     pub fn set_enabled(&mut self,handle:u32,enabled:bool) {if let Some(active)=self.active.iter_mut().find(|a|a.actor==handle) {active.enabled=enabled;if let Some(buff)=&mut active.buff {buff.set_shadow_enabled(enabled);}}}
     pub fn set_text(&mut self,handle:u32,text:&[u8])->Result<()> {
         ensure!(self.active.iter().find(|a|a.actor==handle).is_some_and(|a|self.templates.by_id[&a.effect].kind==2014),"effect handle is not a native Font");
@@ -659,13 +674,14 @@ impl Renderer {
         // GC100ce4f7/100d0102 return null when CMS lookup10106b12 finds no template.
         // A missing child is a zero handle, not failure of its owning composition.
         let Some(template) = self.templates.by_id.get(&binding.effect) else { return Ok(0); };
+        let model_key = texture_model_key(binding.effect, self.store.other_texture_quality());
         if !config.creation.constructs(template.kind) { return Ok(0); }
         if self.source_factory_rejects(template,config) {return Ok(0);}
         // These native dynel constructors do not initialize a visual after
         // InitDynelTemplate fails. A rejected locator still returns its control.
         if config.source_nonvisual && matches!(config.creation,Creation::Dynel) && matches!(template.kind,2004|3001|3005|3009|3010|3012|3014|3018|3022|3023|3024|3025|3027|3028|3030|3031|3033|3035|3038) {
             let actor=self.next_actor;self.next_actor=self.next_actor.wrapping_add(1).max(ACTOR_BASE);
-            self.active.push(Active {actor,enabled:true,native_terminated:true,effect:binding.effect,raw_source:source,source,target,elapsed:0.0,color:binding.color,particles:Vec::new(),emitted:0,next_burst:0.0,repetitions:0,config,beam:None,stop_at:None,ticks:0,sprite:None,control:None,attractor:binding.attractor,composition:None,mesh:None,tracer_mesh:None,aux:None,particle:None,particle2:None,native_replicated:None,buff:None,global:None,nightvision:None,bparticle:None,nano2:None,mesh_test:None,mparticle:None,buffer:None,projectile:None,ground_impact:None,tower:None});
+            self.active.push(Active {actor,model_key,enabled:true,native_terminated:true,effect:binding.effect,raw_source:source,source,target,elapsed:0.0,color:binding.color,particles:Vec::new(),emitted:0,next_burst:0.0,repetitions:0,config,beam:None,stop_at:None,ticks:0,sprite:None,control:None,attractor:binding.attractor,composition:None,mesh:None,tracer_mesh:None,aux:None,particle:None,particle2:None,native_replicated:None,buff:None,global:None,nightvision:None,bparticle:None,nano2:None,mesh_test:None,mparticle:None,buffer:None,projectile:None,ground_impact:None,tower:None});
             return Ok(actor);
         }
         ensure!(source.is_finite() && target.is_finite(), "nonfinite effect anchor");
@@ -752,7 +768,7 @@ impl Renderer {
             for tint in &mut g.layers {
                 if tint.material>=0 {
                     let &(name,columns,rows,_,_)=materials::MATERIALS.get(tint.material as usize).context("unknown global material")?;
-                    tint.layer.texture=Some(TextureKey {rdb_type:1010004,id:self.names.id(1010004,name).with_context(||format!("missing global texture {name}"))?});
+                    tint.layer.texture=Some(TextureKey {rdb_type:self.store.other_texture_type(),id:self.names.id(1010004,name).with_context(||format!("missing global texture {name}"))?});
                     if let Some(key)=tint.layer.texture {
                         if let std::collections::hash_map::Entry::Vacant(entry)=self.screen_resources.entry(key) {
                             entry.insert(ao_formats::texture::load_texture(&self.store,key)?.context("missing global texture")?);
@@ -803,7 +819,7 @@ impl Renderer {
             buff.refresh_anchors(|id|self.anchors.get(&(identity,id)).copied().flatten())?;
         }
         let count = if tower.is_some() || ground_impact.is_some() || mesh_test.is_some() || mparticle.is_some() || buffer.is_some() || projectile.is_some() || nano2.is_some() || global.is_some() || nightvision.is_some() || bparticle.is_some() || template.kind == 1025 || beam.is_some() || sprite.is_some() || controller.is_some() || composition.is_some() || mesh.is_some() || tracer_mesh.is_some() || auxiliary.is_some() || particle.is_some() || particle2.is_some() || native_replicated.is_some() || buff.is_some() { 1 } else { sprite_capacity(template)? };
-        if tower.is_none() && ground_impact.is_none() && mesh_test.is_none() && mparticle.is_none() && buffer.is_none() && projectile.is_none() && global.is_none() && nightvision.is_none() && buff.is_none() && mesh.is_none() && tracer_mesh.is_none() && auxiliary.is_none() && !self.models.contains_key(&binding.effect) {
+        if tower.is_none() && ground_impact.is_none() && mesh_test.is_none() && mparticle.is_none() && buffer.is_none() && projectile.is_none() && global.is_none() && nightvision.is_none() && buff.is_none() && mesh.is_none() && tracer_mesh.is_none() && auxiliary.is_none() && !self.models.contains_key(&model_key) {
             let groups = if let Some(n)=&nano2 {n.models()} else if let Some(p)=&bparticle {p.models()} else if let Some(beam) = &beam { beam.models() } else if let Some(s) = &sprite { s.models() } else if let Some(c) = &controller { c.models() } else if let Some(c) = &composition { c.models() } else if let Some(p)=&particle {p.models()} else if let Some(p)=&particle2 {p.models()} else if let Some(native)=&native_replicated {native.models()} else {
                 vec![(Some(template.word(9)? as usize), (0..count as u32).flat_map(|i| [i*4,i*4+2,i*4+3,i*4,i*4+3,i*4+1]).collect(), count*4)]
             };
@@ -834,7 +850,7 @@ impl Renderer {
                 vertices.resize(vertices.len()+n,Vertex::default());
             }
             scene.meshes.push(Mesh { vertices, submeshes });
-            self.models.insert(binding.effect,EffectModel { scene,uploaded:false });
+            self.models.insert(model_key,EffectModel { scene,uploaded:false });
         }
         let particles = Vec::with_capacity(count);
         let repetitions = config.repetitions.unwrap_or(if template.kind == 1006 { template.word(37)?.max(1) } else { 0 });
@@ -850,7 +866,7 @@ impl Renderer {
             if let Some(scene)=buff.morph_scene() {self.buff_models.insert(actor,EffectModel {scene:scene.clone(),uploaded:false});}
             else if !buff.models().is_empty() {
                 if buff.needs_private_model() {let model=self.buff_model(buff)?;self.buff_models.insert(actor,model);}
-                else if !self.models.contains_key(&binding.effect) {let model=self.buff_model(buff)?;self.models.insert(binding.effect,model);}
+                else if !self.models.contains_key(&model_key) {let model=self.buff_model(buff)?;self.models.insert(model_key,model);}
             }
             // GC100d7ed6 tolerates CreateGfxControl returning null. The installed
             // table has no11762, so retain the native null child, not another effect.
@@ -863,7 +879,7 @@ impl Renderer {
         }
         if let Some(record)=tracer_mesh.as_ref().and_then(|mesh|mesh.record_id()) {self.prepare_mesh_children(actor,actor,record)?;}
         if let Some(mesh)=&mparticle {for (index,(resource,_,_)) in mesh.instances().enumerate() {self.prepare_mesh_children(actor,actor+index as u32,mesh.resources()[resource].0)?;}}
-        self.active.push(Active { actor,enabled:true,native_terminated,effect: binding.effect, source, raw_source,target, elapsed: 0.0, color: binding.color, particles, emitted, next_burst: -1.0, repetitions, config, beam, stop_at: None, ticks:0,sprite,control:controller,attractor,composition,mesh,tracer_mesh,aux:auxiliary,particle,particle2,native_replicated,buff,global,nightvision,bparticle,nano2,mesh_test,mparticle,buffer,projectile,ground_impact,tower });
+        self.active.push(Active { actor,model_key,enabled:true,native_terminated,effect: binding.effect, source, raw_source,target, elapsed: 0.0, color: binding.color, particles, emitted, next_burst: -1.0, repetitions, config, beam, stop_at: None, ticks:0,sprite,control:controller,attractor,composition,mesh,tracer_mesh,aux:auxiliary,particle,particle2,native_replicated,buff,global,nightvision,bparticle,nano2,mesh_test,mparticle,buffer,projectile,ground_impact,tower });
         Ok(actor)
     }
     fn prepare_mesh_children(&mut self,owner:u32,actor:u32,record:u32)->Result<()> {
@@ -1052,7 +1068,7 @@ impl Renderer {
         }
         for (id, model) in &mut self.models {
             if !model.uploaded {
-                host.actor_models.push((MODEL_BASE | *id as u32 as u64, model.scene.clone()));
+                host.actor_models.push((*id, model.scene.clone()));
                 model.uploaded = true;
             }
         }
@@ -1098,7 +1114,7 @@ impl Renderer {
                 if !g.advance(effect.config.resource_connector,runtime.is_none_or(|r|r.visible)) {return false;}
                 let Some(connector)=effect.config.resource_connector else {return false;};
                 let mut vertices=Vec::new();g.render(connector,&mut self.rng,&mut vertices);
-                if !vertices.is_empty() {host.actors.push(ActorFrame {id:effect.actor,model:0xfac2_0000_0000_0000|u64::from(effect.actor),transform:IDENTITY,skin:Some(vertices),always:true,..Default::default()});}
+                if !vertices.is_empty() {host.actors.push(ActorFrame { id:effect.actor,model:0xfac2_0000_0000_0000|u64::from(effect.actor),transform:IDENTITY, skin: Some(std::sync::Arc::new(vertices)), always:true,..Default::default() });}
                 return true;
             }
             if let Some(buffer)=&mut effect.buffer {
@@ -1153,6 +1169,7 @@ impl Renderer {
             if let Some(buff)=&mut effect.buff {
                 if let Some(seconds)=host.effect_game_seconds {buff.set_clock(seconds);}
                 if template.kind==3008 {
+                    if !self.shadows { return true; }
                     if let (Some(body),Some(head_height),Some(sun),Some(dungeon),Some(surface))=(
                         effect.config.source_identity.and_then(|id|self.anchors.get(&(id,0))).copied().flatten(),
                         runtime.and_then(|runtime|runtime.head_height),host.effect_sun_direction,host.effect_dungeon,self.collision.as_ref()
@@ -1190,8 +1207,8 @@ impl Renderer {
                         }
                         let skin:Vec<_>=groups.into_iter().flatten().collect();
                         if !skin.is_empty() {
-                            let model=if buff.needs_private_model() {0xfac2_0000_0000_0000|u64::from(effect.actor)}else{MODEL_BASE|effect.effect as u32 as u64};
-                            host.actors.push(ActorFrame {id:effect.actor,model,transform:IDENTITY,skin:Some(skin),always:true,alpha:1.0,priority:buff.priority().or_else(||native_priority(template.kind)),render_bucket:buff.render_bucket(),..Default::default()});
+                            let model=if buff.needs_private_model() {0xfac2_0000_0000_0000|u64::from(effect.actor)}else{effect.model_key};
+                            host.actors.push(ActorFrame { id:effect.actor,model,transform:IDENTITY, skin: Some(std::sync::Arc::new(skin)), always:true,alpha:1.0,priority:buff.priority().or_else(||native_priority(template.kind)),render_bucket:buff.render_bucket(),..Default::default() });
                         }
                         return true;
                     },
@@ -1201,7 +1218,7 @@ impl Renderer {
             }
             let duration = effect.stop_at.unwrap_or_else(|| if template.kind == 1006 { f32::from_bits(template.word(8).unwrap_or(0)) } else { effect.config.duration.unwrap_or(f32::from_bits(template.word(8).unwrap_or(0))) });
             if effect.control.is_none() && effect.composition.is_none() && effect.native_replicated.is_none() && effect.particle.is_none() && effect.particle2.is_none() && duration > 0.0 && effect.elapsed > duration { return false; }
-            let mut skin = Vec::with_capacity(self.models[&effect.effect].scene.meshes[0].vertices.len());
+            let mut skin = Vec::with_capacity(self.models[&effect.model_key].scene.meshes[0].vertices.len());
             if let Some(n)=&mut effect.nano2 {
                 if let Some(identity)=effect.config.source_identity {n.refresh_anchors(|id|self.anchors.get(&(identity,id)).copied().flatten());}
                 let Ok(Some(groups))=n.vertices(effect.elapsed,[camera,right,up],&mut self.nano2_state,&mut self.display_random,&mut self.rng) else {return false;};
@@ -1247,7 +1264,7 @@ impl Renderer {
                 let color = tint(template, effect.color, 0.0, 13);
                 quad(&mut skin, [tail-side, tail+side, head-side, head+side], [[0.0,0.0], [0.0,1.0], [1.0,0.0], [1.0,1.0]], color);
             } else {
-                let capacity = self.models[&effect.effect].scene.meshes[0].vertices.len()/4;
+                let capacity = self.models[&effect.model_key].scene.meshes[0].vertices.len()/4;
                 effect.particles.retain(|p| effect.elapsed-p.born <= p.life);
                 emit_sprites(template, effect, &mut self.rng, &mut self.random, capacity, step);
                 let material = template.word(9).unwrap_or(0) as usize;
@@ -1284,7 +1301,7 @@ impl Renderer {
                 if !alive && template.kind == 1005 && template.word(0).unwrap_or(0)&0x200 != 0 { return false; }
             }
             // Dynamic world-space skin has no useful bind-pose sphere (actors.rs:191).
-            host.actors.push(ActorFrame { id: effect.actor, model: MODEL_BASE | effect.effect as u32 as u64, transform: IDENTITY, parts: vec![], skin: Some(skin), always: true, alpha: 1.0, priority:native_priority(template.kind), ..Default::default() });
+            host.actors.push(ActorFrame { id: effect.actor, model: effect.model_key, transform: IDENTITY, parts: vec![], skin: Some(std::sync::Arc::new(skin)), always: true, alpha: 1.0, priority:native_priority(template.kind), ..Default::default() });
             true
         });
         if self.active.iter().any(|effect|!effect.enabled) {
@@ -1476,6 +1493,22 @@ mod tests {
         }
     }
     #[test]
+    #[ignore = "installed authored shadow control"]
+    fn shadows_preference_keeps_native_control_alive() -> Result<()> {
+        let mut renderer=Renderer::open(&ao_gui::client_dir())?;
+        let effect=*renderer.templates.by_id.iter().find(|(_,t)|t.kind==3008).expect("retail Shadow3008").0;
+        let handle=renderer.spawn_configured(Binding {group:0,attractor:0,effect,note:0,color:0},Mat4::IDENTITY,Vec3::ZERO,EffectConfig::default())?;
+        let mut host=ao_render::Host::headless();
+        for enabled in [false,true,false,true] {
+            renderer.set_shadows(enabled);
+            renderer.frame(1.0/60.0,&mut host,None);
+            assert!(renderer.is_active(handle),"Shadows must not delete the owning control");
+            if !enabled {assert!(!host.actors.iter().any(|actor|actor.id==handle));}
+            host.actors.clear();
+        }
+        Ok(())
+    }
+    #[test]
     #[ignore = "installed authored texture resource holes"]
     fn missing_sprite_textures_retain_native_material_geometry()->Result<()> {
         let mut renderer=Renderer::open(&ao_gui::client_dir())?;
@@ -1485,7 +1518,7 @@ mod tests {
         for effect in [2620,2621,2622,92000] {
             let creation=if effect==92000 {Creation::Vector}else{Creation::HitLocation};
             renderer.spawn_configured(Binding {group:0,attractor:0,effect,note:0,color:0},Mat4::IDENTITY,Vec3::Z*10.0,EffectConfig {creation,hit_location:Some((Vec3::ZERO,Vec3::Z*10.0)),..Default::default()})?;
-            let scene=&renderer.models[&effect].scene;
+            let scene=&renderer.models[&texture_model_key(effect,renderer.store.other_texture_quality())].scene;
             assert!(scene.textures.is_empty());
             assert!(!scene.meshes.is_empty());
             assert!(scene.meshes.iter().flat_map(|mesh|&mesh.submeshes).all(|sub|sub.texture.is_none()));
@@ -1532,7 +1565,38 @@ mod tests {
     }
 
     fn active_sprite(template: &Template) -> Active {
-        Active { actor:ACTOR_BASE,enabled:true,native_terminated:false,effect:1,source:Mat4::IDENTITY,raw_source:Mat4::IDENTITY,target:Vec3::X,elapsed:0.0,color:0,particles:vec![],emitted:-(template.words[31] as i64),next_burst:-1.0,repetitions:1,config:EffectConfig::default(),beam:None,stop_at:None,ticks:0,sprite:None,control:None,attractor:0,composition:None,mesh:None,tracer_mesh:None,aux:None,particle:None,particle2:None,native_replicated:None,buff:None,global:None,nightvision:None,bparticle:None,nano2:None,mesh_test:None,mparticle:None,buffer:None,projectile:None,ground_impact:None,tower:None }
+        Active { actor:ACTOR_BASE,model_key:texture_model_key(1,3),enabled:true,native_terminated:false,effect:1,source:Mat4::IDENTITY,raw_source:Mat4::IDENTITY,target:Vec3::X,elapsed:0.0,color:0,particles:vec![],emitted:-(template.words[31] as i64),next_burst:-1.0,repetitions:1,config:EffectConfig::default(),beam:None,stop_at:None, ticks:0,sprite:None,control:None,attractor:0,composition:None,mesh:None,tracer_mesh:None,aux:None,particle:None,particle2:None,native_replicated:None,buff:None,global:None,nightvision:None,bparticle:None,nano2:None,mesh_test:None,mparticle:None,buffer:None,projectile:None,ground_impact:None,tower:None }
+    }
+
+    #[test]
+    fn texture_family_changes_keep_old_and_new_effect_assets_alive() {
+        let mut renderer = Renderer::open(&ao_gui::client_dir()).expect("native texture-family regression requires retail data");
+        let binding = Binding { group: 0, attractor: 0, effect: 71222, note: 0, color: 0 };
+        renderer.set_texture_quality(3);
+        let old = renderer.spawn_configured(binding, Mat4::IDENTITY, Vec3::ZERO, EffectConfig { creation: Creation::Vector, ..Default::default() }).unwrap();
+        let old_key = renderer.active.iter().find(|effect| effect.actor == old).unwrap().model_key;
+        let old_dimensions: Vec<_> = renderer.models[&old_key].scene.textures.iter().map(|(key,texture)| (*key,texture.width,texture.height)).collect();
+        renderer.set_texture_quality(1);
+        let new = renderer.spawn_configured(binding, Mat4::IDENTITY, Vec3::ZERO, EffectConfig { creation: Creation::Vector, ..Default::default() }).unwrap();
+        let new_key = renderer.active.iter().find(|effect| effect.actor == new).unwrap().model_key;
+        assert_ne!(old_key, new_key);
+        assert_eq!(old_key, texture_model_key(binding.effect, 3));
+        assert_eq!(new_key, texture_model_key(binding.effect, 1));
+        assert!(renderer.models.contains_key(&old_key) && renderer.models.contains_key(&new_key));
+        assert_eq!(renderer.active.iter().find(|effect| effect.actor == old).unwrap().model_key, old_key);
+        for (key,width,height) in old_dimensions {
+            assert_eq!((renderer.models[&old_key].scene.textures[&key].width, renderer.models[&old_key].scene.textures[&key].height), (width,height));
+        }
+        let mut host = ao_render::Host::headless();
+        let mut ground = |point: Vec3| Some((Vec3::new(point.x, 0.0, point.z), Vec3::Y));
+        renderer.frame(0.01, &mut host, Some(&mut ground));
+        assert!(host.actor_models.iter().any(|(key,_)| *key == old_key));
+        assert!(host.actor_models.iter().any(|(key,_)| *key == new_key));
+        assert!(host.actors.iter().any(|actor| actor.id == old && actor.model == old_key));
+        assert!(host.actors.iter().any(|actor| actor.id == new && actor.model == new_key));
+        renderer.set_texture_quality(3);
+        let again = renderer.spawn_configured(binding, Mat4::IDENTITY, Vec3::ZERO, EffectConfig { creation: Creation::Vector, ..Default::default() }).unwrap();
+        assert_eq!(renderer.active.iter().find(|effect| effect.actor == again).unwrap().model_key, old_key);
     }
     #[test]
     fn authored_tower_dispatch_resources_and_cached_root() {
@@ -1548,7 +1612,7 @@ mod tests {
         let handle=renderer.spawn_configured(binding,Mat4::IDENTITY,Vec3::ZERO,config).unwrap();
         let active=renderer.active.iter().find(|a|a.actor==handle).unwrap();
         assert_eq!(active.raw_source,root);let resource=active.tower.as_ref().unwrap().scene().unwrap().0;
-        assert!(renderer.mesh_resources.contains_key(&resource));assert!(!renderer.mesh_uploaded[&resource]);assert!(!renderer.models.contains_key(&id));
+        assert!(renderer.mesh_resources.contains_key(&resource));assert!(!renderer.mesh_uploaded[&resource]);assert!(!renderer.models.contains_key(&texture_model_key(id,renderer.store.other_texture_quality())));
         let moved=Mat4::from_translation(Vec3::new(9.0,8.0,6.0));
         renderer.refresh_anchors(|who,anchor|if who==identity && anchor==0 {Some(moved)}else{None});
         assert_eq!(renderer.active.iter().find(|a|a.actor==handle).unwrap().raw_source,moved);
@@ -1696,7 +1760,7 @@ mod tests {
         let binding=Binding {group:0,attractor:0,effect:72260,note:0,color:0};
         let vertices=vec![Vertex {pos:[0.0,0.0,0.0],..Default::default()};3];
         let scene=Scene {meshes:vec![Mesh {vertices:vertices.clone(),submeshes:vec![Submesh::new(vec![0,1,2],None)]}],..Default::default()};
-        let actor=ActorFrame {id:1234,model:super::super::super::avatar::MODEL_KEY,transform:IDENTITY,skin:Some(vertices),alpha:1.0,..Default::default()};
+        let actor=ActorFrame { id:1234,model:super::super::super::avatar::MODEL_KEY,transform:IDENTITY, skin: Some(std::sync::Arc::new(vertices)), alpha:1.0,..Default::default() };
         let mut host=ao_render::Host::headless();
         let mut uploaded=std::collections::HashSet::new();
         for cycle in 0..32 {
@@ -1751,7 +1815,7 @@ mod tests {
                 renderer.frame(time-previous,&mut host,None);
                 previous = time;
                 assert!(host.actors.iter().all(|a| a.always && a.skin.as_ref().unwrap().iter().all(|v| v.pos.iter().all(|f| f.is_finite()))));
-                let models: Vec<_> = renderer.models.iter().map(|(&id,m)| (MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();
+                let models: Vec<_> = renderer.models.iter().map(|(&id,m)| (id,m.scene.clone())).collect();
                 ao_render::render_to_png_actors(&Scene::default(),&models,host.actors.clone(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("{id}_{time:.2}.png")),time).unwrap();
             }
         }

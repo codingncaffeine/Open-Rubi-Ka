@@ -51,11 +51,13 @@ pub(super) struct PerkDef {
     pub mask: u32,
     /// RDB word 4 / runtime +0x14: granted Action_e, not an item template (`GC 10052aca`).
     pub action: u32,
+    /// RDB word 5 / Perk_t+0x18: research goal's required contribution (GC 1002ba03).
+    pub research_total: u32,
 }
 
 #[derive(Default)]
 pub(super) struct PerkDb {
-    defs: Vec<PerkDef>,
+    pub(super) defs: Vec<PerkDef>,
     index: HashMap<u32, usize>,
 }
 
@@ -73,7 +75,7 @@ impl PerkDb {
             .filter_map(|id| {
                 let r = store.get(PERK_LIST, id).ok().flatten()?;
                 let w = |i: usize| r.get(4 * i..4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
-                Some(PerkDef { id, item: w(0)?, precursor: w(1)?, flags: w(2)?, mask: w(3)?, action: w(4)? })
+                Some(PerkDef { id, item: w(0)?, precursor: w(1)?, flags: w(2)?, mask: w(3)?, action: w(4)?, research_total: w(5)? })
             })
             .collect();
         Self::from_defs(defs)
@@ -172,9 +174,13 @@ struct Win {
 }
 
 pub(super) struct HudPerks {
-    db: PerkDb,
-    store: Option<RecordStore>,
+    pub(super) db: PerkDb,
+    pub(super) store: Option<RecordStore>,
     names: HashMap<u32, String>,
+    criteria: HashMap<u32, super::chat::info::PerkCriteria>,
+    equipment: super::chat::info::PerkEquipment,
+    completed: Vec<u32>,
+    eligibility_stats: HashMap<u32, i32>,
     texts: Option<TextDb>,
     pub(super) known: Known,
     win: Option<Win>,
@@ -195,6 +201,10 @@ impl HudPerks {
             db: store.as_ref().map(PerkDb::load).unwrap_or_default(),
             store,
             names: HashMap::new(),
+            criteria: HashMap::new(),
+            equipment: super::chat::info::PerkEquipment::default(),
+            completed: vec![],
+            eligibility_stats: HashMap::new(),
             texts: TextDb::load(dir).ok(),
             known: Known::default(),
             win: None,
@@ -222,26 +232,43 @@ impl HudPerks {
     /// Own perk map / perk updates from the zone stream (`FUN_100537a5`, `FUN_10063942`).
     pub(super) fn on_frame(&mut self, f: &Frame, own: i32) {
         let Ok(m) = n3::decode(f) else { return };
+        let mut changed = false;
         match &m.body {
             // `FullCharacter::rest` starts at the first block the decoder could not read: the perk map when the spell list before it is empty
             N3::World(World::FullCharacter(c)) if m.header.target.instance == own && !c.rest.is_empty() => {
                 if let Ok(p) = team::parse_perk_map(&c.rest) {
                     self.known = Known(p.into_iter().map(|k| (k.perk, k.timer)).collect());
+                    changed = true;
                 }
             }
             N3::Unknown(b) if m.header.msg_type == team::PERK_UPDATE && m.header.target.instance == own => match team::parse_perk_update(b) {
                 // `FUN_10063942`: the entry is created when missing (`FUN_100533b3`), its timer set (`FUN_10052842`: negative = 0)
                 Ok(u) => {
                     self.known.0.insert(u.perk, u.remaining.max(0));
+                    changed = true;
                 }
                 Err(e) => eprintln!("perks: PerkUpdate: {e:#}"),
             },
             _ => {}
         }
+        if changed {
+            self.completed.clear();
+            self.completed.extend(self.known.0.iter().filter(|(_, timer)| **timer == 0).map(|(&id, _)| id as u32));
+        }
+    }
+
+    fn eligible(&mut self, id: u32, zone: &Zone) -> anyhow::Result<bool> {
+        let def = self.db.get(id).ok_or_else(|| anyhow::anyhow!("missing perk {id}"))?;
+        let store = self.store.as_ref().ok_or_else(|| anyhow::anyhow!("perk eligibility requires client RDB"))?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.criteria.entry(id) {
+            let raw = store.get(1_000_020, def.item)?.ok_or_else(|| anyhow::anyhow!("missing perk item {}", def.item))?;
+            entry.insert(super::chat::info::PerkCriteria::from_record(&raw)?);
+        }
+        self.criteria[&id].eligible(zone, self.equipment.armor(), &self.completed)
     }
 
     /// `N3Msg_GetPerkName(id, true)` (`FUN_1005366e`): the item's name, then a space and the perk's position in its line.
-    fn name(&mut self, id: u32) -> String {
+    pub(super) fn name(&mut self, id: u32) -> String {
         if let Some(n) = self.names.get(&id) {
             return n.clone();
         }
@@ -313,6 +340,15 @@ impl HudPerks {
     /// Per-frame refresh: tab, point labels (`FUN_100611dc` label groups), the perk lines, the untrain timeout (`FUN_10060553`).
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &Zone) {
         let Some(mut w) = self.win.take() else { return };
+        let stats_changed = self.eligibility_stats.len() != zone.stats.len() + zone.skill_values.keys().filter(|key| !zone.stats.contains_key(key)).count()
+            || zone.stats.iter().chain(zone.skill_values.iter()).any(|(&stat, _)| self.eligibility_stats.get(&stat).copied() != zone.skill_value(stat));
+        let equipment_changed = self.store.as_ref().map(|store| self.equipment.refresh(store, zone)).transpose();
+        if stats_changed || equipment_changed.as_ref().is_ok_and(|changed| *changed == Some(true)) {
+            self.eligibility_stats.clone_from(&zone.stats);
+            self.eligibility_stats.extend(zone.skill_values.iter().map(|(&stat, &value)| (stat, value)));
+            w.drawn = None;
+        }
+        if let Err(e) = equipment_changed { eprintln!("perks equipment: {e:#}"); self.win = Some(w); return; }
         let points = self.points(zone);
         let expansion = zone.skill_value(EXPANSION).unwrap_or(0);
         let alien = expansion & 8 != 0 && zone.stat(ALIEN_LEVEL).unwrap_or(0) >= 1;
@@ -358,7 +394,8 @@ impl HudPerks {
             for &id in line {
                 let known = self.known.0.contains_key(&(id as i32));
                 let precursor_known = self.db.get(id).is_some_and(|d| d.precursor == 0 || self.known.0.contains_key(&(d.precursor as i32)));
-                let color = if known { KNOWN } else if precursor_known { OPEN } else { LOCKED };
+                let eligible = if !known && precursor_known { match self.eligible(id, zone) { Ok(value) => value, Err(e) => { eprintln!("perks item{id}: {e:#}"); false } } } else { false };
+                let color = if known { KNOWN } else if eligible { OPEN } else { LOCKED };
                 let name = self.name(id).replace('&', "&amp;").replace('<', "&lt;").replace('"', "&quot;");
                 src += &format!("<TextButton name=\"perk_{id}\" text=\"{name}\" color=\"{color:#08X}\" hover_color=\"TEXT_HOVER\" pressed_color=\"TEXT_SELECTED\" layout_borders=\"Rect(0,0,10,0)\"/>");
             }
@@ -397,7 +434,14 @@ impl HudPerks {
         if d.precursor != 0 && !self.known.0.contains_key(&(d.precursor as i32)) {
             return self.info_box(gui, "MustTrainPrecursoryPerk", "Info");
         }
-        // `FUN_10052904` (`MeetsPerkCriteria`, the item template's requirement check) is UNRESOLVED: the server refuses a perk the character may not train
+        if let Some(store) = &self.store {
+            if let Err(e) = self.equipment.refresh(store, zone) { eprintln!("perks equipment: {e:#}"); return; }
+        }
+        match self.eligible(id, zone) {
+            Ok(true) => {}
+            Ok(false) => return self.info_box(gui, "DoNotMeetPerkReq", "Info"),
+            Err(e) => { eprintln!("perks item{id}: {e:#}"); return; }
+        }
         let body = self.text("ReallyTrainPerk").replacen("%s", &self.name(id), 1).replacen("%d", &HOURS.to_string(), 1);
         let buttons = [self.text("MsgBox_Yes"), self.text("MsgBox_No")];
         self.dialogs.go(gui, self.screen, Ask::Train(id), &body, &buttons);
@@ -446,7 +490,7 @@ mod tests {
     use super::*;
 
     fn def(id: u32, precursor: u32, flags: u32, mask: u32) -> PerkDef {
-        PerkDef { id, item: 0, precursor, flags, mask, action: 0 }
+        PerkDef { id, item: 0, precursor, flags, mask, action: 0, research_total: 0 }
     }
 
     #[test]
@@ -457,6 +501,21 @@ mod tests {
         let db = PerkDb::from_defs(vec![a, def(100, 0, 0, 128)]);
         let known = Known(BTreeMap::from([(111, 0), (100, 0), (999, 0)]));
         assert_eq!(known.actions(&db).collect::<Vec<_>>(), [10111]);
+    }
+
+    #[test]
+    fn perk_training_uses_native_item_requirements() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let mut perks = HudPerks::new(&dir, (1280, 800));
+        let mut zone = Zone::new(1);
+        // Real catalogue100/item210830 requires profession7 and level>9.
+        zone.stats.extend([(PROFESSION, 7), (LEVEL, 9)]);
+        assert!(!perks.eligible(100, &zone).unwrap());
+        zone.stats.insert(LEVEL, 10);
+        assert!(perks.eligible(100, &zone).unwrap());
+        zone.stats.insert(PROFESSION, 1);
+        assert!(!perks.eligible(100, &zone).unwrap());
     }
 
     /// The perk lines stack below each other (they were all drawn at the top: a `ScrollViewChild` needs its one layout view inside) and start at the left.

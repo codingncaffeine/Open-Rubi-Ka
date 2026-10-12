@@ -183,13 +183,26 @@ fn calc(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
                 *min
             }
         }
+        Kind::Slider(s) => {
+            let (w, h) = env.gfx.size(s.knob);
+            Point::new(if max { BIG } else { w as f32 - 1.0 }, h as f32 - 1.0)
+        }
         Kind::Text(t) => text_pref(env, tree, id, t, max),
         Kind::Button(b) => match b.gfx_override {
             Some([raised, ..]) => {
                 let (w, h) = env.gfx.size(raised);
                 Point::new(w as f32 - 1.0, h as f32 - 1.0)
             }
-            None => button_pref(env, &b.label),
+            None => {
+                let mut p = button_pref(env, &b.label);
+                if let Some(icon) = b.background_icon {
+                    let (w, h) = env.gfx.size(icon);
+                    // 0x10127ee4: max(label, bitmap preferred size + 1), then mode-0 border/padding.
+                    p.x = p.x.max(w as f32 + 25.0);
+                    p.y = p.y.max(h as f32 - 1.0 + 9.0);
+                }
+                p
+            }
         },
         Kind::CcEntry(c) => {
             // Button_c::CalculatePreferredSize 0x10127ee4, 3-slice border mode: x = content (+1 const) - 1, y = border art height.
@@ -256,6 +269,11 @@ fn calc(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
                 }
             }
             p
+        }
+        Kind::RadioButton { .. } if !v.children.is_empty() => {
+            let p = node_calc(env, tree, id, max);
+            // Native View* constructor replaces the label, without its text-label border.
+            Point::new(p.x + 11.0, p.y.max(10.0))
         }
         Kind::CheckBox { label, .. } | Kind::RadioButton { label, .. } => {
             // UNRESOLVED: CheckBox_c/RadioButton_c::CalculatePreferredSize not yet read; 11px marker + gap + label.
@@ -432,6 +450,14 @@ pub fn set_frame(env: &mut Env, tree: &mut Tree, id: ViewId, frame: Rect) {
 pub fn layout(env: &mut Env, tree: &mut Tree, id: ViewId) {
     let f = tree.views[id].frame;
     let b = Rect::new(0.0, 0.0, f.width(), f.height()); // View::GetBounds
+    if matches!(tree.views[id].kind, Kind::RadioButton { .. }) && !tree.views[id].children.is_empty() {
+        for i in 0..tree.views[id].children.len() {
+            let c = tree.views[id].children[i];
+            let r = Rect::new(11.0, 0.0, b.r, b.b).shrink(&tree.views[c].borders);
+            set_frame(env, tree, c, r);
+        }
+        return;
+    }
     let kind_scroll = matches!(tree.views[id].kind, Kind::ScrollView(_) | Kind::ScrollChild);
     if kind_scroll {
         layout_scroll(env, tree, id);

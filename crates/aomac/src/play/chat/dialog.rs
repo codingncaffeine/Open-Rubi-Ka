@@ -46,13 +46,18 @@ pub struct Spec {
 struct Open {
     win: WindowId,
     kind: Kind,
+    escape: bool,
     /// Seconds since `Go` (AFK countdown).
     age: f32,
 }
 
-#[derive(Default)]
 pub struct Dialogs {
     open: Vec<Open>,
+    escape: bool,
+}
+
+impl Default for Dialogs {
+    fn default() -> Self { Self { open: vec![], escape: true } }
 }
 
 /// `AFKDialogView_c`: the dialog answers 0 once more than this many whole seconds have passed (`FUN_10082e78`; the text shows `30 - elapsed`).
@@ -104,8 +109,17 @@ fn xml(spec: &Spec) -> String {
 }
 
 impl Dialogs {
+    pub fn configure_escape(&mut self, values: &super::super::dvalue::DValues) {
+        self.escape = values.get_i64("esc_dialogs").unwrap_or(1) != 0;
+    }
+
+    pub fn esc_closes(&self) -> bool { self.open.iter().any(|o| o.escape) }
     pub fn is_open(&self) -> bool {
         !self.open.is_empty()
+    }
+    /// InputConfig +0x1c8: editing the AFK reply does not clear AFK on keyboard/mouse activity.
+    pub fn afk_input_active(&self) -> bool {
+        self.open.iter().any(|o| o.kind == Kind::Afk)
     }
 
     pub fn windows(&self) -> impl Iterator<Item = WindowId> + '_ {
@@ -138,7 +152,7 @@ impl Dialogs {
         gui.relayout_window(win);
         let (w, h) = gui.outer_size(win);
         gui.set_window_pos(win, ((screen.0 as i32 - w as i32) / 2, (screen.1 as i32 - h as i32) / 2));
-        self.open.push(Open { win, kind: spec.kind, age: 0.0 });
+        self.open.push(Open { win, kind: spec.kind, age: 0.0, escape: self.escape });
     }
 
     fn finish(&mut self, gui: &mut Gui, win: WindowId, button: i32) -> Option<Answer> {
@@ -178,7 +192,8 @@ impl Dialogs {
             // `FUN_10082f50`: Enter in the AFK input = OK
             Event::EnterPressed { window, .. } if own(window) => (true, self.finish(gui, *window, 0)),
             // `esc_dialogs` defaults to true (LoginPrefs.xml): `SlotEscPressed` = `SlotSelected(-1)`
-            Event::Escape { window } if own(window) => (true, self.finish(gui, *window, -1)),
+            Event::Escape { window } if own(window) && self.open.iter().any(|o| o.win == *window && o.escape) => (true, self.finish(gui, *window, -1)),
+            Event::Escape { window } if own(window) => (true, None),
             Event::CloseRequested { window } if own(window) => (true, self.finish(gui, *window, -1)),
             Event::TextChanged { window, .. } | Event::LinkClicked { window, .. } if own(window) => (true, None),
             _ => (false, None),
@@ -266,5 +281,33 @@ mod tests {
         let w = d.open[0].win;
         let (_, a) = d.event(&mut gui, &Event::EnterPressed { window: w, view: "input".into() });
         assert_eq!(a.map(|a| a.button), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::*;
+    #[test]
+    fn chat_dialog_escape_policy_is_captured_at_go() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut d = super::super::super::dvalue::DValues::new(&dir);
+        let mut dialogs = Dialogs::default();
+        let spec = Spec { kind: Kind::MessageBox, body: "Message".into(), buttons: vec!["OK".into()], input: None };
+        d.set_i64("esc_dialogs", 0);
+        dialogs.configure_escape(&d);
+        dialogs.go(&mut gui, (800, 600), &spec);
+        let win = dialogs.windows().next().unwrap();
+        d.set_i64("esc_dialogs", 1);
+        dialogs.configure_escape(&d);
+        assert!(dialogs.event(&mut gui, &Event::Escape { window: win }).1.is_none());
+        assert!(dialogs.is_open());
+        assert_eq!(dialogs.event(&mut gui, &Event::CloseRequested { window: win }).1.unwrap().button, -1);
+        dialogs.go(&mut gui, (800, 600), &spec);
+        let win = dialogs.windows().next().unwrap();
+        d.set_i64("esc_dialogs", 0);
+        dialogs.configure_escape(&d);
+        assert_eq!(dialogs.event(&mut gui, &Event::Escape { window: win }).1.unwrap().button, -1);
     }
 }

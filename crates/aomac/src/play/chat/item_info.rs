@@ -24,14 +24,18 @@ fn inventory_item(zone:&Zone,id:Identity,container:Identity)->Option<(AcgItem,i3
 }
 
 pub(super) fn html(zone:&Zone,request:&ItemRequest,texts:&TextDb)->Result<Option<String>> {
-    html_request(zone,request,texts,None)
+    html_request(zone,request,texts,None).map(|page|page.map(|(html,_)|html))
 }
 
 pub(super) fn html_for_reference(zone:&Zone,item:AcgItem,price:Option<i32>,texts:&TextDb)->Result<Option<String>> {
-    html_request(zone,&ItemRequest::Reference(item),texts,price)
+    html_request(zone,&ItemRequest::Reference(item),texts,price).map(|page|page.map(|(html,_)|html))
 }
 
-fn html_request(zone:&Zone,request:&ItemRequest,texts:&TextDb,price:Option<i32>)->Result<Option<String>> {
+pub(super) fn page(zone:&Zone,request:&ItemRequest,texts:&TextDb)->Result<Option<(String,String)>> {
+    html_request(zone,request,texts,None)
+}
+
+fn html_request(zone:&Zone,request:&ItemRequest,texts:&TextDb,price:Option<i32>)->Result<Option<(String,String)>> {
     let store=RecordStore::open(&ao_gui::client_dir())?;
     let (item,id,shop,container,count)=match request {
         ItemRequest::Reference(item)=>(*item,Identity{kind:0xc788,instance:0},price.is_some(),Identity::default(),None),
@@ -71,7 +75,7 @@ fn html_request(zone:&Zone,request:&ItemRequest,texts:&TextDb,price:Option<i32>)
     let combat=super::item_info_combat::fields(&template,&spells,zone,texts)?;
     let mut out=String::new();
     render(&mut out,&template,&data,id,shop,container,zone,texts,&sections,&combat,&low,high,ql,&store)?;
-    Ok(Some(out))
+    Ok(Some((out,template.name)))
 }
 
 fn interpolated_data(low:&[u8],high:&[u8],ql:i32,aq:i32,bq:i32)->Result<Data> {

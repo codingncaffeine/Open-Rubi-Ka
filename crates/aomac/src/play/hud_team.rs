@@ -425,18 +425,18 @@ impl HudTeam {
         let can = target.is_some_and(|(t, npc)| t != own && !npc && !st.is_member(Identity { kind: n3::outgoing::DYNEL_CHAR, instance: t }));
         gui.set_enabled(w.window, "recruit", can);
         self.win = Some(w);
-        self.invite_dialog(gui);
     }
 
     /// `SlotJoinTeamRequest` (`FUN_1007a1f6`): outside a team the invitation is a Yes / No `DialogBox_c` with "Want to join %s's team?".
-    fn invite_dialog(&mut self, gui: &mut Gui) {
+    pub(super) fn invite_dialog(&mut self, gui: &mut Gui) -> Option<(&'static str, &'static str)> {
         if self.dialog.is_open() {
-            return;
+            return None;
         }
-        let Some((_, name)) = self.state.invite.clone() else { return };
+        let Some((_, name)) = self.state.invite.clone() else { return None };
         let body = fmt(&self.text("Want2JoinXsTeam"), &[&name]);
         let buttons = [self.text("MsgBox_Yes"), self.text("MsgBox_No")];
         self.dialog.go(gui, self.screen, (), &body, &buttons);
+        self.dialog.is_open().then_some(("OnInvitedToTeam", ""))
     }
 
     fn send(&mut self, payload: Vec<u8>, zone: &Zone) {
@@ -641,5 +641,24 @@ mod tests {
         let mut h = HudTeam::new(&ao_gui::client_dir(), (1024, 768));
         feed(&mut h, team_invite(ME, &TeamInvite { from: OTHER, flag: 0, name: "Inviter".into(), refusal: None }));
         assert_eq!(h.state.invite, Some((OTHER, "Inviter".into())));
+    }
+
+    #[test]
+    fn invitation_native_tip_only_on_dialog_branch() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut h = HudTeam::new(&dir, (1024, 768));
+        assert_eq!(h.invite_dialog(&mut gui), None);
+        feed(&mut h, team_invite(ME, &TeamInvite { from: OTHER, flag: 1, name: "Inviter".into(), refusal: Some((12, 3, -4, 55)) }));
+        assert_eq!(h.invite_dialog(&mut gui), None);
+        feed(&mut h, member(ME, "Me"));
+        feed(&mut h, team_invite(ME, &TeamInvite { from: OTHER, flag: 0, name: "Inviter".into(), refusal: None }));
+        assert_eq!(h.invite_dialog(&mut gui), None, "already teamed prints a notice, not a tip");
+        h.state = TeamState::new(ME.instance);
+        feed(&mut h, team_invite(ME, &TeamInvite { from: OTHER, flag: 0, name: "Inviter".into(), refusal: None }));
+        assert!(h.win.is_none(), "the invitation does not require the Team window");
+        assert_eq!(h.invite_dialog(&mut gui), Some(("OnInvitedToTeam", "")));
+        assert_eq!(h.invite_dialog(&mut gui), None, "an existing dialog does not emit again");
     }
 }

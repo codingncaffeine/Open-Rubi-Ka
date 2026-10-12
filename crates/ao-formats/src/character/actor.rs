@@ -168,6 +168,12 @@ struct Mount {
     muzzle: Option<Xf>,
 }
 
+/// Native RCAT skeleton state retained between distance-decimated skin refreshes.
+#[derive(Default)]
+pub struct PoseCache {
+    frames: Vec<Option<Xf>>,
+}
+
 pub struct ActorRig {
     cat: CatMesh,
     parents: Vec<Option<usize>>,
@@ -183,6 +189,8 @@ pub struct ActorRig {
     head: Option<usize>,
     /// Model id (rdb 1010002) this rig was built from.
     pub model_id: u32,
+    /// Native resource sphere radius, before per-dynel scale.
+    pub bounding_radius: f32,
 }
 
 impl ActorRig {
@@ -234,7 +242,22 @@ impl ActorRig {
         let parents = cat.parents();
         let scale = translation_scales(&cat);
         let order = cat.bone_order();
-        Ok(Self { cat, parents, scale, order, bind, used, model, mounts, head: head_att, model_id })
+        let bounding_radius = cat.bounding_radius();
+        Ok(Self { cat, parents, scale, order, bind, used, model, mounts, head: head_att, model_id, bounding_radius })
+    }
+
+    /// Native CAT triangle order, indexing the composed body vertices (scene Z mirror).
+    /// Render submeshes batch materials; collision must retain the original first-hit order.
+    pub fn body_triangles(&self) -> impl Iterator<Item = [usize; 3]> + '_ {
+        let mut base = 0;
+        self.used.iter().flat_map(move |&index| {
+            let mesh = &self.cat.submeshes[index];
+            let offset = base;
+            base += mesh.vertices.len();
+            mesh.indices.chunks_exact(3).map(move |triangle| {
+                [offset + triangle[0] as usize, offset + triangle[2] as usize, offset + triangle[1] as usize]
+            })
+        })
     }
 
     /// A player: body of breed/sex/build, naked skin + worn cloth composite, head mesh, attachments.
@@ -315,23 +338,32 @@ impl ActorRig {
     }
 
     pub fn effect_anchor_composed<'a>(&self, id: i32, layers: impl Clone + Iterator<Item = AnimLayer<'a>>) -> Option<[[f32; 4]; 4]> {
+        self.effect_anchor_with(id, |bone| self.effect_bone(bone, layers.clone()))
+    }
+
+    pub fn cached_effect_anchor(&self, id: i32, pose: &PoseCache) -> Option<[[f32; 4]; 4]> {
+        self.effect_anchor_with(id, |bone| pose.frames.get(bone).copied().flatten())
+    }
+
+    fn effect_anchor_with(&self, id: i32, bone: impl Fn(usize) -> Option<Xf>) -> Option<[[f32; 4]; 4]> {
         const BONES: [&str; 19] = ["Bip01 Pelvis_ac", "Bip01 Spine_ac", "Bip01 Spine1_ac", "Bip01 Spine2_ac", "Bip01 Spine3_ac", "Bip01 Neck_ac", "Bip01 Head_ac", "Bip01 L UpperArm_ac", "Bip01 R UpperArm_ac", "Bip01 L Forearm_ac", "Bip01 R Forearm_ac", "Bip01 L Thigh_ac", "Bip01 R Thigh_ac", "Bip01 L Calf_ac", "Bip01 R Calf_ac", "Bip01 L Foot_ac", "Bip01 R Foot_ac", "Bip01 L Hand_ac", "Bip01 R Hand_ac"];
         const ATTRACTORS: [&str; 24] = ["Attractor02_righthand", "Attractor03_lefthand", "Attractor01_head", "Attractor06_back", "Attractor05_leftshoulder", "Attractor04_rightshoulder", "Attractor07_special", "Attractor08_special", "Attractor09_special", "Attractor10_special", "Attractor11_special", "Attractor12_attack1", "Attractor13_attack2", "Attractor14_destroyed", "Attractor15_flare1_flash", "Attractor16_flare2_flash", "Attractor17_smoke75", "Attractor18_smoke50", "Attractor19_smoke25", "Attractor20_sparks50", "Attractor21_flames15", "Attractor22_flare1", "Attractor23_flare2", "Attractor30_beam"];
         if id == 0 { return Some(IDENTITY) }
-        if id == 3000 { return self.weapon_effect_anchor_composed(1, layers) }
+        if id == 3000 { return self.weapon_effect_anchor_with(1, bone) }
         let w = if let Some(name) = id.checked_sub(1000).and_then(|n| usize::try_from(n).ok()).and_then(|n| BONES.get(n)) {
-            self.cat.bones.iter().position(|b| b.name == *name).and_then(|bone| self.effect_bone(bone, layers.clone()))
-                .or_else(|| self.effect_attractor("Attractor01_head", layers.clone()))?
+            self.cat.bones.iter().position(|b| b.name == *name).and_then(&bone)
+                .or_else(|| self.effect_attractor_with("Attractor01_head", &bone))?
         } else {
             let name = id.checked_sub(2000).and_then(|n| usize::try_from(n).ok()).and_then(|n| ATTRACTORS.get(n))?;
-            self.effect_attractor(name, layers.clone()).or_else(|| self.effect_attractor("Attractor01_head", layers.clone()))?
+            self.effect_attractor_with(name, &bone).or_else(|| self.effect_attractor_with("Attractor01_head", &bone))?
         };
         Some(effect_matrix(w))
     }
 
-    fn effect_attractor<'a>(&self, name: &str, layers: impl Clone + Iterator<Item = AnimLayer<'a>>) -> Option<Xf> {
+
+    fn effect_attractor_with(&self, name: &str, bone: impl Fn(usize) -> Option<Xf>) -> Option<Xf> {
         let att = self.cat.attractors.iter().find(|a| a.name == name)?;
-        Some(self.effect_bone(att.bone as usize, layers)?.mul(&Xf::from_qt(att.rot, att.pos)))
+        Some(bone(att.bone as usize)?.mul(&Xf::from_qt(att.rot, att.pos)))
     }
 
     /// Weapon connector composed through its animated hand attachment (GC 0x1009bded).
@@ -346,10 +378,18 @@ impl ActorRig {
     }
 
     pub fn weapon_effect_anchor_composed<'a>(&self, place: u8, layers: impl Clone + Iterator<Item = AnimLayer<'a>>) -> Option<[[f32; 4]; 4]> {
+        self.weapon_effect_anchor_with(place, |bone| self.effect_bone(bone, layers.clone()))
+    }
+
+    pub fn cached_weapon_effect_anchor(&self, place: u8, pose: &PoseCache) -> Option<[[f32; 4]; 4]> {
+        self.weapon_effect_anchor_with(place, |bone| pose.frames.get(bone).copied().flatten())
+    }
+
+    fn weapon_effect_anchor_with(&self, place: u8, bone: impl Fn(usize) -> Option<Xf>) -> Option<[[f32; 4]; 4]> {
         let name = match place { 1 => "Attractor02_righthand", 2 => "Attractor03_lefthand", _ => return None };
         let mount = self.mounts.iter().find(|m| self.cat.attractors[m.attractor].name == name && m.muzzle.is_some())?;
         let att = &self.cat.attractors[mount.attractor];
-        let w = self.effect_bone(att.bone as usize, layers)?.mul(&Xf::from_qt(att.rot, att.pos)).mul(&mount.muzzle?);
+        let w = bone(att.bone as usize)?.mul(&Xf::from_qt(att.rot, att.pos)).mul(&mount.muzzle?);
         Some(effect_matrix(w))
     }
 
@@ -390,6 +430,10 @@ impl ActorRig {
     }
 
     pub fn pose_composed<'a>(&self, layers: impl Clone + Iterator<Item = AnimLayer<'a>>) -> (Vec<Vertex>, Vec<[[f32; 4]; 4]>) {
+        self.pose_composed_cached(layers, &mut PoseCache::default())
+    }
+
+    pub fn pose_composed_cached<'a>(&self, layers: impl Clone + Iterator<Item = AnimLayer<'a>>, cache: &mut PoseCache) -> (Vec<Vertex>, Vec<[[f32; 4]; 4]>) {
         let animated = layers.clone().any(|l| l.clip.signature == self.cat.signature);
         let mut verts = self.model.meshes[0].vertices.clone();
         let frames: Vec<Option<Xf>> = if animated {
@@ -433,6 +477,7 @@ impl ActorRig {
             t[3] = [w.t[0], w.t[1], -w.t[2], 1.0];
             parts[m.mesh] = t;
         }
+        cache.frames = frames;
         (verts, parts)
     }
 

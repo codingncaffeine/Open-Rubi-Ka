@@ -179,7 +179,7 @@ impl PlanetMap {
                 }
             }
         }
-        Ok(Texture { width: w, height: h, rgba })
+        Ok(Texture { source: Default::default(), width: w, height: h, rgba })
     }
 }
 

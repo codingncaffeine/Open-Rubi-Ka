@@ -225,7 +225,7 @@ mod tests {
     #[test]
     #[ignore="installed retail assets and offscreen Metal rendering"]
     fn retail_class3020_frames() {
-        use super::super::{Binding,Creation,Renderer,MODEL_BASE};
+        use super::super::{Binding,Creation,Renderer};
         let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(||"/tmp/FxRest/frames".into());
         std::fs::create_dir_all(&out).unwrap();
         let mut renderer=Renderer::open(&ao_gui::client_dir()).unwrap();
@@ -265,7 +265,7 @@ mod tests {
                 let mut terrain=|p:Vec3|Some((Vec3::new(p.x,10.0,p.z),Vec3::Y));
                 renderer.frame(1.0/60.0,&mut host,Some(&mut terrain));
                 if [1,6,15,30,45].contains(&frame) {
-                    let models:Vec<_>=renderer.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();
+                    let models:Vec<_>=renderer.models.iter().map(|(&id,m)| (id,m.scene.clone())).collect();
                     ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),center.to_array(),640,480,&out.join(format!("particle3020_{id}_{frame}.png")),frame as f32/60.0).unwrap();
                     if mode==2 {
                         // The 600-unit overview cannot resolve authored 0.075-unit

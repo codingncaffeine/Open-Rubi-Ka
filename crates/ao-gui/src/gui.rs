@@ -27,6 +27,7 @@ mod popup;
 mod select;
 mod textfade;
 mod tooltip;
+mod slider;
 
 pub use frame::{clamp_outer, dragged_rect, hit_item, insert_index};
 pub use popup::MenuItem;
@@ -409,6 +410,9 @@ impl Gui {
         if let Some(Some(win)) = self.windows.get_mut(w) {
             win.pos = if win.framed { (pos.0 + i.0, pos.1 + i.1) } else { pos };
         }
+    }
+    pub fn mouse_position(&self) -> (f32, f32) {
+        (self.mouse.x, self.mouse.y)
     }
     pub fn window_visible(&self, w: WindowId) -> bool {
         matches!(self.windows.get(w), Some(Some(win)) if win.visible)
@@ -798,6 +802,13 @@ impl Gui {
     pub fn is_enabled(&self, w: WindowId, name: &str) -> bool {
         self.find(w, name).is_some_and(|v| self.tree.views[v].enabled)
     }
+    /// Connect/disconnect generic View down/hover signals without replacing the view with a button.
+    pub fn set_view_mouse(&mut self, w: WindowId, name: &str, enabled: bool) {
+        if let Some(v) = self.find(w, name) {
+            self.tree.views[v].mouse_listener = enabled;
+        }
+    }
+
     pub fn set_enabled(&mut self, w: WindowId, name: &str, enabled: bool) {
         if let Some(v) = self.find(w, name) {
             self.tree.views[v].enabled = enabled;
@@ -848,6 +859,18 @@ impl Gui {
                 p.value = value.clamp(0.0, 1.0);
             }
         }
+    }
+    /// `BitmapView_c::Clear/AddBitmap`: replaces the displayed native bitmap.
+    pub fn set_bitmap(&mut self, w: WindowId, name: &str, image: Option<GfxId>) {
+        if let Some(v) = self.find(w, name) {
+            if let Kind::Bitmap { gfx, index } = &mut self.tree.views[v].kind {
+                if gfx.first().copied() == image && gfx.len() == usize::from(image.is_some()) { return; }
+                gfx.clear();
+                gfx.extend(image);
+                *index = 0;
+            }
+        }
+        self.relayout_window(w);
     }
     pub fn focus(&mut self, w: WindowId, name: &str) {
         if let Some(e) = self.find(w, name).and_then(|v| self.editor_of(v)) {
@@ -1145,6 +1168,7 @@ impl Gui {
             }
             Kind::Button(b) => self.draw_button(out, &v, b, rect, tint, alpha),
             Kind::CcEntry(c) => self.draw_cc_entry(out, c, v.enabled, rect, tint, alpha),
+            Kind::Slider(s) => self.draw_slider(out, s, rect, alpha),
             Kind::Canvas(c) => {
                 self.draw_canvas(out, c, rect, alpha);
                 self.draw_view_tabs(out, id, rect, alpha);
@@ -1185,10 +1209,13 @@ impl Gui {
                 if let Some(id) = self.gfx.id(g) {
                     self.push_gfx(out, id, Rect::new(rect.l, rect.t, rect.l + 10.0, rect.t + 10.0), tint, alpha);
                 }
-                self.draw_string(out, FontId::Normal, &label.clone(), rect.l as i32 + 15, rect.t as i32, tint, alpha, false);
+                if v.children.is_empty() {
+                    self.draw_string(out, FontId::Normal, &label.clone(), rect.l as i32 + 15, rect.t as i32, tint, alpha, false);
+                }
             }
             _ => {}
         }
+        let tint = if matches!(v.kind, Kind::RadioButton { .. }) && !v.enabled { mul(tint, [0x90; 3]) } else { tint };
         // children
         match &v.kind {
             Kind::ScrollView(_) => {
@@ -1229,6 +1256,7 @@ impl Gui {
             if b.hover && v.enabled {
                 self.push_gfx(out, hover, r, mul(tint, self.map_color(0x3000000)), alpha * BUTTON_ALPHA);
             }
+            self.draw_button_background_icon(out, b.background_icon, b.background_icon_fade, r, tint, alpha);
             return;
         }
         let g = |ids: [u32; 9]| -> [Option<GfxId>; 9] {
@@ -1249,7 +1277,8 @@ impl Gui {
             let t = mul(tint, self.map_color(0x3000000));
             self.draw_border(out, &hover, r, t, alpha * BUTTON_ALPHA);
         }
-        if !b.label.is_empty() {
+        self.draw_button_background_icon(out, b.background_icon, b.background_icon_fade, r, tint, alpha);
+        if !b.label.is_empty() && (b.background_icon.is_none() || b.background_icon_fade > 0.8) {
             // label: TextView (font NORMAL) centred in the bounds (Rect::TranslateCenter 0x1000aae4)
             let s = text::string_size(&mut self.fonts, &self.colors, FontId::Normal, &b.label);
             let (lw, lh) = (s.x + 1.0, s.y + 1.0);
@@ -1562,7 +1591,7 @@ impl Gui {
         }
         let (l, t) = if is_root { (0.0, 0.0) } else { (ox + v.frame.l, oy + v.frame.t) };
         let r = Rect::new(l, t, l + v.frame.width(), t + v.frame.height());
-        if !is_root && r.contains(Point::new(x, y)) && matches!(v.kind, Kind::Border(_) | Kind::Button(_) | Kind::CcEntry(_) | Kind::Canvas(_) | Kind::Bitmap { .. } | Kind::TextButton(_) | Kind::Text(_) | Kind::PowerBar(_) | Kind::Input | Kind::Combo(_) | Kind::Dropdown(_) | Kind::List(_) | Kind::Multi(_) | Kind::MultiHeader { .. }) {
+        if !is_root && r.contains(Point::new(x, y)) && matches!(v.kind, Kind::Slider(_) | Kind::Border(_) | Kind::Button(_) | Kind::CcEntry(_) | Kind::Canvas(_) | Kind::Bitmap { .. } | Kind::TextButton(_) | Kind::Text(_) | Kind::PowerBar(_) | Kind::Input | Kind::Combo(_) | Kind::Dropdown(_) | Kind::List(_) | Kind::Multi(_) | Kind::MultiHeader { .. }) {
             return true;
         }
         v.children.iter().any(|c| self.covers(*c, x, y, false, l, t))
@@ -1578,6 +1607,7 @@ impl Gui {
     /// `smooth` = bilinear sampling (`RenderWindow_t::UseFilter(true)`), else nearest.
     pub fn add_image(&mut self, _name: &str, rgba: Vec<u8>, w: u32, h: u32, smooth: bool) -> GfxId {
         let id = GfxId(EXTRA_BASE + self.extras.len() as u32);
+        self.gfx.register_runtime_size(id, w, h);
         self.extras.push(ExtraImage { rgba, w, h, smooth });
         id
     }
@@ -1617,6 +1647,7 @@ impl Gui {
                 self.hscroll_drag(x);
                 self.header_drag(x);
                 self.drag_select(x);
+                self.drag_slider(x);
                 self.drag_canvas(x, y);
                 self.frame_mouse_move(x, y);
                 self.sel_drag(x, y);
@@ -1648,6 +1679,7 @@ impl Gui {
                 if self.ix.menu.is_some() {
                     self.menu_mouse_down(x, y);
                 } else {
+                    if let Some((_, v)) = self.hit(x, y) { self.view_mouse_down(v, 2); }
                     self.widget_right_down(x, y);
                     self.frame_right_down(x, y);
                 }
@@ -1714,7 +1746,8 @@ impl Gui {
         }
         for c in v.children.iter().rev() {
             if let Some(h) = self.hit_view(*c, x, y, false, cox, coy, cclip) {
-                return Some(h);
+                // The composed label belongs to the radio control, not a separate text target.
+                return Some(if matches!(v.kind, Kind::RadioButton { .. }) { id } else { h });
             }
         }
         // `TVF_FILL_BOTTOM_UP` text is drawn `dy` below its frame (short content sits at the bottom of the ScrollView): the visible lines are hit-testable too
@@ -1727,15 +1760,41 @@ impl Gui {
         }
         let inside = clip_r.contains(Point::new(x, y)) && !clip_r.is_empty();
         let interactive = match &v.kind {
-            Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) | Kind::Canvas(_) | Kind::ScrollView(_) | Kind::CheckBox { .. } | Kind::RadioButton { .. } | Kind::Dropdown(_) | Kind::List(_) | Kind::Multi(_) | Kind::MultiHeader { .. } => true,
+            Kind::Slider(_) | Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) | Kind::Canvas(_) | Kind::ScrollView(_) | Kind::CheckBox { .. } | Kind::RadioButton { .. } | Kind::Dropdown(_) | Kind::List(_) | Kind::Multi(_) | Kind::MultiHeader { .. } => true,
             Kind::Text(t) => t.tvf & (tvf::ACCEPT_TXT_INPUT | tvf::ACCEPT_MOUSE_INPUT) != 0,
             _ => false,
         };
-        (inside && interactive).then_some(id)
+        (inside && (interactive || v.mouse_listener)).then_some(id)
+    }
+
+    fn view_mouse_owner(&self, mut v: ViewId) -> Option<ViewId> {
+        loop {
+            if self.tree.views[v].mouse_listener { return Some(v); }
+            v = self.tree.views[v].parent?;
+        }
+    }
+
+    fn view_mouse_down(&mut self, v: ViewId, button: u8) {
+        if let Some(v) = self.view_mouse_owner(v) {
+            if let Some(window) = self.window_of(v) {
+                self.events.push(Event::ViewMouse { window, view: self.tree.views[v].name.clone(), button });
+            }
+        }
     }
 
     fn update_hover(&mut self) {
         let h = self.hit(self.mouse.x, self.mouse.y).map(|h| h.1);
+        let old_owner = self.hover.and_then(|v| self.view_mouse_owner(v));
+        let new_owner = h.and_then(|v| self.view_mouse_owner(v));
+        if old_owner != new_owner {
+            for (owner, entered) in [(old_owner, false), (new_owner, true)] {
+                if let Some(v) = owner {
+                    if let Some(window) = self.window_of(v) {
+                        self.events.push(Event::ViewHover { window, view: self.tree.views[v].name.clone(), entered });
+                    }
+                }
+            }
+        }
         if h != self.hover {
             for (id, state) in [(self.hover, false), (h, true)] {
                 if let Some(id) = id {
@@ -1822,6 +1881,7 @@ impl Gui {
             self.focus = None;
             return;
         };
+        self.view_mouse_down(v, 1);
         match self.tree.views[v].kind.clone() {
             Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) | Kind::CheckBox { .. } | Kind::RadioButton { .. } => {
                 self.pressed = Some(v);
@@ -1861,6 +1921,7 @@ impl Gui {
             }
             Kind::Bitmap { .. } => {}
             Kind::Canvas(_) => self.canvas_down(v, x, y),
+            Kind::Slider(_) => self.slider_down(v, x, y),
             Kind::ScrollView(_) => {
                 if !self.hscroll_press(v, x, y) {
                     self.scrollbar_press(v, y)
@@ -1942,6 +2003,7 @@ impl Gui {
     fn mouse_up(&mut self) {
         self.border_release();
         if let Some(p) = self.pressed.take() {
+            self.slider_up(p);
             let over = self.hit(self.mouse.x, self.mouse.y).map(|h| h.1) == Some(p);
             self.canvas_release(p);
             if over {
@@ -2397,6 +2459,31 @@ mod clip_tests {
                 previous_bottom = frame.b;
             }
         }
+    }
+
+    #[test]
+    fn subscribed_plain_view_receives_child_hits_without_button_art() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let w = gui.open_window_xml("signals", r#"<root><View name="row"><Button name="child"/></View></root>"#, (0, 0), WindowSize::Fixed(100, 100)).unwrap();
+        let row = gui.find(w, "row").unwrap();
+        let child = gui.find(w, "child").unwrap();
+        gui.tree.views[child].frame = Rect::new(0.0, 0.0, 19.0, 19.0);
+        assert!(gui.hit(50.0, 50.0).is_none());
+        gui.set_view_mouse(w, "row", true);
+        assert!(matches!(gui.tree.views[row].kind, Kind::View));
+        let enter = Event::ViewHover { window: w, view: "row".into(), entered: true };
+        assert!(gui.input(InputEvent::MouseMove { x: 5.0, y: 5.0 }).contains(&enter));
+        // Moving from the interactive child into bare row space remains inside the same subscriber.
+        assert!(!gui.input(InputEvent::MouseMove { x: 50.0, y: 50.0 }).iter().any(|e| matches!(e, Event::ViewHover { .. })));
+        let events = gui.input(InputEvent::MouseDown { x: 5.0, y: 5.0, button: MouseButton::Left });
+        assert!(events.contains(&Event::ViewMouse { window: w, view: "row".into(), button: 1 }));
+        assert_eq!(gui.pressed, Some(child));
+        let events = gui.input(InputEvent::MouseMove { x: 150.0, y: 150.0 });
+        assert!(events.contains(&Event::ViewHover { window: w, view: "row".into(), entered: false }));
+        gui.set_view_mouse(w, "row", false);
+        assert!(gui.hit(50.0, 50.0).is_none());
     }
 
     #[test]

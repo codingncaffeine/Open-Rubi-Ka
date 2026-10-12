@@ -73,6 +73,9 @@ pub(super) struct ListView {
     pub selected: Option<i32>,
     /// `(column id, descending)` of the list layout (`SetListSortColumn`).
     pub sort: (u32, bool),
+    /// TargetNCUView overrides the ordinary ten-pixel grid gap with five (GUI 0x100dd492).
+    pub spacing: f32,
+    pub icon_height: Option<f32>,
     rows: Vec<Row>,
     /// Row keys in grid cell order / list row order of the last [`ListView::paint`].
     order: Vec<i32>,
@@ -84,6 +87,7 @@ pub(super) struct ListView {
     painted: Option<PaintedLayout>,
     dirty: bool,
     painted_selection: Option<i32>,
+    item_tip: Option<(i32, bool, String)>,
 }
 
 /// Columns of a grid that fits `client_w` px: `n` icons and `n - 1` spacings between the borders (`RecalcCellCount`).
@@ -106,7 +110,7 @@ pub(super) fn scroll_xml(min_h: f32, w: f32) -> String {
 
 impl ListView {
     pub fn new(mode: Mode, columns: Vec<Column>, cols: usize, min_rows: usize, sort: (u32, bool)) -> Self {
-        Self { mode, columns, cols, min_rows, selected: None, sort, rows: vec![], order: vec![], last_click: None, fades: vec![], painted: None, dirty: true, painted_selection: None }
+        Self { mode, columns, cols, min_rows, spacing: SPACING, icon_height: None, selected: None, sort, rows: vec![], order: vec![], last_click: None, fades: vec![], painted: None, dirty: true, painted_selection: None, item_tip: None }
     }
 
     #[cfg(test)]
@@ -155,9 +159,27 @@ impl ListView {
         self.rows.iter().find(|r| r.key == key)
     }
 
+    /// InventoryListView tooltip callback (`GUI 1004178f`): build the full item HTML only for the hovered row.
+    pub fn update_item_tooltip(&mut self, gui: &mut Gui, window: WindowId, icon: f32, descriptions: bool, body: impl FnOnce(i32) -> String) {
+        if !gui.window_visible(window) { self.item_tip = None; return; }
+        let (x, y) = gui.mouse_position();
+        let Some(key) = self.row_at(gui, window, x, y, icon) else { self.item_tip = None; return };
+        if !self.item_tip.as_ref().is_some_and(|(old, enabled, _)| *old == key && *enabled == descriptions) {
+            self.item_tip = Some((key, descriptions, if descriptions { body(key) } else { String::new() }));
+        }
+        let Some((_, _, body)) = &self.item_tip else { return };
+        if let Some(row) = self.rows.iter_mut().find(|r| r.key == key) {
+            if row.tip_body != *body {
+                row.tip_body.clone_from(body);
+                self.dirty = true;
+                self.paint(gui, window, icon);
+            }
+        }
+    }
+
     fn cell_pos(&self, i: usize, icon: f32) -> (f32, f32) {
-        let p = icon + SPACING;
-        (BORDER + (i % self.cols) as f32 * p, BORDER + (i / self.cols) as f32 * p)
+        let p = icon + self.spacing;
+        (BORDER + (i % self.cols) as f32 * p, BORDER + (i / self.cols) as f32 * (self.icon_height.unwrap_or(icon) + self.spacing))
     }
 
     /// Number of grid cells shown: the items rounded up to full rows, at least `min_rows`.
@@ -197,7 +219,8 @@ impl ListView {
     fn paint_grid(&self, gui: &mut Gui, w: WindowId, icon: f32, rebuild: bool) {
         let cells = self.cells();
         let rows = cells / self.cols;
-        let (cw, ch) = (grid_width(self.cols, icon), 2.0 * BORDER + rows as f32 * icon + (rows as f32 - 1.0) * SPACING);
+        let ih = self.icon_height.unwrap_or(icon);
+        let (cw, ch) = (2.0 * BORDER + self.cols as f32 * icon + (self.cols as f32 - 1.0) * self.spacing, 2.0 * BORDER + rows as f32 * ih + (rows as f32 - 1.0) * self.spacing);
         if rebuild {
             let xml = format!("<root><CanvasView name=\"grid\" min_size=\"Point({cw},{ch})\" max_size=\"Point({cw},{ch})\"/></root>");
             if let Err(e) = gui.add_view_xml(w, "lv_content", "Grid", &xml) {
@@ -206,8 +229,8 @@ impl ListView {
             }
         }
         let art = |gui: &Gui, n: &str| gui.gfx_id(n).map(GfxId).map(|g| (g, gui.gfx().size(g)));
-        let slot = art(gui, SLOT_32);
-        let open = art(gui, SLOT_32_OPEN);
+        let slot = art(gui, if self.icon_height.is_some() { "GFX_GUI_MULTILISTVIEW_SLOT_40X24" } else { SLOT_32 });
+        let open = if self.icon_height.is_some() { None } else { art(gui, SLOT_32_OPEN) };
         let (mut items, mut tips) = (vec![], vec![]);
         for i in 0..cells {
             let (x, y) = self.cell_pos(i, icon);
@@ -215,14 +238,14 @@ impl ListView {
             // the slot art is centred on the icon square
             let put = |items: &mut Vec<CanvasItem>, a: Option<(GfxId, (u32, u32))>| {
                 if let Some((g, (aw, ah))) = a {
-                    let (ax, ay) = (x + ((icon - aw as f32) / 2.0).floor(), y + ((icon - ah as f32) / 2.0).floor());
+                    let (ax, ay) = (x + ((icon - aw as f32) / 2.0).floor(), y + ((ih - ah as f32) / 2.0).floor());
                     items.push(CanvasItem::Image { id: g, src: [0.0, 0.0, aw as f32, ah as f32], dst: [ax, ay, ax + aw as f32, ay + ah as f32], alpha: 1.0 });
                 }
             };
             put(&mut items, slot);
             let Some(row) = row else { continue };
             if let Some((g, gw, gh)) = row.icon {
-                items.push(CanvasItem::Image { id: g, src: [0.0, 0.0, gw as f32, gh as f32], dst: [x, y, x + icon, y + icon], alpha: 1.0 });
+                items.push(CanvasItem::Image { id: g, src: [0.0, 0.0, gw as f32, gh as f32], dst: [x, y, x + icon, y + ih], alpha: 1.0 });
             }
             if let (Some((_, p)), Some(g)) = (self.fades.iter().find(|f| f.0 == row.key), gui.gfx_id("GFX_GUI_ICONFADER32").map(GfxId)) {
                 let shrink = (icon - 1.0) * 0.5 * (1.0 - p.clamp(0.0, 1.0));
@@ -231,7 +254,7 @@ impl ListView {
             if self.selected == Some(row.key) {
                 put(&mut items, open);
             }
-            tips.push(CanvasTip { rect: [x, y, x + icon, y + icon], title: row.tip_title.clone(), body: row.tip_body.clone() });
+            tips.push(CanvasTip { rect: [x, y, x + icon, y + ih], title: row.tip_title.clone(), body: row.tip_body.clone() });
         }
         gui.set_canvas(w, "grid", items);
         gui.set_canvas_tips(w, "grid", tips);
@@ -295,7 +318,7 @@ impl ListView {
                 let (lx, ly) = (x - r.l, y - r.t);
                 (0..self.cells()).find(|&i| {
                     let (cx, cy) = self.cell_pos(i, icon);
-                    lx >= cx && lx < cx + icon && ly >= cy && ly < cy + icon
+                    lx >= cx && lx < cx + icon && ly >= cy && ly < cy + self.icon_height.unwrap_or(icon)
                 })
                 .and_then(|i| self.order.get(i).copied())
             }
@@ -494,6 +517,27 @@ mod tests {
     }
 
     #[test]
+    fn item_description_tooltip_is_lazy_and_changes_live() {
+        let Ok(mut gui) = Gui::new(&ao_gui::client_dir(), None) else { return };
+        for mode in [Mode::Grid, Mode::List] {
+            let w = gui.open_window_xml("tips", &format!("<root>{}</root>", scroll_xml(150.0, 200.0)), (10, 10), ao_gui::WindowSize::Fixed(200, 150)).unwrap();
+            let mut list = ListView::new(mode, vec![Column { id: 1, label: "Name".into(), width: 100.0 }], 4, 1, (1, false));
+            list.set_rows(vec![Row { key: 7, cells: vec!["Nano".into()], tip_title: "Nano".into(), ..Default::default() }]);
+            list.paint(&mut gui, w, ICON_32);
+            let name = if mode == Mode::Grid { "grid" } else { "lv_row0" };
+            let r = gui.view_rect(w, name).unwrap();
+            let (x, y) = if mode == Mode::Grid { (r.l + BORDER + 2.0, r.t + BORDER + 2.0) } else { (r.l + 2.0, r.t + 2.0) };
+            gui.input(ao_gui::InputEvent::MouseMove { x, y });
+            list.update_item_tooltip(&mut gui, w, ICON_32, true, |_| "Description".into());
+            assert_eq!(list.row(7).unwrap().tip_body, "Description");
+            list.update_item_tooltip(&mut gui, w, ICON_32, true, |_| panic!("unchanged hover must not reformat the item"));
+            list.update_item_tooltip(&mut gui, w, ICON_32, false, |_| panic!("disabled descriptions must not format the item"));
+            assert!(list.row(7).unwrap().tip_body.is_empty());
+            gui.close_window(w);
+        }
+    }
+
+    #[test]
     fn timer_updates_preserve_hover_and_press_identity() {
         use ao_gui::{InputEvent, MouseButton, WindowSize};
         let Ok(mut gui) = Gui::new(&ao_gui::client_dir(), None) else { return };
@@ -543,6 +587,15 @@ mod tests {
         assert_eq!(grid_cols_for(169.0, ICON_32), 3);
         // the install's NCU frame: 192 px outer, 10 px frame
         assert_eq!(grid_cols_for(182.0, ICON_32), 4);
+    }
+
+    #[test]
+    fn target_ncu_uses_rectangular_icons_and_native_grid_gaps() {
+        let mut v = ListView::new(Mode::Grid, vec![], 3, 0, (12, false));
+        v.spacing = 5.0;
+        v.icon_height = Some(24.0);
+        assert_eq!(v.cell_pos(2, 40.0), (96.0, 6.0));
+        assert_eq!(v.cell_pos(3, 40.0), (6.0, 35.0));
     }
 
     #[test]

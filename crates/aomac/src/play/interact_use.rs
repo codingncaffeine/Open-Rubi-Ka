@@ -3,7 +3,6 @@
 
 use super::dynels::CAN_STAT;
 use super::hud_dialog::Dialogs;
-use super::hud_pick::hits;
 use super::hud_target::Ray;
 use super::interact::{Action, Interact};
 use super::interact_loot::LootUi;
@@ -70,6 +69,10 @@ pub struct UseUi {
 }
 
 impl UseUi {
+    pub(super) fn configure_escape(&mut self, values: &super::dvalue::DValues) {
+        self.dialogs.configure_escape(values);
+        self.loot.configure_escape(values);
+    }
     /// The window of the open loot view of `container`.
     #[cfg(test)]
     pub(super) fn loot_window(&self, container: Identity) -> Option<ao_gui::WindowId> {
@@ -95,12 +98,20 @@ impl UseUi {
 
 /// Every non-character and character body under the pointer, nearest first (`n3Camera_t` hit list, docs/zone/interact.md §8): characters as
 /// `{0xC350, instance}`, props (corpses, vending machines, doors, terminals, items on the ground) by their own identity.
-pub fn pick_objects(ray: &Ray, zone: &Zone) -> Vec<Identity> {
-    let mut bodies = zone.world.pick_bodies(zone.char_id as i32);
+pub(super) fn pick_objects(ray: &Ray, zone: &Zone, player: Option<&super::player::Player>) -> Vec<Identity> {
+    let bodies = zone.world.pick_bodies(zone.char_id as i32);
     let props = zone.world.pick_props();
-    let by_id: HashMap<i32, Identity> = props.iter().map(|(b, id)| (b.id, *id)).collect();
-    bodies.extend(props.iter().map(|(b, _)| *b));
-    hits(&bodies, ray.origin, ray.dir, ray.len).into_iter().map(|id| by_id.get(&id).copied().unwrap_or(Identity { kind: DYNEL_CHAR, instance: id })).collect()
+    let mut picked: Vec<_> = bodies.iter().filter_map(|body| {
+        zone.world.pick_character_hit(body, ray, !zone.triangle_targeting)
+            .map(|distance| (distance, Identity { kind: DYNEL_CHAR, instance: body.id }))
+    }).chain(props.iter().filter_map(|(body, identity)| {
+        body.hit(ray.origin, ray.dir, ray.len).map(|distance| (distance, *identity))
+    })).collect();
+    if let Some(distance) = player.and_then(|player| player.pick_hit(ray, !zone.triangle_targeting)) {
+        picked.push((distance, Identity { kind: DYNEL_CHAR, instance: zone.char_id as i32 }));
+    }
+    picked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.instance.cmp(&b.1.instance)));
+    picked.into_iter().map(|(_, identity)| identity).collect()
 }
 
 impl Interact {
@@ -170,6 +181,8 @@ impl Interact {
     /// `GenericCmd_t` 3 ([`Interact::use_object`]). Inventory items (kinds below 50000: wearing, unwearing, special actions) are the item windows' (`hud_stats`).
     /// [UNRESOLVED] `VisualMesh_t::AdvertisingUseAction` (billboards use client side): not ported, the server just ignores the command.
     pub fn use_item(&mut self, zone: &Zone, id: Identity, confirmed: bool) -> Action {
+        // Interfaces 1000a707 opens the build UI before GC validates ordinary use.
+        if self.queue_tower_use(zone, id) { return Action::Use; }
         let refuse = |s: &mut Self, key| {
             s.use_ui.feedback.push(key);
             Action::Refused(key)
@@ -212,6 +225,12 @@ impl Interact {
             UseOut::Handled => {}
             UseOut::Use(id) => self.use_object(id),
             UseOut::Take(item) => {
+                // GUI 100ca1e7: an owned ItemContainerView uses the item in place;
+                // only external containers and bank move it into the inventory.
+                if self.use_ui.loot.uses_in_place(item) {
+                    self.use_object(item);
+                    return;
+                }
                 if Self::bag_full(zone) {
                     self.use_ui.feedback.push("Feedback_InventoryFull");
                 } else {
@@ -228,22 +247,29 @@ impl Interact {
 
     /// Every decoded zone frame: corpse names, and `InventoryUpdateIIR_t` for a container that is not the own character's (`FUN_100a040e` [GC 0x100a040e]:
     /// the header must be a character, the container a `Chest_t`; the contents are replaced, the window opens with the message's flag).
-    pub(super) fn watch_objects(&mut self, gui: &mut Gui, m: &Message) {
+    pub(super) fn watch_objects(&mut self, gui: &mut Gui, m: &Message, zone: &Zone) {
         match &m.body {
             N3::Inventory(InventoryMsg::Bank(entries)) if m.header.target == self.own_id() => {
                 let container = Identity { kind: 0xdead, instance: self.own as i32 };
                 let u = inventory::InventoryUpdate { capacity: 0x66, kind: 3, entries: entries.clone(), container, word: 0, flag: true };
                 let ui = &mut self.use_ui;
-                ui.loot.update(gui, ui.dir.as_deref(), self.screen, container, "Bank", &u);
+                ui.loot.update(gui, ui.dir.as_deref(), self.screen, container, "Bank", &u, false);
             }
             N3::World(World::Corpse(c)) => {
                 let name = c.base.blob.split(|&b| b == 0).next().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
                 self.use_ui.names.insert((m.header.target.kind, m.header.target.instance), name);
             }
             N3::Inventory(InventoryMsg::Update(u)) if u.container.kind > DYNEL_CHAR && m.header.target.kind == DYNEL_CHAR => {
-                let title = self.use_ui.names.get(&(u.container.kind, u.container.instance)).cloned().unwrap_or_default();
+                let mut title = self.use_ui.names.get(&(u.container.kind, u.container.instance)).cloned().unwrap_or_default();
                 let ui = &mut self.use_ui;
-                ui.loot.update(gui, ui.dir.as_deref(), self.screen, u.container, &title, u);
+                let owned = zone.is_item_mine(u.container);
+                if owned {
+                    let entry = zone.inventory.values().chain(zone.containers.values().flat_map(|(_, entries)| entries.iter())).find(|e| e.id == u.container);
+                    if let Some(entry) = entry {
+                        if let Some(name) = ui.loot.item_title(gui, ui.dir.as_deref(), entry.item.low_id) { title = name; }
+                    }
+                }
+                ui.loot.update(gui, ui.dir.as_deref(), self.screen, u.container, &title, u, owned);
             }
             // the server's answer to the take: `{0x6b, word << 16 | slot}` goes into our bag, the corpse list loses it (zone side: `Zone::apply_inventory`)
             N3::Inventory(InventoryMsg::ContainerAdd { item, container, .. })
@@ -512,6 +538,65 @@ mod tests {
         }
         assert!(rows.contains(&1), "{rows:?}");
         assert_eq!(rows.last(), Some(&0), "{rows:?}");
+    }
+
+    #[test]
+    fn real_backpack_archive_opens_owned_view_and_snapshots_escape() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let store = ao_rdb::RecordStore::open(&client).unwrap();
+        let template = ao_formats::dynel_visual::item_template(&store, 99228).unwrap().unwrap();
+        assert!(template.name.as_deref().unwrap().contains("Backpack"));
+        let mut gui = Gui::new(&client, None).unwrap();
+        gui.set_screen_size(1280, 800);
+        let mut zone = Zone::new(0x830e);
+        let mut i = Interact::new(zone.char_id, (1280, 800));
+        i.set_client_dir(client);
+        let container = Identity { kind: 0xc749, instance: 42 };
+        // Native inventory element decode, with the installed Small Backpack
+        // record rather than a fake template.
+        let frame = loot_frame(zone.char_id, &[(0x40, 99228)], false);
+        let N3::Inventory(InventoryMsg::Update(mut carrying)) = ao_net::n3::decode(&frame).unwrap().body else { panic!() };
+        let mut entry = carrying.entries.remove(0);
+        entry.id = container;
+        zone.inventory.insert(entry.slot, entry);
+        assert!(zone.is_item_mine(container));
+        let mut values = super::super::dvalue::DValues::default();
+        values.set_i64("esc_backpacks", 0);
+        values.set_i64("esc_chests", 1);
+        i.use_ui.configure_escape(&values);
+        // Reuse real server-described contents from the archived loot update.
+        let mut message = include_str!("../../../../docs/captures/zone_loot_take_ithaca.rec").lines().find_map(|line| {
+            let mut fields = line.split(' ');
+            let (_, direction, hex) = (fields.next()?, fields.next()?, fields.next()?);
+            if direction != "<" { return None; }
+            let bytes: Vec<_> = (0..hex.len()/2).map(|n| u8::from_str_radix(&hex[n*2..n*2+2], 16).unwrap()).collect();
+            let frame = ao_net::frame::Frame::decode_with(&bytes, false).unwrap()?.0;
+            let message = ao_net::n3::decode(&frame).ok()?;
+            matches!(&message.body, N3::Inventory(InventoryMsg::Update(u)) if u.flag && !u.entries.is_empty()).then_some(message)
+        }).unwrap();
+        let N3::Inventory(InventoryMsg::Update(update)) = &mut message.body else { panic!() };
+        update.container = container;
+        zone.apply_inventory(&InventoryMsg::Update(update.clone()));
+        i.watch_objects(&mut gui, &message, &zone);
+        let window = i.use_ui.loot.window_of(container).unwrap();
+        assert!(!i.loot_dump(&mut gui)[0].1[0].2.is_empty());
+        values.set_i64("esc_backpacks", 1);
+        i.use_ui.configure_escape(&values);
+        assert!(i.event(&mut gui, &Event::Escape { window }, &zone));
+        assert!(i.use_ui.loot.is_open(container));
+        assert!(i.loot_take(&mut gui, &zone, 0));
+        let frames = i.take_outbox();
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(ao_net::n3::decode(&frames[0]).unwrap().body,
+            N3::Misc(Misc::GenericCmd(cmd)) if cmd.cmd == 3));
+        assert!(i.event(&mut gui, &Event::CloseRequested { window }, &zone));
+        i.watch_objects(&mut gui, &message, &zone);
+        let window = i.use_ui.loot.window_of(container).unwrap();
+        assert!(i.event(&mut gui, &Event::Escape { window }, &zone));
+        assert!(!i.use_ui.loot.is_open(container));
+        zone.inventory.clear();
+        assert!(!zone.is_item_mine(container), "cached contents are not ownership");
     }
 
     #[test]

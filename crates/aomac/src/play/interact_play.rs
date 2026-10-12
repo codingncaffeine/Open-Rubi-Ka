@@ -17,6 +17,7 @@ impl Play {
             i.close_all(&mut self.gui);
         }
         let mut i = Interact::new(self.zone.char_id, self.size);
+        if let Some(hud) = self.hud.as_ref() { i.configure_escape(&hud.dvalues); }
         i.set_client_dir(self.dir.clone());
         i.trade.texts = super::interact_chat::ChatTexts::load(&self.text);
         i.ptrade.set_texts(self.text.by_key(10000, "MsgBox_Yes").unwrap_or_default(), self.text.by_key(10000, "MsgBox_No").unwrap_or_default());
@@ -26,6 +27,7 @@ impl Play {
     pub(super) fn interact_zone_frame(&mut self, f: &Frame) {
         if let Some(i) = self.interact.as_mut() {
             if let Some(hud) = self.hud.as_ref() {
+                i.configure_escape(&hud.dvalues);
                 i.mission.load_config(&hud.dvalues);
             }
             i.on_frame(&mut self.gui, f, &mut self.zone);
@@ -33,19 +35,37 @@ impl Play {
     }
 
     pub(super) fn interact_event(&mut self, e: &Event) -> bool {
+        if let (Some(i), Some(hud)) = (self.interact.as_mut(), self.hud.as_ref()) { i.configure_escape(&hud.dvalues); }
         self.interact.as_mut().is_some_and(|i| i.event(&mut self.gui, e, &self.zone))
     }
 
     /// Per frame: the frames the player's actions produced go to the zone server.
     pub(super) fn interact_frame(&mut self) {
         let Some(i) = self.interact.as_mut() else { return };
+        let mut check_ready = true;
+        if let Some(hud) = self.hud.as_mut() {
+            i.configure_escape(&hud.dvalues);
+            check_ready = hud.actions.list.progress(0xa1).is_none();
+            for item in hud.take_tower_uses() { i.queue_tower_use(&self.zone, item); }
+        }
+        for item in std::mem::take(&mut i.tower_uses) {
+            match i.tower.open(&mut self.gui, self.size, &self.zone, item, &self.text) {
+                Ok(Some(payload)) => i.send(payload),
+                Ok(None) => {}
+                Err(error) => eprintln!("tower build menu: {error:#}"),
+            }
+        }
+        if let Some(reply) = i.tower_reply.take() { i.tower.result(&mut self.gui, &reply, &self.text, &self.zone); }
+        i.tower.update(&mut self.gui, &self.zone, check_ready);
         i.resize(self.size);
         i.tick(self.time);
         if let Some(hud) = self.hud.as_mut() {
             i.mission.load_config(&hud.dvalues);
             i.mission.save_config(&mut hud.dvalues);
+            i.tower.sync_config(&mut self.gui, &mut hud.dvalues, self.size);
+            i.use_ui.loot.update_tooltips(&mut self.gui, &self.zone, &self.text, hud.dvalues.flag("ItemDescriptionTooltips"));
         }
-        for t in i.take_notices() {
+        for t in i.take_notices().into_iter().chain(i.tower.take_notices()) {
             if let Some(c) = self.chat.as_mut() {
                 c.system_line(&mut self.gui, &t, 12);
             }
@@ -62,6 +82,11 @@ impl Play {
             }
         }
         for url in i.mission.take_urls() {
+            if let Some(chat) = self.chat.as_mut() {
+                chat.show_url(&mut self.gui, &self.zone, &self.text, &url);
+            }
+        }
+        for url in i.tower.take_urls() {
             if let Some(chat) = self.chat.as_mut() {
                 chat.show_url(&mut self.gui, &self.zone, &self.text, &url);
             }
@@ -111,7 +136,7 @@ impl Play {
             if self.hud.as_ref().is_some_and(|h| h.item_dragging()) {
                 let under = (!self.gui.wants_mouse(x, y)).then(|| {
                     let ray = pick_ray(&host.camera, &host.lens.unwrap_or_default(), (self.size.0 as f32, self.size.1 as f32), (x, y));
-                    pick_objects(&ray, &self.zone).first().copied()
+                    pick_objects(&ray, &self.zone, self.player.as_ref()).first().copied()
                 });
                 if let Some(h) = self.hud.as_mut() {
                     h.set_world_under(under.flatten());
@@ -124,7 +149,7 @@ impl Play {
             return;
         }
         let ray = pick_ray(&host.camera, &host.lens.unwrap_or_default(), (self.size.0 as f32, self.size.1 as f32), (x, y));
-        let list = pick_objects(&ray, &self.zone);
+        let list = pick_objects(&ray, &self.zone, self.player.as_ref());
         let target = self.zone.selected_target();
         let Some(id) = target.filter(|t| list.contains(t)).or_else(|| list.first().copied()) else { return };
         let (now, zone) = (self.time, &self.zone);

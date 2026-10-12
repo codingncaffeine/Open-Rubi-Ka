@@ -46,6 +46,10 @@ pub struct Interact {
     pub(super) shop: ShopUi,
     /// Mission terminal selection (`MissionSelectionView_c`).
     pub(super) mission: MissionUi,
+    pub(super) tradeskill: super::interact_tradeskill::TradeskillUi,
+    pub(super) tower: super::interact_tower::TowerUi,
+    pub(super) tower_uses: Vec<Identity>,
+    pub(super) tower_reply: Option<ao_net::n3::world::CharacterAction>,
     outbox: Vec<Frame>,
     /// Text of `KnubotCloseChatWindow` for the chat window ([INFERENCE]: the `+0xf0` slot's consumer was not located; the live server sends the reason, e.g. "You are too far away from <npc> to continue this conversation.").
     notices: Vec<String>,
@@ -54,6 +58,7 @@ pub struct Interact {
     use_actions: super::combat::use_actions::Uses,
     /// Screen size for centring the window.
     pub(super) screen: (u32, u32),
+    pub(super) escape_options: Option<[bool; 3]>,
     /// Every NPC dialogue line seen, in order, for the live harness (`HTML` as shown).
     pub log: Vec<String>,
 }
@@ -65,6 +70,14 @@ impl Interact {
 
     pub fn resize(&mut self, screen: (u32, u32)) {
         self.screen = screen;
+    }
+
+    /// Refresh preferences before dispatch; constructors capture their own ESC policy.
+    pub fn configure_escape(&mut self, values: &super::dvalue::DValues) {
+        self.escape_options = Some(["esc_shops", "esc_trades", "esc_npcchat"].map(|key| values.get_i64(key).unwrap_or(if key == "esc_npcchat" { 0 } else { 1 }) != 0));
+        self.use_ui.configure_escape(values);
+        self.ptrade.configure_escape(values);
+        self.tower.configure_escape(values);
     }
 
     pub(super) fn own_id(&self) -> Identity {
@@ -86,11 +99,15 @@ impl Interact {
     /// The zone changes or the connection ends: the dialogue window goes away without a word to the server.
     pub fn close_all(&mut self, gui: &mut Gui) {
         self.use_actions.clear();
+        self.tower.close_all(gui);
+        self.tower_uses.clear();
+        self.tower_reply = None;
         self.use_ui.close_all(gui);
         self.ptrade.close_all(gui);
         self.shop_close_all(gui);
         self.grid.close_all(gui);
         self.mission.close_all(gui);
+        self.tradeskill.close_all(gui);
         if let Some(c) = self.chat.take() {
             c.close(gui);
         }
@@ -129,10 +146,14 @@ impl Interact {
         let Ok(m) = n3::decode(f) else { return };
         let who = m.header.target;
         self.shop.literacy = zone.skill_value(0xa1).unwrap_or(0).min(3000);
-        self.watch_objects(gui, &m);
+        self.watch_objects(gui, &m, zone);
         self.shop_watch(&m);
         self.use_actions.on_message(&m, zone);
         match m.body {
+            N3::World(ao_net::n3::world::World::CharacterAction(a)) if who == self.own_id() => {
+                self.tradeskill.reply(&a);
+                if a.action == 0xb0 { self.tower_reply = Some(a); }
+            }
             N3::Knubot(k) => self.on_knubot(gui, k, zone),
             N3::Trade(t) => self.on_trade(gui, t, who, zone),
             N3::Inventory(m) => self.ptrade_inventory(&m),
@@ -203,6 +224,14 @@ impl Interact {
     /// GUI events of the NPC chat window; `true` when consumed.
     pub fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone) -> bool {
         let me = self.own_id();
+        if let Some(out) = self.tower.event(gui, ev, me) {
+            match out {
+                super::interact_tower::TowerOut::Handled => {}
+                super::interact_tower::TowerOut::Request(payload) => self.send(payload),
+                super::interact_tower::TowerOut::Build(item) => self.use_object(item),
+            }
+            return true;
+        }
         if let Some(out) = self.use_ui.event(gui, ev) {
             self.use_out(zone, out);
             return true;
@@ -221,6 +250,7 @@ impl Interact {
         if self.trade_event(gui, ev, zone) {
             return true;
         }
+        if self.tradeskill.event(ev) { return true; }
         let own = Self::own_name(zone);
         let Some(c) = self.chat.as_mut() else { return false };
         let Some(out) = c.event(gui, ev, &own) else { return false };
@@ -253,6 +283,22 @@ impl Interact {
         let cmd = GenericCmd { state: 0, seq: self.seq, cmd: CMD_USE_ITEM, args: GenericArgs::Item { flag: 0, actor: self.own_id(), item } };
         let p = Misc::GenericCmd(cmd).encode(self.own_id(), 1);
         self.send(p);
+    }
+
+    pub(super) fn queue_tower_use(&mut self, zone: &Zone, id: Identity) -> bool {
+        match self.tower.classify(zone, id) {
+            Ok(Some(_)) => { self.tower_uses.push(id); true }
+            Ok(None) => false,
+            Err(error) => { eprintln!("tower item: {error:#}"); true }
+        }
+    }
+
+    /// CityTerminalGUIModule_c::SlotOpenCityTerminal (GUI 100e630b) requires a
+    /// CityClientInterface model 1/2 before CityTerminalView ctor 100e6f11 reads ESC.
+    /// The city.dll service emitter/model payload is not decoded by this client.
+    /// This guarded constructor-policy reader deliberately creates no fake window.
+    pub fn city_terminal_constructor_policy(values: &super::dvalue::DValues, city_model: Option<u32>) -> Option<bool> {
+        matches!(city_model, Some(1 | 2)).then(|| values.get_i64("esc_cityterminal").unwrap_or(1) != 0)
     }
 }
 

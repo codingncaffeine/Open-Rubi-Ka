@@ -33,19 +33,20 @@ pub const VENDING_MACHINE: i32 = 0xC75B;
 pub const SHOP_ITEM: i32 = 0x6f;
 /// The window is a `TradeView_c`: same client size as the player trade's.
 const CLIENT: (u32, u32) = super::interact_ptrade::CLIENT;
-/// Option `esc_shops` (`LoginPrefs.xml`: true): Esc declines (`FUN_100df810`).
-const ESC_SHOPS: bool = true;
 const ZERO: Identity = Identity { kind: 0, instance: 0 };
 /// `AddColumn` flags of the item lists: resizable | label | sortable.
 const COL_FLAGS: u32 = 0xe;
 /// Original list widths (`FUN_100cdb3a`, `_DAT_101a959c`, `_DAT_101ae5c8`, `_DAT_101ae160`).
 const COLUMNS: [(i32, &str, f32); 4] = [(1, "Name", 200.0), (2, "Count", 30.0), (3, "Price", 100.0), (4, "Quality", 100.0)];
 const LISTS: [&str; 3] = ["shop_items", "bought_items", "sold_items"];
+const GRIDS: [&str; 3] = ["shop_items_grid", "bought_items_grid", "sold_items_grid"];
+const GRID_SCROLLS: [&str; 3] = ["shop_items_grid_scroll", "bought_items_grid_scroll", "sold_items_grid_scroll"];
 const MODE_MENU: u32 = 0x5348_0000;
 
 /// The open window and its model.
 struct Shop {
     win: WindowId,
+    escape: bool,
     machine: Identity,
     cash_shop: bool,
     sold: Vec<super::interact_ptrade::Entry>,
@@ -65,6 +66,7 @@ struct Shop {
     dock_registered: bool,
     prices: Vec<Option<i32>>,
     net_cost: Option<i64>,
+    tip: Option<(usize, i64, AcgItem, Option<i32>, bool, String)>,
 }
 
 #[derive(Default)]
@@ -169,7 +171,7 @@ impl Shop {
         }
         gui.relayout_window(win);
         gui.set_window_context(win, true);
-        Ok(Shop { win, machine, stock, cash_shop, sold: vec![], bought: vec![], due: None, dirty: true, rows: Default::default(), literacy: 0, configs: Default::default(), grid_keys: Default::default(), grid_width: dw as f32 - 13.0, dock_registered: false, prices: vec![], net_cost: None })
+        Ok(Shop { win, escape: true, machine, stock, cash_shop, sold: vec![], bought: vec![], due: None, dirty: true, rows: Default::default(), literacy: 0, configs: Default::default(), grid_keys: Default::default(), grid_width: dw as f32 - 13.0, dock_registered: false, prices: vec![], net_cost: None, tip: None })
     }
 
     fn apply_modes(&mut self, gui: &mut Gui) {
@@ -201,7 +203,7 @@ impl Shop {
         if let Err(e) = gui.add_view_xml(self.win, &format!("{view}_grid_content"), &canvas, &src) { eprintln!("shop grid: {e:#}"); return; }
         let mut pictures = vec![];
         let mut tips = vec![];
-        for (n, (_, icon, title)) in rows.iter().enumerate() {
+        for (n, (key, icon, title)) in rows.iter().enumerate() {
             let (x, y) = inv_grid::cell_origin(n % cols, n / cols, (gap, inv_grid::SPACING));
             if let Some(id) = gui.gfx_id("GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED").map(GfxId) {
                 let (w, h) = gui.gfx().size(id);
@@ -213,7 +215,8 @@ impl Shop {
                 } else { gui.gfx().size(*id) };
                 pictures.push(CanvasItem::Image { id: *id, src: [0.0, 0.0, w as f32, h as f32], dst: [x, y, x + 48.0, y + 48.0], alpha: 1.0 });
             }
-            tips.push(CanvasTip { rect: [x, y, x + 48.0, y + 48.0], title: title.clone(), body: String::new() });
+            let body = self.tip.as_ref().filter(|(list, old_key, _, _, _, _)| *list == i && old_key == key).map_or("", |(_, _, _, _, _, body)| body.as_str());
+            tips.push(CanvasTip { rect: [x, y, x + 48.0, y + 48.0], title: title.clone(), body: body.to_owned() });
         }
         self.grid_keys[i] = rows.iter().map(|r| r.0).collect();
         gui.set_canvas(self.win, &canvas, pictures);
@@ -233,6 +236,49 @@ impl Shop {
     /// The stock entry an identity names.
     fn item(&self, id: Identity) -> Option<AcgItem> {
         (id.kind == SHOP_ITEM).then(|| self.stock.get(id.instance as usize).copied()).flatten()
+    }
+
+    fn update_tooltip(&mut self, gui: &mut Gui, zone: &super::zone::Zone, text: &ao_formats::screens::TextDb, descriptions: bool) {
+        let (x, y) = gui.mouse_position();
+        let hovered = GRIDS.iter().enumerate().find_map(|(list, canvas)| {
+            if self.configs[list].list.unwrap_or(false) || !gui.window_visible(self.win) { return None; }
+            let scroll = gui.view_rect(self.win, GRID_SCROLLS[list])?;
+            if x < scroll.l || x >= scroll.r || y < scroll.t || y >= scroll.b { return None; }
+            let rect = gui.view_rect(self.win, canvas)?;
+            let (lx, ly) = (x - rect.l, y - rect.t);
+            let cell = gui.canvas_tips(self.win, canvas).iter().position(|tip| lx >= tip.rect[0] && lx < tip.rect[2] && ly >= tip.rect[1] && ly < tip.rect[3])?;
+            let key = *self.grid_keys[list].get(cell)?;
+            let (item, price) = match list {
+                0 => (self.stock.get(key as usize).copied()?, self.prices.get(key as usize).copied().flatten()),
+                1 => {
+                    let id = *self.bought.get(key as usize)?;
+                    (self.item(id)?, self.prices.get(id.instance as usize).copied().flatten())
+                }
+                _ => (self.sold.get(key as usize)?.acg?, None),
+            };
+            Some((list, cell, key, item, price))
+        });
+        if hovered.as_ref().is_some_and(|(list, _, key, item, price)| self.tip.as_ref().is_some_and(|(old_list, old_key, old_item, old_price, enabled, _)| list == old_list && key == old_key && item == old_item && price == old_price && *enabled == descriptions)) { return; }
+        let Some((list, cell, key, item, price)) = hovered else {
+            if self.tip.take().is_some() {
+                for canvas in GRIDS { gui.set_canvas_tip_body(self.win, canvas, None, ""); }
+            }
+            return;
+        };
+        let body = if descriptions {
+            let result = match price.filter(|_| list < 2) {
+                Some(price) => super::chat::shop_item_html(zone, item, price, text),
+                None => super::chat::item_html(zone, &super::chat::ItemRequest::Reference(item), text),
+            };
+            match result {
+                Ok(body) => body.unwrap_or_default(),
+                Err(error) => { eprintln!("shop tooltip: {error:#}"); String::new() }
+            }
+        } else { String::new() };
+        for (n, canvas) in GRIDS.iter().enumerate() {
+            gui.set_canvas_tip_body(self.win, canvas, (n == list).then_some(cell), &body);
+        }
+        self.tip = Some((list, key, item, price, descriptions, body));
     }
 }
 
@@ -354,7 +400,7 @@ impl Interact {
                         let stock = self.shop.stocks.get(&key).cloned().unwrap_or_default();
                         let cash_shop = self.shop.pricing.get(&key).is_none_or(|p| p.0 == 0x3d);
                         match Shop::open(gui, self.screen, t.a, name, stock, cash_shop) {
-                            Ok(mut s) => { s.literacy = self.shop.literacy; s.configs = self.shop.configs.clone(); s.restore_config(gui); self.shop.shop = Some(s); }
+                            Ok(mut s) => { s.escape = self.escape_options.unwrap_or([true, true, false])[0]; s.literacy = self.shop.literacy; s.configs = self.shop.configs.clone(); s.restore_config(gui); self.shop.shop = Some(s); }
                             Err(e) => eprintln!("interact: shop window: {e:#}"),
                         }
                     }
@@ -478,7 +524,7 @@ impl Interact {
             // `FUN_100df810`
             Event::Clicked { window, view, .. } if *window == s.win && view == "DeclineButton" => out.push(trade::abort(me, true)),
             Event::CloseRequested { window } if *window == s.win => out.push(trade::abort(me, true)),
-            Event::Escape { window } if *window == s.win && ESC_SHOPS => out.push(trade::abort(me, true)),
+            Event::Escape { window } if *window == s.win && s.escape => out.push(trade::abort(me, true)),
             Event::Escape { window } if *window == s.win => {}
             Event::TextChanged { window, .. } if *window == s.win => {}
             Event::MultiMouse { window, view, id, button, clicks, .. } if *window == s.win => {
@@ -652,6 +698,7 @@ impl super::Play {
                 s.dock_registered = true;
             }
             i.shop_render(&mut self.gui, &mut |gui, item| h.shop_info(gui, item));
+            if let Some(s) = i.shop.shop.as_mut() { s.update_tooltip(&mut self.gui, &self.zone, &self.text, h.dvalues.flag("ItemDescriptionTooltips")); }
         }
         for key in std::mem::take(&mut i.shop.feedback) {
             if let Some(c) = self.chat.as_mut() {
@@ -816,6 +863,67 @@ mod tests {
         i.on_frame(gui, &server(Trade { op: trade::START, a: ME, b: SESSION }.encode(MACHINE)), z);
         i.shop_render(gui, &mut info);
         i
+    }
+
+    #[test]
+    fn shop_description_tooltip_uses_actual_quality_and_price_and_clears() {
+        let Some(mut gui) = rig() else { return };
+        let text = ao_formats::screens::TextDb::load(&ao_gui::client_dir()).unwrap();
+        let mut values = DValues::new(&ao_gui::client_dir());
+        let mut z = Zone::new(OWN);
+        let mut i = open(&mut gui, &mut z);
+        let item = AcgItem { low_id: 21797, high_id: 21797, level: 1 };
+        let s = i.shop.shop.as_mut().unwrap();
+        s.stock[0] = item;
+        s.dirty = true;
+        i.shop_render(&mut gui, &mut info);
+        let s = i.shop.shop.as_mut().unwrap();
+        let r = gui.view_rect(s.win, GRIDS[0]).unwrap();
+        let tip = gui.canvas_tips(s.win, GRIDS[0])[0].rect;
+        gui.input(ao_gui::InputEvent::MouseMove { x: r.l + tip[0] + 2.0, y: r.t + tip[1] + 2.0 });
+        values.set_i64("ItemDescriptionTooltips", 0);
+        s.update_tooltip(&mut gui, &z, &text, values.flag("ItemDescriptionTooltips"));
+        assert!(gui.canvas_tips(s.win, GRIDS[0])[0].body.is_empty());
+        values.set_i64("ItemDescriptionTooltips", 1);
+        s.update_tooltip(&mut gui, &z, &text, values.flag("ItemDescriptionTooltips"));
+        let expected = super::super::chat::shop_item_html(&z, item, s.prices[0].unwrap(), &text).unwrap().unwrap();
+        assert!(!expected.is_empty());
+        assert_eq!(gui.canvas_tips(s.win, GRIDS[0])[0].body, expected);
+        let cached = s.tip.as_ref().unwrap().5.as_ptr();
+        s.update_tooltip(&mut gui, &z, &text, values.flag("ItemDescriptionTooltips"));
+        assert_eq!(s.tip.as_ref().unwrap().5.as_ptr(), cached);
+        values.set_i64("ItemDescriptionTooltips", 0);
+        s.update_tooltip(&mut gui, &z, &text, values.flag("ItemDescriptionTooltips"));
+        assert!(gui.canvas_tips(s.win, GRIDS[0])[0].body.is_empty());
+        values.set_i64("ItemDescriptionTooltips", 1);
+        s.update_tooltip(&mut gui, &z, &text, values.flag("ItemDescriptionTooltips"));
+        gui.input(ao_gui::InputEvent::MouseMove { x: -100.0, y: -100.0 });
+        s.update_tooltip(&mut gui, &z, &text, values.flag("ItemDescriptionTooltips"));
+        assert!(gui.canvas_tips(s.win, GRIDS[0]).iter().all(|tip| tip.body.is_empty()));
+    }
+
+    #[test]
+    fn shop_escape_policy_is_captured_at_open() {
+        let Some(mut gui) = rig() else { return };
+        let mut z = Zone::new(OWN);
+        let mut i = open(&mut gui, &mut z);
+        let mut d = super::super::dvalue::DValues::new(&ao_gui::client_dir());
+        d.set_i64("esc_shops", 0);
+        i.configure_escape(&d);
+        let win = i.shop.shop.as_ref().unwrap().win;
+        i.event(&mut gui, &Event::Escape { window: win }, &z);
+        assert_eq!(sent(&mut i), [trade::abort(ME, true)]);
+        i.close_all(&mut gui);
+        i.on_frame(&mut gui, &server(ShopUpdate { items: items() }.encode(MACHINE)), &mut z);
+        i.on_frame(&mut gui, &server(Trade { op: trade::START, a: MACHINE, b: SESSION }.encode(ME)), &mut z);
+        i.on_frame(&mut gui, &server(Trade { op: trade::START, a: ME, b: SESSION }.encode(MACHINE)), &mut z);
+        let win = i.shop.shop.as_ref().unwrap().win;
+        d.set_i64("esc_shops", 1);
+        i.configure_escape(&d);
+        i.event(&mut gui, &Event::Escape { window: win }, &z);
+        assert!(sent(&mut i).is_empty());
+        i.event(&mut gui, &Event::CloseRequested { window: win }, &z);
+        assert_eq!(sent(&mut i), [trade::abort(ME, true)]);
     }
 
     #[test]

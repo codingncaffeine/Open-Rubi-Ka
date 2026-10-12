@@ -119,7 +119,7 @@ impl Deformer {
             v.pos=p.to_array();
         }
     }
-    pub(super) fn apply_actor(&self,actors:&mut[ActorFrame],original:&[Vertex]) {if self.mode()!=4 {if let Some(actor)=actors.iter_mut().find(|a|Some(a.id)==self.actor) {if let Some(v)=actor.skin.as_mut() {self.deform(v,original);}}}}
+    pub(super) fn apply_actor(&self,actors:&mut[ActorFrame],original:&[Vertex]) {if self.mode()!=4 {if let Some(actor)=actors.iter_mut().find(|a|Some(a.id)==self.actor) {if let Some(v)=actor.skin.as_mut() {self.deform(std::sync::Arc::make_mut(v),original);}}}}
     pub(super) fn morph_fraction(&self)->f32 {let rise=f32::from_bits(self.t.word(12).unwrap_or(0));let hold=f32::from_bits(self.t.word(13).unwrap_or(0));if self.elapsed<rise {self.elapsed/rise}else if self.elapsed<=rise+hold {1.0}else{1.0-(self.elapsed-rise-hold)/rise}}
     pub(super) fn morph_alpha(&self)->f32 {self.morph_fraction()*0.7+0.15}
     pub(super) fn morph_child_should_stop(&self)->bool {self.elapsed>f32::from_bits(self.t.word(12).unwrap_or(0))+f32::from_bits(self.t.word(13).unwrap_or(0))}
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     #[ignore="installed authored native3000/3001 assets and offscreen GPU"]
     fn retail_native30001_authored_frames()->Result<()> {
-        use super::super::{Binding,Renderer,MODEL_BASE};
+        use super::super::{Binding,Renderer};
         use anyhow::Context;
         let out=std::env::var_os("AOMAC_EFFECT_FRAMES").context("AOMAC_EFFECT_FRAMES required")?;
         let out=std::path::PathBuf::from(out);std::fs::create_dir_all(&out)?;
@@ -246,7 +246,7 @@ mod tests {
             r.clear();
             // Tracked native constructors resolve the source before the first frame.
             let (skin,parts)=visual.rig.pose(Some((&visual.clip,0.0)));
-            let actor=ActorFrame {id:1,model:1,transform:source.to_cols_array_2d(),skin:Some(skin),parts,..Default::default()};
+            let actor=ActorFrame { id:1,model:1,transform:source.to_cols_array_2d(), skin: Some(std::sync::Arc::new(skin)), parts,..Default::default() };
             r.prepare_source_mesh((50000,1),visual.model(),&actor);
             r.prepare_anchors((50000,1),|_,anchor|visual.rig.effect_anchor_composed(anchor,std::iter::empty()).map(|m|source*Mat4::from_cols_array_2d(&m)));
             let handle=r.spawn_configured(Binding {group:0,attractor:0,effect:id,note:0,color:0},source,origin,EffectConfig {creation:super::super::Creation::Dynel,source_identity:Some((50000,1)),track_source:true,..Default::default()})?;
@@ -254,7 +254,7 @@ mod tests {
             for frame in 1..=240 {
                 host.actors.clear();
                 let (skin,parts)=visual.rig.pose(Some((&visual.clip,frame as f32*1000.0/60.0)));
-                let actor=ActorFrame {id:1,model:1,transform:source.to_cols_array_2d(),skin:Some(skin),parts,..Default::default()};
+                let actor=ActorFrame { id:1,model:1,transform:source.to_cols_array_2d(), skin: Some(std::sync::Arc::new(skin)), parts,..Default::default() };
                 r.prepare_source_mesh((50000,1),visual.model(),&actor);
                 r.prepare_anchors((50000,1),|_,anchor|visual.rig.effect_anchor_composed(anchor,std::iter::empty()).map(|m|source*Mat4::from_cols_array_2d(&m)));
                 host.actors.push(actor);
@@ -263,7 +263,7 @@ mod tests {
                 host.effect_environment_wind=Some(crate::play::flow::environment_channels(&mut environment_phase,1.0/60.0));
                 r.frame(1.0/60.0,&mut host,Some(&mut ground));
                 if [1,6,15,30,60,120,210,240].contains(&frame) {
-                    let mut models:Vec<_>=r.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();
+                    let mut models:Vec<_>=r.models.iter().map(|(&id,m)| (id,m.scene.clone())).collect();
                     models.extend(r.buff_models.iter().map(|(&id,m)|(0xfac2_0000_0000_0000|u64::from(id),m.scene.clone())));
                     models.push((1,visual.model().clone()));
                     ao_render::render_to_png_actors(&Scene::default(),&models,host.actors.clone(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("native30001_{id}_{frame}.png")),frame as f32/60.0)?;

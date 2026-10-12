@@ -113,19 +113,29 @@ impl HudStats {
                 self.info_click = mods.shift || mods.ctrl;
                 if self.info_click {
                     self.dnd.press = None;
+                    self.item_hold = None;
                     if let Some(slot) = self.info_slot_at(gui, zone, x, y) {
                         self.inspect_slot(zone, slot);
                     }
                     return;
                 }
-                self.dnd.press = self.place_at(gui, x, y).filter(|&p| self.slot_of(p).is_some_and(|s| zone.inventory.contains_key(&s))).map(|p| (p, x, y));
+                self.item_button = MouseButton::Left;
+                self.dnd.press = self.new_mouse.then(|| self.place_at(gui, x, y)).flatten().filter(|&p| self.slot_of(p).is_some_and(|s| zone.inventory.contains_key(&s))).map(|p| (p, x, y));
+                self.item_hold = self.dnd.press.map(|_| (0.0, self.item_hold_delay));
             }
             InputEvent::MouseDown { x, y, button: MouseButton::Right } => {
+                if !self.new_mouse {
+                    self.item_button = MouseButton::Right;
+                    self.dnd.press = self.place_at(gui, x, y).filter(|&p| self.slot_of(p).is_some_and(|s| zone.inventory.contains_key(&s))).map(|p| (p, x, y));
+                    self.item_hold = self.dnd.press.map(|_| (0.0, self.item_hold_delay));
+                    return;
+                }
                 if let Some(slot) = self.info_slot_at(gui, zone, x, y) {
                     self.inspect_slot(zone, slot);
                 }
             }
             InputEvent::MouseMove { x, y } => {
+                self.item_mouse = (x, y);
                 if let Some((ghost, slot)) = self.dnd.drag.as_ref().map(|d| (d.ghost, d.slot)) {
                     gui.set_window_pos(ghost, (x as i32 - GHOST as i32 / 2, y as i32 - GHOST as i32 / 2));
                     self.dnd.hover = self.place_at(gui, x, y).map(|p| (p, self.drop_action(zone, slot, p).is_some()));
@@ -135,12 +145,22 @@ impl HudStats {
                     }
                 }
             }
-            InputEvent::MouseUp { x, y, button: MouseButton::Left } => {
-                self.dnd.press = None;
+            InputEvent::MouseUp { x, y, button } if button == self.item_button => {
+                let pressed = self.dnd.press.take();
+                self.item_hold = None;
+                if button == MouseButton::Right && self.dnd.drag.is_none() {
+                    if let Some((place, _, _)) = pressed.filter(|(place, _, _)| self.place_at(gui, x, y) == Some(*place)) {
+                        if let Some(slot) = self.slot_of(place) { self.use_slot(zone, slot); }
+                    }
+                }
                 if let Some(d) = self.dnd.drag.take() {
                     gui.close_window(d.ghost);
                     self.dnd.hover = None;
                     let dest = self.place_at(gui, x, y);
+                    if self.equipment_locked && (d.slot < inv::BAG_FIRST || matches!(dest, Some(Place::Wear { .. }))) {
+                        self.equipment_feedback = true;
+                        return;
+                    }
                     let action = match dest {
                         Some(p) => self.drop_action(zone, d.slot, p),
                         // released over the world: `N3Msg_DropItem` (the position under the cursor is picked by the 3D view: UNRESOLVED, we drop at our feet)
@@ -159,6 +179,10 @@ impl HudStats {
                         }
                     };
                     if let Some(a) = action {
+                        if let Action::Drop { item } = a {
+                            self.request_drop(gui, zone, item);
+                            return;
+                        }
                         self.run(zone, a, dest);
                     }
                 }
@@ -167,20 +191,40 @@ impl HudStats {
         }
     }
 
+    pub(super) fn advance_item_hold(&mut self, gui: &mut Gui, zone: &Zone, dt: f32) {
+        let Some((held, delay)) = &mut self.item_hold else { return };
+        *held += dt;
+        if *held < *delay { return; }
+        self.item_hold = None;
+        if let Some((place, x, y)) = self.dnd.press {
+            self.begin_drag(gui, zone, place, x, y);
+        }
+    }
+
     fn begin_drag(&mut self, gui: &mut Gui, zone: &Zone, from: Place, x: f32, y: f32) {
         let Some(slot) = self.slot_of(from) else { return };
         let Some(e) = zone.inventory.get(&slot).copied() else { return };
+        if self.equipment_locked && slot < inv::BAG_FIRST {
+            self.dnd.press = None;
+            self.item_hold = None;
+            self.equipment_feedback = true;
+            return;
+        }
         let src = format!("<root><CanvasView name=\"icon\" min_size=\"Point({0},{0})\" max_size=\"Point({0},{0})\"/></root>", GHOST as u32);
         let Ok(ghost) = gui.open_window_xml("ItemDrag", &src, (x as i32 - GHOST as i32 / 2, y as i32 - GHOST as i32 / 2), WindowSize::Preferred) else { return };
         if let Some((g, w, h)) = self.items.info(gui, e.item.low_id).and_then(|i| i.icon) {
             gui.set_canvas(ghost, "icon", vec![CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [0.0, 0.0, GHOST, GHOST], alpha: 1.0 }]);
         }
         self.dnd.press = None;
+        self.item_hold = None;
         self.dnd.drag = Some(Drag { slot, ghost });
     }
 
     /// What dropping the item of inventory slot `slot` on `dest` asks for; `None` = refused (the drop is cancelled).
     pub(super) fn drop_action(&self, zone: &Zone, slot: u32, dest: Place) -> Option<Action> {
+        if self.equipment_locked && (slot < inv::BAG_FIRST || matches!(dest, Place::Wear { .. })) {
+            return None;
+        }
         let item = inv::item_identity(slot);
         let e = zone.inventory.get(&slot)?;
         match dest {
@@ -230,6 +274,11 @@ impl HudStats {
         let char_id = zone.char_id as i32;
         let payload = match a {
             Action::Move { item, slot } => {
+                // Guard the shared dispatch as well: double-clicks do not pass through drop_action.
+                if self.equipment_locked && (item.instance < inv::BAG_FIRST as i32 || slot < inv::BAG_FIRST as i32) {
+                    self.equipment_feedback = true;
+                    return;
+                }
                 // `FUN_100cbc21`: the cell the item was dropped on is where it appears once the server has moved it into the bag
                 if let (Some(Place::Bag { cell }), Some(i)) = (dest, self.inventory.as_mut()) {
                     i.pending_drop = Some(cell);
@@ -248,6 +297,13 @@ impl HudStats {
                 inv::drop_item(char_id, item, p)
             }
             Action::Use { item } => {
+                if let Some(entry) = zone.inventory.get(&(item.instance as u32)) {
+                    match self.items.is_tower_item(entry.item.low_id) {
+                        Ok(true) => { self.tower_uses.push(item); return; }
+                        Ok(false) => {}
+                        Err(error) => { eprintln!("tower item: {error:#}"); return; }
+                    }
+                }
                 self.use_seq += 1;
                 let own = Identity { kind: DYNEL_CHAR, instance: char_id };
                 let cmd = GenericCmd { state: 0, seq: self.use_seq, cmd: CMD_USE_ITEM, args: GenericArgs::Item { flag: 0, actor: own, item } };
@@ -262,6 +318,62 @@ impl HudStats {
             }
         };
         self.outbox.push(n3_frame(0, zone.char_id, payload));
+    }
+
+    /// GUI `FUN_100cb081`: the Char int chooses direct drop or the Yes/No confirmation.
+    fn request_drop(&mut self, gui: &mut Gui, zone: &Zone, item: Identity) {
+        if !self.confirm_drop {
+            self.run(zone, Action::Drop { item }, None);
+            return;
+        }
+        let Some(e) = zone.inventory.get(&(item.instance as u32)) else { return };
+        let Some(info) = self.items.info(gui, e.item.low_id) else { return };
+        let body = super::super::chat::log::ldb_format(
+            &self.db.by_key(10000, "Want2DropItemXonGround").unwrap_or_default(),
+            &[super::super::chat::log::Arg::S(info.name.clone())],
+        );
+        let buttons = ["MsgBox_Yes", "MsgBox_No"].map(|key| self.db.by_key(10000, key).unwrap_or_default());
+        let position = zone.own().map_or([0.0; 3], |d| d.pos);
+        self.drop_dialogs.go(gui, self.screen, (item, position), &body, &buttons);
+    }
+
+    pub(super) fn drop_dialog_event(&mut self, gui: &mut Gui, ev: &ao_gui::Event, zone: &Zone) -> bool {
+        let (handled, choice) = self.drop_dialogs.event(gui, ev);
+        if let Some(((item, position), 0)) = choice {
+            if zone.inventory.contains_key(&(item.instance as u32)) {
+                self.outbox.push(n3_frame(0, zone.char_id, inv::drop_item(zone.char_id as i32, item, position)));
+            }
+        }
+        handled
+    }
+
+    pub(super) fn tooltip_body(&self, zone: &Zone, id: Identity) -> String {
+        match super::super::chat::item_html(zone, &super::super::chat::ItemRequest::Identity { id, shop: false, container: Identity::default() }, &self.db) {
+            Ok(body) => body.unwrap_or_default(),
+            Err(error) => { eprintln!("item tooltip: {error:#}"); String::new() }
+        }
+    }
+
+    pub(super) fn update_item_tooltip(&mut self, gui: &mut Gui, zone: &Zone) {
+        let (x, y) = self.item_mouse;
+        let slot = self.info_slot_at(gui, zone, x, y);
+        let key = slot.and_then(|slot| zone.inventory.get(&slot).copied().map(|e| (slot, e, self.item_description_tips)));
+        if key == self.item_tip { return; }
+        self.item_tip = key;
+        let body = if self.item_description_tips { slot.map(|s| self.tooltip_body(zone, inv::item_identity(s))).unwrap_or_default() } else { String::new() };
+        let title = key.and_then(|(_, e, _)| self.items.info(gui, e.item.low_id)).map(|i| i.name.as_str()).unwrap_or("");
+        if let Some(w) = self.wear.as_ref() {
+            gui.set_tooltip(w.window, "items", if slot.is_some_and(|s| s < inv::BAG_FIRST) { title } else { "" }, if slot.is_some_and(|s| s < inv::BAG_FIRST) { &body } else { "" });
+        }
+        if let Some(i) = self.inventory.as_ref() {
+            if i.list {
+                if let Some(slot) = slot.filter(|s| *s >= inv::BAG_FIRST) {
+                    gui.set_tooltip(i.window, &format!("item{slot}"), title, &body);
+                }
+            } else {
+                gui.set_tooltip(i.window, "grid", if slot.is_some_and(|s| s >= inv::BAG_FIRST) { title } else { "" }, if slot.is_some_and(|s| s >= inv::BAG_FIRST) { &body } else { "" });
+            }
+        }
     }
 
     /// A short click on an item cell (`Event::CanvasClick`): the second click on the same cell within [`DOUBLE_CLICK`] seconds uses the item

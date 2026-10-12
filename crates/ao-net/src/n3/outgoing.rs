@@ -50,6 +50,11 @@ pub fn char_in_play(char_id: i32) -> Vec<u8> {
     iir(CHAR_IN_PLAY, Identity { kind: DYNEL_CHAR, instance: char_id }, |_| {})
 }
 
+/// `N3Msg_LeaveBattle` GC 0x100182ec / ctor 0x10131816: own identity, no subclass body.
+pub fn leave_battle(char_id: i32) -> Vec<u8> {
+    iir(0x3F3A1914, Identity { kind: DYNEL_CHAR, instance: char_id }, |_| {})
+}
+
 /// Body of `CharDCMoveIIR_t` (`FUN_1006b9d6` [GC 0x1006b9d6] + `FUN_1006bc55` [GC 0x1006bc55]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CharMove {
@@ -311,6 +316,10 @@ pub fn parse_char_dc_move(payload: &[u8]) -> Result<(Identity, u8, CharMove)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn leave_battle_has_only_the_native_own_dynel_envelope() {
+        assert_eq!(leave_battle(0x6584), hex("3f3a1914 0000c350 00006584 01"));
+    }
     use crate::n3::{capture, capture_n3};
 
     fn hex(s: &str) -> Vec<u8> {

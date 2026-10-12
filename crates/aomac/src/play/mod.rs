@@ -16,6 +16,8 @@ mod dynels_doors;
 mod fightmode;
 mod flow;
 mod hud;
+mod hud_help;
+mod hud_tips;
 mod level_notice;
 mod hud_aggdef;
 mod hud_actions;
@@ -25,6 +27,8 @@ mod hud_compass;
 mod hud_dialog;
 mod hud_faction;
 mod hud_perks;
+mod hud_research_vehicle;
+mod vehicle_guard;
 mod hud_pet;
 mod hud_team;
 mod hud_wincfg;
@@ -38,6 +42,8 @@ mod hud_nano;
 mod hud_keys;
 mod hud_nanodb;
 mod hud_ncu;
+mod hud_target_ncu;
+mod hud_notification;
 mod hud_pools;
 mod hud_rollup;
 mod hud_special;
@@ -54,11 +60,14 @@ mod interact_ptrade;
 mod interact_shop;
 mod interact_bank;
 mod interact_trade;
+mod interact_tradeskill;
+mod interact_tower;
 mod interact_use;
 mod logout;
 mod options;
 mod own_nanos;
 mod movement;
+mod native_life_render;
 mod player;
 mod prefs;
 mod preview;
@@ -100,11 +109,13 @@ enum Bg {
     Servers(Result<Vec<ServerEntry>, String>),
     Connected(u32, Result<LoginSession, String>),
     Backdrop(Result<Box<Scene>, String>),
-    World(u32, Result<Box<Scene>, String>),
+    World(u32, i32, Result<Box<Scene>, String>),
+    GroundTextures(u64, Result<HashMap<ao_scene::TextureKey, ao_scene::Texture>, String>),
     /// The live sky source of playfield `id` (`None`: indoor / no tweak script), sent just before its [`Bg::World`].
     Sky(u32, Option<ao_formats::playfield::SkyClock>),
     /// Per-frame effect wind, loaded independently of the audio device.
     Weather(u32, Box<ao_formats::weather::Weather>),
+    Life(u32, Result<(native_life_spawn::LifeWorld, native_life_render::LifeModels), String>),
     /// The top-down ground image of playfield `id` for the Map window (`Report::ground` rendered by `topdown::render` from the scene
     /// the loader just built; `bool`: dungeon rooms), sent just before its [`Bg::World`].
     Ground(u32, Option<Box<WorldGround>>),
@@ -143,6 +154,14 @@ struct Row {
 
 struct Play {
     dir: PathBuf,
+    /// Texture colour depth is read once by native DisplaySystem construction.
+    texture_resolution: i32,
+    texture_quality: i32,
+    texture_compressed: bool,
+    ground_texture_quality: i32,
+    ground_texture_patches: Vec<(usize, [i32; 2], usize)>,
+    ground_texture_serial: u64,
+    ground_texture_installed_quality: i32,
     gui: Gui,
     text: TextDb,
     pf_names: HashMap<u32, String>,
@@ -211,6 +230,11 @@ struct Play {
     /// Live sky of the loading/loaded playfield, installed in the viewer when the world appears.
     world_sky: Option<ao_formats::playfield::SkyClock>,
     world_weather: Option<ao_formats::weather::Weather>,
+    world_life: Option<(native_life_spawn::LifeWorld, native_life_render::LifeModels)>,
+    wildlife_enabled: bool,
+    life_characters: Vec<native_life::CharacterSensor>,
+    life_dead: Vec<glam::Vec3>,
+    life_dangers: Vec<native_life::CharacterSensor>,
     /// GC environment-manager +0xc oscillator phase; retained across playfield changes.
     effect_environment_phase: f32,
     time: f32,
@@ -272,7 +296,21 @@ impl Play {
             })),
         )?;
         let (tx, rx) = channel();
+        let mut texture_values = dvalue::DValues::new(&dir);
+        if let Some(root) = prefs::dir() {
+            if let Ok(xml) = std::fs::read_to_string(root.join("Prefs.xml")) {
+                texture_values.load_config(&xml, dvalue::CAT_MAIN, false);
+            }
+        }
         Ok(Play {
+            texture_resolution: texture_values.get_i64("DisplayTextureResolution").unwrap_or(2) as i32,
+            texture_quality: texture_values.get_i64("DisplayOtherTextureQuality").unwrap_or(3) as i32,
+            texture_compressed: texture_values.flag("DisplayCompressedTextures"),
+            wildlife_enabled: texture_values.flag("Wildlife"),
+            ground_texture_quality: texture_values.get_i64("GroundTextureQuality").unwrap_or(2) as i32,
+            ground_texture_patches: Vec::new(),
+            ground_texture_serial: 0,
+            ground_texture_installed_quality: texture_values.get_i64("GroundTextureQuality").unwrap_or(2) as i32,
             pf_names: screens::pfnr_names(&dir).unwrap_or_default(),
             audio,
             prefs: Prefs::load(),
@@ -322,6 +360,10 @@ impl Play {
             world_ground: None,
             world_sky: None,
             world_weather: None,
+            world_life: None,
+            life_characters: Vec::new(),
+            life_dead: Vec::new(),
+            life_dangers: Vec::new(),
             effect_environment_phase: 0.0,
             time: 0.0,
             cc: None,
@@ -350,10 +392,24 @@ impl Play {
     fn start_backdrop(&self) {
         let (tx, dir) = (self.tx.clone(), self.dir.clone());
         std::thread::spawn(move || {
-            let r = RecordStore::open(&dir).and_then(|s| screens::login_world_scene(&s, 0)).map(Box::new).map_err(|e| format!("{e:#}"));
+            let r = open_texture_store(&dir).and_then(|s| screens::login_world_scene(&s, 0)).map(Box::new).map_err(|e| format!("{e:#}"));
             let _ = tx.send(Bg::Backdrop(r));
         });
     }
+}
+
+/// Loads the native Main-category texture family before a background asset loader starts.
+fn open_texture_store(dir: &std::path::Path) -> anyhow::Result<RecordStore> {
+    let store = RecordStore::open(dir)?;
+    let mut values = dvalue::DValues::new(dir);
+    if let Some(root) = prefs::dir() {
+        if let Ok(xml) = std::fs::read_to_string(root.join("Prefs.xml")) {
+            values.load_config(&xml, dvalue::CAT_MAIN, false);
+        }
+    }
+    store.set_other_texture_quality(values.get_i64("DisplayOtherTextureQuality").unwrap_or(3) as i32);
+    store.set_ground_texture_quality(values.get_i64("GroundTextureQuality").unwrap_or(2) as i32);
+    Ok(store)
 }
 
 pub fn run(dir: PathBuf, fake_charlist: Option<usize>, server_arg: Option<String>) -> Result<()> {

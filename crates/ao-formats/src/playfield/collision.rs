@@ -476,6 +476,22 @@ impl Collision {
         self.liquid_probe(p, p[1], self.rooms.as_ref().and_then(|_| self.room_at(p, -1)))
     }
 
+    /// Wildlife's `GetLiquidSurfaceHeight(..., -1, -1)` tests authored XZ polygons
+    /// without requiring the requesting flying body's Y to lie beneath their surface.
+    pub fn liquid_surface_at(&self, p: [f32; 3]) -> Option<Liquid> {
+        let room = self.rooms.as_ref().and_then(|_| self.room_at(p, -1));
+        for (triangle, kind) in &self.liquids {
+            if triangle.n[1].abs() <= 1e-6 || !triangle.liquid_contains_xz(p[0], p[2]) { continue; }
+            let level = triangle.y_at(p[0], p[2]);
+            if let Some(rooms) = &self.rooms {
+                let index = room?;
+                if triangle.floor != index as u16 + 1 || level <= rooms.rooms[index].0.pos[1] { continue; }
+            } else if level <= 0.0 { continue; }
+            return Some(Liquid { level, kind: *kind & 0x1f, normal: triangle.n });
+        }
+        None
+    }
+
     /// Liquid test of a closest-point query: `ground` is the closest point found, `y` the queried height, `room` the dungeon room.
     ///
     /// * dungeon (`n3Zone_t::PerformLiquidCollisionTest` @0x1001a80c, `FUN_1000b498`; the room's own list only): the **first**

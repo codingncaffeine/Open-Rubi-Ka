@@ -3,7 +3,7 @@
 //! Layout (all little endian), see `docs/formats.md` § meshes:
 //! ```text
 //! u32 version (=3), u32 range_count
-//! range_count x { u32, char[32] name }     named animation ranges ("idle", "walk", ...), skipped
+//! range_count x { i32 time_ms, char[32] name }  named animation segment starts
 //! u32, u32 (=1)                            unused
 //! u32 name_count; name_count x { cstr kind, cstr name }   class/member name table
 //! u32 object_count; (object_count + 1) x object           object 0 is the root holder
@@ -28,6 +28,8 @@ pub struct Archive<'a> {
     /// Index of the root object in `objects` (the `obj` member of the root holder).
     pub root: usize,
     pub objects: Vec<Object<'a>>,
+    /// DS 1006ab17: authored named segment starts, signed milliseconds.
+    pub animation_ranges: Vec<(i32, &'a [u8])>,
 }
 
 const ANIM_RANGE_SIZE: usize = 36;
@@ -62,7 +64,11 @@ impl<'a> Archive<'a> {
         ensure!(version == 3, "not an object archive (version word {version})");
         let anims = r.u32()? as usize;
         ensure!(anims <= 256, "implausible animation range count ({anims})");
-        r.take(anims * ANIM_RANGE_SIZE + 8)?; // named ranges, then two words the reader does not use
+        let mut animation_ranges = Vec::with_capacity(anims);
+        for range in r.take(anims * ANIM_RANGE_SIZE)?.chunks_exact(ANIM_RANGE_SIZE) {
+            animation_ranges.push((i32::from_le_bytes(range[..4].try_into().unwrap()), &range[4..]));
+        }
+        r.take(8)?; // packed resource colour and archive word
         let name_count = r.u32()? as usize;
         ensure!(name_count <= 256, "implausible name table ({name_count})");
         let mut names = Vec::with_capacity(name_count);
@@ -96,7 +102,7 @@ impl<'a> Archive<'a> {
             }
         }
         let root = root.filter(|&r| r < objects.len());
-        Ok(Archive { root: root.ok_or_else(|| anyhow::anyhow!("archive has no root object"))?, objects })
+        Ok(Archive { root: root.ok_or_else(|| anyhow::anyhow!("archive has no root object"))?, objects, animation_ranges })
     }
 }
 
@@ -185,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_animation_ranges() {
+    fn retains_native_animation_ranges() {
         let plain = fixture();
         let mut b = plain[..4].to_vec();
         b.extend(1u32.to_le_bytes()); // one named range
@@ -194,6 +200,7 @@ mod tests {
         b.extend(&plain[8..]);
         let a = Archive::parse(&b).unwrap();
         assert_eq!(a.objects[0].f32s::<3>("local_pos"), Some([1.0, 2.0, 3.0]));
+        assert_eq!(a.animation_ranges, [(7, &b[12..44])]);
     }
 
     #[test]

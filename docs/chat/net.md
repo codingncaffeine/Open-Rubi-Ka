@@ -75,6 +75,11 @@ Field codes (pack `FUN_1017161f`, unpack `FUN_10171ae5`):
 
 `0x15 S` lookup name; `0x1e ISD` tell; `0x28 ID` / `0x29 I` buddy add / remove; `0x32 I` invite, `0x33 I` kick, `0x34 I` join, `0x35 I` part (private group, docs/chat/social.md §5);
 `0x39 ISD` private group message; `0x40 GID` group flags; `0x41 GSD` group message (`FUN_1016c9f4` picks 0x39 when the group kind is 0xE);
+`0x36` has no fields: disband the own private group (`ChatCmd::PrivDisband`).
+ChatConfig callback GUI `100a0af1` invokes `10084dde`, then `1016d652`,
+which calls no-argument sender `1016c7d6(0x36)`. That sender builds the
+header with body length zero (`1017159c`) and sends exactly four bytes:
+`00 36 00 00`. The regression is native-RE-derived, not a server capture.
 `0x46 IG`, `0x47 IIII`, `0x578 IS`, `0x579 S`, `0x5dc S` LFT on, `0x5dd (empty)` LFT off, `0x5de IIII` LFT query (`ChatCmd::LftQuery`: side, profession mask, location index, -1), `0x3e9..0x406` (mail / misc, not implemented).
 `D` of outgoing requests (RE of the GUI callers, GUI.dll, 2026-10):
 * tell 0x1e [`0x1008947b` -> `0x10089c00` -> `FUN_1016c8c9`]: `D = buf[0..n+1]`, `buf[0] = request.kind` (0 for a typed tell), `buf[1..] = FUN_10089163(attachment)`; the attachment serializer returns 0 when the message has no link attachment, so **D = `00`** (1 byte).

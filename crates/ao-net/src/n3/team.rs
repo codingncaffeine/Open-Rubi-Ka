@@ -19,6 +19,43 @@ pub const TEAM_MEMBER_INFO: u32 = 0x28784248;
 pub const TEAM_INVITE: u32 = 0x4D2A313B;
 /// `PerkUpdateIIR` (vtable [GC 0x10155f74], read `FUN_10061f79`, apply `FUN_10063942`).
 pub const PERK_UPDATE: u32 = 0x435F7023;
+/// `RaidIIR_c`, GC read100a35d8/apply100a3b6a.
+pub const RAID: u32 = 0x3B3B2878;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaidLock {
+    pub playfield: Identity,
+    pub instance: Identity,
+    pub expires: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RaidEvent {
+    Created,
+    Locks(Vec<RaidLock>),
+}
+
+/// GC10056dd4 list version1/count; GC10056d30 two identities + expiry.
+pub fn parse_raid(body: &[u8]) -> Result<RaidEvent> {
+    let mut r = Reader::new(body);
+    let event = match r.u16()? {
+        0 => RaidEvent::Created,
+        1 => {
+            let version = r.i32()?;
+            if version != 1 { bail!("raid lock version {version}"); }
+            let count = r.u32()? as usize;
+            if count > r.remaining() / 20 { bail!("raid lock count exceeds body"); }
+            let mut locks = Vec::with_capacity(count);
+            for _ in 0..count {
+                locks.push(RaidLock { playfield: Identity::read(&mut r)?, instance: Identity::read(&mut r)?, expires: r.u32()? });
+            }
+            RaidEvent::Locks(locks)
+        }
+        opcode => bail!("unknown raid opcode {opcode}"),
+    };
+    if r.remaining() != 0 { bail!("trailing raid bytes"); }
+    Ok(event)
+}
 
 /// `CharacterActionIIR_t` action ids of the team / perk senders and the team relays (docs/zone/actions.md).
 pub mod action {
@@ -186,6 +223,7 @@ fn header(msg: u32, target: Identity) -> Writer {
     w
 }
 
+
 /// Full N3 payload of a `TeamMemberIIR_t` for header dynel `target` (tests, server emulation).
 pub fn team_member(target: Identity, m: &TeamMember) -> Vec<u8> {
     let mut w = header(TEAM_MEMBER, target);
@@ -300,6 +338,17 @@ mod tests {
     }
 
     #[test]
+    fn raid_requests_use_native_command_and_zero_identity() {
+        for command in [1i32, 6] {
+            let p = super::super::textcmd::raid_cmd(ME.instance, command, Identity::default(), Identity::default(), Identity::default());
+            assert_eq!(p[12], 0);
+            assert_eq!(p.len(), 25);
+            assert_eq!(&p[13..17], &command.to_be_bytes());
+            assert_eq!(&p[17..], &[0; 8]);
+        }
+    }
+
+    #[test]
     fn team_member_round_trip_and_bounds() {
         let m = TeamMember { member: OTHER, team: Identity { kind: TEAM_KIND, instance: 99 }, sub_team: 0, profession: 6, level: 37, name: "Aomactest".into() };
         let p = team_member(ME, &m);
@@ -380,5 +429,20 @@ mod tests {
         assert_eq!(&p[..4], &message_key("CharacterActionIIR_t").to_be_bytes());
         assert_eq!(p.len(), 13 + 4 + 4 + 8 + 8 + 2);
         assert_eq!(&p[13..17], &0x18i32.to_be_bytes());
+    }
+}
+
+#[cfg(test)]
+mod raid_reply_tests {
+    use super::*;
+    #[test]
+    fn native_lock_list_is_bounded_and_exact() {
+        let bytes = [0,1, 0,0,0,1, 0,0,0,1, 0,0,0,0, 0,0,0,127, 0,0,0,0, 0,0,0,9, 0,0,14,16];
+        assert_eq!(parse_raid(&bytes).unwrap(), RaidEvent::Locks(vec![RaidLock {
+            playfield: Identity { kind: 0, instance: 127 }, instance: Identity { kind: 0, instance: 9 }, expires: 3600,
+        }]));
+        assert!(parse_raid(&bytes[..bytes.len()-1]).is_err());
+        assert!(parse_raid(&[0,1,0,0,0,1,255,255,255,255]).is_err());
+        assert!(parse_raid(&[0,0,1]).is_err());
     }
 }

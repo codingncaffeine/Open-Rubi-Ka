@@ -460,6 +460,10 @@ pub struct Controls {
 }
 
 impl Controls {
+    #[cfg(test)]
+    pub(super) fn option_prefs(&self) -> &ControlPrefs {
+        &self.prefs
+    }
     /// The options changed (live from the DValues).
     pub fn set_prefs(&mut self, prefs: ControlPrefs) {
         self.prefs = prefs;

@@ -60,7 +60,10 @@ pub(super) fn store_of(kind: WindowKind) -> Option<Store> {
     Some(match kind {
         WindowKind::Skills => Store::Value("SkillConfig"),
         WindowKind::Perks => Store::Value("PerkWindowConfig"),
+        WindowKind::Research => Store::Value("ResearchConfig"),
+        WindowKind::Vehicle => Store::Value("MechSelectConfig"),
         WindowKind::Pet => Store::Value("PetWindowConfig"),
+        WindowKind::Raid => Store::Value("RaidConfig"),
         WindowKind::Inventory | WindowKind::Team | WindowKind::Ncu | WindowKind::Mission | WindowKind::Map | WindowKind::PlanetMap | WindowKind::Faction | WindowKind::Actions => {
             Store::Dock(kind.dvalue())
         }
@@ -208,6 +211,7 @@ fn view_archive(identity: &str) -> Option<&'static str> {
         "map_window" => "PFMapWindowConfig",
         "planetmap_window" => "PlanetMapViewConfig",
         "faction_window" => "FactionWindowConfig",
+        "tip_window" => "TipViewConfig",
         _ => return None,
     })
 }

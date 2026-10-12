@@ -60,10 +60,11 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
         counters: counters(objs),
         waves: [0.0; 16],
     };
+    scene.water_light=water_light(objs,&ctx);
     let mut b = Builder { fog, store, names, ctx, objs, sky, scene, sorts };
     // (sort, mesh, constant spin, aurora simulation, wave driven turns)
-    type Layer = (u32, Mesh, Option<SkySpin>, Option<(ao_scene::aurora::GloomySky, f32)>, Vec<SkyWaveSpin>);
-    let mut layers: Vec<Layer> = vec![(b.sorts.get("Atmosphere").copied().unwrap_or(ATMOSPHERE_SORT), dome, None, None, vec![])];
+    type Layer = (u32, Mesh, Option<SkySpin>, Option<(ao_scene::aurora::GloomySky, f32)>, Vec<SkyWaveSpin>, Option<f32>);
+    let mut layers: Vec<Layer> = vec![(b.sorts.get("Atmosphere").copied().unwrap_or(ATMOSPHERE_SORT), dome, None, None, vec![], None)];
     for o in objs.iter().filter(|o| o.field("Priority").is_some_and(|p| p.trim() == "e_RenderPriority_PreRendering")) {
         let mut colors = None;
         let mesh = match o.fxid() {
@@ -80,17 +81,33 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
         // a layer whose every vertex alpha is 0 (sun below the horizon, `TFACTOR` 0) draws nothing
         if let Some(m) = mesh.filter(|m| m.vertices.iter().any(|v| v.color[3] > 0.0)) {
             let spin = if o.fxid() == "GenericMeshObject" { b.spin(o) } else { None };
-            layers.push((b.sort(o), m, spin, colors, wave_spins(o, &b.ctx)));
+            let altitude=(o.fxid()=="SingleCloud").then(||script::float(o,&b.ctx,"Altitude",100.0));
+            layers.push((b.sort(o), m, spin, colors, wave_spins(o, &b.ctx), altitude));
         }
     }
     layers.sort_by_key(|l| l.0);
-    for (_, m, spin, colors, waves) in layers {
+    for (_, m, spin, colors, waves, cloud_altitude) in layers {
         scene.meshes.push(m);
+        if let Some(altitude)=cloud_altitude {
+            scene.single_clouds.push(ao_scene::cloud::CloudLayer {mesh:scene.meshes.len()-1,altitude,
+                wind:[sky.weather.high_altitude_wind_rate[0],0.0,sky.weather.high_altitude_wind_rate[1]],
+                storm:sky.weather.storm_intensity(),thick:sky.weather.thick_clouds_intensity(),
+                sun_y:sky.sun_ao[1],light:sky.sun.unwrap_or([0.0;3]),light_direction:sky.sun_dir,ambient:sky.ambient.unwrap_or([0.0;3])});
+        }
         scene.sky_colors.extend(colors.map(|(sim, gain)| SkyColors { mesh: scene.meshes.len() - 1, sim, gain }));
         scene.sky.push(Instance { mesh: scene.meshes.len() - 1, transform: IDENTITY });
         scene.sky_spin.extend(spin.map(|s| SkySpin { instance: scene.sky.len() - 1, ..s }));
         scene.sky_wave_spin.extend(waves.into_iter().map(|w| SkyWaveSpin { instance: scene.sky.len() - 1, ..w }));
     }
+}
+
+/// DS1005d589 binds the actual SunLight formulas, not merely the RGB tracks.
+/// Shadowlands has populated tracks but deliberately sets WaterLightCurrent black.
+fn water_light(objs:&[Obj],ctx:&Ctx)->Option<([f32;3],[f32;3])> {
+    let light=objs.iter().find(|o|o.name=="SunLight")?;
+    let color=script::vector(light,ctx,light.field("WaterLightCurrent")?,0)?;
+    let rotation=script::rotation(light,ctx,light.field("WaterLightDirection")?,0)?;
+    Some((color.map(srgb_to_linear),scene(rotation.rotate([0.0,0.0,-1.0]))))
 }
 
 /// Position expressions of the scenery objects: `RKPP.<place> - PlayfieldData.UniversePosition + This.UniversePosition + v(..)`
@@ -152,6 +169,7 @@ pub fn emit_distant(objs: &[Obj], store: &RecordStore, scene: &mut Scene, day_ti
     let Ok(names) = NameTable::load(store) else { return };
     let ctx = Ctx::at(0.0);
     scene.day_time = day_time;
+    let first_instance = scene.instances.len();
     let mut ship_meshes = HashMap::new();
     for o in objs {
         let is_scenery = o.fxid() == "GenericMeshObject"
@@ -186,6 +204,7 @@ pub fn emit_distant(objs: &[Obj], store: &RecordStore, scene: &mut Scene, day_ti
             scene.far_away.push(scene.instances.len() - 1);
         }
     }
+    scene.spaceships.extend(first_instance..scene.instances.len());
 }
 
 /// `ScaleType e_ScaleVisibleFarAway` (= 3): the client pulls the object in towards the camera every frame, see
@@ -493,32 +512,14 @@ impl Builder<'_> {
         Some(mesh)
     }
 
-    /// `e_SingleCloud`, `Altitude` metres above the camera. The client (`VisualSingleCloud_t`, `FUN_1005485a` update,
-    /// `FUN_10053e45` respawn) keeps 10 clouds (high detail; 2 in low detail) as randomly warped 10 x 10 vertex sheets inside a
-    /// +-1600 m square around the camera that drift with the wind and respawn when they leave it; the sheet shapes, sizes
-    /// and vertex colours are procedural **[UNRESOLVED]**: we place 10 fixed 260 x 130 m billboards at random points of
-    /// the square (the textures are the client's `single_cloud01..04.png`).
-    fn single_clouds(&mut self, o: &Obj) -> Option<Mesh> {
-        let altitude = script::float(o, &self.ctx, "Altitude", 100.0);
-        let keys: Vec<TextureKey> = (1..=4).filter_map(|n| self.texture(&format!("single_cloud0{n}.png"))).collect();
-        if keys.is_empty() {
-            return None;
-        }
-        let mut rng = Lcg(0x2545_F491);
-        let tint = self.sky.cloud_light.map(srgb_to_linear);
-        let mut mesh = Mesh::default();
-        let mut per_key: Vec<Vec<u32>> = vec![vec![]; keys.len()];
-        for i in 0..10 {
-            let (x, z) = ((rng.next() * 2.0 - 1.0) * 1600.0, (rng.next() * 2.0 - 1.0) * 1600.0);
-            let dir = [x, altitude, z];
-            let len = x.hypot(z).hypot(altitude);
-            let base = mesh.vertices.len() as u32;
-            // a 260 x 130 m cloud seen at its distance
-            quad(&mut mesh, scene(dir.map(|c| c / len)), (130.0 / len * 300.0, 65.0 / len * 300.0), [tint[0], tint[1], tint[2], 0.9], [(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)]);
-            per_key[i % keys.len()].extend([base, base + 1, base + 2, base, base + 2, base + 3]);
-        }
-        for (key, idx) in keys.into_iter().zip(per_key) {
-            mesh.submeshes.push(Submesh { two_sided: true, blend: Blend::AlphaBlend, ..Submesh::new(idx, Some(key)) });
+    /// Native30 sheets: prefs15/16 select10x10 warped lit /2x2 unlit grids,
+    /// not the cloud count (DisplaySystem100532b8/10053681/1005485a).
+    fn single_clouds(&mut self, _o: &Obj) -> Option<Mesh> {
+        let keys: Vec<TextureKey> = (1..=4).map(|n|self.texture(&format!("single_cloud0{n}.png"))).collect::<Option<_>>()?;
+        let mut mesh=ao_scene::cloud::Clouds::mesh();
+        for ((first,end),key) in [(0,2),(2,4),(4,27),(27,30)].into_iter().zip(keys) {
+            mesh.submeshes.push(Submesh {two_sided:true,blend:Blend::AlphaBlend,
+                ..Submesh::new(ao_scene::cloud::Clouds::indices(10,first,end),Some(key))});
         }
         Some(mesh)
     }
@@ -672,6 +673,16 @@ fn wave_curves_read(o: &Obj, expr: &str, depth: u32) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn water_light_uses_authored_current_not_ground_or_unused_tracks() {
+        let make=|current:&str|script::parse_objects(&format!("Object SunLight\n{{\n Quaternion WaterLightDirection: GAME.Sun1Rotation\n Float WaterLightR [2]: 0.25,0.75\n Float WaterLightG [2]: 0.5,1\n Float WaterLightB [2]: 0.75,0.25\n Vector WaterLightCurrent: {current}\n}}\n"));
+        let ctx=Ctx::at(0.0);
+        let tracked=make("v(This.WaterLightR[GAME.DayTimeFactor],This.WaterLightG[GAME.DayTimeFactor],This.WaterLightB[GAME.DayTimeFactor])");
+        assert_eq!(water_light(&tracked,&ctx),Some(([0.25,0.5,0.75].map(srgb_to_linear),[0.0,0.0,1.0])));
+        assert_eq!(water_light(&make("v(0,0,0)"),&ctx),Some(([0.0;3],[0.0,0.0,1.0])));
+        assert_eq!(water_light(&[],&ctx),None);
+    }
 
     #[test]
     fn self_referencing_waypoint_is_rejected() {

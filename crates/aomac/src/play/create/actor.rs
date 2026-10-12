@@ -68,7 +68,7 @@ fn frames(store: &RecordStore, spec: Spec, role: Role) -> anyhow::Result<Vec<Sce
 }
 
 fn run(dir: &std::path::Path, spec: Spec, req: &Receiver<Option<usize>>, tx: &Sender<Out>) -> anyhow::Result<()> {
-    let store = RecordStore::open(dir)?;
+    let store = super::super::open_texture_store(dir)?;
     let first = character::load_player_build(&store, &player(spec), spec.build, Some((Role::Idle, 0.0)))?;
     if tx.send(Out::First(Box::new(first))).is_err() {
         return Ok(());

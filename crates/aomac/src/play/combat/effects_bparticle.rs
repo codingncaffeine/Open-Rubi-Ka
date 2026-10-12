@@ -177,7 +177,7 @@ mod tests {
     #[test]
     #[ignore = "requires installed retail data and offscreen GPU"]
     fn authored_bparticle_offscreen()->Result<()> {
-        use super::super::{Binding,Creation,Renderer,MODEL_BASE};
+        use super::super::{Binding,Creation,Renderer};
         let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).context("set AOMAC_EFFECT_FRAMES")?;
         std::fs::create_dir_all(&out)?;
         let templates=super::super::Templates::open(&ao_gui::client_dir())?;
@@ -206,7 +206,7 @@ mod tests {
                 let mut terrain=|p:Vec3|Some((Vec3::new(p.x,0.0,p.z),Vec3::Y));
                 host.actors.clear();renderer.frame(0.01,&mut host,Some(&mut terrain));
                 if ![1,10,20,40].contains(&step) {continue;}
-                let models:Vec<_>=renderer.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();
+                let models:Vec<_>=renderer.models.iter().map(|(&id,m)| (id,m.scene.clone())).collect();
                 let path=out.join(format!("bparticle3024_{id}_{step}.png"));
                 let blank=out.join(format!("bparticle3024_blank_{id}_{step}.png"));
                 let time=step as f32*0.01;

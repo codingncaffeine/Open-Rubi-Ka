@@ -29,6 +29,24 @@ pub struct Host {
     pub lens: Option<ao_scene::Lens>,
     /// Fog density multiplier of the `FogMode` pref ([`ao_scene::fog_mode_density_scale`]); `None` leaves it as it is; drained by the viewer.
     pub fog_density_scale: Option<f32>,
+    /// Startup color-depth quality and future-upload native compression preference.
+    pub texture_policy: Option<(i32, bool)>,
+    /// Live character preference controlling authored `GAME.GameShowSpaceship` instances.
+    pub spaceships_shown: bool,
+    pub smooth_animations: bool,
+    pub previous_visible_actors: HashSet<u32>,
+    /// Live native liquid subdivision preference, not a liquid visibility switch.
+    pub realistic_water: bool,
+    /// EnvPrefs15/16, consumed by both the real viewer and offscreen harness.
+    pub cloud_preferences: Option<(bool, bool)>,
+    /// Native terrain quality / full-quality-radius DValues; consumed on the next frame.
+    pub ground_detail: Option<(i32, i32)>,
+    pub ground_rendering: i32,
+    pub ground_textures: Option<std::collections::HashMap<ao_scene::TextureKey, ao_scene::Texture>>,
+    /// Character preference, observed live by DisplaySystem (0x10078f75).
+    pub wait_for_vert_sync: Option<bool>,
+    /// DisplaySystem 0x100787ec / Randy 0x10042f76: synchronize the previous rendered frame at Flip.
+    pub mouse_lag_fix: bool,
     /// Frontend request: capture the cursor and deliver [`GameInput::MouseMotion`] (mouse-look); applied after each frame/input.
     pub look: bool,
     /// Actor models to upload before the next frame (`key`, model scene), see [`Renderer::add_actor_model`]; drained by the viewer.
@@ -78,6 +96,10 @@ pub struct Host {
     native_fog_preference: Option<i32>,
 }
 
+fn present_mode(wait: bool) -> wgpu::PresentMode {
+    if wait { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync }
+}
+
 impl Host {
     pub fn bind_native_fog(&mut self,state:super::SharedNativeFog) {
         if self.native_fog.as_ref().is_some_and(|old|std::rc::Rc::ptr_eq(old,&state)){return;}
@@ -114,7 +136,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None }
+        Host { smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -325,6 +347,7 @@ struct State {
     stat_frames: u32,
     perf: bool,
     cpu: f32,
+    previous_submission: Option<wgpu::SubmissionIndex>,
     gui: Option<Gui>,
     /// Seconds since start (drives `Submesh::uv_scroll`).
     clock: f32,
@@ -423,6 +446,7 @@ impl State {
             stat_t: now,
             stat_frames: 0,
             cpu: 0.0,
+            previous_submission: None,
             perf: std::env::var_os("AOMAC_PERF").is_some(),
             gui,
             clock: 0.0,
@@ -465,8 +489,19 @@ impl State {
             g.frontend.game_input(GameInput::MouseMotion { dx, dy, dt }, &mut g.host);
         }
         let size = (self.config.width / g.scale, self.config.height / g.scale);
+        self.renderer.visible_actor_ids(&mut g.host.previous_visible_actors);
         let list = g.frontend.frame(dt, size, &mut g.host);
+        if let Some(wait) = g.host.wait_for_vert_sync.take() {
+            let mode = present_mode(wait && std::env::var_os("AOMAC_NOVSYNC").is_none());
+            if self.config.present_mode != mode {
+                self.config.present_mode = mode;
+                self.surface.configure(&self.renderer.device, &self.config);
+            }
+        }
         self.cam = g.host.camera;
+        if let Some((quality, compressed)) = g.host.texture_policy.take() {
+            self.renderer.set_texture_policy(quality, compressed);
+        }
         if let Some(scene) = g.host.scene.take() {
             self.renderer.upload(&scene);
             self.speed = (self.renderer.radius() * 0.15).max(5.0);
@@ -481,6 +516,14 @@ impl State {
         if let Some(s) = g.host.fog_density_scale.take() {
             self.renderer.set_fog_density_scale(s);
         }
+        self.renderer.set_spaceships_shown(g.host.spaceships_shown);
+        self.renderer.set_realistic_water(g.host.realistic_water);
+        if let Some((realistic,simple))=g.host.cloud_preferences.take() {self.renderer.set_cloud_preferences(realistic,simple,false);}
+        if let Some((quality, radius)) = g.host.ground_detail.take() {
+            self.renderer.set_ground_detail(quality, radius);
+        }
+        self.renderer.set_ground_rendering(g.host.ground_rendering);
+        if let Some(textures) = g.host.ground_textures.take() { self.renderer.refresh_ground_textures(&textures); }
         g.host.apply_actors(&mut self.renderer);
         (Some(list), g.host.quit)
     }
@@ -544,12 +587,20 @@ impl State {
         };
         let view = frame.texture.create_view(&Default::default());
         let t0 = Instant::now();
-        self.renderer.render(&view, &self.targets, &self.cam);
+        let submission = self.renderer.render(&view, &self.targets, &self.cam);
         self.cpu += t0.elapsed().as_secs_f32();
         if let Some(list) = gui_out {
             let gview = crate::GuiRenderer::view(&frame.texture);
             self.paint_gui(list, &gview);
         }
+        if self.gui.as_ref().is_some_and(|g| g.host.mouse_lag_fix) {
+            if let Some(previous) = self.previous_submission.take() {
+                if let Err(error) = self.renderer.device.poll(wgpu::PollType::Wait { submission_index: Some(previous), timeout: None }) {
+                    eprintln!("render: MouseLagFix GPU synchronization: {error}");
+                }
+            }
+        }
+        self.previous_submission = Some(submission);
         self.window.pre_present_notify();
         frame.present();
 
@@ -720,7 +771,11 @@ impl Offscreen {
     pub fn frame(&mut self, fe: &mut dyn Frontend, dt: f32) -> ao_gui::DrawList {
         self.r.time += dt;
         if let Some(sun) = LiveRun::advance(&mut self.live, &mut self.r, dt) { self.host.effect_sun_direction = Some(sun); }
+        self.r.visible_actor_ids(&mut self.host.previous_visible_actors);
         let list = fe.frame(dt, self.size, &mut self.host);
+        if let Some((quality, compressed)) = self.host.texture_policy.take() {
+            self.r.set_texture_policy(quality, compressed);
+        }
         if let Some(scene) = self.host.scene.take() {
             self.r.upload(&scene);
         }
@@ -734,6 +789,14 @@ impl Offscreen {
         if let Some(s) = self.host.fog_density_scale.take() {
             self.r.set_fog_density_scale(s);
         }
+        self.r.set_spaceships_shown(self.host.spaceships_shown);
+        self.r.set_realistic_water(self.host.realistic_water);
+        if let Some((realistic,simple))=self.host.cloud_preferences.take() {self.r.set_cloud_preferences(realistic,simple,false);}
+        if let Some((quality, radius)) = self.host.ground_detail.take() {
+            self.r.set_ground_detail(quality, radius);
+        }
+        self.r.set_ground_rendering(self.host.ground_rendering);
+        if let Some(textures) = self.host.ground_textures.take() { self.r.refresh_ground_textures(&textures); }
         self.host.apply_actors(&mut self.r);
         list
     }
@@ -760,6 +823,16 @@ impl Offscreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mouse_lag_fix_defaults_to_no_gpu_barrier() {
+        assert!(!Host::headless().mouse_lag_fix);
+    }
+    #[test]
+    fn vertical_sync_preference_selects_the_surface_present_mode() {
+        assert_eq!(present_mode(false), wgpu::PresentMode::AutoNoVsync);
+        assert_eq!(present_mode(true), wgpu::PresentMode::AutoVsync);
+        assert_eq!(Host::headless().wait_for_vert_sync, None);
+    }
     #[test]
     fn native_shadow_sun_uses_the_loaded_environment_ray_direction() {
         let mut host = Host::headless();

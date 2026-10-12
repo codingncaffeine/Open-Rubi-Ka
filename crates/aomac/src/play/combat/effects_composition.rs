@@ -467,7 +467,7 @@ mod tests {
     #[test]
     #[ignore = "requires authored retail assets and offscreen renderer; AOMAC_EFFECT_FRAMES selects output"]
     fn authored_hit_meta_frames() -> Result<()> {
-        use super::super::{Creation,HitLocationRequest,MODEL_BASE};
+        use super::super::{Creation,HitLocationRequest};
         let mut renderer=Renderer::open(&ao_gui::client_dir())?;
         let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from)
             .unwrap_or_else(|| "/tmp/FxClasses/meta-frames".into());
@@ -495,7 +495,7 @@ mod tests {
                 previous=time;
                 assert!(renderer.is_active(handle));
                 assert!(!host.actors.is_empty(),"authored Meta children must render");
-                let models:Vec<_>=renderer.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone()))
+                let models:Vec<_>=renderer.models.iter().map(|(&id,m)| (id,m.scene.clone()))
                     .chain(renderer.buff_models.iter().map(|(&id,m)|(0xfac2_0000_0000_0000|u64::from(id),m.scene.clone()))).collect();
                 ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),
                     [2.0,1.0,5.0],[2.0,0.0,0.0],640,480,&out.join(format!("{id}_{time:.2}.png")),time)?;

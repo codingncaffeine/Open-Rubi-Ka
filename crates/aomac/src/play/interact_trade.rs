@@ -206,12 +206,14 @@ impl Interact {
         self.trade.close(gui);
         match NpcChat::open(gui, self.screen, npc, name, BarFlags { description: b20, trade: b21, use_npc }, &self.trade.texts) {
             Ok(mut c) => {
+                c.escape = self.escape_options.unwrap_or([true, true, false])[2];
                 c.show_questions = self.trade.show_questions;
                 self.chat = Some(c);
             }
             Err(e) => eprintln!("interact: NPC chat window: {e:#}"),
         }
     }
+
 
     /// `StartTrade` / `RejectedItems` of the dialogue.
     pub(super) fn on_trade_knubot(&mut self, gui: &mut Gui, k: &Knubot) {
@@ -449,6 +451,29 @@ mod tests {
     use crate::play::interact_chat::{dock_below, dock_right};
     use crate::play::interact_chat::STAT0_USE_BIT;
     use crate::play::zone::DynelState;
+
+    #[test]
+    fn npc_escape_policy_is_captured_at_open() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut i = Interact::new(7, (800, 600));
+        let mut d = super::super::dvalue::DValues::new(&dir);
+        let npc = Identity { kind: 50000, instance: 9 };
+        d.set_i64("esc_npcchat", 1);
+        i.configure_escape(&d);
+        i.open_chat(&mut gui, npc, "NPC", false, false, false);
+        let win = i.chat.as_ref().unwrap().win;
+        d.set_i64("esc_npcchat", 0);
+        i.configure_escape(&d);
+        assert!(matches!(i.chat.as_mut().unwrap().event(&mut gui, &Event::Escape { window: win }, "Me"), Some(Some(super::super::interact_chat::ChatOut::Closed))));
+        i.close_all(&mut gui);
+        i.open_chat(&mut gui, npc, "NPC", false, false, false);
+        let win = i.chat.as_ref().unwrap().win;
+        d.set_i64("esc_npcchat", 1);
+        i.configure_escape(&d);
+        assert!(i.chat.as_mut().unwrap().event(&mut gui, &Event::Escape { window: win }, "Me").is_none());
+    }
     use ao_gui::InputEvent;
     use ao_net::n3::misc::Misc;
     use ao_net::n3::outgoing::n3_frame;

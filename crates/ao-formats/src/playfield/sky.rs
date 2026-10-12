@@ -390,6 +390,11 @@ impl SkyClock {
         Ok(Tweaks::load(client_dir, id, true).map(|tweaks| SkyClock { store, tweaks, env, sent: HashSet::new(), day: crate::weather::OFFLINE_DAY }))
     }
 
+    /// Resource quality for textures first loaded by this independent sky store.
+    pub fn set_texture_quality(&mut self, quality: i32) {
+        self.store.set_other_texture_quality(quality);
+    }
+
     /// The weather follows the server's game day (`GameTimeIIR_t.arg3`) instead of the offline day.
     pub fn on_day(mut self, game_day: u32) -> Self {
         self.day = game_day;
@@ -534,6 +539,10 @@ mod tests {
         let Ok(Some(mut clock)) = SkyClock::open(&dir, 566) else { return };
         let (noon, night) = (clock.at(3240.0), clock.at(0.0));
         assert!(!noon.sky.is_empty() && !noon.textures.is_empty() && night.textures.is_empty(), "textures are sent once");
+        assert_eq!(noon.single_clouds.len(),1,"native SingleCloud layer stays live independently of clear weather");
+        let clouds=&noon.meshes[noon.single_clouds[0].mesh];
+        assert_eq!(clouds.vertices.len(),ao_scene::cloud::COUNT*ao_scene::cloud::GRID*ao_scene::cloud::GRID);
+        assert_eq!(clouds.submeshes.len(),4,"four native single_cloud textures");
         // the cloud dome drifts, the layers other than clouds do not
         let drifting = noon.meshes.iter().flat_map(|m| &m.submeshes).filter(|s| s.uv_scroll != [0.0, 0.0]).count();
         // pf 566 has only the clear weight (w3 = 100): clear weather leaves the cloud dome invisible, so it is dropped

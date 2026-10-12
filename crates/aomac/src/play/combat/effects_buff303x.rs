@@ -302,7 +302,6 @@ mod tests {
     #[ignore="installed authored assets and offscreen GPU regression"]
     fn retail_surface_authored_modes_frames()->Result<()> {
         use anyhow::Context;
-        use super::super::MODEL_BASE;
         use ao_formats::character::{actor::{ActorAssets,ActorRig,PlayerLook},Breed,Gender,Skin,Equipment};
         let out=std::env::var_os("AOMAC_EFFECT_FRAMES").ok_or_else(||anyhow::anyhow!("AOMAC_EFFECT_FRAMES required"))?;
         let out=std::path::PathBuf::from(out);std::fs::create_dir_all(&out)?;
@@ -369,7 +368,7 @@ mod tests {
             let mut emitted_geometry=false;
             for frame in 1..=60 {
                 let (skin,parts)=rig.pose(None);
-                let actor=ao_scene::ActorFrame {id:1,model:1,transform:Mat4::from_translation(origin).to_cols_array_2d(),skin:Some(skin),parts,part_attractors:rig.part_attractors(),..Default::default()};
+                let actor=ao_scene::ActorFrame { id:1,model:1,transform:Mat4::from_translation(origin).to_cols_array_2d(), skin: Some(std::sync::Arc::new(skin)), parts,part_attractors:rig.part_attractors(),..Default::default() };
                 r.prepare_source_mesh(identity,rig.model(),&actor);host.actors.clear();host.actors.push(actor);
                 r.prepare_anchors(identity,|_,id|rig.effect_anchor(id,None).map(|m|Mat4::from_translation(origin)*Mat4::from_cols_array_2d(&m)));
                 // GC1011202f samples Vehicle+cc and GetDir, not body scale.
@@ -411,7 +410,7 @@ mod tests {
                 // invisible at tick1 and already expired by the old tick15 sample.
                 if [1,2,15,30,45,60].contains(&frame) {
                     let mut models=vec![(1,rig.model().clone())];
-                    models.extend(r.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())));
+                    models.extend(r.models.iter().map(|(&id,m)| (id,m.scene.clone())));
                     models.extend(r.buff_models.iter().map(|(&id,m)|(0xfac2_0000_0000_0000|u64::from(id),m.scene.clone())));
                     let world=if id==25002 {&highlight_world}else{&ao_scene::Scene::default()};
                     let suffix=if creation==super::super::Creation::Dynel {""}else{"_hitlocation"};

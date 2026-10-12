@@ -36,6 +36,7 @@ pub struct GfxSet {
     names: Vec<String>,
     by_name: HashMap<String, GfxId>,
     images: HashMap<GfxId, GfxImage>,
+    runtime_sizes: HashMap<GfxId, (u32, u32)>,
 }
 
 pub const COLOR_KEY: [u8; 3] = [0, 255, 0];
@@ -63,7 +64,7 @@ impl GfxSet {
             let data = blob.get(off..off + len).ok_or_else(|| anyhow!("{name}: range outside uvga"))?;
             images.insert(id, decode_png(name, data)?);
         }
-        Ok(Self { names, by_name, images })
+        Ok(Self { names, by_name, images, runtime_sizes: HashMap::new() })
     }
 
     pub fn id(&self, name: &str) -> Option<GfxId> {
@@ -86,7 +87,10 @@ impl GfxSet {
     }
     /// Pixel size of an image as `(w, h)`; `(0, 0)` when absent.
     pub fn size(&self, id: GfxId) -> (u32, u32) {
-        self.images.get(&id).map_or((0, 0), |i| (i.width, i.height))
+        self.runtime_sizes.get(&id).copied().unwrap_or_else(|| self.images.get(&id).map_or((0, 0), |i| (i.width, i.height)))
+    }
+    pub(crate) fn register_runtime_size(&mut self, id: GfxId, w: u32, h: u32) {
+        self.runtime_sizes.insert(id, (w, h));
     }
 }
 

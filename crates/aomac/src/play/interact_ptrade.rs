@@ -33,8 +33,6 @@ pub const RANGE: f32 = 5.0;
 const RADIUS: f32 = 0.5;
 /// The own cash field is sent this long after the last edit: `EventTimer_c::Start(0xf4240, 0, 1)` [GUI 0x100df82d] ([INFERENCE]: microseconds).
 pub const CASH_DELAY: f32 = 1.0;
-/// Option `esc_trades` (`LoginPrefs.xml`: true): Esc declines the trade (`FUN_100df810`).
-const ESC_TRADES: bool = true;
 /// Cell art of the item lists (`MultiListView_c` 48 px icons in 54 px slots, hud_stats/items.rs).
 const SLOT: f32 = 54.0;
 const ICON: f32 = 48.0;
@@ -61,6 +59,7 @@ pub struct Entry {
 /// The open window and its model (`TradeView_c`: `+0x1c8` partner, `+0x1d0` own).
 pub struct PTrade {
     pub win: WindowId,
+    escape: bool,
     pub own: Identity,
     pub partner: Identity,
     pub ours: Vec<Entry>,
@@ -75,6 +74,7 @@ pub struct PTrade {
     /// When the own cash field is sent (the 1 s `EventTimer_c` of `+0x200`).
     cash_due: Option<f32>,
     dirty: bool,
+    tip: Option<(usize, usize, Entry, bool, String)>,
 }
 
 #[derive(Default)]
@@ -126,7 +126,7 @@ impl PTrade {
         gui.set_text(win, "PartnerName", name);
         gui.set_text(win, "PartnerCashView", "0");
         gui.relayout_window(win);
-        Ok(PTrade { win, own, partner, ours: vec![], theirs: vec![], accepted: false, partner_cash: 0, cash: 0, scroll: [0; 2], dock: (dw, dh), cash_due: None, dirty: true })
+        Ok(PTrade { win, escape: true, own, partner, ours: vec![], theirs: vec![], accepted: false, partner_cash: 0, cash: 0, scroll: [0; 2], dock: (dw, dh), cash_due: None, dirty: true, tip: None })
     }
 
     /// Paints both lists and the status bitmap when something changed. `info(gui, low_id)` = name and icon of a template.
@@ -150,7 +150,8 @@ impl PTrade {
                     let o = (SLOT - ICON) / 2.0;
                     cmds.push(CanvasItem::Image { id, src: [0.0, 0.0, w as f32, h as f32], dst: [x + o, y + o, x + o + ICON, y + o + ICON], alpha: 1.0 });
                 }
-                tips.push(CanvasTip { rect: [x, y, x + SLOT, y + SLOT], title: name, body: String::new() });
+                let body = self.tip.as_ref().filter(|(list, index, entry, _, _)| *list == i && *index == first + n && entry == e).map_or("", |(_, _, _, _, body)| body.as_str());
+                tips.push(CanvasTip { rect: [x, y, x + SLOT, y + SLOT], title: name, body: body.to_owned() });
             }
             gui.set_canvas(self.win, view, cmds);
             gui.set_canvas_tips(self.win, view, tips);
@@ -158,6 +159,39 @@ impl PTrade {
         let s = STATUS_GFX[usize::from(self.accepted)];
         let (w, h) = gui.gfx().size(GfxId(s));
         gui.set_canvas(self.win, "status", vec![CanvasItem::Image { id: GfxId(s), src: [0.0, 0.0, w as f32, h as f32], dst: [0.0, 0.0, w as f32, h as f32], alpha: 1.0 }]);
+    }
+
+    fn update_tooltip(&mut self, gui: &mut Gui, zone: &super::zone::Zone, text: &ao_formats::screens::TextDb, descriptions: bool) {
+        let (x, y) = gui.mouse_position();
+        let hovered = ["our_items", "partner_items"].iter().enumerate().find_map(|(list, view)| {
+            let r = gui.view_rect(self.win, view)?;
+            if !gui.window_visible(self.win) || x < r.l || x >= r.r || y < r.t || y >= r.b { return None; }
+            let index = self.entry_at(list, x - r.l, y - r.t)?;
+            Some((list, index, self.entries(list)[index].clone()))
+        });
+        if hovered.as_ref().is_some_and(|(list, index, entry)| self.tip.as_ref().is_some_and(|(old_list, old_index, old_entry, enabled, _)| list == old_list && index == old_index && entry == old_entry && *enabled == descriptions)) { return; }
+        let Some((list, index, entry)) = hovered else {
+            if self.tip.take().is_some() {
+                for view in ["our_items", "partner_items"] { gui.set_canvas_tip_body(self.win, view, None, ""); }
+            }
+            return;
+        };
+        let body = if descriptions {
+            let request = if list == 0 {
+                super::chat::ItemRequest::Identity { id: entry.item, shop: false, container: self.own }
+            } else if let Some(item) = entry.acg { super::chat::ItemRequest::Reference(item) }
+            else { super::chat::ItemRequest::Identity { id: entry.item, shop: false, container: self.partner } };
+            match super::chat::item_html(zone, &request, text) {
+                Ok(body) => body.unwrap_or_default(),
+                Err(error) => { eprintln!("trade tooltip: {error:#}"); String::new() }
+            }
+        } else { String::new() };
+        let (cx, cy) = cell(index - self.scroll[list] * COLS);
+        for (n, view) in ["our_items", "partner_items"].iter().enumerate() {
+            let tip_index = (n == list).then(|| gui.canvas_tips(self.win, view).iter().position(|tip| tip.rect[0] == cx && tip.rect[1] == cy)).flatten();
+            gui.set_canvas_tip_body(self.win, view, tip_index, &body);
+        }
+        self.tip = Some((list, index, entry, descriptions, body));
     }
 
     /// The list view a canvas name stands for: 0 = own items, 1 = the partner's.
@@ -195,6 +229,9 @@ impl PTrade {
 }
 
 impl PTradeUi {
+    pub(super) fn configure_escape(&mut self, values: &super::dvalue::DValues) {
+        self.confirm.configure_escape(values);
+    }
     pub fn set_texts(&mut self, yes: String, no: String) {
         self.buttons = [yes, no];
     }
@@ -379,7 +416,7 @@ impl Interact {
                 out.push(trade::abort(me, true));
             }
             Event::Escape { window } | Event::CloseRequested { window } if *window == p.win => {
-                if matches!(ev, Event::CloseRequested { .. }) || ESC_TRADES {
+                if matches!(ev, Event::CloseRequested { .. }) || p.escape {
                     p.cash_due = None;
                     out.push(trade::abort(me, true));
                 }
@@ -449,7 +486,7 @@ impl Interact {
         }
         let name = zone.dynels.get(&partner.instance).map(|d| d.name.clone()).unwrap_or_default();
         match PTrade::open(gui, self.screen, me, partner, &name) {
-            Ok(t) => self.ptrade.trade = Some(t),
+            Ok(mut t) => { t.escape = self.escape_options.unwrap_or([true, true, false])[1]; self.ptrade.trade = Some(t); }
             Err(e) => eprintln!("interact: trade window: {e:#}"),
         }
     }
@@ -470,6 +507,7 @@ impl Interact {
         for (slot, x, y) in drops {
             self.shop_drop(gui, zone, slot, x, y);
             self.ptrade_drop(gui, zone, slot, x, y);
+            self.tradeskill.drop_item(gui, zone, slot, x, y);
         }
     }
 }
@@ -482,10 +520,24 @@ impl Play {
         i.ptrade_start(&mut self.gui, &self.zone, |id| chat.is_some_and(|c| c.is_ignored(id)));
         i.ptrade_tick(&self.gui, self.time);
         if let Some(h) = self.hud.as_mut() {
+            let tradeskill_on = h.dvalue("tradeskill_window");
+            i.tradeskill.sync(&mut self.gui, &mut h.dvalues, i.screen);
+            if tradeskill_on && !h.dvalue("tradeskill_window") { h.set_dvalue(&mut self.gui, "tradeskill_window", false); }
+            if let Some(w) = i.tradeskill.window() {
+                if let Err(e) = h.register_dock(&mut self.gui, "tradeskill_window", w) { eprintln!("dock tradeskill_window: {e:#}"); }
+            }
             i.ptrade_drops(&self.gui, &self.zone, h.take_item_drops());
             if let Some(p) = i.ptrade.trade.as_mut() {
                 p.render(&mut self.gui, &mut |g, low| h.item_info(g, low));
+                p.update_tooltip(&mut self.gui, &self.zone, &self.text, h.dvalues.flag("ItemDescriptionTooltips"));
             }
+            i.tradeskill.render(&mut self.gui, &self.zone, &self.text, |g, low| h.item_info(g, low));
+        }
+        for request in i.tradeskill.take_requests() {
+            i.send(ao_net::n3::action::character_action(i.own as i32, &request));
+        }
+        if let Some(chat) = self.chat.as_mut() {
+            for url in i.tradeskill.take_urls() { chat.show_url(&mut self.gui, &self.zone, &self.text, &url); }
         }
         for f in i.take_outbox() {
             if let Some(s) = &self.session {
@@ -565,12 +617,66 @@ mod tests {
         Trade { op, a, b }
     }
 
+    #[test]
+    fn trade_description_tooltip_is_lazy_and_clears_when_disabled() {
+        let Some(mut gui) = rig() else { return };
+        let text = ao_formats::screens::TextDb::load(&ao_gui::client_dir()).unwrap();
+        let mut values = super::super::dvalue::DValues::new(&ao_gui::client_dir());
+        let mut z = zone();
+        let item = AcgItem { low_id: 21797, high_id: 21797, level: 1 };
+        z.inventory.get_mut(&0x40).unwrap().item = item;
+        let mut i = open(&mut gui, &z);
+        let p = i.ptrade.trade.as_mut().unwrap();
+        let id = ao_net::n3::inventory::item_identity(0x40);
+        p.ours.push(Entry { item: id, acg: Some(item) });
+        p.render(&mut gui, &mut |_, _| Some(("Item".into(), None)));
+        let r = gui.view_rect(p.win, "our_items").unwrap();
+        gui.input(ao_gui::InputEvent::MouseMove { x: r.l + 10.0, y: r.t + 10.0 });
+        values.set_i64("ItemDescriptionTooltips", 0);
+        p.update_tooltip(&mut gui, &z, &text, values.flag("ItemDescriptionTooltips"));
+        assert!(gui.canvas_tips(p.win, "our_items")[0].body.is_empty());
+        values.set_i64("ItemDescriptionTooltips", 1);
+        p.update_tooltip(&mut gui, &z, &text, values.flag("ItemDescriptionTooltips"));
+        let expected = super::super::chat::item_html(&z, &super::super::chat::ItemRequest::Identity { id, shop: false, container: p.own }, &text).unwrap().unwrap();
+        assert!(!expected.is_empty());
+        assert_eq!(gui.canvas_tips(p.win, "our_items")[0].body, expected);
+        let cached = p.tip.as_ref().unwrap().4.as_ptr();
+        p.update_tooltip(&mut gui, &z, &text, values.flag("ItemDescriptionTooltips"));
+        assert_eq!(p.tip.as_ref().unwrap().4.as_ptr(), cached);
+        values.set_i64("ItemDescriptionTooltips", 0);
+        p.update_tooltip(&mut gui, &z, &text, values.flag("ItemDescriptionTooltips"));
+        assert!(gui.canvas_tips(p.win, "our_items")[0].body.is_empty());
+    }
+
     /// A trade window with Bob, opened through the server's op 0.
     fn open(gui: &mut Gui, z: &Zone) -> Interact {
         let mut i = Interact::new(OWN as u32, (1280, 800));
         i.on_trade(gui, msg(trade::START, BOB, ZERO), ME, z);
         i.ptrade_start(gui, z, |_| false);
         i
+    }
+
+    #[test]
+    fn trade_escape_policy_is_captured_at_open() {
+        let Some(mut gui) = rig() else { return };
+        let z = zone();
+        let mut i = open(&mut gui, &z);
+        let mut d = super::super::dvalue::DValues::new(&ao_gui::client_dir());
+        d.set_i64("esc_trades", 0);
+        i.configure_escape(&d);
+        let win = i.ptrade.trade.as_ref().unwrap().win;
+        i.event(&mut gui, &Event::Escape { window: win }, &z);
+        assert_eq!(sent(&mut i), [msg(trade::ABORT, flag(1), ZERO)]);
+        i.close_all(&mut gui);
+        i.on_trade(&mut gui, msg(trade::START, BOB, ZERO), ME, &z);
+        i.ptrade_start(&mut gui, &z, |_| false);
+        let win = i.ptrade.trade.as_ref().unwrap().win;
+        d.set_i64("esc_trades", 1);
+        i.configure_escape(&d);
+        i.event(&mut gui, &Event::Escape { window: win }, &z);
+        assert!(sent(&mut i).is_empty());
+        i.event(&mut gui, &Event::CloseRequested { window: win }, &z);
+        assert_eq!(sent(&mut i), [msg(trade::ABORT, flag(1), ZERO)]);
     }
 
     fn click(i: &mut Interact, gui: &mut Gui, z: &Zone, view: &str) {

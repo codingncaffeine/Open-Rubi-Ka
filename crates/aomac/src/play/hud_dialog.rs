@@ -8,15 +8,17 @@ use ao_gui::{Event, Gui, WindowId, WindowSize};
 pub(super) struct Open<T> {
     win: WindowId,
     pub tag: T,
+    escape: bool,
 }
 
 pub(super) struct Dialogs<T> {
     open: Vec<Open<T>>,
+    escape: bool,
 }
 
 impl<T> Default for Dialogs<T> {
     fn default() -> Self {
-        Self { open: vec![] }
+        Self { open: vec![], escape: true }
     }
 }
 
@@ -48,14 +50,22 @@ fn xml(body: &str, buttons: &[String]) -> String {
 }
 
 impl<T: Copy> Dialogs<T> {
+    pub(super) fn configure_escape(&mut self, values: &super::dvalue::DValues) {
+        self.escape = values.get_i64("esc_dialogs").unwrap_or(1) != 0;
+    }
+
     pub(super) fn go(&mut self, gui: &mut Gui, screen: (u32, u32), tag: T, body: &str, buttons: &[String]) {
-        let Ok(win) = gui.open_framed_window_xml("DialogBox", &xml(body, buttons), (0, 0), WindowSize::Preferred) else { return };
+        self.go_named(gui, screen, "DialogBox", tag, body, buttons);
+    }
+
+    pub(super) fn go_named(&mut self, gui: &mut Gui, screen: (u32, u32), name: &str, tag: T, body: &str, buttons: &[String]) {
+        let Ok(win) = gui.open_framed_window_xml(name, &xml(body, buttons), (0, 0), WindowSize::Preferred) else { return };
         gui.set_text(win, "text", body);
         gui.set_default_button(win, "btn0");
         gui.relayout_window(win);
         let (w, h) = gui.outer_size(win);
         gui.set_window_pos(win, ((screen.0 as i32 - w as i32) / 2, (screen.1 as i32 - h as i32) / 2));
-        self.open.push(Open { win, tag });
+        self.open.push(Open { win, tag, escape: self.escape });
     }
 
     pub(super) fn is_open(&self) -> bool {
@@ -97,9 +107,38 @@ impl<T: Copy> Dialogs<T> {
                 (true, self.finish(gui, *window, n))
             }
             // `esc_dialogs` defaults to true: `DialogBox_c::SlotEscPressed` = `SlotSelected(-1)`
-            Event::Escape { window } | Event::CloseRequested { window } if own(window) => (true, self.finish(gui, *window, -1)),
+            Event::Escape { window } if own(window) && self.open.iter().any(|o| o.win == *window && o.escape) => (true, self.finish(gui, *window, -1)),
+            Event::Escape { window } if own(window) => (true, None),
+            Event::CloseRequested { window } if own(window) => (true, self.finish(gui, *window, -1)),
             Event::TextChanged { window, .. } | Event::LinkClicked { window, .. } if own(window) => (true, None),
             _ => (false, None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn dialog_escape_policy_is_captured_at_go() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut values = super::super::dvalue::DValues::new(&dir);
+        let mut dialogs = Dialogs::default();
+        values.set_i64("esc_dialogs", 0);
+        dialogs.configure_escape(&values);
+        dialogs.go(&mut gui, (800, 600), (), "Question", &["OK".into()]);
+        let win = dialogs.windows()[0];
+        values.set_i64("esc_dialogs", 1);
+        dialogs.configure_escape(&values);
+        assert_eq!(dialogs.event(&mut gui, &Event::Escape { window: win }), (true, None));
+        assert!(dialogs.is_open());
+        assert_eq!(dialogs.event(&mut gui, &Event::CloseRequested { window: win }), (true, Some(((), -1))));
+        dialogs.go(&mut gui, (800, 600), (), "Question", &["OK".into()]);
+        let win = dialogs.windows()[0];
+        values.set_i64("esc_dialogs", 0);
+        dialogs.configure_escape(&values);
+        assert_eq!(dialogs.event(&mut gui, &Event::Escape { window: win }), (true, Some(((), -1))));
     }
 }

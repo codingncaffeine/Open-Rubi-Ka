@@ -16,6 +16,9 @@ const SLOT_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED";
 
 struct Loot {
     window: WindowId,
+    escape: bool,
+    /// ItemContainerView +0x14c, captured by the native constructor.
+    owned: bool,
     container: Identity,
     /// `word` of the last `InventoryUpdateIIR_t` (chest `+0x1dc`): the key of the items' identities (`container_item_identity`).
     word: i32,
@@ -25,6 +28,7 @@ struct Loot {
     slots: usize,
     /// The cell of the last short click and when (`Interact::now`), for the double click.
     clicked: Option<(usize, f32)>,
+    tip: Option<(usize, bool, String)>,
 }
 
 /// `(container, [(container slot, item low id, name)])` of every open window, for the harness and the tests.
@@ -36,6 +40,7 @@ pub type LootRows = Vec<(Identity, Vec<(u32, i32, String)>)>;
 pub struct LootUi {
     items: Option<Items>,
     open: Vec<Loot>,
+    escape_options: Option<[bool; 3]>,
 }
 
 fn gap() -> (f32, f32) {
@@ -71,6 +76,18 @@ fn cell_at_for(x: f32, y: f32, slots: usize) -> Option<usize> {
 fn cell_at(x: f32, y: f32) -> Option<usize> { cell_at_for(x, y, SLOTS) }
 
 impl LootUi {
+    pub(super) fn configure_escape(&mut self, values: &super::dvalue::DValues) {
+        self.escape_options = Some(["esc_backpacks", "esc_chests", "esc_corpses"].map(|key| values.get_i64(key).unwrap_or(1) != 0));
+    }
+    pub(super) fn uses_in_place(&self, item: Identity) -> bool {
+        item.kind == ao_net::n3::inventory::KIND_IN_CONTAINER &&
+            self.open.iter().any(|l| l.owned && i32::from(l.word as i16) == item.instance >> 16)
+    }
+
+    pub(super) fn item_title(&mut self, gui: &mut Gui, dir: Option<&Path>, low_id: i32) -> Option<String> {
+        if self.items.is_none() { self.items = dir.map(Items::new); }
+        self.items.as_mut()?.info(gui, low_id).map(|info| info.name.clone())
+    }
     pub fn bank_drop(&self, gui: &Gui, x: f32, y: f32) -> Option<Identity> {
         self.open.iter().find(|l| l.container.kind == 0xdead && gui.view_rect(l.window, "scrollview").is_some_and(|r| x >= r.l && x < r.r && y >= r.t && y < r.b)).map(|l| l.container)
     }
@@ -80,6 +97,7 @@ impl LootUi {
         if self.open[at].entries != entries {
             self.open[at].entries = entries.to_vec();
             self.open[at].entries.sort_by_key(|e| e.slot);
+            self.open[at].tip = None;
             self.draw(gui, at);
         }
     }
@@ -107,7 +125,7 @@ impl LootUi {
 
     /// `InventoryUpdateIIR_t` for `container` [GC 0x100a040e]: the contents are replaced; with `u.flag` the container is opened (a window appears
     /// unless one is open already, `SlotContainerOpened`), without it only an open window is refreshed (`+0x8c`, container changed).
-    pub fn update(&mut self, gui: &mut Gui, dir: Option<&Path>, screen: (u32, u32), container: Identity, title: &str, u: &InventoryUpdate) {
+    pub fn update(&mut self, gui: &mut Gui, dir: Option<&Path>, screen: (u32, u32), container: Identity, title: &str, u: &InventoryUpdate, owned: bool) {
         let slots = if container.kind == 0xdead { 0x66 } else { SLOTS };
         if self.items.is_none() {
             self.items = dir.map(Items::new);
@@ -132,13 +150,17 @@ impl LootUi {
                 let (ow, oh) = gui.outer_size(window);
                 // `Window::MoveToCenter` is the default of a window without a saved frame (`container_position` is not stored)
                 gui.set_window_pos(window, ((screen.0 as i32 - ow as i32) / 2, (screen.1 as i32 - oh as i32) / 2));
-                self.open.push(Loot { window, container, word: u.word, slots, entries: vec![], clicked: None });
+                // GUI 100cc2ca: owned Chest_t uses esc_backpacks, world Chest_t esc_chests, Corpse_t esc_corpses.
+                let policy = self.escape_options.unwrap_or([true; 3]);
+                let escape = match container.kind { 0xc749 => policy[usize::from(!owned)], 0xc76a => policy[2], _ => false };
+                self.open.push(Loot { window, escape, owned, container, word: u.word, slots, entries: vec![], clicked: None, tip: None });
                 self.open.len() - 1
             }
             None => return,
         };
         self.open[at].entries = entries;
         self.open[at].word = u.word;
+        self.open[at].tip = None;
         self.draw(gui, at);
     }
 
@@ -154,12 +176,43 @@ impl LootUi {
             let Some(items) = self.items.as_mut() else { continue };
             cmds.extend(items.picture(gui, &e, x, y));
             if let Some(info) = items.info(gui, e.item.low_id) {
-                tips.push(CanvasTip { rect: [x, y, x + SLOT, y + SLOT], title: info.name.clone(), body: String::new() });
+                let body = self.open[at].tip.as_ref().filter(|(cell, _, _)| *cell == n).map_or("", |(_, _, body)| body.as_str());
+                tips.push(CanvasTip { rect: [x, y, x + SLOT, y + SLOT], title: info.name.clone(), body: body.to_owned() });
             }
         }
         let w = self.open[at].window;
         gui.set_canvas(w, "grid", cmds);
         gui.set_canvas_tips(w, "grid", tips);
+    }
+
+    /// The native InventoryListView asks `100384f3` for long tooltip HTML only for the hovered item.
+    pub(super) fn update_tooltips(&mut self, gui: &mut Gui, zone: &super::zone::Zone, text: &ao_formats::screens::TextDb, descriptions: bool) {
+        let (x, y) = gui.mouse_position();
+        for at in 0..self.open.len() {
+            let loot = &self.open[at];
+            if gui.view_rect(loot.window, "scrollview").is_some_and(|r| x < r.l || x >= r.r || y < r.t || y >= r.b) {
+                self.open[at].tip = None;
+                continue;
+            }
+            let cell = gui.view_rect(loot.window, "grid").filter(|r| gui.window_visible(loot.window) && x >= r.l && x < r.r && y >= r.t && y < r.b)
+                .and_then(|r| cell_at_for(x - r.l, y - r.t, loot.slots));
+            let Some((cell, entry)) = cell.and_then(|cell| loot.entries.get(cell).copied().map(|e| (cell, e))) else {
+                self.open[at].tip = None;
+                continue;
+            };
+            if loot.tip.as_ref().is_some_and(|(old, enabled, _)| *old == cell && *enabled == descriptions) { continue; }
+            let body = if descriptions {
+                let request = super::chat::ItemRequest::Identity { id: container_item_identity(loot.word, entry.slot), shop: false, container: loot.container };
+                match super::chat::item_html(zone, &request, text) {
+                    Ok(body) => body.unwrap_or_default(),
+                    Err(error) => { eprintln!("container tooltip: {error:#}"); String::new() }
+                }
+            } else { String::new() };
+            let origin = slot_origin(cell);
+            let tip = gui.canvas_tips(loot.window, "grid").iter().position(|t| t.rect[0] == origin.0 && t.rect[1] == origin.1);
+            gui.set_canvas_tip_body(loot.window, "grid", tip, &body);
+            self.open[at].tip = Some((cell, descriptions, body));
+        }
     }
 
     /// `ContainerAddItemIIR_t` for `{0x6b, key << 16 | slot}` into our bag (`FUN_1004a7b3`: the container cell is emptied, `FUN_100490cd` refreshes the
@@ -168,6 +221,7 @@ impl LootUi {
         let (key, slot) = (item.instance >> 16, (item.instance & 0xffff) as u32);
         let Some(at) = self.open.iter().position(|l| i32::from(l.word as i16) == key && l.entries.iter().any(|e| e.slot == slot)) else { return };
         self.open[at].entries.retain(|e| e.slot != slot);
+        self.open[at].tip = None;
         self.draw(gui, at);
     }
 
@@ -191,7 +245,7 @@ impl LootUi {
     /// time (`FUN_100ca1e7` -> `MoveItemToInventory(item)`): the item to take.
     pub fn event(&mut self, gui: &mut Gui, ev: &Event, now: f32) -> Option<Option<Identity>> {
         match ev {
-            Event::Escape { window } if self.open.iter().any(|l| l.window == *window && l.container.kind == 0xdead) => Some(None),
+            Event::Escape { window } if self.open.iter().any(|l| l.window == *window && !l.escape) => Some(None),
             Event::CanvasClick { window, view, x, y } if view == "grid" => {
                 let l = self.open.iter_mut().find(|l| l.window == *window)?;
                 let Some(n) = cell_at_for(*x, *y, l.slots).filter(|&n| n < l.entries.len()) else { return Some(None) };
@@ -217,6 +271,39 @@ impl LootUi {
             out.push((l.container, rows));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::*;
+
+    #[test]
+    fn container_escape_policy_is_captured_at_open() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut values = super::super::dvalue::DValues::new(&dir);
+        for (kind, owned, key) in [(0xc749, true, "esc_backpacks"), (0xc749, false, "esc_chests"), (0xc76a, false, "esc_corpses")] {
+            let mut ui = LootUi::default();
+            let container = Identity { kind, instance: 7 };
+            let update = InventoryUpdate { capacity: 21, kind: 2, entries: vec![], container, word: 0, flag: true };
+            values.set_i64(key, 0);
+            ui.configure_escape(&values);
+            ui.update(&mut gui, None, (800, 600), container, "Container", &update, owned);
+            let win = ui.window_of(container).unwrap();
+            values.set_i64(key, 1);
+            ui.configure_escape(&values);
+            ui.event(&mut gui, &Event::Escape { window: win }, 0.0);
+            assert!(ui.is_open(container));
+            ui.event(&mut gui, &Event::CloseRequested { window: win }, 0.0);
+            ui.update(&mut gui, None, (800, 600), container, "Container", &update, owned);
+            let win = ui.window_of(container).unwrap();
+            values.set_i64(key, 0);
+            ui.configure_escape(&values);
+            ui.event(&mut gui, &Event::Escape { window: win }, 0.0);
+            assert!(!ui.is_open(container));
+        }
     }
 }
 
@@ -248,7 +335,7 @@ mod tests {
         let c = Identity { kind: 0xdead, instance: 7 };
         let mut u = update(true, &[101]);
         u.container = c;
-        ui.update(&mut gui, None, (1280, 800), c, "Bank", &u);
+        ui.update(&mut gui, None, (1280, 800), c, "Bank", &u, false);
         assert_eq!(ui.open[0].slots, 102);
         assert_eq!(ui.take(&mut gui, 0, 1.0), Some(Identity { kind: 0x69, instance: 101 }));
         let w = ui.open[0].window;
@@ -273,9 +360,9 @@ mod tests {
         gui.set_screen_size(1280, 800);
         let (mut ui, c) = (LootUi::default(), Identity { kind: 0xC76A, instance: 5 });
         // an update without the open flag does not open anything
-        ui.update(&mut gui, None, (800, 600), c, "Remains of a Test", &update(false, &[0]));
+        ui.update(&mut gui, None, (800, 600), c, "Remains of a Test", &update(false, &[0]), false);
         assert!(!ui.is_open(c));
-        ui.update(&mut gui, None, (800, 600), c, "Remains of a Test", &update(true, &[3, 1]));
+        ui.update(&mut gui, None, (800, 600), c, "Remains of a Test", &update(true, &[3, 1]), false);
         assert!(ui.is_open(c));
         let w = ui.open[0].window;
         assert_eq!(ui.open[0].entries.iter().map(|e| e.slot).collect::<Vec<_>>(), [1, 3], "cells follow the container slots");
@@ -288,9 +375,14 @@ mod tests {
         assert_eq!(ui.event(&mut gui, &click, 5.0), Some(None));
         let (ex, ey) = cell_origin(2, 5, gap());
         assert_eq!(ui.event(&mut gui, &Event::CanvasClick { window: w, view: "grid".into(), x: ex, y: ey }, 5.1), Some(None));
+        ui.open[0].tip = Some((0, true, "old item body".into()));
+        ui.taken(&mut gui, container_item_identity(ui.open[0].word, 1));
+        assert!(ui.open[0].tip.is_none(), "taken items invalidate cached tooltip bodies");
+        ui.open[0].tip = Some((0, true, "old item body".into()));
         // a refresh with the flag clear keeps the window and replaces the items; closing removes it
-        ui.update(&mut gui, None, (800, 600), c, "", &update(false, &[7]));
+        ui.update(&mut gui, None, (800, 600), c, "", &update(false, &[7]), false);
         assert_eq!(ui.open[0].entries.len(), 1);
+        assert!(ui.open[0].tip.is_none(), "a container refresh invalidates cached tooltip bodies");
         assert_eq!(ui.event(&mut gui, &Event::CloseRequested { window: w }, 6.0), Some(None));
         assert!(!ui.is_open(c));
     }

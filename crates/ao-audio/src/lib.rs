@@ -1,6 +1,7 @@
 pub mod combat;
 pub mod decode;
 pub mod district;
+mod district_reader;
 mod engine;
 mod game;
 pub mod mixer;

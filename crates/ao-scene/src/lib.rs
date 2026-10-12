@@ -4,6 +4,9 @@
 //! Matrices are column-major `[[f32; 4]; 4]` (`m[col][row]`), applied as `M * v`.
 
 pub mod aurora;
+pub mod cloud;
+pub mod ground_detail;
+pub mod liquid;
 pub mod mover;
 pub mod wave;
 pub use wave::{sun_flicker_table, wave_curves, SkyWaveSpin};
@@ -11,12 +14,24 @@ pub use mover::{Counter, Mover, MoverState, RotTerm};
 
 use std::collections::HashMap;
 
+/// Original bitmap format; PNG is explicitly exempt from native DXT compression.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextureSource {
+    #[default]
+    Generated,
+    Rgb,
+    Rgba,
+    PngRgb,
+    PngRgba,
+}
+
 /// Decoded texture, tightly packed RGBA8 (sRGB), row-major, top row first.
 #[derive(Clone, Debug)]
 pub struct Texture {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    pub source: TextureSource,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -261,8 +276,8 @@ pub struct ActorFrame {
     /// Per-mesh overrides; missing entries preserve the actor/material values.
     pub part_materials: Vec<ActorMaterialOverride>,
     /// New vertices of model mesh 0 (the skinned body pose); `None` keeps the last ones (the bind-pose vertices of the model
-    /// at first sight).
-    pub skin: Option<Vec<Vertex>>,
+    /// at first sight). Shared ownership retains the exact CPU pose for targeting after GPU upload, without copying vertices.
+    pub skin: Option<std::sync::Arc<Vec<Vertex>>>,
     /// Skip frustum culling (the own avatar).
     pub always: bool,
     /// Opacity of the whole actor, 1 = normal (`RRefFrame_t::SetTransparency`, randy31 0x100453ed: the value is the diffuse alpha
@@ -320,6 +335,10 @@ impl Default for ActorFrame {
 pub struct Scene {
     pub textures: HashMap<TextureKey, Texture>,
     pub meshes: Vec<Mesh>,
+    /// Native camera-cell adaptive liquid surfaces; empty when no liquid is authored.
+    pub liquids: Vec<liquid::Surface>,
+    /// Native adaptive binary ground patches; empty for indoor/model scenes.
+    pub ground_detail: Vec<ground_detail::GroundPatch>,
     pub instances: Vec<Instance>,
     /// Suggested initial camera position (world space); `None` = frame the scene bounds.
     pub spawn: Option<[f32; 3]>,
@@ -327,6 +346,9 @@ pub struct Scene {
     pub spawn_look_at: Option<[f32; 3]>,
     /// `None` = renderer defaults.
     pub environment: Option<Environment>,
+    /// Native WaterLightCurrent and direction towards WaterLightDirection (DS1003f3db uses DAT10150264).
+    /// Colour is linear; water has independent authored tracks, not the ground sun's doubled diffuse.
+    pub water_light: Option<([f32; 3], [f32; 3])>,
     /// `None` = [`Lens::default`].
     pub lens: Option<Lens>,
     pub lights: Vec<Light>,
@@ -345,8 +367,12 @@ pub struct Scene {
     pub sky_wave_spin: Vec<SkyWaveSpin>,
     /// Vertex colours of `meshes` that the renderer re-simulates every frame (the Shadowlands aurora, [`aurora`]).
     pub sky_colors: Vec<SkyColors>,
+    /// Native VisualSingleCloud sheets, advanced at the camera every frame.
+    pub single_clouds: Vec<cloud::CloudLayer>,
     /// Traffic ships: instances of `instances` whose transform the renderer advances every frame ([`Mover`]).
     pub movers: Vec<Mover>,
+    /// Instances whose authored visibility expression is `GAME.GameShowSpaceship`.
+    pub spaceships: Vec<usize>,
     /// Instances of `instances` whose script has `ScaleType e_ScaleVisibleFarAway` (city skylines, ships): the renderer
     /// re-poses them every frame with [`far_away_pose`] (`GenericMeshObject::Process`, DisplaySystem @0x1005c124).
     pub far_away: Vec<usize>,

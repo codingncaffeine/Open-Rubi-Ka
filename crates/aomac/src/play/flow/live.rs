@@ -20,6 +20,8 @@
 //! PNG readback may run slower than real time; simulation dt stays 1/60 s. Use unique prefixes.
 //! `arm=prefix:seconds[:note|special|either|equipment|use|level]` defaults to either (note/special).
 //! Special stat 148 identifies Burst, 150 Fling Shot. Arm before input, including internally waiting `dclick`/`invuse`.
+//! `option=NativeVariable:value` dispatches Options control input and checks native store/runtime consumers.
+//! `optionpersist=name:name` saves/reopens native user files; `optioncheck=name:value` observes a subsequent login without writing.
 use super::*;
 use ao_render::{GameInput, KeyCode, Offscreen};
 use std::io::BufRead;
@@ -616,6 +618,48 @@ fn live_walk() {
     for step in std::env::var("AOMAC_LIVE_STEPS").unwrap_or_else(|_| "wait=2,shot=enter".into()).split(',') {
         let (k, v) = step.split_once('=').unwrap_or((step, ""));
         match k {
+            "option" | "optioncheck" => {
+                let (name, value) = v.split_once(':').expect("option=NativeVariable:value");
+                let value: f64 = value.parse().expect("native option number");
+                let before = l.p.hud.as_ref().expect("HUD").live_option_value(name);
+                if k == "option" {
+                    let events = l.p.hud.as_mut().expect("HUD").live_option_inputs(&mut l.p.gui, name, value);
+                    for event in events {
+                        l.p.input(event, &mut l.o.host);
+                        l.tick();
+                    }
+                }
+                l.tick();
+                let h = l.p.hud.as_ref().expect("HUD");
+                let actual = h.live_option_value(name);
+                assert!((actual - value).abs() <= 1e-4 * value.abs().max(1.0), "native option {name}: wanted {value}, got {actual}");
+                l.p.player.as_ref().expect("built player").assert_option_prefs(&h.dvalues);
+                assert_eq!(l.p.zone.world.show_all_names, h.dvalues.prefs.get_int("ShowAllNames", super::super::dvalue::Kind::Login).unwrap_or(1) != 0, "actual overhead-name consumer");
+                let prefs = super::super::options::audio_prefs(&h.dvalues);
+                let audio = l.p.audio.as_ref().expect("audio engine");
+                let gains = audio.preference_gains();
+                for (actual, expected) in [(gains[0], if prefs.sound_on && prefs.fx_on { prefs.master * prefs.fx } else { 0.0 }), (gains[1], if prefs.sound_on && prefs.music_on { prefs.master * prefs.music } else { 0.0 })] {
+                    assert!((actual - expected).abs() < 1e-5, "actual audio bus {actual} != {expected}");
+                }
+                l.p.chat.as_ref().expect("chat").assert_option_prefs(&h.dvalues);
+                eprintln!("option PASS {name} before={before} stored={actual} changed={} names={} camera={:?} audio_gains={gains:?} {}", actual != before, l.p.zone.world.show_all_names, l.o.host.camera, audio.status());
+            }
+            "optionpersist" => {
+                let h = l.p.hud.as_ref().expect("HUD");
+                h.dvalues.save_user();
+                let mut restored = super::super::dvalue::DValues::new(&dir);
+                let character = h.dvalues.char_dir().expect("loaded user preferences");
+                let account = character.parent().expect("account preferences directory");
+                let root = account.parent().expect("preferences root");
+                let char_id = character.file_name().and_then(|s| s.to_str()).and_then(|s| s.strip_prefix("Char")).and_then(|s| s.parse().ok()).expect("native character preferences directory");
+                restored.open_user(root, account.file_name().and_then(|s| s.to_str()).expect("native account directory"), char_id);
+                for name in v.split(':') {
+                    let expected = h.live_option_value(name);
+                    let actual = h.live_option_restored_value(&restored, name);
+                    assert!((actual - expected).abs() <= 1e-5 * expected.abs().max(1.0), "saved registry recreation {name}");
+                    eprintln!("optionpersist PASS recreated-native-store {name}={actual}; not a server relog");
+                }
+            }
             "wait" => l.wait(v.parse().unwrap()),
             "arm" => l.capture(v, true),
             "capturewait" => l.capture_wait(v.parse().unwrap()),
@@ -1000,7 +1044,7 @@ fn live_walk() {
                             continue;
                         }
                         let ray = crate::play::hud_target::pick_ray(&cam, &lens, (1280.0, 800.0), (x as f32, y as f32));
-                        let hits = crate::play::interact_use::pick_objects(&ray, &l.p.zone);
+                        let hits = crate::play::interact_use::pick_objects(&ray, &l.p.zone, l.p.player.as_ref());
                         let picked = if id.kind == 50000 { hits.contains(&id) } else { hits.first() == Some(&id) };
                         if picked {
                             hit = Some((x as f32, y as f32));
@@ -1024,7 +1068,7 @@ fn live_walk() {
                         for ev in [ao_gui::InputEvent::MouseMove { x, y }, ao_gui::InputEvent::MouseDown { x, y, button }, ao_gui::InputEvent::MouseUp { x, y, button }] {
                             if matches!(ev, ao_gui::InputEvent::MouseUp { .. }) {
                                 let ray = crate::play::hud_target::pick_ray(&l.o.host.camera, &l.o.host.lens.unwrap_or_default(), (1280.0, 800.0), (x, y));
-                                eprintln!("release hits {:?}", crate::play::interact_use::pick_objects(&ray, &l.p.zone));
+                                eprintln!("release hits {:?}", crate::play::interact_use::pick_objects(&ray, &l.p.zone, l.p.player.as_ref()));
                             }
                             l.p.input(ev, &mut l.o.host);
                         }

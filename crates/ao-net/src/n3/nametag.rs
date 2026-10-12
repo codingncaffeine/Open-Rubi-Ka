@@ -2,9 +2,9 @@
 //! composition, colours, geometry, distances); evidence and addresses in `docs/zone/motion.md` §6 (GUI = GUI.dll).
 
 /// Nametags exist only while the pref `ShowAllNames` (IndependentPrefs, `OptionPanel/Root.xml` line 331, category `Login`, int,
-/// absent from every prefs xml = 0) is 1; `HandleNametags` [GUI 0x10025d96] then rebuilds the set every 2 s.
+/// default 1 from GUI `SetDefaultLoginPrefs` 0x10124b33) is 1; `HandleNametags` [GUI 0x10025d96] then rebuilds the set every 2 s.
 pub const PREF_SHOW_ALL_NAMES: &str = "ShowAllNames";
-/// Second line with the organisation name: pref `IsOrgNameShownOverHead` (category `Char`, `Root.xml` line 332), 0 by default.
+/// Second line with the organisation name: pref `IsOrgNameShownOverHead` (category `Char`, `Root.xml` line 332), default 1 (GUI 0x1012447a).
 pub const PREF_SHOW_ORG_NAME: &str = "IsOrgNameShownOverHead";
 /// Seconds between two rebuilds of the nametag set (`_DAT_101ae17c`, the timer accumulates `Timer_t` frame time).
 pub const NAME_TAG_REFRESH_SECS: f32 = 2.0;

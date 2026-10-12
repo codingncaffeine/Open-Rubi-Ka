@@ -36,11 +36,11 @@ fn factor(value:u32)->wgpu::BlendFactor {
     match value {1=>Zero,2=>One,3=>Src,4=>OneMinusSrc,5|12=>SrcAlpha,6|13=>OneMinusSrcAlpha,7=>DstAlpha,8=>OneMinusDstAlpha,9=>Dst,10=>OneMinusDst,11=>SrcAlphaSaturated,_=>Zero}
 }
 impl ScreenPass {
-    pub fn upload(&mut self,device:&wgpu::Device,queue:&wgpu::Queue,key:TextureKey,texture:&ao_scene::Texture) {
+    pub fn upload(&mut self,device:&wgpu::Device,queue:&wgpu::Queue,key:TextureKey,texture:&ao_scene::Texture,policy:crate::native_texture::Policy) {
         self.init(device,queue);
         let gpu=self.gpu.as_mut().unwrap();
         if gpu.textures.contains_key(&Some(key)) {return;}
-        gpu.textures.insert(Some(key),upload(device,queue,texture));
+        gpu.textures.insert(Some(key),upload(device,queue,texture,policy));
     }
     fn init(&mut self,device:&wgpu::Device,queue:&wgpu::Queue) {
         if self.gpu.is_some() {return;}
@@ -50,8 +50,8 @@ impl ScreenPass {
             wgpu::BindGroupLayoutEntry {binding:2,visibility:wgpu::ShaderStages::FRAGMENT,ty:wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),count:None}]});
         let shader=device.create_shader_module(wgpu::ShaderModuleDescriptor {label:None,source:wgpu::ShaderSource::Wgsl(include_str!("screen.wgsl").into())});
         let sampler=device.create_sampler(&wgpu::SamplerDescriptor {address_mode_u:wgpu::AddressMode::Repeat,address_mode_v:wgpu::AddressMode::Repeat,mag_filter:wgpu::FilterMode::Linear,min_filter:wgpu::FilterMode::Linear,mipmap_filter:wgpu::MipmapFilterMode::Linear,..Default::default()});
-        let white=ao_scene::Texture {width:1,height:1,rgba:vec![255;4]};
-        let mut textures=HashMap::new();textures.insert(None,upload(device,queue,&white));
+        let white=ao_scene::Texture { source: Default::default(), width:1,height:1,rgba:vec![255;4] };
+        let mut textures=HashMap::new();textures.insert(None,upload(device,queue,&white,Default::default()));
         self.gpu=Some(ScreenGpu {layout,shader,sampler,textures,pipes:HashMap::new(),frames:vec![]});
     }
     pub fn prepare(&mut self,device:&wgpu::Device,queue:&wgpu::Queue,format:wgpu::TextureFormat,_size:(u32,u32)) {
@@ -92,9 +92,13 @@ fn bind(device:&wgpu::Device,gpu:&ScreenGpu,buffer:&wgpu::Buffer,key:Option<Text
     let texture=gpu.textures.get(&key).expect("authored screen texture must be uploaded");
     device.create_bind_group(&wgpu::BindGroupDescriptor {label:None,layout:&gpu.layout,entries:&[wgpu::BindGroupEntry {binding:0,resource:buffer.as_entire_binding()},wgpu::BindGroupEntry {binding:1,resource:wgpu::BindingResource::TextureView(texture)},wgpu::BindGroupEntry {binding:2,resource:wgpu::BindingResource::Sampler(&gpu.sampler)}]})
 }
-fn upload(device:&wgpu::Device,queue:&wgpu::Queue,image:&ao_scene::Texture)->wgpu::TextureView {
-    let texture=device.create_texture(&wgpu::TextureDescriptor {label:Some("native gamma screen texture"),size:wgpu::Extent3d {width:image.width,height:image.height,depth_or_array_layers:1},mip_level_count:1,sample_count:1,dimension:wgpu::TextureDimension::D2,format:wgpu::TextureFormat::Rgba8Unorm,usage:wgpu::TextureUsages::TEXTURE_BINDING|wgpu::TextureUsages::COPY_DST,view_formats:&[]});
-    queue.write_texture(wgpu::TexelCopyTextureInfo {texture:&texture,mip_level:0,origin:wgpu::Origin3d::ZERO,aspect:wgpu::TextureAspect::All},&image.rgba,wgpu::TexelCopyBufferLayout {offset:0,bytes_per_row:Some(image.width*4),rows_per_image:Some(image.height)},wgpu::Extent3d {width:image.width,height:image.height,depth_or_array_layers:1});
+fn upload(device:&wgpu::Device,queue:&wgpu::Queue,image:&ao_scene::Texture,policy:crate::native_texture::Policy)->wgpu::TextureView {
+    let encoding=policy.encoding(image.source,device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC),image.width,image.height);
+    let block=encoding.block_edge();
+    let mut encoded=Vec::new();
+    let bytes=if encoding==crate::native_texture::Encoding::Rgba8 {image.rgba.as_slice()} else {encoding.encode(&image.rgba,image.width,image.height,&mut encoded);encoded.as_slice()};
+    let texture=device.create_texture(&wgpu::TextureDescriptor {label:Some("native gamma screen texture"),size:wgpu::Extent3d {width:image.width,height:image.height,depth_or_array_layers:1},mip_level_count:1,sample_count:1,dimension:wgpu::TextureDimension::D2,format:encoding.format().remove_srgb_suffix(),usage:wgpu::TextureUsages::TEXTURE_BINDING|wgpu::TextureUsages::COPY_DST,view_formats:&[]});
+    queue.write_texture(wgpu::TexelCopyTextureInfo {texture:&texture,mip_level:0,origin:wgpu::Origin3d::ZERO,aspect:wgpu::TextureAspect::All},bytes,wgpu::TexelCopyBufferLayout {offset:0,bytes_per_row:Some(image.width.div_ceil(block)*encoding.block_bytes()),rows_per_image:Some(image.height.div_ceil(block))},wgpu::Extent3d {width:image.width.div_ceil(block)*block,height:image.height.div_ceil(block)*block,depth_or_array_layers:1});
     texture.create_view(&Default::default())
 }
 
@@ -120,7 +124,7 @@ mod tests {
         let path=out.join("screen-texture-modulate.png");
         let key=TextureKey {rdb_type:1010004,id:13};
         let mut scene=Scene::default();
-        scene.textures.insert(key,ao_scene::Texture {width:1,height:1,rgba:vec![255,0,0,255]});
+        scene.textures.insert(key,ao_scene::Texture { source: Default::default(), width:1,height:1,rgba:vec![255,0,0,255] });
         super::super::render_to_png_screen(&scene,vec![ScreenLayer {texture:Some(key),color:[0.5,1.0,1.0,1.0],repetitions:1,..Default::default()}],false,64,64,&path).unwrap();
         let mut reader=png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap())).read_info().unwrap();
         let mut pixels=vec![0;reader.output_buffer_size()];

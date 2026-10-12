@@ -181,6 +181,8 @@ pub enum ChatCmd {
     Lookup(String),
     /// 0x1e `ISD`.
     Tell { to: u32, text: String },
+    /// HandlePrivateMessage GUI 0x1008792e: AFK replies carry kind 6, preventing reply loops.
+    TellAutoReply { to: u32, text: String },
     /// 0x41 `GSD` (kind 0xE -> private group message 0x39 `ISD`).
     Group { group: GroupId, text: String },
     /// A group message with an extras block (`/voice`: `BBBSS(1, breed, sex, fx, sound)`, GUI `FUN_10089163`) in the data field `D`.
@@ -197,6 +199,8 @@ pub enum ChatCmd {
     PrivKick(u32),
     PrivJoin(u32),
     PrivPart(u32),
+    /// 0x36, no fields: disband own private group [GUI 0x1016d652 -> 0x1016c7d6].
+    PrivDisband,
     /// 0x78 `sI`: `/cc <args..>` — the argument strings after `/cc` (each `ExpandChatTextArgs`'d) and the window id [GUI 0x1016cadf].
     Cc { args: Vec<String>, window: u32 },
     /// 0x6e `IM`: forward data to a character [GUI 0x1016cac2]. `/cc info <name>` sends `{"commane": "ccinfo", "destination": "chatserver"}`
@@ -252,6 +256,12 @@ pub fn encode(cmd: &ChatCmd) -> Option<Vec<u8>> {
             put_s(&mut w, TELL_DATA);
             0x1e
         }
+        ChatCmd::TellAutoReply { to, text } => {
+            w.u32(*to);
+            put_s(&mut w, text.as_bytes());
+            put_s(&mut w, &[6]);
+            0x1e
+        }
         ChatCmd::Group { group, text } if group.kind == KIND_PRIVATE_GROUP => {
             w.u32(group.id);
             put_s(&mut w, text.as_bytes());
@@ -301,6 +311,7 @@ pub fn encode(cmd: &ChatCmd) -> Option<Vec<u8>> {
             w.u32(*id);
             0x35
         }
+        ChatCmd::PrivDisband => 0x36,
         ChatCmd::Cc { args, window } => {
             // pack code `s` (GUI 0x1017161f): u16 count, then `S` strings
             w.u16(args.len().min(0xFFFF) as u16);
@@ -568,6 +579,7 @@ mod tests {
         assert_eq!(b, [0, 0x41, 0, 13, 3, 0, 0, 0, 5, 0, 1, b'a', 0, 3, 1, 2, 3]);
         let b = encode(&ChatCmd::Tell { to: 1, text: "a".into() }).unwrap();
         assert_eq!(b, [0, 0x1e, 0, 10, 0, 0, 0, 1, 0, 1, b'a', 0, 1, 0]); // D = one kind byte 0
+        assert_eq!(encode(&ChatCmd::TellAutoReply { to: 1, text: "a".into() }).unwrap(), [0, 0x1e, 0, 10, 0, 0, 0, 1, 0, 1, b'a', 0, 1, 6]);
         assert_eq!(encode(&ChatCmd::BuddyAdd { id: 1, permanent: true }).unwrap(), [0, 0x28, 0, 7, 0, 0, 0, 1, 0, 1, 1]);
         assert_eq!(encode(&ChatCmd::BuddyAdd { id: 1, permanent: false }).unwrap(), [0, 0x28, 0, 7, 0, 0, 0, 1, 0, 1, 0]);
     }
@@ -579,6 +591,8 @@ mod tests {
         assert_eq!(encode(&ChatCmd::PrivKick(5)).unwrap(), [0, 0x33, 0, 4, 0, 0, 0, 5]);
         assert_eq!(encode(&ChatCmd::PrivJoin(5)).unwrap(), [0, 0x34, 0, 4, 0, 0, 0, 5]);
         assert_eq!(encode(&ChatCmd::PrivPart(5)).unwrap(), [0, 0x35, 0, 4, 0, 0, 0, 5]);
+        // Native no-argument sender 1016c7d6 emits a four-byte frame, not an owner id.
+        assert_eq!(encode(&ChatCmd::PrivDisband).unwrap(), [0, 0x36, 0, 0]);
         let cc = encode(&ChatCmd::Cc { args: vec!["addbuddy".into(), "Bob".into()], window: 2 }).unwrap();
         assert_eq!(cc, [0, 0x78, 0, 21, 0, 2, 0, 8, b'a', b'd', b'd', b'b', b'u', b'd', b'd', b'y', 0, 3, b'B', b'o', b'b', 0, 0, 0, 2]);
         let f = encode(&ChatCmd::Forward { to: 9, entries: vec![("ab".into(), "xyz".into())] }).unwrap();

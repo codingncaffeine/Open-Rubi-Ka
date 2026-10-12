@@ -4,12 +4,15 @@
 //! named `rdb_<type>`, schema `(id INTEGER PRIMARY KEY, version INTEGER, data BLOB)`.
 
 use std::path::Path;
+use std::cell::Cell;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 pub struct RecordStore {
     conn: Connection,
+    other_texture_type: Cell<u32>,
+    ground_texture_type: Cell<u32>,
 }
 
 impl RecordStore {
@@ -18,7 +21,33 @@ impl RecordStore {
         let path = client_dir.join("cd_image").join("rdb.db");
         let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening {}", path.display()))?;
-        Ok(Self { conn })
+        Ok(Self { conn, other_texture_type: Cell::new(1_010_004), ground_texture_type: Cell::new(1_010_006) })
+    }
+
+    /// DisplaySystem 0x10076a24: ordinary textures select a resource family, not a resize.
+    pub fn set_other_texture_quality(&self, quality: i32) -> bool {
+        let ty = other_texture_type(quality);
+        self.other_texture_type.replace(ty) != ty
+    }
+
+    pub fn other_texture_quality(&self) -> i32 {
+        match self.other_texture_type.get() { 1_010_017 => 1, 1_010_016 => 2, _ => 3 }
+    }
+
+    pub fn other_texture_type(&self) -> u32 { self.other_texture_type.get() }
+
+    /// Native ground resource families: low, medium, high.
+    pub fn set_ground_texture_quality(&self, quality: i32) -> bool {
+        let ty = match quality { 0 => 1_010_022, 1 => 1_010_021, _ => 1_010_006 };
+        self.ground_texture_type.replace(ty) != ty
+    }
+
+    fn texture_type(&self, ty: u32) -> u32 {
+        match ty {
+            1_010_004 => self.other_texture_type.get(),
+            1_010_006 => self.ground_texture_type.get(),
+            _ => ty,
+        }
     }
 
     /// Record types present in the database, ascending.
@@ -50,6 +79,7 @@ impl RecordStore {
 
     /// Raw record payload, or `None` if the type or id is absent.
     pub fn get(&self, rdb_type: u32, id: u32) -> Result<Option<Vec<u8>>> {
+        let rdb_type = self.texture_type(rdb_type);
         if !self.has_type(rdb_type)? {
             return Ok(None);
         }
@@ -65,6 +95,7 @@ impl RecordStore {
 
     /// Like [`RecordStore::get`] with the record's `version` column (the data format selector of the DbObject).
     pub fn get_versioned(&self, rdb_type: u32, id: u32) -> Result<Option<(u32, Vec<u8>)>> {
+        let rdb_type = self.texture_type(rdb_type);
         if !self.has_type(rdb_type)? {
             return Ok(None);
         }
@@ -84,5 +115,46 @@ impl RecordStore {
             )
             .optional()?
             .is_some())
+    }
+}
+
+fn other_texture_type(quality: i32) -> u32 {
+    match quality {
+        1 => 1_010_017,
+        2 => 1_010_016,
+        _ => 1_010_004,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn native_other_texture_quality_selects_asset_family() {
+        assert_eq!(super::other_texture_type(0), 1_010_004);
+        assert_eq!(super::other_texture_type(1), 1_010_017);
+        assert_eq!(super::other_texture_type(2), 1_010_016);
+        assert_eq!(super::other_texture_type(-1), 1_010_004);
+        assert_eq!(super::other_texture_type(3), 1_010_004);
+    }
+
+    #[test]
+    fn texture_preferences_route_real_record_reads_without_changing_other_types() {
+        use super::*;
+        let conn = Connection::open_in_memory().unwrap();
+        for ty in [1_010_004u32, 1_010_017, 1_010_016, 1_010_006, 1_010_021, 1_010_022, 1_010_011] {
+            conn.execute_batch(&format!("CREATE TABLE rdb_{ty} (id INTEGER PRIMARY KEY, version INTEGER, data BLOB);")).unwrap();
+            conn.execute(&format!("INSERT INTO rdb_{ty} VALUES (7, ?1, ?2)"), rusqlite::params![ty, ty.to_le_bytes().to_vec()]).unwrap();
+        }
+        let store = RecordStore { conn, other_texture_type: Cell::new(1_010_004), ground_texture_type: Cell::new(1_010_006) };
+        for (quality, ty) in [(1, 1_010_017u32), (2, 1_010_016), (3, 1_010_004)] {
+            store.set_other_texture_quality(quality);
+            assert_eq!(store.get(1_010_004, 7).unwrap().unwrap(), ty.to_le_bytes());
+            assert_eq!(store.get_versioned(1_010_004, 7).unwrap().unwrap().0, ty);
+            assert_eq!(store.get_versioned(1_010_011, 7).unwrap().unwrap().0, 1_010_011);
+        }
+        for (quality, ty) in [(0, 1_010_022), (1, 1_010_021), (2, 1_010_006)] {
+            store.set_ground_texture_quality(quality);
+            assert_eq!(store.get_versioned(1_010_006, 7).unwrap().unwrap().0, ty);
+        }
     }
 }

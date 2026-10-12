@@ -137,6 +137,7 @@ pub(super) struct HudStats {
     closed: Vec<WindowKind>,
     /// Zone frames produced by the windows (`SkillIIR_t`, `ResetSkill`); the HUD forwards them.
     outbox: Vec<Frame>,
+    tower_uses: Vec<Identity>,
     screen: (u32, u32),
     /// `listview_mode` of `prefs/NewChar/Containers/Inventory.xml` and the saved `WindowFrame` of `DockAreas/DockArea0.xml`.
     inventory_list: bool,
@@ -148,6 +149,18 @@ pub(super) struct HudStats {
     use_seq: i32,
     info_urls: Vec<String>,
     info_click: bool,
+    /// Gamecode `FUN_1002654d`: equipment moves are refused while `LockEquipment` is set.
+    equipment_locked: bool,
+    equipment_feedback: bool,
+    confirm_drop: bool,
+    drop_dialogs: super::hud_dialog::Dialogs<(ao_net::msg::Identity, [f32; 3])>,
+    item_description_tips: bool,
+    item_tip: Option<(u32, ao_net::n3::world::InventoryEntry, bool)>,
+    item_mouse: (f32, f32),
+    new_mouse: bool,
+    item_hold_delay: f32,
+    item_hold: Option<(f32, f32)>,
+    item_button: ao_gui::MouseButton,
 }
 
 /// Value of the first `<Bool name=NAME value=..>` below `e`.
@@ -192,6 +205,7 @@ impl HudStats {
             stat: None,
             closed: vec![],
             outbox: vec![],
+            tower_uses: vec![],
             screen,
             inventory_list,
             inventory_frame,
@@ -200,6 +214,17 @@ impl HudStats {
             use_seq: 0,
             info_urls: vec![],
             info_click: false,
+            equipment_locked: false,
+            equipment_feedback: false,
+            confirm_drop: true,
+            drop_dialogs: Default::default(),
+            item_description_tips: true,
+            item_tip: None,
+            item_mouse: (0.0, 0.0),
+            new_mouse: true,
+            item_hold_delay: 0.3,
+            item_hold: None,
+            item_button: ao_gui::MouseButton::Left,
         })
     }
 
@@ -256,6 +281,14 @@ impl HudStats {
     /// Zone frames queued by the windows since the last call.
     pub(super) fn take_outbox(&mut self) -> Vec<Frame> {
         std::mem::take(&mut self.outbox)
+    }
+
+    pub(in crate::play) fn take_tower_uses(&mut self) -> Vec<Identity> {
+        std::mem::take(&mut self.tower_uses)
+    }
+
+    pub(super) fn take_equipment_feedback(&mut self) -> Option<&'static str> {
+        std::mem::take(&mut self.equipment_feedback).then_some("Feedback_EquipmentLocked")
     }
 
     /// True while an item is carried by the pointer.
@@ -330,6 +363,7 @@ impl HudStats {
     }
 
     fn close_inventory(&mut self, gui: &mut Gui) {
+        self.item_tip = None;
         if let Some(i) = self.inventory.take() {
             gui.close_window(i.window);
         }
@@ -350,6 +384,7 @@ impl HudStats {
     }
 
     pub(super) fn close_all(&mut self, gui: &mut Gui, rollup: &mut Rollup) {
+        self.drop_dialogs.close_all(gui);
         for k in [WindowKind::Skills, WindowKind::Inventory, WindowKind::Character, WindowKind::Stat] {
             self.close(gui, rollup, k);
         }
@@ -687,6 +722,7 @@ impl HudStats {
         hits += "</View></root>";
         gui.add_view_xml(w, "wear_tab_hits", "WearTabHits", &hits)?;
         self.wear = Some(Tabbed { window: w, tab: 0, drawn: vec![(u32::MAX, 0)] });
+        self.item_tip = None;
         self.select_wear_tab(gui, 0);
         Ok(())
     }
@@ -760,6 +796,7 @@ impl HudStats {
             positions: Default::default(),
             pending_drop: None,
         });
+        self.item_tip = None;
         Ok(())
     }
 
@@ -870,6 +907,12 @@ impl HudStats {
     // ------------------------------------------------------------------------------------------------------------ dispatch
 
     pub(super) fn configure_stat(&mut self, d: &super::dvalue::DValues) {
+        self.equipment_locked = d.flag("LockEquipment");
+        self.confirm_drop = d.prefs.get_int("ShowDropItemDialog", super::dvalue::Kind::Char) != Some(0);
+        self.drop_dialogs.configure_escape(d);
+        self.item_description_tips = d.flag("ItemDescriptionTooltips");
+        self.new_mouse = d.flag("UseNewMouseFunc");
+        self.item_hold_delay = d.get_f32("MouseButtonHoldDelay");
         if let Some(s) = self.stat.as_mut() { s.configure(d); }
     }
 
@@ -911,10 +954,12 @@ impl HudStats {
 
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &mut Zone, _dt: f32) {
         self.dnd.clock += _dt;
+        self.advance_item_hold(gui, zone, _dt);
         self.refresh_stats(zone);
         self.update_skills(gui, zone);
         self.update_wear(gui, zone);
         self.update_inventory(gui, zone);
+        self.update_item_tooltip(gui, zone);
         if let Some(s) = self.stat.as_mut() {
             s.update(gui, zone);
         }
@@ -922,6 +967,9 @@ impl HudStats {
 
     /// `true` when the event belonged to one of these windows.
     pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone) -> bool {
+        if self.drop_dialog_event(gui, ev, zone) {
+            return true;
+        }
         if self.skills_event(gui, ev, zone) {
             return true;
         }
@@ -993,7 +1041,7 @@ mod tests {
         }
         fn input(&mut self, ev: InputEvent, _host: &mut Host) {
             self.hud.input(&mut self.gui, &self.zone, &ev, _host.mods);
-            self.rollup.input(&mut self.gui, &ev);
+            self.rollup.input(&mut self.gui, &ev, self.dvalues.get_i64("MouseWheel").unwrap_or(0));
             for e in self.gui.input(ev) {
                 self.rollup.event(&mut self.gui, &e);
                 self.hud.stat_event(&mut self.gui, &e, &self.zone, &mut self.dvalues);
@@ -1369,6 +1417,53 @@ mod tests {
         assert_eq!(hud.dnd.drag.as_ref().map(|d| d.slot), Some(0x40), "list rows share the inventory drag route");
     }
 
+    #[test]
+    fn equipment_lock_blocks_drag_and_double_click() {
+        let Some((mut s, _)) = shot() else { return };
+        s.zone.inventory.insert(6, item(6, 0xc1a5, 1));
+        s.zone.inventory.insert(0x40, item(0x40, 0xc1a2, 1));
+        let mut d = super::super::dvalue::DValues::new(&ao_gui::client_dir());
+        d.set_i64("LockEquipment", 1);
+        s.hud.configure_stat(&d);
+        assert!(s.hud.drop_action(&s.zone, 6, item_dnd::Place::Bag { cell: (0, 0) }).is_none());
+        assert!(s.hud.drop_action(&s.zone, 0x40, item_dnd::Place::Wear { tab: 0, id: 6, slot: 6 }).is_none());
+        s.hud.item_click(&s.zone, item_dnd::Place::Wear { tab: 0, id: 6, slot: 6 });
+        s.hud.item_click(&s.zone, item_dnd::Place::Wear { tab: 0, id: 6, slot: 6 });
+        assert!(s.hud.take_outbox().is_empty(), "double click shares the lock gate");
+        assert_eq!(s.hud.take_equipment_feedback(), Some("Feedback_EquipmentLocked"));
+        assert_eq!(s.hud.take_equipment_feedback(), None);
+        s.hud.dnd.press = Some((item_dnd::Place::Wear { tab: 0, id: 6, slot: 6 }, 0.0, 0.0));
+        s.hud.item_hold = Some((0.0, 0.3));
+        s.hud.advance_item_hold(&mut s.gui, &s.zone, 0.3);
+        assert!(s.hud.dnd.drag.is_none() && s.hud.dnd.press.is_none(), "locked equipment cannot begin a world-drop drag");
+        assert_eq!(s.hud.take_equipment_feedback(), Some("Feedback_EquipmentLocked"));
+        d.set_i64("LockEquipment", 0);
+        s.hud.configure_stat(&d);
+        assert!(s.hud.drop_action(&s.zone, 6, item_dnd::Place::Bag { cell: (0, 0) }).is_some(), "unlock applies without reopening");
+    }
+
+    #[test]
+    fn item_hold_and_description_options_apply_without_reopening() {
+        let Some((mut s, mut o)) = shot() else { return };
+        s.zone.inventory.insert(0x40, item(0x40, 21797, 1));
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Inventory);
+        o.frame(&mut s, 0.016);
+        let (x, y) = bag_xy(&s, (0, 0));
+        s.input(InputEvent::MouseMove { x, y }, &mut Host::headless());
+        o.frame(&mut s, 0.016);
+        assert!(s.hud.item_tip.is_some_and(|(_, _, descriptions)| descriptions));
+        s.dvalues.set_i64("ItemDescriptionTooltips", 0);
+        s.dvalues.set_i64("UseNewMouseFunc", 0);
+        s.dvalues.set("MouseButtonHoldDelay", super::super::dvalue::Variant::Float(1.0));
+        o.frame(&mut s, 0.016);
+        assert!(s.hud.item_tip.is_some_and(|(_, _, descriptions)| !descriptions));
+        s.hud.input(&mut s.gui, &s.zone, &InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Right }, Default::default());
+        s.hud.advance_item_hold(&mut s.gui, &s.zone, 0.5);
+        assert!(s.hud.dnd.drag.is_none());
+        s.hud.advance_item_hold(&mut s.gui, &s.zone, 0.5);
+        assert!(s.hud.dnd.drag.is_some());
+    }
+
     /// Worn items appear in their cells of the four wear tabs, bag items in the inventory grid and list (icons from rdb 1010008).
     #[test]
     fn wear_and_inventory_show_items() {
@@ -1511,6 +1606,18 @@ mod tests {
         assert_eq!(payload(&mut s), [inv::move_item_to_inventory(me, inv::item_identity(0x40), 0x13)]);
         // released over the world: `DropTemplateIIR_t` at the player's position
         dnd!(s, o, bag_xy(&s, (1, 0)), (20.0, 300.0));
+        assert!(payload(&mut s).is_empty(), "the default asks before sending");
+        let dialog = s.hud.drop_dialogs.windows()[0];
+        s.hud.event(&mut s.gui, &Event::Clicked { window: dialog, view: "btn1".into(), item: None }, &s.zone);
+        assert!(payload(&mut s).is_empty(), "No never sends a drop");
+        dnd!(s, o, bag_xy(&s, (1, 0)), (20.0, 300.0));
+        let dialog = s.hud.drop_dialogs.windows()[0];
+        s.hud.event(&mut s.gui, &Event::Clicked { window: dialog, view: "btn0".into(), item: None }, &s.zone);
+        assert_eq!(payload(&mut s), [inv::drop_item(me, inv::item_identity(0x41), s.zone.own().map_or([0.0; 3], |d| d.pos))]);
+        s.dvalues.prefs.set_int("ShowDropItemDialog", 0, super::super::dvalue::Kind::Char);
+        s.hud.configure_stat(&s.dvalues);
+        dnd!(s, o, bag_xy(&s, (1, 0)), (20.0, 300.0));
+        assert!(s.hud.drop_dialogs.windows().is_empty(), "disabled confirmation drops immediately");
         assert_eq!(payload(&mut s), [inv::drop_item(me, inv::item_identity(0x41), s.zone.own().map_or([0.0; 3], |d| d.pos))]);
         // released over a world object (`Play::interact_mouse` stores the pick): `UseItemOnItem` (`GenericCmd_t` 5), over a character `UseItemOnCharacter` (0x20)
         for (target, cmd) in [(Identity { kind: 51005, instance: -1073474847 }, 5), (Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: 77 }, 0x20)] {

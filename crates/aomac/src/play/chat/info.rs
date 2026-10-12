@@ -23,6 +23,9 @@ mod item_effects;
 mod item_info_combat;
 #[path = "item_requirements.rs"]
 mod item_requirements;
+#[path = "item_eligibility.rs"]
+mod item_eligibility;
+pub(crate) use item_eligibility::{PerkCriteria, PerkEquipment};
 #[path = "item_info_building.rs"]
 mod item_info_building;
 #[path = "skill_info.rs"]
@@ -36,11 +39,20 @@ pub enum ItemRequest {
     Skill(u32),
 }
 
+/// `N3Msg_GetPerkDescription`: the catalogue item's authored description, not the full item-info panel.
+pub(super) fn item_description(record: &[u8]) -> anyhow::Result<Option<String>> {
+    Ok(template_spells::data(record, 0)?.description)
+}
+
 pub fn item_html(zone: &crate::play::zone::Zone, request: &ItemRequest, texts: &ao_formats::screens::TextDb) -> anyhow::Result<Option<String>> {
     match request {
         ItemRequest::Skill(stat) => skill::html(zone, *stat, texts).map(Some),
         _ => item::html(zone, request, texts),
     }
+}
+
+pub(super) fn item_page(zone: &crate::play::zone::Zone, request: &ItemRequest, texts: &ao_formats::screens::TextDb) -> anyhow::Result<Option<(String, String)>> {
+    item::page(zone, request, texts)
 }
 
 pub fn shop_item_html(zone: &crate::play::zone::Zone, item: ao_net::n3::world::AcgItem, price: i32, texts: &ao_formats::screens::TextDb) -> anyhow::Result<Option<String>> {
@@ -49,6 +61,11 @@ pub fn shop_item_html(zone: &crate::play::zone::Zone, item: ao_net::n3::world::A
 
 pub(crate) fn item_template_spells(record: &[u8], list: u32) -> anyhow::Result<Vec<ao_net::n3::spells::Spell>> {
     template_spells::spells(record, list)
+}
+
+/// GC 100274e1: the item use-event criterion list contains action 0x53.
+pub(crate) fn item_is_shield_disabler(record: &[u8]) -> anyhow::Result<bool> {
+    Ok(template_spells::data(record, 3)?.criteria.iter().any(|(_, event, criteria)| *event == 3 && criteria.iter().any(|criterion| criterion[2] == 0x53)))
 }
 
 
@@ -142,6 +159,8 @@ pub struct InfoView {
     /// `<client>/cd_image/text` (`AnarchyPath_t::GetCDPath` + `text/`).
     text_dir: PathBuf,
     win: Option<WindowId>,
+    escape: bool,
+    escape_option: bool,
     hist: History,
     /// `InfoView_c+0x1a0`: the URL of the shown page (also kept for `text://` / `charref://`).
     url: String,
@@ -176,7 +195,7 @@ fn section_param(url: &str) -> Option<i32> {
 
 /// The text between the end of the `n`-th (0-based) `<section>` tag and the next `</section>`; empty when it is not closed
 /// (`FUN_100eda84`: `HTMLParser_c` tag tokens, `section` / `/section`).
-fn extract_section(html: &str, n: i32) -> String {
+pub(in crate::play) fn extract_section(html: &str, n: i32) -> String {
     let mut left = n;
     let mut start = None;
     let mut i = 0;
@@ -236,8 +255,14 @@ fn item_request(url: &str) -> Option<ItemRequest> {
 
 impl InfoView {
     pub fn new(client: &std::path::Path) -> Self {
-        Self { text_dir: client.join("cd_image/text"), win: None, hist: History::default(), url: String::new() }
+        Self { text_dir: client.join("cd_image/text"), win: None, escape: true, escape_option: true, hist: History::default(), url: String::new() }
     }
+
+    pub fn configure_escape(&mut self, values: &super::super::dvalue::DValues) {
+        self.escape_option = values.get_i64("esc_infoview").unwrap_or(1) != 0;
+    }
+
+    pub fn esc_closes(&self) -> bool { self.win.is_some() && self.escape }
 
     pub fn window(&self) -> Option<WindowId> {
         self.win
@@ -354,6 +379,7 @@ impl InfoView {
         match gui.open_tabbed_window("InfoView", "Info", pos, WindowSize::Fixed(CLIENT.0, CLIENT.1)) {
             Ok(w) => {
                 self.win = Some(w);
+                self.escape = self.escape_option;
                 // ctor tail of `FUN_100ee972`: Forward starts disabled, Back only when there is older history
                 gui.set_enabled(w, "ForwardButton", false);
                 gui.set_enabled(w, "BackButton", false);
@@ -409,6 +435,10 @@ impl InfoView {
                 self.close(gui);
                 (true, vec![])
             }
+            Event::Escape { window } if *window == w && self.escape => {
+                self.close(gui);
+                (true, vec![])
+            }
             _ => (false, vec![]),
         }
     }
@@ -417,6 +447,26 @@ impl InfoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn info_escape_policy_is_captured_at_open() {
+        let Some((mut gui, mut iv)) = rig() else { return };
+        let mut d = super::super::super::dvalue::DValues::new(&ao_gui::client_dir());
+        d.set_i64("esc_infoview", 0);
+        iv.configure_escape(&d);
+        iv.open(&mut gui, (800, 600));
+        let win = iv.window().unwrap();
+        d.set_i64("esc_infoview", 1);
+        iv.configure_escape(&d);
+        iv.event(&mut gui, (800, 600), &Event::Escape { window: win });
+        assert_eq!(iv.window(), Some(win));
+        iv.event(&mut gui, (800, 600), &Event::CloseRequested { window: win });
+        iv.open(&mut gui, (800, 600));
+        let win = iv.window().unwrap();
+        d.set_i64("esc_infoview", 0);
+        iv.configure_escape(&d);
+        iv.event(&mut gui, (800, 600), &Event::Escape { window: win });
+        assert!(iv.window().is_none());
+    }
     #[test]
     fn external_urls_do_not_visit_or_open_an_info_page() {
         let Some((mut gui, mut iv)) = rig() else { return };

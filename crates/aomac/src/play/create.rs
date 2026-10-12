@@ -300,7 +300,7 @@ impl Play {
             None => {
                 let (tx, dir) = (self.tx.clone(), self.dir.clone());
                 std::thread::spawn(move || {
-                    let r = RecordStore::open(&dir).and_then(|s| cc_world(&s)).map(Box::new).map_err(|e| format!("{e:#}"));
+                    let r = super::open_texture_store(&dir).and_then(|s| cc_world(&s)).map(Box::new).map_err(|e| format!("{e:#}"));
                     let _ = tx.send(Bg::CcWorld(r));
                 });
             }

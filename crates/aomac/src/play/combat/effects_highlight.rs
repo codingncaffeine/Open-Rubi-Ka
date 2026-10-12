@@ -101,6 +101,34 @@ mod tests {
         assert_eq!(h.color(),[1.0,0.0,0.0,0.0]);assert!(!h.advance(0.001));
     }
     #[test]
+    fn chat_flash_11507_uses_authored_head_only_material_and_expires() -> Result<()> {
+        let dir=ao_gui::client_dir();
+        if !dir.join("Setupf/gfxtweak.bin").exists() || !dir.join("cd_image/rdb.db").exists() { return Ok(()); }
+        let mut renderer=super::super::Renderer::open(&dir)?;
+        let template=&renderer.templates.by_id[&0x2cf3];
+        assert_eq!(template.kind,2011);
+        assert_eq!(template.words,[3,3,1065353216,1065353216,0,0,0,1065353216,1065353216,1065353216,1065353216,0]);
+        let identity=(50000,1);
+        let handle=renderer.spawn_configured(super::super::Binding {group:0,attractor:0,effect:0x2cf3,note:0,color:0},glam::Mat4::IDENTITY,glam::Vec3::ZERO,
+            EffectConfig {creation:super::super::Creation::Dynel,source_identity:Some(identity),..Default::default()})?;
+        let actor=ao_scene::ActorFrame {id:1,part_attractors:vec![None,Some(0),Some(1)],..Default::default()};
+        renderer.prepare_source_mesh(identity,&ao_scene::Scene::default(),&actor);
+        let mut host=ao_render::Host::headless();
+        host.actors.push(actor.clone());
+        renderer.frame(0.5,&mut host,None);
+        let flashed=host.actors.iter().find(|a|a.id==1).context("flash source actor missing")?;
+        assert_eq!(flashed.alpha,1.0);assert!(flashed.emissive.is_none());
+        assert!(flashed.part_materials[0].emissive.is_none());
+        assert_eq!(flashed.part_materials[1].emissive,Some([1.0;3]));
+        assert_eq!(flashed.part_materials[1].specular,Some([1.0;3]));
+        assert!(flashed.part_materials[2].emissive.is_none());
+        host.actors.clear();host.actors.push(actor);
+        renderer.frame(0.501,&mut host,None);
+        assert!(!renderer.is_active(handle));
+        assert!(host.actors[0].part_materials.is_empty());
+        Ok(())
+    }
+    #[test]
     fn authored_61110_suppresses_only_root_visual_priority() {
         let t=Template {kind:2011,words:vec![1027,0,1077936128,0,0,0,0,0,0,0,0,0]};
         let mut h=Highlight::new(&t,EffectConfig {source_identity:Some((50000,1)),..Default::default()}).unwrap();
@@ -159,7 +187,7 @@ mod tests {
             for frame in 0..=60 {
                 if frame>0 {h.advance(1.0/60.0);}
                 let (skin,parts)=rig.pose(None);
-                let mut actor=ao_scene::ActorFrame {id:1,model:1,skin:Some(skin),parts,part_attractors:rig.part_attractors(),..Default::default()};
+                let mut actor=ao_scene::ActorFrame { id:1,model:1, skin: Some(std::sync::Arc::new(skin)), parts,part_attractors:rig.part_attractors(),..Default::default() };
                 h.apply(std::slice::from_mut(&mut actor));
                 assert!(actor.emissive.is_none());assert_eq!(actor.alpha,1.0);
                 assert_eq!(actor.part_materials[head].emissive,Some(std::array::from_fn(|i|h.color()[i+1].powf(2.2))));

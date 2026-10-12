@@ -278,13 +278,13 @@ fn slider_drag_writes_the_value_and_shows_it_formatted() {
     // default 0.33 shown as "33%" in `value_fmt`
     assert_eq!(r.gui.text(id, &format!("v{n}")), "<font color=#70C4D0>33%</font>");
     // grab the knob and drag to the far right: the value is clamped to the DValue's max (1.0)
-    let left = rect.l + knob_x(0.33, 0.0, 1.0, width);
+    let left = rect.l + (0.33_f32 * (width - 11.0)).floor();
     r.send(InputEvent::MouseDown { x: left + 3.0, y: rect.t + 4.0, button: MouseButton::Left });
     r.send(InputEvent::MouseMove { x: rect.l + width * 2.0, y: rect.t + 4.0 });
     assert_eq!(r.d.get("CCFadeLow"), Some(&Variant::Float(1.0)));
     assert_eq!(r.gui.text(id, &format!("v{n}")), "<font color=#70C4D0>100%</font>");
     // half way
-    r.send(InputEvent::MouseMove { x: rect.l + 3.0 + (width - KNOB_W) / 2.0, y: rect.t + 4.0 });
+    r.send(InputEvent::MouseMove { x: rect.l + 3.0 + (width - 11.0) / 2.0, y: rect.t + 4.0 });
     let Some(Variant::Float(v)) = r.d.get("CCFadeLow").cloned() else { panic!() };
     assert!((v - 0.5).abs() < 0.02, "{v}");
     r.send(InputEvent::MouseUp { x: 0.0, y: 0.0, button: MouseButton::Left });
@@ -315,9 +315,9 @@ fn settings_survive_a_restart() {
     let s = r.show("CCFadeHigh");
     let rect = r.gui.view_rect(r.win(), &s).unwrap();
     let width = r.gui.canvas_size(r.win(), &s).0 as f32;
-    let left = rect.l + knob_x(0.85, 0.0, 1.0, width);
+    let left = rect.l + (0.85_f32 * (width - 11.0)).floor();
     r.send(InputEvent::MouseDown { x: left + 3.0, y: rect.t + 4.0, button: MouseButton::Left });
-    r.send(InputEvent::MouseMove { x: rect.l + 3.0 + (width - KNOB_W) / 4.0, y: rect.t + 4.0 });
+    r.send(InputEvent::MouseMove { x: rect.l + 3.0 + (width - 11.0) / 4.0, y: rect.t + 4.0 });
     r.send(InputEvent::MouseUp { x: 0.0, y: 0.0, button: MouseButton::Left });
     assert!(!r.d.take_changed().is_empty());
     // closing stores the window (`OptionWindowConfig`); the flow saves on every change
@@ -333,6 +333,33 @@ fn settings_survive_a_restart() {
     let Some(Variant::Archive(a)) = again.get(CONFIG) else { panic!("OptionWindowConfig not saved") };
     assert!(a.contains("WindowFrame") && a.contains("selected_panel"), "{a}");
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn every_retail_option_roundtrips_through_its_native_store() {
+    let dir = ao_gui::client_dir();
+    let Ok(root) = std::fs::read_to_string(dir.join("cd_image/gui/Default/OptionPanel/Root.xml")) else { return eprintln!("skipping: no client") };
+    let pages = model::parse(&root);
+    let tmp = std::env::temp_dir().join(format!("aomac-all-options-persist-{}", std::process::id()));
+    let mut values = DValues::new(&dir);
+    values.open_user(&tmp, "test", 7);
+    for option in pages.iter().flat_map(model::Page::opts) {
+        let (low, high) = option.range(&values);
+        let checked = option.checked(&values);
+        let value = if option.value(&values) == low { high } else { low };
+        match option.ctl {
+            model::Ctl::Check => option.set_checked(&mut values, !checked),
+            _ => option.set_value(&mut values, value),
+        }
+    }
+    assert!(!values.take_changed().is_empty());
+    values.save_user();
+    let mut restored = DValues::new(&dir);
+    restored.open_user(&tmp, "test", 7);
+    for option in pages.iter().flat_map(model::Page::opts) {
+        assert_eq!(option.value(&restored), option.value(&values), "{} ({:?}, {:?})", option.var, option.ty, option.kind);
+    }
+    std::fs::remove_dir_all(tmp).unwrap();
 }
 
 #[test]
@@ -418,6 +445,20 @@ fn esc_closes_only_windows_whose_option_was_set_when_they_opened() {
     o.arm_esc(K::Options, &d);
     o.disarm_esc(K::Options);
     assert_eq!(o.take_esc(), [K::Inventory]);
+    d.set_i64("esc_raid", 1);
+    o.arm_esc(K::Raid, &d);
+    d.set_i64("esc_raid", 0);
+    assert_eq!(o.take_esc(), [K::Raid]);
+    o.arm_esc(K::Raid, &d);
+    assert!(o.take_esc().is_empty());
+    for (kind, key) in [(K::Research, "esc_research"), (K::Vehicle, "esc_vehicle")] {
+        d.set_i64(key, 1);
+        o.arm_esc(kind, &d);
+        d.set_i64(key, 0);
+        assert_eq!(o.take_esc(), [kind]);
+        o.arm_esc(kind, &d);
+        assert!(o.take_esc().is_empty());
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ Fixed keys / Key bindings tabs

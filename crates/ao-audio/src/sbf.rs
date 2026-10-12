@@ -57,6 +57,8 @@ pub struct SoundDef {
     pub vol_max: f32,
     pub min_dist: f32,
     pub max_dist: f32,
+    /// SI10003520 record+DC -> sample+280; positional PlaySample emits AFCM9/119.
+    pub scare_radius: f32,
     pub fade_in: f32,
     pub fade_out: f32,
     pub duration_min: f32,
@@ -117,6 +119,7 @@ impl SoundDb {
                     vol_max: r[3] as f32 / 255.0,
                     min_dist: f(0xd4),
                     max_dist: f(0xd8),
+                    scare_radius: f(0xdc),
                     fade_in: f(0xe0),
                     fade_out: u16_(12),
                     duration_min: f(0xd0),

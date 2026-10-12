@@ -162,7 +162,7 @@ fn frames(store: &RecordStore, look: &CharSelectLook, role: Role) -> anyhow::Res
 }
 
 fn run(dir: &std::path::Path, breed: i32, sex: i32, (char_id, head): (i32, i32), prefs: Option<&std::path::Path>, req: &Receiver<Option<usize>>, tx: &Sender<Out>) -> anyhow::Result<()> {
-    let store = RecordStore::open(dir)?;
+    let store = super::open_texture_store(dir)?;
     let look = screens::char_select_look(&store, breed, sex)?;
     let cache = cached(dir, prefs, char_id).or_else(|| listed_appearance(char_id, breed, sex, look.model as i32, head));
     let mut assets = cache.as_ref().map(|_| character::actor::ActorAssets::new(&store)).transpose()?;

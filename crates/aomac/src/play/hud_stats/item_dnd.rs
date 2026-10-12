@@ -39,7 +39,7 @@ pub fn tab_page(tab: usize) -> Option<(Page, i32)> {
     }
 }
 
-/// `N3Msg_IsItemPossibleToWear` without the checks that need state we do not have (equipment lock `FUN_1002654d`, the wearer's skill requirements
+/// `N3Msg_IsItemPossibleToWear` without the checks that need state we do not have (the wearer's skill requirements
 /// `vtable+0x5c`, implant access `FUN_10044b6e(0x10)`; the server decides those): `ItemClass` in {1, 2, 3, 5}, the `Placement` bit of the slot id, and the
 /// deck slot rule of `FUN_10047be5` for weapons.
 /// UNRESOLVED: the decompilation drops the `class` argument (`param_3`) the callers pass, so whether the original also compares it to the item's class is

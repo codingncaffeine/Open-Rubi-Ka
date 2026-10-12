@@ -50,8 +50,6 @@ pub struct MusicPlayer {
     sh: Arc<Shared>,
     proj: Arc<Project>,
     dir: PathBuf,
-    /// `Total_Music` (master x music volume x mutes).
-    pub volume: f32,
     layer: Option<usize>,
     /// Sandy ctor sets force mode 1 (authored sample fades), not mode 0.
     force: bool,
@@ -75,11 +73,23 @@ pub struct MusicPlayer {
 impl MusicPlayer {
     pub(crate) fn new(sh: Arc<Shared>, proj: Arc<Project>, seed: u64) -> Self {
         let dir = sh.root.join("music/env");
-        MusicPlayer { sh, proj, dir, volume: 1.0, layer: None, state: State::Idle, force: true, played: 0.0, node: 0, pause_layer: None, resume: None, streams: Vec::new(), weights: HashMap::new(), rng: Rng(seed | 1), now_playing: None }
+        MusicPlayer { sh, proj, dir, layer: None, state: State::Idle, force: true, played: 0.0, node: 0, pause_layer: None, resume: None, streams: Vec::new(), weights: HashMap::new(), rng: Rng(seed | 1), now_playing: None }
     }
 
     pub fn layer(&self) -> Option<usize> {
         self.layer
+    }
+
+    /// Miles reinitialisation discards stream handles, but the current world still requests
+    /// the same layer. Let the next tick start its entry rather than keeping a dead handle.
+    pub(crate) fn restart_device(&mut self) {
+        self.stop_streams();
+        self.state = State::Idle;
+        self.now_playing = None;
+        self.played = 0.0;
+        self.pause_layer = None;
+        self.resume = None;
+        self.weights.clear();
     }
 
     pub fn project(&self) -> &Project {
@@ -169,7 +179,7 @@ impl MusicPlayer {
 
     fn gain(&self, s: usize) -> f32 {
         let sample = &self.proj.samples[s];
-        self.volume * self.proj.layers[sample.layer].vol * sample.vol
+        self.proj.layers[sample.layer].vol * sample.vol
     }
 
     /// Starts sample `s`; `reset` restarts the pause clock on the sample's layer.
@@ -479,21 +489,12 @@ mod tests {
     }
 
     #[test]
-    fn reset_closes_streams_and_cancels_pause_resume() {
-        let (mut mp, sh) = player("logout");
-        mp.signal(Some(0));
-        let voices = mp.streams.clone();
-        assert!(!voices.is_empty());
-        mp.resume = Some(1);
-        mp.state = State::Paused { left: 0.1 };
-        mp.reset();
-        assert!(voices.iter().all(|&id| !sh.mixer().is_playing(id)));
-        assert!(mp.streams.is_empty() && mp.resume.is_none() && mp.pause_layer.is_none());
-        run(&mut mp, &sh, 40.0);
-        assert!(mp.layer().is_none() && mp.now_playing.is_none());
-        mp.signal(Some(0));
-        assert!(mp.now_playing.is_some(), "the same layer can start in the next session");
-        mp.reset();
+parking_lot = "0.12"
+texpresso = "2.0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
         let _ = std::fs::remove_dir_all(&sh.root);
     }
 

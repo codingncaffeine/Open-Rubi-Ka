@@ -88,7 +88,7 @@ pub struct CharLook {
     pub monster_data: i32,
     /// `TextureData_t`: (material name, rdb 1010004 texture, env texture [layer 3], alpha mode).
     pub textures: Vec<(String, i32, i32, i32)>,
-    /// `ClothData_t` page 0: (part, rdb 1010004 texture).
+    /// `ClothData_t`: (page * 5 + part, rdb 1010004 texture).
     pub cloth: Vec<(i32, i32)>,
     /// `AttractorMeshData_t`: (place, rdb 1010001 mesh).
     pub attractors: Vec<(u8, i32)>,
@@ -116,7 +116,7 @@ impl CharLook {
             head: u.head_mesh,
             monster_data: u.monster_data,
             textures: u.textures.iter().map(|t| (t.material.clone(), t.texture, t.field_24, t.flag)).collect(),
-            cloth: u.cloth.iter().filter(|c| c.page == 0).map(|c| (c.part(), c.texture)).collect(),
+            cloth: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(),
             attractors,
             skip_attractors: u.flags & ao_net::n3::dynel::flag::SET_DYNEL_800 != 0,
         }
@@ -125,15 +125,16 @@ impl CharLook {
 
 impl CharLook {
     /// `AppearanceUpdateIIR_c::Activate` [GC 0x10071679] on a character's look, any `SimpleChar_t` (NPCs too, no kind test beyond the identity):
-    /// the cloth entries are written by `FUN_100480fc` at index `page * 5 + part` (only page 0 is drawn; an entry whose texture is unchanged is
+    /// the cloth entries are written by `FUN_100480fc` at index `page * 5 + part` (visible page priority 2 > 1 > 0, GC 0x1004b521); an entry whose texture is unchanged is
     /// left alone, one with texture 0 clears the part, parts the message does not name stay), then `VisualCATMesh_t::ClearAttractors` +
     /// `CharacterMesh::AddAttractors(list)`: the mounted set is exactly the wire list (head = its place 0), unconditionally (the `SET_DYNEL_800`
     /// flag only skips the full update's block). `cloth` is kept sorted so equal looks share a model whatever order the updates came in.
     pub fn apply_appearance(&mut self, a: &ao_net::n3::world::AppearanceUpdate) {
-        for c in a.cloth.iter().filter(|c| c.c == 0) {
-            self.cloth.retain(|p| p.0 != c.id);
+        for c in &a.cloth {
+            let index = c.c * 5 + c.id;
+            self.cloth.retain(|p| p.0 != index);
             if c.b > 0 {
-                self.cloth.push((c.id, c.b));
+                self.cloth.push((index, c.b));
             }
         }
         self.cloth.sort_unstable();
@@ -169,11 +170,23 @@ pub enum Look {
 }
 
 impl Look {
-    pub fn key(&self) -> u64 {
+    pub fn key(&self, texture_quality: i32) -> u64 {
         let mut h = DefaultHasher::new();
         self.hash(&mut h);
-        h.finish()
+        // Reserve two bits for the native resource family so queued loads retain their identity.
+        (h.finish() & !3) | match texture_quality { 1 => 1, 2 => 2, _ => 3 }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn future_texture_family_changes_model_identity_without_mutating_existing_looks() {
+    let look = Look::Item { template: Some(7), stats: vec![] };
+    let full = look.key(3);
+    assert_eq!(full, look.key(0));
+    assert_ne!(full, look.key(1));
+    assert_ne!(look.key(1), look.key(2));
+    assert_eq!(full, look.key(3));
 }
 
 /// A built model: the scene to upload, the rig (pose source) of CAT models, the clips of its set by client animation id
@@ -222,7 +235,7 @@ enum Model {
 }
 
 enum Req {
-    Model { key: u64, look: Look },
+    Model { key: u64, look: Look, texture_quality: i32 },
     /// The dynels the playfield places by itself (rdb 1000026).
     Placed(u32),
     /// A wielded weapon: its `AnimSet` (stat 353) from the template record under the message stats.
@@ -258,7 +271,10 @@ impl Worker {
             };
             for r in req_rx {
                 let resp = match r {
-                    Req::Model { key, look } => Resp::Model { key, result: build(&store, &mut assets, &look).map(Box::new).map_err(|e| format!("{e:#}")) },
+                    Req::Model { key, look, texture_quality } => {
+                        store.set_other_texture_quality(texture_quality);
+                        Resp::Model { key, result: build(&store, &mut assets, &look).map(Box::new).map_err(|e| format!("{e:#}")) }
+                    }
                     Req::Clip { key, look, id } => {
                         // the record's variants of the key (`FUN_10010ebe`), every one loaded; the character rolls one when the clip starts
                         let ids = match clip_ids(&store, &assets, &look, id) {
@@ -431,7 +447,7 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
         };
         // the race selects the naked skin; the head mesh is the place-0 attractor (`attractor_list`)
         let mut equipment = Equipment::default();
-        for &(part, tex) in &look.cloth {
+        for (part, tex) in super::avatar::visible_cloth(&look.cloth) {
             if let Some(p) = ClothPart::ALL.get(part as usize).filter(|_| tex > 0) {
                 equipment.wear(*p, tex as u32);
             }
@@ -517,7 +533,7 @@ fn npc_rig(store: &RecordStore, assets: &ActorAssets, look: &CharLook, rec: &Npc
     let model = rec.mesh().context("NPC record has no mesh")?;
     let cat = load_cat_mesh(store, CHAR_MESH_TYPE, model)?;
     let list: Vec<TextureOverride> = look.textures.iter().map(|(m, t, env, alpha)| TextureOverride { material: m, texture: *t as u32, env_texture: *env as u32, alpha_mode: *alpha as u32 }).collect();
-    let cloth: Vec<(ClothPart, u32)> = look.cloth.iter().filter(|c| c.1 > 0).filter_map(|&(p, t)| Some((*ClothPart::ALL.get(p as usize)?, t as u32))).collect();
+    let cloth: Vec<(ClothPart, u32)> = super::avatar::visible_cloth(&look.cloth).filter_map(|(p, t)| Some((*ClothPart::ALL.get(p as usize)?, t as u32))).collect();
     let skin_head = rec.stat(64).filter(|&h| h > 0).map(|h| h as u32);
     let overrides = npc_part_textures(store, &assets.names, &cat, skin_head, &list, &cloth);
     let rig = ActorRig::new(store, assets, model, head, &overrides, &npc_part_layers(&cat, &list), attachments)?;
@@ -588,6 +604,9 @@ pub struct Char {
     features_set: bool,
     /// Model-space box of the last pose's skinned body vertices (`RCATMesh_t+0x1fc/+0x208`, hud_pick.rs); `None` until posed.
     bounds: Option<([f32; 3], [f32; 3])>,
+    current_skin: Option<Arc<Vec<ao_scene::Vertex>>>,
+    cadence: ao_formats::character::AnimationCadence,
+    pose_cache: ao_formats::character::actor::PoseCache,
     roll: Roll,
     /// Bit `i` = event `i` of the playing clip has fired its note (`piVar7[0xd]` of the holder's clip entry, `FUN_1003c036`).
     note_fired: u32,
@@ -713,13 +732,14 @@ const PROP_ID_BASE: u32 = 0x4000_0000;
 pub struct Dynels {
     dir: Option<PathBuf>,
     worker: Option<Worker>,
+    texture_quality: i32,
     own: i32,
     pub chars: HashMap<i32, Char>,
     /// Non-character dynels by `(identity kind, instance)`.
     props: HashMap<(i32, i32), Prop>,
     next_prop: u32,
     /// Looks asked for before the worker existed.
-    pending: Vec<Look>,
+    pending: Vec<(u64, Look)>,
     /// `AnimSet` of the weapon in the right (slot 6) / left (slot 8) hand of a holder.
     wield: HashMap<i32, [Option<Wield>; 2]>,
     /// Characters whose fight controller is in state 2 (`SimpleChar+0x1d4 +0x44`, fed by [`Dynels::set_fighting`]): they stand in the weapon's
@@ -745,8 +765,10 @@ pub struct Dynels {
     models: HashMap<u64, Model>,
     asked: HashSet<u64>,
     scene_generation: u64,
-    /// Pref `ShowAllNames` (default off, docs/zone/motion.md §6): name tags over every dynel within [`NAME_TAG_RADIUS`].
+    /// Login pref `ShowAllNames` (default on, GUI 0x10124b33).
     pub show_all_names: bool,
+    /// Char pref `IsOrgNameShownOverHead` (default on, GUI 0x1012447a).
+    show_org_names: bool,
     /// `DisplayCharViewDistance` in metres (default 80, `FUN_1001f964` N3 0x1001f964; docs/chat/dvalue.md): characters farther from the
     /// viewer are not drawn (`n3VisualDynel_t::Run`, N3 0x100196bd: squared distance to the controlled dynel on ground playfields).
     pub char_view_distance: f32,
@@ -848,6 +870,7 @@ impl Default for Dynels {
         Self {
             dir: None,
             worker: None,
+            texture_quality: 3,
             own: 0,
             chars: HashMap::new(),
             props: HashMap::new(),
@@ -868,7 +891,8 @@ impl Default for Dynels {
             models: HashMap::new(),
             asked: HashSet::new(),
             scene_generation: 0,
-            show_all_names: false,
+            show_all_names: true,
+            show_org_names: true,
             char_view_distance: 80.0,
             lens: Lens::default(),
             tags: TagLayer::default(),
@@ -948,6 +972,15 @@ impl Dynels {
 
     pub fn object_position(&self, id: ao_net::msg::Identity) -> Option<[f32; 3]> {
         self.props.get(&(id.kind, id.instance)).map(|p| p.pos)
+    }
+
+    pub fn texture_quality(&self) -> i32 { self.texture_quality }
+
+    /// Native CAT observer changes the resource family for future loads, not cached models.
+    pub fn set_texture_quality(&mut self, quality: i32) {
+        self.texture_quality = quality;
+        if let Some(store) = &self.nano_store { store.set_other_texture_quality(quality); }
+        if let Some(effects) = &self.effects { effects.set_texture_quality(quality); }
     }
 
     #[cfg(test)]
@@ -1189,6 +1222,23 @@ impl Dynels {
         self.chars.get(&id).is_some_and(|c| matches!(c.special, Special::Die(_)))
     }
 
+    /// Wildlife vicinity queries use Type50000 positions; fly landing accepts
+    /// their dead flag (0x10), never the separate Type51050 corpse props.
+    pub fn life_sensors(&self, own_pos: glam::Vec3, characters: &mut Vec<super::native_life::CharacterSensor>, dead: &mut Vec<glam::Vec3>) {
+        characters.clear();
+        dead.clear();
+        if !self.chars.contains_key(&self.own) {
+            characters.push(super::native_life::CharacterSensor { pos: own_pos, radius: 0.0 });
+        }
+        for (&id, character) in &self.chars {
+            let pos = if id == self.own { own_pos } else { glam::Vec3::from_array(character.pose.pos) };
+            // Radius belongs to the separate danger sphere list; character
+            // proximity is tested against the species' authored query radius.
+            characters.push(super::native_life::CharacterSensor { pos, radius: 0.0 });
+            if matches!(character.special, Special::Die(_)) { dead.push(pos); }
+        }
+    }
+
     /// `CharDie_t` ctor [GC 0x1007b2ba] / `FUN_1005d0d8` case 0x5b [GC 0x1005eada]: the death (`key` = [`canim::npc_sound::DEATH`]) or hit
     /// (`HIT`) sound of character `id`, `PlayGameSound` at its position (docs/zone/combat-anim.md §6). A character with an NPC record plays a random
     /// value of the record's sound list `key` (`FUN_1004570c`; nothing while the model is not built or the record has no such key), every other
@@ -1329,8 +1379,12 @@ impl Dynels {
         let world = glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(c.scale), glam::Quat::from_rotation_y(scene_yaw(c.pose.yaw)), glam::Vec3::from(scene_pos(c.pose.pos)));
         if anchor==0 {return Some(world);}
         let rig=built.rig.as_ref()?;
-        let layers = c.layers(built);
-        let matrix = if anchor == 3000 { rig.weapon_effect_anchor_composed(if slot == 8 { 2 } else { 1 }, layers) } else { rig.effect_anchor_composed(anchor, layers) };
+        let matrix = if c.current_skin.is_some() {
+            if anchor == 3000 { rig.cached_weapon_effect_anchor(if slot == 8 { 2 } else { 1 }, &c.pose_cache) } else { rig.cached_effect_anchor(anchor, &c.pose_cache) }
+        } else {
+            let layers = c.layers(built);
+            if anchor == 3000 { rig.weapon_effect_anchor_composed(if slot == 8 { 2 } else { 1 }, layers) } else { rig.effect_anchor_composed(anchor, layers) }
+        };
         matrix.map(|matrix| world * glam::Mat4::from_cols_array_2d(&matrix))
     }
 
@@ -1805,8 +1859,8 @@ impl Dynels {
             Look::Corpse(_) => vec![(CAN_STAT, CORPSE_CAN)],
             Look::Char(_) => vec![],
         };
-        self.props.insert((kind, instance), Prop { id, key: look.key(), parent: None, name: None, pos, yaw: rot.map_or(0.0, |q| quat_yaw(&q)), scale, submitted: false, anim: PropAnim::default(), stats });
-        self.pending.push(look);
+        self.props.insert((kind, instance), Prop { id, key: look.key(self.texture_quality), parent: None, name: None, pos, yaw: rot.map_or(0.0, |q| quat_yaw(&q)), scale, submitted: false, anim: PropAnim::default(), stats });
+        self.pending.push((look.key(self.texture_quality), look));
     }
     /// Message stats of the known prop `who` (a corpse's, a `StatIIR_t`'s): they replace earlier values.
     fn set_stats(&mut self, who: ao_net::msg::Identity, new: impl Iterator<Item = (u32, i32)>) {
@@ -1922,6 +1976,18 @@ impl Dynels {
     pub fn effect_camera_offset(&mut self, eye: glam::Vec3) -> anyhow::Result<glam::Vec3> {
         self.effects.as_mut().map_or(Ok(glam::Vec3::ZERO), |effects| effects.camera_offset(eye))
     }
+    /// GC1001698d: an existing dynel gets authored Highlight11507, no replacement art.
+    pub fn flash_head(&mut self, who: u32) -> anyhow::Result<()> {
+        use super::combat::effects::{Binding, Creation, EffectConfig};
+        if who != self.own as u32 && !self.chars.contains_key(&(who as i32)) { return Ok(()); }
+        let Some(renderer) = &mut self.effects else { return Ok(()); };
+        renderer.spawn_configured(
+            Binding { group: 0, attractor: 0, effect: 0x2cf3, note: 0, color: 0 },
+            glam::Mat4::IDENTITY, glam::Vec3::ZERO,
+            EffectConfig { creation: Creation::Dynel, source_identity: Some((CHAR_KIND as u32, who)), ..Default::default() },
+        ).map(|_| ())
+    }
+
     /// GUI world feedback creates the authored Font control on the real dynel.
     pub fn floating_text(&mut self, who:i32, text:&str, color:u32, mut own_anchor:impl FnMut(i32)->Option<glam::Mat4>) -> anyhow::Result<()> {
         use anyhow::Context;
@@ -2059,7 +2125,7 @@ impl Dynels {
                 if let Some(c) = self.chars.get_mut(&who.instance) {
                     if let Look::Char(l) = &mut c.look {
                         l.apply_appearance(a);
-                        let key = c.look.key();
+                        let key = c.look.key(self.texture_quality);
                         c.next = Some(key).filter(|&k| k != c.key);
                     }
                     c.visual_flags = i32::from(a.visual_flags);
@@ -2095,7 +2161,7 @@ impl Dynels {
             N3::Dynel(Dynel::SimpleCharFullUpdate(u)) => {
                 let look = CharLook::from_update(u);
                 let look = Look::Char(look);
-                let key = look.key();
+                let key = look.key(self.texture_quality);
                 let yaw = u.yaw().unwrap_or(0.0);
                 let mut mover = Mover::new(u.pos, yaw);
                 mover.set_body_scale(if u.monster_scale == 0 { 1.0 } else { u.monster_scale as f32 / 100.0 });
@@ -2140,6 +2206,9 @@ impl Dynels {
                         parts: vec![],
                         features_set: !u.is_npc(),
                         bounds: None,
+                        current_skin: None,
+                        cadence: Default::default(),
+                        pose_cache: Default::default(),
                         roll: Roll::default(),
                         next: None,
                         note_fired: 0,
@@ -2359,14 +2428,13 @@ impl Dynels {
         let own = self.own;
         for (id, c) in &self.chars {
             if *id != own && !self.asked.contains(&c.next.unwrap_or(c.key)) {
-                self.pending.push(c.look.clone());
+                self.pending.push((c.next.unwrap_or(c.key), c.look.clone()));
             }
         }
-        for look in std::mem::take(&mut self.pending) {
-            let key = look.key();
+        for (key, look) in std::mem::take(&mut self.pending) {
             if self.asked.insert(key) {
                 self.models.insert(key, Model::Loading);
-                let _ = worker.tx.send(Req::Model { key, look });
+                let _ = worker.tx.send(Req::Model { key, look, texture_quality: (key & 3) as i32 });
             }
         }
         for (&(kind, instance), p) in &mut self.props {
@@ -2396,7 +2464,7 @@ impl Dynels {
             let skin = built.held.as_ref().filter(|_| !p.submitted).map(|h| h.0.clone()).or(moved);
             p.submitted = true;
             let parts = built.held.as_ref().map_or(vec![], |h| h.1.clone());
-            let actor = ActorFrame { id: p.id, model: p.key, transform, parts, part_attractors: built.rig.as_ref().map_or_else(Vec::new, |rig| rig.part_attractors()), skin, always: false, alpha: 1.0, ..Default::default() };
+            let actor = ActorFrame { id: p.id, model: p.key, transform, parts, part_attractors: built.rig.as_ref().map_or_else(Vec::new, |rig| rig.part_attractors()), skin: skin.map(Arc::new), always: false, alpha: 1.0, ..Default::default() };
             if let Some(effects) = &mut self.effects {
                 let identity = (kind as u32, instance as u32);
                 if effects.needs_source_mesh(identity) { effects.prepare_source_mesh(identity, &built.model, &actor); }
@@ -2411,7 +2479,11 @@ impl Dynels {
             let id_ref = id;
             if let Some(k) = c.next {
                 match self.models.get(&k) {
-                    Some(Model::Ready { .. }) => (c.key, c.next) = (k, None),
+                    Some(Model::Ready { .. }) => {
+                        (c.key, c.next) = (k, None);
+                        c.current_skin = None;
+                        c.cadence = Default::default();
+                    }
                     Some(Model::Failed) => c.next = None,
                     _ => {}
                 }
@@ -2520,16 +2592,19 @@ impl Dynels {
             if let Some(a) = clip.filter(|a| matches!(c.special, Special::None | Special::Cast(_)) && a.duration > 0.0 && c.clip_ms > 4.0 * a.duration) {
                 c.clip_ms = super::avatar::clip_time(a, c.clip_ms, false);
             }
-            // DS 0x10074bb4 samples the CAT clock each frame, not a distance-selected Hz.
+            let sample_pose = c.cadence.sample(host.smooth_animations, dist * dist, rig.bounding_radius, host.previous_visible_actors.contains(&(*id as u32)));
             if dist > self.char_view_distance {
                 c.submitted = false;
                 continue;
             }
             let terminal = dead && clip.is_some_and(|a| c.clip_ms >= a.duration);
             let needs_effect_pose = self.effects.as_ref().is_some_and(|effects| effects.needs_source_pose((CHAR_KIND as u32, *id as u32)));
-            let skin = if !terminal || !c.terminal_pose || !c.submitted || needs_effect_pose {
+            let skin = if c.current_skin.is_none() || (sample_pose && (!terminal || !c.terminal_pose || !c.submitted || needs_effect_pose)) {
                 c.terminal_pose = terminal;
-                Some(rig.pose_composed(c.layers(built)))
+                let mut cache = std::mem::take(&mut c.pose_cache);
+                let pose = rig.pose_composed_cached(c.layers(built), &mut cache);
+                c.pose_cache = cache;
+                Some(pose)
             } else {
                 None
             };
@@ -2537,7 +2612,9 @@ impl Dynels {
             let skin = skin.map(|(v, parts)| {
                 c.parts = parts;
                 c.bounds = super::hud_pick::bounds_of(v.iter().map(|x| &x.pos));
-                v
+                let vertices = Arc::new(v);
+                c.current_skin = Some(Arc::clone(&vertices));
+                vertices
             });
             let (s, cs) = scene_yaw(c.pose.yaw).sin_cos();
             let k = c.scale;
@@ -2552,6 +2629,18 @@ impl Dynels {
         self.refresh_effect_anchors(own_anchor);
         if let Some(effects) = &mut self.effects { effects.frame(dt, host, collision); }
         self.worker = Some(worker);
+    }
+
+    pub fn set_shadows(&mut self, enabled: bool) {
+        if let Some(effects) = &mut self.effects {
+            effects.set_shadows(enabled);
+        }
+    }
+
+    pub fn set_name_prefs(&mut self, values: &super::dvalue::DValues) {
+        use super::dvalue::Kind;
+        self.show_all_names = values.prefs.get_int("ShowAllNames", Kind::Login).unwrap_or(1) != 0;
+        self.show_org_names = values.prefs.get_int("IsOrgNameShownOverHead", Kind::Char).unwrap_or(1) != 0;
     }
 
     /// The tag of `id` for `kind` (`FUN_10024e14` text and colours, `FUN_10024d5b` position): the text of [`name_tag`], centred on the head
@@ -2617,8 +2706,16 @@ impl Dynels {
 
     /// Adds the world-space tags of this frame to `host` (docs/zone/motion.md §6, `play/tags.rs`): `own_pos` = the player's scene
     /// position, `indicators` from [`super::tags::indicators`].
-    pub fn name_tags(&mut self, dt: f32, gui: &mut Gui, host: &mut Host, own_pos: [f32; 3], indicators: &[Indicator]) {
-        let tags = self.collect_tags(dt, own_pos, indicators);
+    pub fn name_tags(&mut self, dt: f32, gui: &mut Gui, host: &mut Host, own_pos: [f32; 3], indicators: &[Indicator], org_name: impl Fn(i32) -> Option<String>) {
+        let mut tags = self.collect_tags(dt, own_pos, indicators);
+        if self.show_org_names {
+            for tag in &mut tags {
+                if let Some(name) = org_name(tag.id) {
+                    let side = self.chars.get(&tag.id).map_or(0, |c| i32::from(c.side));
+                    tag.org = Some((name, ao_net::n3::nametag::org_color(side)));
+                }
+            }
+        }
         self.tags.frame(gui, host, &tags);
     }
 
@@ -2630,6 +2727,17 @@ impl Dynels {
             .filter(|(id, _)| **id != own)
             .filter_map(|(id, c)| Some(super::hud_pick::PickBody { id: *id, bounds: c.bounds?, pos: scene_pos(c.pose.pos), yaw: scene_yaw(c.pose.yaw), scale: c.scale }))
             .collect()
+    }
+
+    /// False BoundingBoxTargeting uses the same composed body pose as the actor renderer.
+    pub fn pick_character_hit(&self, body: &super::hud_pick::PickBody, ray: &super::hud_target::Ray, bounding_box: bool) -> Option<f32> {
+        let distance = body.hit(ray.origin, ray.dir, ray.len)?;
+        if bounding_box { return Some(distance); }
+        let character = self.chars.get(&body.id)?;
+        let Some(Model::Ready { built, .. }) = self.models.get(&character.key) else { return None };
+        let rig = built.rig.as_ref()?;
+        let vertices = character.current_skin.as_ref()?;
+        body.hit_triangles(ray.origin, ray.dir, ray.len, vertices, rig.body_triangles())
     }
 
     /// `(Flags (stat 0), Features (stat 0xe0) of the NPC record)` of `id`: what `InputConfig_t::CheckObjectUnderMouse` reads for the pointer.
@@ -2657,6 +2765,29 @@ fn model_state(world: &Dynels, key: u64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_preferences_follow_independent_stores() {
+        use super::super::dvalue::{DValues, Kind};
+        let mut world = Dynels::default();
+        let mut values = DValues::new(std::path::Path::new(""));
+        world.set_name_prefs(&values);
+        assert!(world.show_all_names && world.show_org_names);
+        values.prefs.set_int("ShowAllNames", 0, Kind::Login);
+        values.prefs.set_int("IsOrgNameShownOverHead", 0, Kind::Char);
+        world.set_name_prefs(&values);
+        assert!(!world.show_all_names && !world.show_org_names);
+        let mut restored = DValues::new(std::path::Path::new(""));
+        restored.prefs.load(&values.prefs.save(Kind::Login), Kind::Login);
+        restored.prefs.load(&values.prefs.save(Kind::Char), Kind::Char);
+        let mut startup = Dynels::default();
+        startup.set_name_prefs(&restored);
+        assert!(!startup.show_all_names && !startup.show_org_names, "both native archives restore before the first name-tag frame");
+        values.prefs.set_int("ShowAllNames", 1, Kind::Login);
+        values.prefs.set_int("IsOrgNameShownOverHead", 1, Kind::Char);
+        world.set_name_prefs(&values);
+        assert!(world.show_all_names && world.show_org_names);
+    }
 
     #[test]
     fn spell_visual_fallback_only_retries_native_null() {
@@ -3149,7 +3280,7 @@ mod tests {
         let mid = [body.pos[0], body.pos[1] + (body.bounds.0[1] + body.bounds.1[1]) * 0.5 * body.scale, body.pos[2]];
         let origin = ao_render::Vec3::new(mid[0] + 4.0, mid[1] + 0.5, mid[2] + 4.0);
         let toward = (ao_render::Vec3::new(mid[0], mid[1], mid[2]) - origin).normalize();
-        let hit = crate::play::interact_use::pick_objects(&crate::play::hud_target::Ray { origin, dir: toward, len: 100.0 }, &z);
+        let hit = crate::play::interact_use::pick_objects(&crate::play::hud_target::Ray { origin, dir: toward, len: 100.0 }, &z, None);
         // A ray aimed at a corpse can enter a captured character first (23557:
         // 50000:1026268 before 51050:5628). N3 0x1000fc8d -> 0x1000f8e5
         // sorts collision distance, not the identity whose centre we aimed at.
@@ -3637,7 +3768,7 @@ mod variant_tests {
         }
     }
 
-    /// `AppearanceUpdateIIR_c::Activate` [GC 0x10071679] on a look: cloth by part (page 0 only; texture 0 clears, unnamed parts stay), the
+    /// `AppearanceUpdateIIR_c::Activate` [GC 0x10071679] on a look: cloth by page and part (texture 0 clears, unnamed parts stay), the
     /// attractor list replaces the old one wholesale (an empty list unmounts the head too), `SET_DYNEL_800` no longer skips it.
     #[test]
     fn appearance_update_edits_the_look() {
@@ -3646,11 +3777,11 @@ mod variant_tests {
         let cl = |id, b, c| ClothData { id, b, c, ..Default::default() };
         let mut a = AppearanceUpdate { cloth: vec![cl(1, 0, 0), cl(2, 77, 0), cl(3, 9, 1)], attractors: vec![Attractor { a: 1, b: 0x3ddf, c: 0, d: 2 }, Attractor { a: 0, b: 7, c: 0, d: 4 }], visual_flags: 0x1f, extra: 0 };
         l.apply_appearance(&a);
-        assert_eq!((l.cloth.as_slice(), l.attractors.as_slice(), l.skip_attractors), (&[(2, 77), (4, 50)][..], &[(1, 0x3ddf), (0, 7)][..], false));
+        assert_eq!((l.cloth.as_slice(), l.attractors.as_slice(), l.skip_attractors), (&[(2, 77), (4, 50), (8, 9)][..], &[(1, 0x3ddf), (0, 7)][..], false));
         a.cloth.clear();
         a.attractors.clear();
         l.apply_appearance(&a);
-        assert_eq!((l.cloth.len(), l.attractors.len()), (2, 0), "no cloth named = unchanged; no attractors = no head, no weapon");
+        assert_eq!((l.cloth.len(), l.attractors.len()), (3, 0), "no cloth named = unchanged; no attractors = no head, no weapon");
     }
 
     /// The captured wear / unwear `AppearanceUpdate`s (zone_wear_rifle_borealis.rec, own character) retargeted to another player of
@@ -3923,7 +4054,25 @@ mod variant_tests {
         assert!(z.world.take_sounds().is_empty(), "unknown dynels are silent");
     }
 
-    /// A captured zone with the selected player's and Beach Leet's models ready: (zone, player, Beach Leet).
+    #[test]
+    fn wildlife_sensors_use_native_characters_and_dead_flags() {
+        let mut zone = Zone::new(25988);
+        for frame in frames(include_str!("../../../../docs/captures/zone_ithaca.rec")) {
+            zone.on_frame(&frame);
+        }
+        let id = *zone.world.chars.iter().find(|(_, c)| c.name == "Beach Leet").unwrap().0;
+        let native_pos = glam::Vec3::from_array(zone.world.chars[&id].pose.pos);
+        zone.world.die(id, 0);
+        let control = glam::Vec3::new(100.0, 20.0, 300.0);
+        let (mut characters, mut dead) = (Vec::new(), Vec::new());
+        zone.world.life_sensors(control, &mut characters, &mut dead);
+        assert!(characters.iter().any(|sensor| sensor.pos == control));
+        assert!(characters.iter().any(|sensor| sensor.pos == native_pos));
+        assert!(dead.contains(&native_pos));
+        assert!(characters.iter().all(|sensor| sensor.radius == 0.0), "danger radii do not come from character bodies");
+    }
+
+    /// A zone with the captured characters and every model built (`start` + frames + update ticks): (zone, a player, a Beach Leet).
     fn fight_zone() -> Option<(Zone, i32, i32)> {
         let dir = client()?;
         let mut z = Zone::new(25988);

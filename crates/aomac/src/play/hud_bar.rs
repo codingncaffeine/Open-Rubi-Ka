@@ -29,7 +29,7 @@ const BAR_H: f32 = 38.0;
 const ICON: f32 = 32.0;
 const ICON_X: f32 = 2.0;
 const ICON_Y: f32 = 3.0;
-/// `MouseButtonHoldDelay` (`LoginPrefs.xml` default 0.3 s, option slider 0.1 .. 2.0 not ported): how long a slot must be held before it is
+/// `MouseButtonHoldDelay` (`LoginPrefs.xml` default 0.3 s): how long a slot must be held before it is
 /// dragged (`FUN_100410a0` starts the `EventTimer_c` at slot +0x340 with it, its timer slot `FUN_1004173a` emits the drag-begin signal).
 const HOLD_DELAY: f32 = 0.3;
 
@@ -85,6 +85,7 @@ struct Drag {
     from: Option<usize>,
     slot: Slot,
     ghost: WindowId,
+    button: MouseButton,
 }
 
 pub(super) struct ShortcutBar {
@@ -95,7 +96,7 @@ pub(super) struct ShortcutBar {
     /// Every row; the entry of the visible row is empty (its slots are in `slots`, see [`Self::set_row`]).
     rows: Vec<[Option<Slot>; SLOTS]>,
     row: usize,
-    /// Left button is down on this slot and has not been held for [`HOLD_DELAY`] (`MultiListView_c::MouseDown` +0x265 / the hold timer).
+    /// A captured slot press; the hold interval and button are sampled when the timer is armed.
     press: Option<Press>,
     drag: Option<Drag>,
     uses: Vec<SlotUse>,
@@ -107,11 +108,17 @@ pub(super) struct ShortcutBar {
     icons: HashMap<u32, Slot>,
     /// DValue `IconTimerText` (`CharPrefs.xml` default true): the recharge seconds are printed over the icon.
     timer_text: bool,
+    pub(super) hold_delay: f32,
+    pub(super) new_mouse: bool,
+    tooltip_key: Option<(usize, u32, u32, bool)>,
+    tooltip_body: String,
 }
 
 struct Press {
     slot: usize,
     held: f32,
+    button: MouseButton,
+    delay: Option<f32>,
 }
 
 /// `window / slot` XML: the painted `bar` canvas under a row of 36 x 38 `slotN` canvases (clicks, tooltips) with a label view
@@ -194,7 +201,7 @@ impl ShortcutBar {
         let (x, y) = (20, 20);
         let store = ao_rdb::RecordStore::open(dir).ok();
         let slots = if n == 0 { first_login(gui, store.as_ref()) } else { Default::default() };
-        let mut bar = ShortcutBar { window, primary: n == 0, slots, rows: vec![Default::default(); ROWS], row: 0, press: None, drag: None, uses: vec![], store, timers: [None; SLOTS], mouse: (0.0, 0.0), icons: HashMap::new(), timer_text: true };
+        let mut bar = ShortcutBar { window, primary: n == 0, slots, rows: vec![Default::default(); ROWS], row: 0, press: None, drag: None, uses: vec![], store, timers: [None; SLOTS], mouse: (0.0, 0.0), icons: HashMap::new(), timer_text: true, hold_delay: HOLD_DELAY, new_mouse: true, tooltip_key: None, tooltip_body: String::new() };
         bar.place(gui, (x, y), screen);
         bar.paint(gui);
         Ok(bar)
@@ -246,8 +253,8 @@ impl ShortcutBar {
         // Native spinner `FUN_100da8eb`: preferred-sized NORMAL (font 5) yellow label, rows 1..9,0.
         gui.set_text(self.window, "page", &((self.row + 1) % ROWS).to_string());
         for (i, s) in self.slots.iter().enumerate() {
-            // short tooltips (`ShortcutShortTooltips` = true in LoginPrefs.xml): the item name. UNRESOLVED: the long form.
-            gui.set_tooltip(self.window, &format!("slot{i}"), s.as_ref().map_or("", |s| s.name.as_str()), "");
+            let body = if self.tooltip_key.is_some_and(|(slot, kind, instance, _)| slot == i && s.as_ref().is_some_and(|s| s.kind == kind && s.instance == instance)) { self.tooltip_body.as_str() } else { "" };
+            gui.set_tooltip(self.window, &format!("slot{i}"), s.as_ref().map_or("", |s| s.name.as_str()), body);
             // `FUN_1003f8e4`: macros show `<font color=yellow>name</font>` (font 7 = SMALL) centred over the macro icon
             gui.set_text(self.window, &format!("label{i}"), s.as_ref().filter(|s| s.kind == KIND_MACRO).map_or("", |s| s.name.as_str()));
             // `FUN_1003eebe`: the remaining seconds (`IconTimerText`) in yellow bold, centred over the icon
@@ -255,8 +262,26 @@ impl ShortcutBar {
         }
     }
 
+    /// GUI `100d77b3` sets description mode to `!ShortcutShortTooltips`; `1004178f` additionally gates it with ItemDescriptionTooltips.
+    pub(super) fn update_tooltip(&mut self, gui: &mut Gui, zone: &super::zone::Zone, stats: &super::hud_stats::HudStats, long: bool) {
+        let key = self.slot_at(gui, self.mouse.0, self.mouse.1).and_then(|i| self.slots[i].as_ref().map(|s| (i, s.kind, s.instance, long)));
+        if key == self.tooltip_key { return; }
+        self.tooltip_key = key;
+        let Some((i, kind, instance, long)) = key else { return };
+        let slot = self.slots[i].as_ref().unwrap();
+        self.tooltip_body = if kind == KIND_MACRO {
+            slot.text.clone()
+        } else if long {
+            stats.tooltip_body(zone, ao_net::msg::Identity { kind: kind as i32, instance: instance as i32 })
+        } else {
+            String::new()
+        };
+        gui.set_tooltip(self.window, &format!("slot{i}"), &slot.name, &self.tooltip_body);
+    }
+
     /// Slot under a screen position.
     fn slot_at(&self, gui: &Gui, x: f32, y: f32) -> Option<usize> {
+        if !gui.window_visible(self.window) { return None; }
         let (px, py) = gui.window_pos(self.window);
         let (lx, ly) = (x - px as f32 - CHROME_W, y - py as f32);
         ((0.0..PITCH * SLOTS as f32).contains(&lx) && (0.0..BAR_H).contains(&ly)).then(|| (lx / PITCH) as usize)
@@ -320,12 +345,12 @@ impl ShortcutBar {
         // the hold: `EndMouseClick`, then the drag-begin signal (which does nothing while the bars are locked)
         if let Some(p) = &mut self.press {
             p.held += dt;
-            if p.held >= HOLD_DELAY {
-                let slot = p.slot;
+            if p.delay.is_some_and(|delay| p.held >= delay) {
+                let (slot, button) = (p.slot, p.button);
                 self.press = None;
                 if !locked {
                     let (x, y) = self.mouse;
-                    self.begin_drag(gui, slot, x, y);
+                    self.begin_drag(gui, slot, x, y, button);
                 }
             }
         }
@@ -359,21 +384,22 @@ impl ShortcutBar {
     /// handler) arms the hold timer for a left press on an item; `MouseUp` 0x10133c28 emits the click only when the release is in the same cell
     /// (and the capture was still held, i.e. the timer had not fired), `FUN_10040a17`: Shift / Ctrl -> the info signal (`FUN_100d765d`, no info
     /// view here: nothing happens), else the **use** signal. Use therefore fires on the release, never on the press; a slot held for
-    /// [`HOLD_DELAY`] starts its drag without moving (see [`Self::update`]); a right press / release does nothing (the right-click signal
-    /// of the item list is not connected by `ShortcutBarView_c`). The drag follows `FUN_100d7ec1` (begin: not when locked), `FUN_100d8047`
+    /// `MouseButtonHoldDelay` starts its drag without moving (see [`Self::update`]); the legacy mode instead arms the timer on a right press.
+    /// In new mode the right-click signal is not connected by `ShortcutBarView_c`. The drag follows `FUN_100d7ec1` (begin: not when locked), `FUN_100d8047`
     /// (drop on a slot of this bar: `MoveItem`) and `FUN_100d76cf` (after the drag ended the item is deleted if it still sits in its
     /// source slot: a drop outside the bar removes the shortcut).
     pub(super) fn input(&mut self, gui: &mut Gui, ev: &InputEvent, list: &SpecialList, mods: ao_gui::Modifiers) {
         match *ev {
-            InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
+            InputEvent::MouseDown { x, y, button: button @ (MouseButton::Left | MouseButton::Right) } => {
                 self.mouse = (x, y);
-                if let Some(d) = self.row_button(gui, x, y) {
+                if let Some(d) = (button == MouseButton::Left).then(|| self.row_button(gui, x, y)).flatten() {
                     // HUD input precedes Gui::input for this same event: arrows page without capturing the window.
                     gui.set_window_move_region(self.window, None);
                     self.set_row(gui, (self.row as isize + d).rem_euclid(ROWS as isize) as usize);
                     return;
                 }
-                self.press = self.slot_at(gui, x, y).filter(|&i| self.slots[i].is_some()).map(|slot| Press { slot, held: 0.0 });
+                let drag_button = if self.new_mouse { MouseButton::Left } else { MouseButton::Right };
+                self.press = self.slot_at(gui, x, y).filter(|&i| self.slots[i].is_some()).map(|slot| Press { slot, held: 0.0, button, delay: (button == drag_button).then_some(self.hold_delay) });
             }
             InputEvent::MouseMove { x, y } => {
                 self.mouse = (x, y);
@@ -381,12 +407,13 @@ impl ShortcutBar {
                     gui.set_window_pos(d.ghost, (x as i32 - ICON as i32 / 2, y as i32 - ICON as i32 / 2));
                 }
             }
-            InputEvent::MouseUp { x, y, button: MouseButton::Left } => {
+            InputEvent::MouseUp { x, y, button: button @ (MouseButton::Left | MouseButton::Right) } => {
+                if self.drag.as_ref().is_some_and(|d| d.button != button) || self.press.as_ref().is_some_and(|p| p.button != button) { return; }
                 if let Some(d) = self.drag.take() {
                     gui.close_window(d.ghost);
                     self.drop(gui, d, x, y);
                 } else if let Some(p) = self.press.take() {
-                    if self.slot_at(gui, x, y) == Some(p.slot) && !(mods.shift || mods.ctrl) {
+                    if button == MouseButton::Left && self.slot_at(gui, x, y) == Some(p.slot) && !(mods.shift || mods.ctrl) {
                         self.activate(p.slot, list);
                     }
                 }
@@ -399,6 +426,7 @@ impl ShortcutBar {
     /// [`Self::paint`]): `-1` = previous row, `+1` = next row. Native arrow handlers (`100dae98..100daec5`) wrap
     /// with `(row + 9) % 10` / `(row + 1) % 10`, then call `100daa9e`.
     fn row_button(&self, gui: &Gui, x: f32, y: f32) -> Option<isize> {
+        if !gui.window_visible(self.window) { return None; }
         let (px, py) = gui.window_pos(self.window);
         let (lx, ly) = (x - px as f32 - RADIO_W - 11.0, y - py as f32);
         let size = |n: &str| gui.gfx_id(n).map_or((0, 0), |g| gui.gfx().size(GfxId(g)));
@@ -450,9 +478,10 @@ impl ShortcutBar {
         true
     }
 
-    fn begin_drag(&mut self, gui: &mut Gui, from: usize, x: f32, y: f32) {
+    fn begin_drag(&mut self, gui: &mut Gui, from: usize, x: f32, y: f32, button: MouseButton) {
         let Some(slot) = self.slots[from].clone() else { return };
         self.start_drag(gui, Some(from), slot, x, y);
+        if let Some(d) = &mut self.drag { d.button = button; }
     }
 
     /// Learned nano signal (`FUN_100d7999`): active bar, first free cell across all rows.
@@ -484,7 +513,7 @@ impl ShortcutBar {
         if let Some((g, w, h)) = slot.icon {
             gui.set_canvas(ghost, "icon", vec![CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [0.0, 0.0, ICON, ICON], alpha: 1.0 }]);
         }
-        self.drag = Some(Drag { from, slot, ghost });
+        self.drag = Some(Drag { from, slot, ghost, button: MouseButton::Left });
     }
 
     /// `FUN_100d8047` / `FUN_100d76cf`. UNRESOLVED: dropping on an occupied slot, the original moves the item and starts a new drag
@@ -533,6 +562,65 @@ pub(super) fn default_count(dvalues: &super::dvalue::DValues) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_hold_uses_the_configured_delay() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut bar = ShortcutBar::new(&mut gui, &dir, 0, (1280, 800)).unwrap();
+        let list = SpecialList::new();
+        bar.hold_delay = 1.0;
+        bar.press = Some(Press { slot: 0, held: 0.0, button: MouseButton::Left, delay: Some(bar.hold_delay) });
+        bar.update(&mut gui, 0.5, &list, &[], false, (true, true));
+        assert!(bar.press.is_some() && bar.drag.is_none());
+        bar.hold_delay = 0.1; // An already running native timer keeps the interval captured on press.
+        bar.update(&mut gui, 0.5, &list, &[], false, (true, true));
+        assert!(bar.press.is_none() && bar.drag.is_some());
+    }
+
+    #[test]
+    fn legacy_mouse_moves_hold_drag_to_the_right_button() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut bar = ShortcutBar::new(&mut gui, &dir, 0, (1280, 800)).unwrap();
+        let list = SpecialList::new();
+        let (x, y) = gui.window_pos(bar.window);
+        let (x, y) = (x as f32 + CHROME_W + 10.0, y as f32 + 10.0);
+        bar.new_mouse = false;
+        bar.input(&mut gui, &InputEvent::MouseDown { x, y, button: MouseButton::Left }, &list, Default::default());
+        bar.update(&mut gui, 1.0, &list, &[], false, (true, true));
+        assert!(bar.drag.is_none());
+        bar.input(&mut gui, &InputEvent::MouseUp { x, y, button: MouseButton::Left }, &list, Default::default());
+        bar.input(&mut gui, &InputEvent::MouseDown { x, y, button: MouseButton::Right }, &list, Default::default());
+        bar.update(&mut gui, 1.0, &list, &[], false, (true, true));
+        assert!(bar.drag.is_some());
+        bar.input(&mut gui, &InputEvent::MouseUp { x, y, button: MouseButton::Left }, &list, Default::default());
+        assert!(bar.drag.is_some(), "other button release does not end the captured drag");
+        bar.input(&mut gui, &InputEvent::MouseUp { x, y, button: MouseButton::Right }, &list, Default::default());
+        assert!(bar.drag.is_none());
+    }
+
+    #[test]
+    fn long_shortcut_tooltips_share_the_item_info_formatter() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut bar = ShortcutBar::new(&mut gui, &dir, 0, (1280, 800)).unwrap();
+        let stats = super::super::hud_stats::HudStats::new(&dir, (1280, 800)).unwrap();
+        let zone = super::super::zone::Zone::default();
+        let (x, y) = gui.window_pos(bar.window);
+        bar.mouse = (x as f32 + CHROME_W + 10.0, y as f32 + 10.0);
+        bar.update_tooltip(&mut gui, &zone, &stats, false);
+        assert!(bar.tooltip_body.is_empty());
+        bar.update_tooltip(&mut gui, &zone, &stats, true);
+        assert!(!bar.tooltip_body.is_empty());
+        bar.paint(&mut gui);
+        assert!(bar.tooltip_key.is_some(), "recharge repaint retains the cached item information");
+        bar.update_tooltip(&mut gui, &zone, &stats, false);
+        assert!(bar.tooltip_body.is_empty());
+    }
 
     #[test]
     fn first_login_layout_and_actions() {

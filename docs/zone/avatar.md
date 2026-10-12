@@ -3,6 +3,10 @@
 Code: `crates/aomac/src/play/avatar.rs` (appearance, clips, `ActorFrame`), `play/zone.rs::{scene_forward, scene_yaw}` (heading).
 Renderer side: `ao_render` actor layer (`ActorFrame`, `Host::actor_models/actors`), `ao_formats::character::actor::ActorRig`.
 
+Native visual-option authority: `N3Msg_EventFeedback` (Gamecode `0x1001cbb4`, event `0x46`) sends action `0xa6` without locally writing stat 673. `AppearanceUpdateIIR_c::Activate` (`0x10071679`) writes that stat and mounts the returned attractor list verbatim; DisplaySystem `CharacterMesh::AddAttractors` (`0x10071d4f`) has no VisualFlags mask. Helmet/shoulder/social choices therefore use the server-selected appearance, not guessed client-side suppression of place 0 (which is also the bare head). The port mirrors the authoritative stat into settings for own and remote updates.
+
+Cloth selection is resolved: Gamecode `0x1004b521` examines pages 2, 1, 0 for each of five parts, taking the first nonzero texture. `0x1004b5ab` uploads that result via `VisualCATMesh_t::SetCATTextures`. Own and remote rigs retain all three pages, so clearing an overlay reveals the lower page rather than losing the underlying outfit.
+
 ## 1. Heading handedness (resolved)
 
 **Server/engine space is the client's left-handed D3D space; a model's rest forward axis is +Z; a dynel's rotation is a unit

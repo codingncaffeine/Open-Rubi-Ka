@@ -487,6 +487,14 @@ Code: `interact_loot.rs`, `interact_use.rs::{watch_objects, use_out}`. Test: `in
 tooltip = item name) when an `Update` for a non-character container with flag != 0 arrives, refreshes it on later `Update`s (flag 0), closes it with its close button / Esc; double click on an item sends
 the move. The title is the corpse's name from `CorpseFullUpdateIIR_t`'s name blob ("Remains of ..."), centred on the screen.
 
+**Owned backpacks [CODE, 2026-10-07]:** the same native inventory-use command 3 and server `InventoryUpdateIIR_t` open the existing type-1 view, not a separate fabricated inventory.
+`N3Msg_IsItemMine` GC `10017707` delegates to `100489be`; real SimpleItem dynels use `10087e68`, which compares the parent and its parent against the controlled character.
+The inventory-only lookup `1002a724` compares the entry's actual dynel identity, not its template id. `Zone::is_item_mine` uses the own protocol inventory membership and one owned-container parent;
+merely caching a world chest/corpse update never grants ownership. GUI `100cdb3a` captures this predicate at `+14c`; `100cc2ca` selects `esc_backpacks` only for owned `c749`, `esc_chests` for external `c749`, `esc_corpses` for `c76a`.
+The preference and ownership are stored when opening; later updates do not re-arm either. Owned item activation follows GUI `100ca1e7`'s UseItem branch; external/bank activation retains MoveItemToInventory.
+Backpack titles resolve the actual carried item's archive name. Regression `real_backpack_archive_opens_owned_view_and_snapshots_escape` decodes installed `1000020:99228` (Small Backpack) and real captured loot contents,
+then checks use-in-place, close/reopen, Esc snapshot and loss of ownership after removal. It is an archive/protocol regression, not a captured live backpack session.
+
 **[UNRESOLVED]:** (a) the order / flag of the live server's answer is now captured (one `InventoryUpdateIIR_t`, flag 1, word 0x70); (b) the window title
 (`String::Format` of `FUN_100cc2ca` was not read; the saved window position `container_position` / `container_id` and `TempContainer_%u.xml` are not stored); (c) the original's
 list / grid mode switch (`InventoryViewMode`) and the scrollbar of the container view; (d) chest (0xC749) items use the same `Chest_t` path (`FUN_1007de99`, kind 0x6b) but were never captured; (e) team loot (`Feedback_TeamLoot*`, "Random Looter" / "Looter" columns of
@@ -653,6 +661,7 @@ An open trade refuses with `Feedback_YouAreAlreadyInATrade` (shop or player trad
 * View XML `ShopBuy`: `PartnerName` (the machine's name: `N3Msg_GetName`, or its parent's), "Shop" + `ShopInventoryDock`, "Bought Items" + `PartnerInventoryDock`, "Credits" + `PartnerCashView` (read-only, "0", green 0x44dd44, `FUN_100e039a`), `AcceptButton`, `DeclineButton`. There is **no** own credits field and no status light in this view (those are `PlayerTrade` / `ShopTrade`).
 * `ShopInventoryDock` (`FUN_100dfeca`): `ItemContainerView_c` `FUN_100cdb3a(msg, mode 1, machine, flags 0xf, 0x15, 6, 0)`: mode 1 = `N3Msg_GetContainerInventoryList(machine)` = the stock; preferred cell counts (1,1)..(1000,1000), horizontal scrollbar off, vertical auto. `PartnerInventoryDock` (`FUN_100e0053`): mode 2 = `N3Msg_TradeGetInventory(machine)` = `FUN_1009991a` (the session's list, the bought items), flags 0xf in shop types (0xb in player trade), preferred counts (1,1)..(1000,1). This caps **preferred height**, not item row count: `SetViewCellCounts` `10132d68` writes preferred-size bounds (and clamps 1000 to 50); `GetClientPreferredSize` `10133255` consumes them. Auto-arranged `GridPosToViewPos` `10132fdb` wraps item index `x` to `(x % viewport_columns, y + x / viewport_columns)`, so bought items wrap and scroll vertically instead of overflowing a horizontal tray.
 * Columns by flags (`FUN_100cdb3a`): Icon (id 0, 16 px), Name (1, 200), Count (2, 30; flag 1), Price (3, 100; flag 4), Quality (4, 100; flag 8); list sorted by Name. Row cells (`FUN_100404a9`, `FUN_100cd4b6`): count = stat 0x19c (0 -> 1), **price = `N3Msg_GetShopItemStat(item, 0x4a)`** (`n3EngineClientAnarchy_t` 0x10017a38: the item's `VendingMachine_t` virtual +0x108; shown empty when 0 or 0x499602d2), quality = level; the tooltip of the price (`FUN_10031562`) is `FormatNumeric(price)` in the text LDB 0x1fa.
+* Long item tooltips follow `ItemDescriptionTooltips` (`GUI 1004178f` → shared full item formatter `100384f3`): shop stock/bought/sold grids and both player-trade grids now compute HTML only for the hovered item when enabled. Shop stock and bought pages retain actual ACG quality and the rendered shop price. Hover identity/template/price/option form the cache key; stationary frames reuse the body, and disabling the option or leaving the grid clears it without repainting item pictures. Regressions: `trade_description_tooltip_is_lazy_and_clears_when_disabled` and `shop_description_tooltip_uses_actual_quality_and_price_and_clears`.
 * Credits (`FUN_100dfbf3`, GlobalSignals `+0xd8`, emitted after every item add / remove): `PartnerCashView` = `FormatNumeric` of the cost of the list (`FUN_10099d56`: sum of price x count over the bought items); the machine's `TradeIIR_t` op 7 sets it directly (`FUN_100672c7` -> `+0xdc` -> `FUN_100dfe5e`).
 * Buttons: Accept (`FUN_100dfd33`) disables itself and sends **`N3Msg_TradeAccept`** (`TradeIIR_t` op 1; the player trade sends `TradeConfirm`); Decline (`FUN_100df810`) = `N3Msg_TradeAbort(true)` (op 2, `a = {0, 1}`); the frame's close button and Esc decline too.
 * Items: a double click on a list item is `FUN_100ca1e7`: with Shift / Ctrl (`View::GetQualifiers() & 0xc`) and a trade view open **`N3Msg_TradeAddItem(own, item)`** (`TradeIIR_t` op 5 `a = own, b = {0x6f, index}`; `N3Msg_TradeAddItem` [GC 0x191f6] treats `kind 0x6f` as a shop item and, before sending, refuses with a credits message when `FUN_100662b7` (cost so far + price - own credits) is positive), otherwise **`MoveItemToInventory(item)`** = `ClientMoveItemToInventoryIIR_t({0x6f, index}, any bag slot 0x6f)` (what the loot window sends for a corpse item, §9; `N3Msg_MoveItemToInventory` [GC 0x10027a30] with the source check `FUN_1004b80a`, whose 0x6f branches were not decoded). A double click on a bought item removes it (`FUN_100df67e` -> `N3Msg_TradeRemoveItem(own, item)`, op 6; [INFERENCE] that the handler is wired to this list).
@@ -713,3 +722,58 @@ Muted offscreen `live_walk` sessions used the shared live lock and credentials o
 * **Verified cash purchase:** Aomacrceg reached and persisted on the ICC vendor platform at `(940,47.02,874.78)`. Antonio's cart (`ruse=50000:1000188,btn=3`) opened the correctly named Cash shop. An initial Tiny Dirk purchase (stock 6, 262 credits) charged Cash `1005 → 743` and exposed the missing TemplateAction/temporary-container transfer (§13.5); its real messages are replayed by both codec and zone inventory tests. After implementing that authoritative transfer, a fresh muted, locked 47.81-second session (`stats,inv,ruse=50000:1000188,btn=3,shopadd=12,shopaccept,wait=2,stats,inv`) bought **Oak Bo** for 262 credits. Before purchase bag slots `0x40..0x45` held six existing items and Cash was 743. Immediately afterwards, without reconnecting, bag slot **`0x46`** contained real template **121565**, QL 1, count 1, inventory identity `{0x68,0x46}`, and Cash was **481**. The tray showed Oak Bo / 262 with Accept enabled; op 1 completed and closed the shop. No speculative SetCash or completion-time stock insertion was used.
   Focused wire evidence for the final delivery is `docs/captures/zone_shop_oak_bo_ithaca.rec` (zone shop/item/credit frames only, login traffic excluded). The earlier Tiny Dirk tray and post-accept offscreen frames were inspected: the real dagger icon and 262-credit cost were visible before acceptance, and the shop disappeared with 743 credits afterwards. Those frames revealed the missing immediate inventory path before its correction; the final Oak Bo inventory result above comes from the production zone state printed in the same live session.
 * **Remaining unrelated live prerequisites:** The nearby Borealis store-door approach stopped 5.7 m away without a transition. Testy was on ICC, offshore at `(1010.4,20.3,663.1)`, not Arrival Hall. No owned pet was demonstrated on the exercised Soldier characters; an Anger Manifestation appeared near another player, but its ownership was not established and it was not used for a pet-command check.
+
+## 15. Tradeskill Kit
+
+`interact_tradeskill.rs` owns the reachable `tradeskill_window` opened by the retail
+`ActionMenu/CommandMenu.xml` Tradeskill Kit entry and the existing chat window command.
+The view is the installed `Views/TradeskillPanel.xml`, not a replacement layout.
+GUI `TradeSkillView_c` constructor `100de9b8` titles it `Tradeskill Kit`, loads
+`TradeSkillViewConfig`, starts the slider at 100 with QL bounds 1..300, and captures
+`esc_tradeskill` at `100df0af`. `FUN_100ddb44` uses float constants
+`101b183c=300.0`, `101b1840=400.0` for the client size.
+The archive uses the existing `WinCfgs` DValue persistence path.
+
+The three native `ItemSlotView` elements become application-painted canvases, retaining
+their XML names and layout. `ItemSlotView_c` XML factory `100309ec` calls `1004235f`;
+initialization `100420f5` loads graphic `0x11d` (`GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED`).
+The installed Graphics.uvgi record is offset **976601**, length **3954**; its PNG IHDR
+is **54x54**, framing a centred 48x48 inventory icon. Inventory names/icons and
+the result template reuse the existing HUD item-information loader.
+
+### 15.1 Authoritative analyzer requests and replies
+
+No recipe is guessed locally. Source/target drops send the retail analyzer requests,
+the server supplies counts, requirements and result template/QL bounds, and Build sends
+the selected QL. All use the existing `CharacterActionIIR_t` codec (flag 0, param 0,
+empty text).
+
+| Direction/action | Payload | Retail evidence |
+|---|---|---|
+| C2S `0xdc` source | `identity_a=0`, `identity_b=item identity` | Gamecode `N3Msg_InsertSourceAnalyzerItem` `10029892` |
+| C2S `0xdd` target | same layout | Gamecode `N3Msg_InsertTargetAnalyzerItem` `10029933` |
+| C2S `0xde` build | `identity_a={0,selected QL}`, `identity_b=0` | Gamecode `N3Msg_BuildAnalyzerItem` `100299d4` |
+| S2C `0xdf` source analysis | `identity_b.instance=count` | GC `1005ec5a→100126eb`, GlobalSignals `+0x1cc`; GUI `100ddf79` |
+| S2C `0xe0` target analysis | `identity_b.instance=count` | GC `1005ec71→1001276a`, signal `+0x1d0`; GUI `100de084` |
+| S2C `0xe1` source-only feedback | no arguments | GC `1005ec88→100127e9`, signal `+0x1dc`; GUI `100ddbee` |
+| S2C `0xe2` required source QL | `identity_b.instance=QL` | GC `1005ec99→10012857`, signal `+0x1e0`; GUI `100ddc3e` |
+| S2C `0xe3` skill requirement | `identity_b={stat,required value}` | GC `1005ecb0→100128d6`, signal `+0x1e4`; GUI `100de18f` |
+| S2C `0xe4` result | `identity_b={min QL,max QL}`, `identity_a={low template,high template}` | GC `1005eccb→10012965`, signal `+0x1e8`; GUI `100de988` |
+
+GUI `100de63e` computes `min + ((max-min+1)*slider)/100`, integer division,
+clamped to max. `100de816` makes the preview from the result templates and selected QL.
+Localized category 10000 keys are `X_Lvl_Y_used_in_Z`, `MaybyUsedAsSource`,
+`X_MustBeLvl_Y_ToCombineWithZZ`, `YouNeedAtLeastSkill`, and `ResultWillBeXY`;
+they use the existing retail LDB formatter and native stat-name table.
+Build is enabled when both inputs are nonzero (`100ddb7e`), not when a locally
+invented recipe predicate passes. Build (`100ddf3e`) clears its input identities
+before clearing the view, avoiding extra empty-input requests. Clear/destruction
+(`100ddd4a`) sends a zero analyzer identity only for each populated input.
+MouseDown `100de34a` (TradeSkillView vtable `101bf504+0x3c`) clears a clicked input;
+clicking the result opens `itemref://low/high/QL` through the existing InfoView.
+
+Regression tests: `analyzer_requests_replies_and_inclusive_quality`,
+`native_panel_escape_capture_and_inventory_drop`. These have been added, not run
+by this worker. Main should run the headless aomac tests and clippy gate.
+Real-window acceptance: **not done (user using Mac)**; no live tradeskill recipe
+or server response was exercised here.

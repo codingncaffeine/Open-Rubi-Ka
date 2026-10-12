@@ -281,7 +281,7 @@ mod tests {
     #[test]
     #[ignore="installed assets and offscreen GPU; set AOMAC_EFFECT_FRAMES"]
     fn retail_legacy_sprite_authored_frames() -> Result<()> {
-        use super::super::{Binding,Creation,Renderer,MODEL_BASE,MESH_MODEL_BASE};
+        use super::super::{Binding,Creation,Renderer,MESH_MODEL_BASE};
         let out=std::env::var_os("AOMAC_EFFECT_FRAMES").ok_or_else(||anyhow::anyhow!("AOMAC_EFFECT_FRAMES required"))?;
         let out=std::path::PathBuf::from(out);std::fs::create_dir_all(&out)?;
         let mut renderer=Renderer::open(&ao_gui::client_dir())?;
@@ -294,7 +294,7 @@ mod tests {
                 host.actors.clear();let mut terrain=|p:Vec3|Some((Vec3::new(p.x,9.0,p.z),Vec3::Y));
                 renderer.frame(1.0/60.0,&mut host,Some(&mut terrain));
                 if [1,6,30,60,120].contains(&frame) {
-                    let mut models:Vec<_>=renderer.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();
+                    let mut models:Vec<_>=renderer.models.iter().map(|(&id,m)| (id,m.scene.clone())).collect();
                     models.extend(renderer.mesh_resources.iter().map(|(&id,m)|(MESH_MODEL_BASE|id as u64,m.as_ref().clone())));
                     ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("legacy_{id}_{frame}.png")),frame as f32/60.0)?;
                 }

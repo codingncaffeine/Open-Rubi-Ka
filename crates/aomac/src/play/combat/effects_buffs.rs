@@ -182,7 +182,7 @@ impl Buff {
     pub(super) fn morph_actor(&self,id:u32,model:u64)->Option<ActorFrame> {
         let Native::Deformer {effect,visual:Some(visual),..}=&self.native else {return None};
         let (vertices,parts)=visual.pose(effect);
-        Some(ActorFrame {id,model,transform:self.source.to_cols_array_2d(),skin:Some(vertices),parts,alpha:effect.morph_alpha(),always:true,..Default::default()})
+        Some(ActorFrame { id,model,transform:self.source.to_cols_array_2d(), skin: Some(std::sync::Arc::new(vertices)), parts,alpha:effect.morph_alpha(),always:true,..Default::default() })
     }
     pub(super) fn set_environment_position(&mut self,position:Vec3) {if let Native::Native301722(n)=&mut self.native {n.set_environment_position(position);}}
     pub(super) fn set_visible(&mut self,visible:bool) {match &mut self.native {Native::Spiral(n)=>n.set_visible(visible),Native::Native301722(n)=>n.set_source_visible(visible),_=>{}}}

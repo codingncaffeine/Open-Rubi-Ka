@@ -151,7 +151,7 @@ fn quad_model(width_px: u32, rgba: Vec<u8>) -> Scene {
     sub.two_sided = true;
     sub.emissive = [1.0; 3];
     let mut scene = Scene::default();
-    scene.textures.insert(key, Texture { width: width_px, height: SPRITE_H as u32, rgba });
+    scene.textures.insert(key, Texture { source: Default::default(), width: width_px, height: SPRITE_H as u32, rgba });
     scene.meshes.push(Mesh { vertices: vertices.to_vec(), submeshes: vec![sub] });
     scene
 }

@@ -30,11 +30,13 @@ pub struct VoiceDesc {
     pub looping: bool,
     /// Pool priority (sbf byte 6 bits 5-6: 0 highest .. 2); `None` = stream voice outside the 13 handle pool.
     pub priority: Option<u8>,
+    /// Player speech uses its own Sandy player-FX volume, not the ordinary FX volume.
+    pub player: bool,
 }
 
 impl VoiceDesc {
     pub fn new(source: Source) -> Self {
-        VoiceDesc { source, gain: 1.0, looping: false, priority: Some(1) }
+        VoiceDesc { source, gain: 1.0, looping: false, priority: Some(1), player: false }
     }
 }
 
@@ -48,6 +50,7 @@ struct Voice {
     gain: f32,
     looping: bool,
     priority: Option<u8>,
+    player: bool,
     /// playback rate factor (`pitch% / 100`, `SE_Update2DSoundPitch`)
     pitch: f32,
     fade: f32,
@@ -69,6 +72,11 @@ pub struct Stats {
 pub struct Mixer {
     pub rate: u32,
     pub master: f32,
+    pub sound_on: bool,
+    pub fx: f32,
+    pub music: f32,
+    pub player: f32,
+    pub(crate) player_prefs: Option<(bool, f32)>,
     /// Gain applied to the device output after the level statistics are taken (0 = muted harness runs that still log voices / RMS).
     pub output: f32,
     voices: Vec<Voice>,
@@ -78,7 +86,7 @@ pub struct Mixer {
 
 impl Mixer {
     pub fn new(rate: u32) -> Self {
-        Mixer { rate, master: 1.0, output: 1.0, voices: Vec::new(), next_id: 1, stats: Arc::default() }
+        Mixer { rate, master: 1.0, sound_on: true, fx: 1.0, music: 1.0, player: 1.0, player_prefs: None, output: 1.0, voices: Vec::new(), next_id: 1, stats: Arc::default() }
     }
 
     pub fn voice_count(&self) -> usize {
@@ -95,6 +103,7 @@ impl Mixer {
     /// priority above 2 never steals). Nothing stealable: not played (id 0). Stream voices (priority `None`) only
     /// have [`MAX_STREAMS`] handles: beyond that nothing is played (id 0), nothing is stolen.
     pub fn play(&mut self, d: VoiceDesc) -> u64 {
+        if !self.sound_on { return 0; }
         match d.priority {
             None if self.voices.iter().filter(|v| v.priority.is_none() && !v.done).count() >= MAX_STREAMS => return 0,
             Some(r) if self.voices.iter().filter(|v| v.priority.is_some() && !v.done).count() >= MAX_VOICES => {
@@ -110,7 +119,7 @@ impl Mixer {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.voices.push(Voice { id, src: d.source, cur: Vec::new(), pos: 0.0, done: false, gain: d.gain, looping: d.looping, priority: d.priority, pitch: 1.0, fade: 1.0, fade_target: 1.0, fade_step: 0.0, stop_at_fade_end: false, last: f32::NAN });
+        self.voices.push(Voice { id, src: d.source, cur: Vec::new(), pos: 0.0, done: false, gain: d.gain, looping: d.looping, priority: d.priority, player: d.player, pitch: 1.0, fade: 1.0, fade_target: 1.0, fade_step: 0.0, stop_at_fade_end: false, last: f32::NAN });
         id
     }
 
@@ -162,6 +171,9 @@ impl Mixer {
         for v in &mut self.voices {
             let g1 = v.gain;
             let g0 = if v.last.is_nan() { g1 } else { v.last };
+            // Apply preferences after authored gain/fades: already-playing samples and old music
+            // streams must follow sliders and mute switches without restarting.
+            let bus = if v.player { self.player } else if v.priority.is_none() { self.music } else { self.fx };
             let (rate, ch) = match &v.src {
                 Source::Sample(p) => (p.rate, p.channels as usize),
                 Source::Stream { rate, channels, .. } => (*rate, *channels as usize),
@@ -172,7 +184,7 @@ impl Mixer {
                     break;
                 }
                 let t = i as f32 / n as f32;
-                let g = (g0 + (g1 - g0) * t) * v.fade;
+                let g = (g0 + (g1 - g0) * t) * v.fade * bus;
                 if v.fade != v.fade_target {
                     v.fade += v.fade_step;
                     if (v.fade_step >= 0.0 && v.fade >= v.fade_target) || (v.fade_step < 0.0 && v.fade <= v.fade_target) {

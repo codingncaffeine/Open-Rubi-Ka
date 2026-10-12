@@ -13,6 +13,8 @@ struct G {
     ambient_g: vec4<f32>,  // device ambient, gamma space
     fog_g: vec4<f32>,      // fog colour, gamma space
     view: mat4x4<f32>,     // world -> camera space (env map texgen)
+    water_dir: vec4<f32>,
+    water_g: vec4<f32>,    // authored WaterLightCurrent, not doubled GroundLightCurrent
 }
 struct Mat {
     color: vec4<f32>,
@@ -82,6 +84,19 @@ fn vs(v: VIn) -> VOut {
     o.dlight = l.dlight;
     o.spec = l.spec;
     o.tint = to_g(mat.color.rgb * select(v.color.rgb, vec3<f32>(1.0), prelit));
+    return o;
+}
+
+@vertex
+fn vs_liquid(v: VIn) -> VOut {
+    var o = vtx(v);
+    // FUN_10059b98(..., mono=1): diffuse is white max(RGB); specular keeps the authored RGB.
+    let intensity = max(max(g.water_g.r, g.water_g.g), g.water_g.b);
+    let l = light_vertex_sun(o.wpos, o.n, mat.emissive.rgb, mat.spec.rgb, mat.spec.w, g.water_dir.xyz, g.water_g, vec3<f32>(intensity));
+    o.light = l.light;
+    o.dlight = l.dlight;
+    o.spec = l.spec;
+    o.tint = to_g(mat.color.rgb * v.color.rgb);
     return o;
 }
 
@@ -193,19 +208,23 @@ fn vertex_lights(p: vec3<f32>, n: vec3<f32>, power: f32) -> array<vec3<f32>, 2> 
 }
 
 fn light_vertex(p: vec3<f32>, n_in: vec3<f32>, emissive: vec3<f32>, specular: vec3<f32>, power: f32) -> Lit {
+    return light_vertex_sun(p, n_in, emissive, specular, power, g.sun_dir.xyz, g.sun_g, g.sun_g.rgb);
+}
+
+fn light_vertex_sun(p: vec3<f32>, n_in: vec3<f32>, emissive: vec3<f32>, specular: vec3<f32>, power: f32, sun_dir: vec3<f32>, sun: vec4<f32>, sun_diffuse: vec3<f32>) -> Lit {
     let nl = length(n_in);
     let n = select(vec3<f32>(0.0, 1.0, 0.0), n_in / nl, nl > 1e-6);
     let dl = vertex_lights(p, n, power);
-    // the sun: a directional light, diffuse = GroundLightCurrent, specular = SpecularLightIntensity * GroundLightCurrent
-    let s = g.sun_dir.xyz;
+    // DisplaySystem temporarily installs the authored WaterLight for liquid passes.
+    let s = sun_dir;
     let sn = dot(n, s);
     var sun_spec = vec3<f32>(0.0);
     if sn > 0.0 && power > 0.0 {
-        sun_spec = g.sun_g.rgb * (g.sun_g.w * pow(max(dot(n, normalize(s + normalize(g.eye.xyz - p))), 0.0), power));
+        sun_spec = sun.rgb * (sun.w * pow(max(dot(n, normalize(s + normalize(g.eye.xyz - p))), 0.0), power));
     }
     var o: Lit;
     o.dlight = dl[0];
-    o.light = min(to_g(emissive) + g.ambient_g.rgb + g.sun_g.rgb * max(sn, 0.0) + dl[0], vec3<f32>(1.0));
+    o.light = min(to_g(emissive) + g.ambient_g.rgb + sun_diffuse * max(sn, 0.0) + dl[0], vec3<f32>(1.0));
     o.spec = min(to_g(specular) * (dl[1] + sun_spec), vec3<f32>(1.0));
     return o;
 }
@@ -318,4 +337,49 @@ fn fs_env(i: VOut) -> @location(0) vec4<f32> {
     let t = textureSample(tex, samp, i.uv);
     let f = clamp((length(g.eye.xyz - i.wpos) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
     return vec4<f32>(mix(srgb_enc(t.rgb), g.fog_g.rgb, f), 1.0);
+}
+
+// N3 10033b97: +668 ADD palette/diffuse then MODULATE tile; +6ec
+// SELECTARG1 tile followed by +770 ZERO/SRCCOLOR palette/diffuse.
+@vertex
+fn vs_ground(v: VIn) -> VOut {
+    var o = vtx(v);
+    let n = normalize(o.n);
+    o.light = clamp(g.sun_g.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + vertex_lights(o.wpos, n, 0.0)[0], vec3<f32>(0.0), vec3<f32>(1.0));
+    o.dlight = clamp(o.light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    o.spec = vec3<f32>(0.0);
+    o.tint = vec3<f32>(1.0);
+    return o;
+}
+fn ground_fog(i: VOut) -> f32 {
+    return clamp((length(g.eye.xyz - i.wpos) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
+}
+fn ground_palette(i: VOut) -> vec3<f32> {
+    return textureSample(holo0, samp, vec2<f32>(i.wpos.x, -i.wpos.z) * mat.wave.xz).rgb;
+}
+fn ground_tile(i: VOut) -> vec3<f32> {
+    let tile = textureSample(tex, samp, i.uv);
+    if tile.a <= 128.0 / 255.0 { discard; }
+    return srgb_enc(tile.rgb);
+}
+@fragment
+fn fs_ground_fused(i: VOut) -> @location(0) vec4<f32> {
+    let light = clamp(i.light + ground_palette(i), vec3<f32>(0.0), vec3<f32>(1.0));
+    let tile = ground_tile(i);
+    return vec4<f32>(mix(tile * light, g.fog_g.rgb, ground_fog(i)), 1.0);
+}
+@fragment
+fn fs_ground_base(i: VOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(mix(ground_tile(i), g.fog_g.rgb, ground_fog(i)), 1.0);
+}
+@fragment
+fn fs_ground_shadow(i: VOut) -> @location(0) vec4<f32> {
+    let light = clamp(i.light + ground_palette(i), vec3<f32>(0.0), vec3<f32>(1.0));
+    // +770 sets FOGCOLOR white so fog tends toward the identity multiplier.
+    return vec4<f32>(mix(light, vec3<f32>(1.0), ground_fog(i)), 1.0);
+}
+@fragment
+fn fs_ground_simple(i: VOut) -> @location(0) vec4<f32> {
+    // +a0c material has white ambient; +a08 has black ambient.
+    return vec4<f32>(mix(ground_tile(i) * i.dlight, g.fog_g.rgb, ground_fog(i)), 1.0);
 }

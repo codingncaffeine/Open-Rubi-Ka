@@ -687,6 +687,138 @@ fn prefs_default_to_the_client_values() {
     assert_eq!(WinPrefs::default().font, ("Verdana".to_string(), "Regular".to_string(), 140));
 }
 
+#[test]
+fn root_chat_options_survive_restart_and_apply_live() {
+    use crate::play::dvalue::{DValues, CAT_MAIN, CAT_LOGIN, CAT_CHAR};
+    let client = ao_gui::client_dir();
+    if !client.join("cd_image/gui").exists() {
+        return;
+    }
+    let mut d = DValues::new(&client);
+    for (key, value) in [("ChatTextShadowOffset", 2), ("ChatShowOGrpInTitleBar", 0), ("ChatShowOGrpInInputBar", 0), ("ChatWarnWhenSpeakingToUnsubGroups", 0), ("ChatPGInviteAction", 0)] {
+        d.set_i64(key, value);
+    }
+    d.set("ChatTextFadeDelay", crate::play::dvalue::Variant::Float(3.0));
+    d.set("ChatTextFadeTime", crate::play::dvalue::Variant::Float(1.0));
+    let expected = WinPrefs::from_dvalues(&d);
+    assert_eq!(expected.shadow_offset, 2);
+    assert_eq!(expected.fade, (3.0, 1.0));
+    assert!(!expected.title_group && !expected.input_group);
+    let mut restored = DValues::new(&client);
+    for cat in [CAT_MAIN, CAT_LOGIN, CAT_CHAR] {
+        assert!(restored.load_config(&d.save_config(cat), cat, false));
+    }
+    assert_eq!(WinPrefs::from_dvalues(&restored), expected);
+    let Some((mut gui, _)) = rig((1280, 800)) else { return };
+    let mut hub = super::super::Chat::new();
+    hub.set_prefs(&mut gui, &mut restored);
+    assert!(!hub.warn_unsub);
+    assert_eq!(hub.invite_action, super::super::social::InviteAction::Decline);
+    restored.set_i64("ChatWarnWhenSpeakingToUnsubGroups", 1);
+    restored.set_i64("ChatPGInviteAction", 2);
+    hub.set_prefs(&mut gui, &mut restored);
+    assert!(hub.warn_unsub);
+    assert_eq!(hub.invite_action, super::super::social::InviteAction::Flash);
+}
+
+#[test]
+fn renamed_document_and_log_frame_round_trip() {
+    let mut c = Cfg::blank("Bob's \"chat\" & <friends>", "Window3");
+    c.default_window = true;
+    c.log_frame = Some([10.0, 20.0, 300.0, 400.0]);
+    c.set = vec![G_VICINITY];
+    assert_eq!(Cfg::parse(&c.to_xml(&|_| "A&B's group".into())), Some(c));
+}
+
+#[test]
+fn native_document_missing_key_defaults() {
+    let cfg = Cfg::parse("<Archive><String name=\"name\" value=\"Chat\"/></Archive>").unwrap();
+    assert!(!cfg.open);
+    assert_eq!(cfg.visual_mode, 0);
+    let defaults = code_defaults();
+    assert!(defaults.iter().all(|c| c.open));
+    assert!(defaults[0].startup && !defaults[0].default_window);
+}
+
+#[test]
+fn chat_configuration_native_private_group_rights() {
+    let Some((mut gui, mut ch)) = rig((1280, 800)) else { return };
+    let mut d = crate::play::dvalue::DValues::new(&ao_gui::client_dir());
+    d.set_i64("chat_group_window", 1);
+    ch.sync_config(&mut gui, &mut d);
+    ch.config_own_id(5);
+    let window = ch.config.window.unwrap();
+    for (owner, operation, expected) in [
+        (5u32, 106, vec![WinOut::DisbandGroup]),
+        (5, 107, vec![]),
+        (6, 106, vec![]),
+        (6, 107, vec![WinOut::LeaveGroup(6)]),
+    ] {
+        let group = 0xe_0000_0000 | u64::from(owner);
+        ch.add_group(group, "Private");
+        ch.event(&mut gui, &Event::ListItemMouse { window, view: "groups".into(), id: group_ident(group), button: 2, clicks: 1, x: 20, y: 20 });
+        assert_eq!(ch.event(&mut gui, &Event::MenuPicked { id: operation << 16 }), expected);
+    }
+    let group = 0xe_0000_0006;
+    ch.remove_group(group);
+    ch.event(&mut gui, &Event::ListItemMouse { window, view: "groups".into(), id: group_ident(group), button: 2, clicks: 1, x: 20, y: 20 });
+    assert!(ch.event(&mut gui, &Event::MenuPicked { id: 107 << 16 }).is_empty());
+    ch.close_all(&mut gui);
+}
+
+#[test]
+fn chat_configuration_native_window_menu_and_live_archive() {
+    let Some((mut gui, mut ch)) = rig((1280, 800)) else { return };
+    let mut d = crate::play::dvalue::DValues::new(&ao_gui::client_dir());
+    d.set_i64("chat_group_window", 1);
+    ch.sync_config(&mut gui, &mut d);
+    let window = ch.config.window.unwrap();
+    let document = ch.wins[0].cfg.window_name.clone();
+    ch.event(&mut gui, &Event::ListSelected { window, view: "windows".into(), id: document.clone(), selected: true });
+    ch.sync_config(&mut gui, &mut d);
+    assert!(matches!(d.get("ChatGroupWindowConfig"), Some(crate::play::dvalue::Variant::Archive(src)) if src.contains(&document)));
+    for expected in [true,false] {
+        ch.event(&mut gui, &Event::ListItemMouse { window, view: "windows".into(), id: document.clone(), button: 2, clicks: 1, x: 20, y: 20 });
+        ch.event(&mut gui, &Event::MenuPicked { id: 103 << 16 });
+        assert_eq!(ch.wins[0].cfg.logged, expected);
+    }
+    ch.event(&mut gui, &Event::ListItemMouse { window, view: "windows".into(), id: document.clone(), button: 2, clicks: 1, x: 20, y: 20 });
+    ch.event(&mut gui, &Event::MenuPicked { id: 101 << 16 });
+    assert!(!ch.wins[0].cfg.open);
+    ch.event(&mut gui, &Event::ListItemMouse { window, view: "windows".into(), id: document, button: 1, clicks: 2, x: 20, y: 20 });
+    assert!(ch.wins[0].cfg.open);
+    ch.close_all(&mut gui);
+}
+
+#[test]
+fn chat_configuration_escape_is_captured_and_archive_restores() {
+    let Some((mut gui, mut ch)) = rig((1280, 800)) else { return };
+    let mut d = crate::play::dvalue::DValues::new(&ao_gui::client_dir());
+    d.set_i64("chat_group_window", 1);
+    d.set_i64("esc_chatconfig", 0);
+    ch.sync_config(&mut gui, &mut d);
+    let first = ch.config.window.unwrap();
+    d.set_i64("esc_chatconfig", 1);
+    ch.event(&mut gui, &Event::Escape { window: first });
+    ch.sync_config(&mut gui, &mut d);
+    assert_eq!(ch.config.window, Some(first));
+    let selected = ch.wins[1].cfg.window_name.clone();
+    ch.event(&mut gui, &Event::ListSelected { window: first, view: "windows".into(), id: selected.clone(), selected: true });
+    ch.event(&mut gui, &Event::CloseRequested { window: first });
+    ch.sync_config(&mut gui, &mut d);
+    assert!(ch.config.window.is_none());
+    let saved = d.save_config(crate::play::dvalue::CAT_CHAR);
+    let mut restored = crate::play::dvalue::DValues::new(&ao_gui::client_dir());
+    restored.load_config(&saved, crate::play::dvalue::CAT_CHAR, false);
+    restored.set_i64("chat_group_window", 1);
+    ch.sync_config(&mut gui, &mut restored);
+    assert_eq!(ch.config.selected, selected);
+    let reopened = ch.config.window.unwrap();
+    ch.event(&mut gui, &Event::Escape { window: reopened });
+    ch.sync_config(&mut gui, &mut restored);
+    assert!(ch.config.window.is_none());
+}
+
 /// Draws a world-like backdrop (sky gradient above a mottled pavement) under the GUI so transparency can be judged.
 fn backdrop(list: &mut ao_gui::DrawList, size: (u32, u32)) {
     use ao_gui::DrawCmd;

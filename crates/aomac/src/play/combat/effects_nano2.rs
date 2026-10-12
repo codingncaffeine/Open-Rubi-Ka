@@ -116,7 +116,7 @@ mod tests {
     #[test]
     #[ignore="installed authored Nano2, source actor rig and offscreen GPU; AOMAC_EFFECT_FRAMES required"]
     fn authored_nano2_actor_frames()->Result<()> {
-        use super::super::{Renderer,Binding,EffectConfig,Creation,MODEL_BASE};
+        use super::super::{Renderer,Binding,EffectConfig,Creation};
         use ao_formats::character::{actor::{ActorAssets,ActorRig,PlayerLook},Breed,Gender,Skin,Equipment};
         let out=std::path::PathBuf::from(std::env::var_os("AOMAC_EFFECT_FRAMES").ok_or_else(||anyhow::anyhow!("AOMAC_EFFECT_FRAMES required"))?);
         std::fs::create_dir_all(&out)?;
@@ -130,7 +130,7 @@ mod tests {
         let handle=r.spawn_configured(Binding {group:0,attractor:0,effect:8012,note:0,color:0},Mat4::from_translation(origin),origin,EffectConfig {source_identity:Some(identity),creation:Creation::Dynel,..Default::default()})?;
         for frame in 1..=60 {
             let (skin,parts)=rig.pose(None);
-            let actor=ao_scene::ActorFrame {id:1,model:1,transform:Mat4::from_translation(origin).to_cols_array_2d(),skin:Some(skin),parts,part_attractors:rig.part_attractors(),..Default::default()};
+            let actor=ao_scene::ActorFrame { id:1,model:1,transform:Mat4::from_translation(origin).to_cols_array_2d(), skin: Some(std::sync::Arc::new(skin)), parts,part_attractors:rig.part_attractors(),..Default::default() };
             r.prepare_source_mesh(identity,rig.model(),&actor);
             r.refresh_anchors(|source,id| {
                 (source==identity).then(||rig.effect_anchor(id,None)).flatten()
@@ -141,7 +141,7 @@ mod tests {
             r.frame(1.0/60.0,&mut host,None);
             if [1,6,12,30,60].contains(&frame) {
                 let mut models=vec![(1,rig.model().clone())];
-                models.extend(r.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())));
+                models.extend(r.models.iter().map(|(&id,m)| (id,m.scene.clone())));
                 ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),(origin+Vec3::Y).to_array(),640,480,&out.join(format!("nano2_8012_{frame}.png")),frame as f32/60.0)?;
             }
         }

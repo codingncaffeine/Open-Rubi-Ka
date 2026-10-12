@@ -15,6 +15,18 @@ impl Zone {
         (inv::BAG_FIRST..inv::BAG_FIRST + inv::BAG_SLOTS).find(|s| !self.inventory.contains_key(s))
     }
 
+    /// GC 10017707 -> 100489be/10087e68: inventory membership, including one
+    /// container parent. A world chest/corpse being cached does not imply ownership.
+    pub(in crate::play) fn is_item_mine(&self, item: Identity) -> bool {
+        if item == Identity::default() { return false; }
+        let carried = |id| self.inventory.values().any(|e| e.id == id || inv::item_identity(e.slot) == id);
+        if carried(item) { return true; }
+        self.containers.iter().any(|(&(kind, instance), (word, entries))| {
+            carried(Identity { kind, instance }) && entries.iter().any(|e|
+                e.id == item || inv::container_item_identity(*word, e.slot) == item)
+        })
+    }
+
     /// Server `CharacterActionIIR_t` 0x70: GC 0x1005d8f1 -> 0x1004a191.
     /// `identity_b.kind > 0` consumes one stack unit; otherwise the whole item is deleted.
     pub(in crate::play) fn delete_inventory_item(&mut self, item: Identity, one: bool) {

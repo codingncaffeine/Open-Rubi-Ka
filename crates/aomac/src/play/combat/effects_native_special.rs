@@ -284,7 +284,7 @@ mod tests {
             let mut vertices = Vec::new();
             effect.render(connector,&mut rng,&mut vertices);
             assert_eq!(vertices.len(),effect.indices.len());
-            let actor = ActorFrame {id:1,model:1,skin:Some(vertices),alpha:1.0,always:true,rendering_effect:5,priority:Some(6),..Default::default()};
+            let actor = ActorFrame { id:1,model:1, skin: Some(std::sync::Arc::new(vertices)), alpha:1.0,always:true,rendering_effect:5,priority:Some(6),..Default::default() };
             ao_render::render_to_png_actors(&Scene::default(),&models,vec![actor],[1.5,1.0,3.0],[0.0,0.0,0.5],640,480,&out.join(format!("90000_{frame:02}.png")),frame as f32/60.0)?;
         }
         assert!(!effect.advance(None,true));

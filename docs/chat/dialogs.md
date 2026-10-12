@@ -19,15 +19,15 @@ Items marked **GUESS** / **UNRESOLVED** are not read from the binary. Table of w
 
 ### 1.2 The window
 
-`InfoView_c` ctor `FUN_100ee972`: base `FUN_10038b47(Rect(), "info_window", "Info", style 5, flags 0)` (the DValue-bound window ctor: the window is
-shown while the DValue is true), view XML `GUIPath/Views/InfoView.xml`, a vertical view: `TextView BrowserView` (font LARGE, flags
+`InfoView_c` ctor `FUN_100ee972`: base `DockableView_c` ctor `FUN_10038b47(Rect(), "info_window", "Info", view flags 5, layout flags 0)`.
+`FUN_10038b47` forwards those last arguments to `View::View`, not `Window::Window`: **5 is not a window style**. The view XML is `GUIPath/Views/InfoView.xml`, a vertical view: `TextView BrowserView` (font LARGE, flags
 `TVF_MULTILINE|TVF_WORD_WRAP|TVF_ACCEPT_MOUSE_INPUT|TVF_ALLOW_TEXT_SELECTION`, no h-scrollbar, v-scrollbar AUTO, borders 3, `use_macros="true"`)
 over a row `HLayoutSpacer, Button "#Back" BackButton, Button "#Forward" ForwardButton` (borders (5,0,5,5) / (0,0,5,5)). Failure to load the XML
 shows a `TextView` "Failed to load GUI definition!". The text renderer gets flag 0x80; BackButton / ForwardButton start **disabled**.
 The client size is `FUN_100eeedb` = `Point(400, 500)` (0x101b1840 / 0x101b172c; used as the client size = **GUESS**, the creation `Rect()` is empty). The saved
 `InfoViewConfig` DValue (CharPrefs.xml archive) is empty on a fresh install. `esc_infoview` (LoginPrefs.xml, default `true`; Options → "InfoView") connects
-Esc to close. Port: `Gui::open_tabbed_window("InfoView", "Info", ...)`. **GUESS**: style 5 is drawn with the style-0 tab frame (`WndBorder` style 5
-is not decoded), and the placement is the screen centre.
+Esc to close. Port: `Gui::open_tabbed_window("InfoView", "Info", ...)`. The native free dock is a style-0 `DockWindow_c`
+(`FUN_1003bdd4`: `Window::Window(..., 0, 0x1000)`), not a style-5 frame. `DockableView_c::LoadConfig` (`FUN_10038c98`) centres its preferred view extent before resolving the saved dock through `FUN_1003a26f`; saved docking can override that initial placement.
 
 ### 1.3 URL handling (`FUN_100ee05c(url, flag)`; flag 1 from `ShowURL`, 0 from link clicks via `FUN_100ee961`)
 
@@ -74,7 +74,44 @@ is not decoded), and the placement is the screen centre.
 
 Requires stat 0x36 (Level) > 3, else nothing happens. `n` = DValue `CurrentTipOfTheDay` (CharPrefs.xml default **-1**); `prev` (case-insensitive, after `Strip`) → `n-1`, anything else → `n+1`; below 0 → **0** (asm 0x100b6ffb);
 no upper wrap (a section past the last gives an empty page). URL = `"file://" + CDPath + "text\" + "TipOfTheDay.html?section=" + n`; `ShowURL`; DValue stored. Port: `ChatAction::TipOfTheDay` →
-`Chat::tip`, level from `zone.stat(0x36)`. The "Tip of the day" popup at login is `TipView.xml`/the tip system (not decoded here; the Options "Show tip of the day" DValue `ShowTipOfTheDay` has no port store).
+`Chat::tip`, level from `zone.stat(0x36)`. This slash-command feature is distinct from the tutorial `TipSystem_t`, whose native event registry is `cd_image/text/tips/TipHeader.xml` and whose enable preference is `IsTipEnabled`.
+
+`TipView_c` (`100568ac`) is a `DockableView_c`, with the same View-flags-5 distinction as InfoView (§1.2), not a style-5 Window.
+Its preferred-size virtual (`vtable +0x80`, `100571bd`) returns Point extents **399 × 299**: floats at `101b1d18` (`43c78000`) and `101b1d1c` (`43958000`).
+The native initial client size is therefore **400 × 300 pixels**, with free style-0 dock outer size **410 × 331**. Existing `Gui::open_tabbed_window` supplies the WINDOW3 outer border and TAB surfaces; the archived `GFX_GUI_DIALOG_HELP_*` surfaces are not selected by this native dock path.
+`ao-gui/tests/frame.rs::native_tip_view_uses_dock_tab_art_and_bounds` covers the original TipView XML, those client/frame dimensions, native corner/tab art bounds and title-strip movement (not executed by this worker).
+
+### 1.6 Tutorial tips and the Help floater
+
+`play/hud_tips.rs` loads the installed TipHeader registry. `TipSystem_t::SlotFrameProcess` (`10053edd`) matches the event plus optional data using `10053251` (case-insensitive exact/prefix/suffix/substring patterns); the disabled-tip identity concatenates the registry event and data. Reachable native producers are listed below. Registry-only Inventory/Skills/Accept names have no executable producer literals in this installed binary and are not synthesized from window opening.
+
+| Native event | Retail producer (GUI.dll) | Runtime source |
+| --- | --- | --- |
+| `AfterMinutesOfPlay` | `10053edd`, minute text | Enabled TipSystem elapsed clock |
+| `OnSelectingPlayer` | `SetTarget 100257b0`, empty data | Accepted changed non-self player selection |
+| `OnSelectingNPC` / `OnSelecting` | `100257b0`, target name | Accepted NPC character / non-character selection |
+| `OnChangeCameraMode` | `10027c9f`, empty data | Accepted first/third-person keyboard toggle |
+| `OnEnteringPlayfield` | `10027d26`, PF name | World-ready installed pfnrmap name; unmapped native GetPFName fallback input unavailable |
+| `OnResurrect` | `10027d47`, empty data | Newly received authoritative resurrection event |
+| `OnReceiveTellMessage` | `1008792e`, empty data | Accepted incoming tell, excluding own echo and ignored non-GM sender |
+| `OnLookatItem` | `100ee05c`, item name | Existing non-shop item identity InfoView consumer; itemref/skill pages do not synthesize it |
+| `OnInvitedToTeam` | `1007a1f6`, empty data | Native invitation-dialog branch, excluding ignored/already-teamed branch |
+| `OnHidingToolbar` | `1006a779`, empty data | Visible shortcut toolbar transition to hidden |
+| `OnReceiveMission` | `SlotGotNewMission 100c69e2`, empty data | Each decoded own-character quest in a `QuestFullUpdateIIR_t` whose trailing new-mission flag is nonzero; unflagged initial lists and empty lists emit nothing |
+
+`Gamecode.dll N3Msg_IsNpc 1001666c` returns true for non-character dynels, NPC `SimpleChar+0x21c`, or character dynel-state flag `0x800000`. The selection bridge preserves full-update flag bit18, mapped by GC `1007846e` / `10044cb5` to that dynel-state flag, independently of the NPC class byte. Other registry events lack executable producer literals in this installed client; their gameplay/server sources must be established before they can be emitted.
+
+Mission signal provenance: GC `QuestFullUpdateIIR_t` constructor `100acaca` installs handler `100aca88`; reader `100aca12` reads the quest list and trailing byte. The handler stores each quest via `10056796`, emitting `GlobalSignals+0x154` only when the byte is nonzero and the owning character has main-dynel byte `+0x140` set (`SetMainDynel 10019f77`, write at `10019fbe`). GUI `InventoryGUIModule_c::SlotInitialize` subscribes `100c69e2` to that signal at `100c7354`; its TipSystem event has null/empty data, not the quest identity or name. `HudMission::on_frame` preserves the own-character gate and returns one empty event per decoded quest. Regressions cover the flagged/unflagged, empty/undecoded list branches, the invitation/refusal/already-teamed/dialog branches, ignored-sender rejection, and toolbar show/hide/already-hidden/no-window branches.
+
+`10056105` creates a `GFX_GUI_NEW_TIP` pending button at `(screen_width-60, screen_height-453)` (doubles `101b1b38`, `101b1b90`) after closing retained enabled history. `TipButtonWindow_c 10055ded` uses asset `0xb2` in all three button states. Callback `10055877` sets `tip_window` true, reopening retained history; listeners `100558bd` / `100558dc` remove the button when the view opens or global tips become disabled. Global disable uses `TipSystem::DisableTips 10053399` confirmation named `DisableTips`, category10000 body `ReallyDisableTips` and buttons `MsgBox_Yes` / `MsgBox_No`; `SlotDisableTipsDlg 10053334` writes false only for response index zero. No, Escape and frame close preserve global enable. These lifecycles are implemented in `hud_tips.rs` with the shared HUD dialog layout.
+
+
+The window uses `Views/TipView.xml`. `TipView_c` constructor `100568ac` samples `esc_tips` at `10056e0e`; changing the option while open does not change that window's Escape behavior. `100562e3` reads the actual `text/tips/<file>`, uses its document title, reveals sections cumulatively and appends `NextSubTip`, `PrevTip`, `NextTip` links. `10056806` consumes those three navigation targets and forwards other URLs to InfoView. `100560d5` toggles the current tip's disabled identity; `100539e3`/`100534d2` load/save character-owned `DisabledTipsMap.xml` entries (`DisabledTip tip_id=...`). The global disable checkbox is read on close (`10056105`). The existing docking controller persists the `tip_window` view through `TipViewConfig`, rather than inventing a separate tips settings store.
+
+`play/hud_help.rs` reproduces the literal **Help** text button created by `HelpButtonWindow_c` (`10071d87`, style 1, flags `0x800`), controlled by Login DValue `ShowHelpButtonWindow`. Its place uses character archive `HelpButtonWindowConfig`; closing sets the enable DValue false (`10072064`). Clicking sends retail AFCM `(0xf,0x137)` (`10072169`); its registered consumer `StartHelpLayerMessage` (`1001bd39`) selects static input mode `0x39` and runs `/showfile What 's-This General Help.html`. The actual help document therefore reaches the existing InfoView, not an invented help page or the unrelated `/help` command list.
+
+Regressions: `hud_help::tests::native_help_button_option_click_and_close`, `hud_tips::tests::native_tip_pattern_matching`, `hud_tips::tests::player_tip_uses_native_file_and_samples_escape_at_creation`, `hud_tips::tests::disabled_tip_checkbox_persists_native_identity`, and `hud::tests::accepted_player_selection_opens_authored_tutorial_tip`. No builds/tests/live checks were run by this worker; real-window acceptance is not done.
+
 
 ## 2. DialogBox_c (message / confirmation boxes)
 
@@ -134,7 +171,11 @@ Both after `/afk` already switched AFK on with the default message (cmd.md §`/a
 
 ## 4. Esc
 
-Esc closes the topmost dialog box first (`DialogBox_c::SlotEscPressed`), else the InfoView (`esc_infoview`); otherwise the flow's existing Esc handling runs (`Chat::esc_closes` / `Chat::escape`).
+The native constructors capture ESC preferences when opening, not while their windows remain visible. `DialogBox_c::Go` (GUI 0x1012a3bf) reads `esc_dialogs`; InfoView constructor `100ee972` reads `esc_infoview` at `100eee41`. Both dialog implementations and `InfoView` now retain that captured policy. The frame close button remains independent of ESC. Text input suppresses the global command; InfoView mode suppresses other global ESC actions even when its captured close policy is off. Dialog ESC listeners otherwise share the global broadcast.
+
+The same capture applies to existing interaction windows: `TradeView_c` constructor `100e092f` reads `esc_shops` at `100e0dcb` and `esc_trades` at `100e0dfd`; `NPCChatWindow` constructor `10059e8a` reads `esc_npcchat` at `1005a037`. Container constructor `100cc2ca` reads `esc_backpacks` at `100cca03`, `esc_chests` at `100ccae0`, and `esc_corpses` at `100ccb29`. For identity kind `0xc749`, `ItemContainerView_c`'s owned flag distinguishes backpack from world chest (`100cdb3a` calls `N3Msg_IsItemMine`, retained at `+0x14c`); `0xc76a` uses the corpse option. Bank windows do not subscribe to ESC.
+
+Regressions: `trade_escape_policy_is_captured_at_open`, `shop_escape_policy_is_captured_at_open`, `npc_escape_policy_is_captured_at_open`, `container_escape_policy_is_captured_at_open`, `dialog_escape_policy_is_captured_at_go`, `chat_dialog_escape_policy_is_captured_at_go`, and `info_escape_policy_is_captured_at_open` exercise changing the preference while visible, reopening, and frame-close independence.
 
 ## 5. Gating of GM-only commands (documented, not implemented)
 

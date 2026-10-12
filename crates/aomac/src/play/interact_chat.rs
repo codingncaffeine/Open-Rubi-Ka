@@ -227,6 +227,7 @@ pub fn dock_right(outer: (i32, i32, u32, u32)) -> (i32, i32) {
 
 pub struct NpcChat {
     pub win: WindowId,
+    pub(super) escape: bool,
     pub npc: ao_net::msg::Identity,
     pub name: String,
     pub text: Composer,
@@ -255,7 +256,7 @@ impl NpcChat {
         for (i, (n, ..)) in BAR.iter().enumerate() {
             gui.set_tooltip(bar, n, &texts.tips[i], "");
         }
-        let mut c = NpcChat { win, npc, name: name.to_owned(), text: Composer::default(), answers: vec![], split: SPLIT, drag: None, bar, flags, show_questions: true, docked: None };
+        let mut c = NpcChat { win, escape: false, npc, name: name.to_owned(), text: Composer::default(), answers: vec![], split: SPLIT, drag: None, bar, flags, show_questions: true, docked: None };
         c.set_flags(gui, flags);
         c.paint_splitter(gui);
         c.sync_docks(gui, None);
@@ -392,6 +393,7 @@ impl NpcChat {
             Event::LinkClicked { window, view, href } if *window == self.win && view == "npc_answers" => Some(self.link(gui, href, own)),
             Event::LinkClicked { window, view, href } if *window == self.win && view == "npc_text" => Some(Some(ChatOut::Link(href.clone()))),
             Event::CloseRequested { window } if *window == self.win => Some(Some(ChatOut::Closed)),
+            Event::Escape { window } if *window == self.win && self.escape => Some(Some(ChatOut::Closed)),
             Event::Clicked { window, view, .. } if *window == self.bar => Some(BAR.iter().position(|b| b.0 == view).and_then(|i| self.press(i))),
             Event::CanvasPress { window, view, button: MouseButton::Left, .. } if *window == self.win && view == "npc_split" => {
                 self.drag_start(gui);

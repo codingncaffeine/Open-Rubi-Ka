@@ -54,13 +54,13 @@ impl Gui {
         }
     }
 
-    /// `Button_c::SlotFadeTimer` 0x10127c6d: the fade runs toward 1 while hovered, toward 0 otherwise, 0.075 per tick
-    /// (`_DAT_101c5780`). UNRESOLVED: the timer period (50 Hz assumed).
+    /// `Button_c::MouseMove` 0x10127869 starts a 30000-us timer; `SlotFadeTimer` adds/subtracts 0.075.
     pub(super) fn tick_cc_fades(&mut self, dt: f32) {
-        let step = 0.075 * dt / 0.02;
         for v in &mut self.tree.views {
-            if let Kind::CcEntry(c) = &mut v.kind {
-                c.fade = if c.hover { (c.fade + step).min(1.0) } else { (c.fade - step).max(0.0) };
+            match &mut v.kind {
+                Kind::CcEntry(c) if c.icon.is_some() => tick_icon_fade(&mut c.fade, &mut c.fade_timer, c.hover, dt),
+                Kind::Button(b) if b.background_icon.is_some() => tick_icon_fade(&mut b.background_icon_fade, &mut b.background_icon_timer, b.hover, dt),
+                _ => {}
             }
         }
     }
@@ -72,10 +72,19 @@ impl Gui {
         self.push_gfx(out, l, Rect::new(r.l, r.t, r.l + wl - 1.0, r.b), tint, alpha);
         self.push_gfx(out, rt, Rect::new(r.r - wr + 1.0, r.t, r.r, r.b), tint, alpha);
     }
+    pub(super) fn draw_button_background_icon(&self, out: &mut Vec<DrawCmd>, icon: Option<GfxId>, fade: f32, r: Rect, tint: [u8; 3], alpha: f32) {
+        if let Some(g) = icon {
+            let (w, h) = self.gfx.size(g);
+            let l = r.l + ((r.width() + 1.0 - w as f32) * 0.5).floor();
+            let t = r.t + ((r.height() + 1.0 - h as f32) * 0.5).floor();
+            // UpdateBgIconFade 0x10127bdd; LayoutLabel 0x101278d6: centered, no pressed displacement.
+            let grey = 0x20 + ((1.0 - fade) * 223.0) as u32;
+            self.push_gfx(out, g, Rect::new(l, t, l + w as f32 - 1.0, t + h as f32 - 1.0), mul(tint, [grey as u8; 3]), alpha * BUTTON_ALPHA);
+        }
+    }
 
     /// `Button_c` rendering (`StateChanged` 0x10128338) of a control-centre menu entry: raised/pressed 3-slice art tinted DEFAULT/SELECTED,
-    /// the hover set tinted HOVER on top, the `bgicon` bitmap centred at layer-2 alpha with `Button_c::UpdateBgIconFade` 0x10127bdd tint
-    /// (0x20 grey, full on hover; the ramp of `SlotFadeTimer` is not animated: UNRESOLVED).
+    /// the hover set tinted HOVER on top, and the same centered background icon consumer as ordinary Buttons.
     pub(super) fn draw_cc_entry(&mut self, out: &mut Vec<DrawCmd>, c: &CcEntryData, enabled: bool, r: Rect, tint: [u8; 3], alpha: f32) {
         let tint = mul(tint, if enabled { [255; 3] } else { [0x90; 3] });
         let pressed = c.pressed || (c.toggle && c.active);
@@ -91,14 +100,7 @@ impl Gui {
             let t = mul(tint, self.map_color(0x3000000));
             self.slice3(out, HOVER, r, t, alpha * BUTTON_ALPHA);
         }
-        if let Some(g) = c.icon {
-            let (w, h) = self.gfx.size(g);
-            let l = r.l + ((r.width() + 1.0 - w as f32) * 0.5).floor();
-            let t = r.t + ((r.height() + 1.0 - h as f32) * 0.5).floor();
-            // `UpdateBgIconFade` 0x10127bdd: tint 0x20 + (1 - fade) * 223 (bright at rest, dimmed while the label fades in)
-            let grey = 0x20 + ((1.0 - c.fade) * 223.0) as u32;
-            self.push_gfx(out, g, Rect::new(l, t, l + w as f32 - 1.0, t + h as f32 - 1.0), mul(tint, [grey as u8; 3]), alpha * BUTTON_ALPHA);
-        }
+        self.draw_button_background_icon(out, c.icon, c.fade, r, tint, alpha);
         // the label view is shown iff fade > 0.8 (`_DAT_101c5778`) once an icon exists; label-only entries always show it
         if !c.label.is_empty() && (c.icon.is_none() || c.fade > 0.8) {
             let s = text::string_size(&mut self.fonts, &self.colors, FontId::Normal, &c.label);
@@ -108,5 +110,32 @@ impl Gui {
             let lt = mul(tint, self.map_color(col));
             self.draw_string(out, FontId::Normal, &c.label, lx as i32, ly as i32, lt, alpha, false);
         }
+    }
+}
+
+fn tick_icon_fade(fade: &mut f32, timer: &mut f32, hover: bool, dt: f32) {
+    if (hover && *fade >= 1.0) || (!hover && *fade <= 0.0) {
+        *timer = 0.0;
+        return;
+    }
+    *timer += dt;
+    while *timer >= 0.03 {
+        *timer -= 0.03;
+        *fade = (*fade + if hover { 0.075 } else { -0.075 }).clamp(0.0, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tick_icon_fade;
+    #[test]
+    fn native_background_icon_timer_ticks() {
+        let (mut fade, mut timer) = (0.0, 0.0);
+        tick_icon_fade(&mut fade, &mut timer, true, 0.02);
+        assert_eq!(fade, 0.0);
+        tick_icon_fade(&mut fade, &mut timer, true, 0.011);
+        assert_eq!(fade, 0.075);
+        tick_icon_fade(&mut fade, &mut timer, false, 0.03);
+        assert_eq!(fade, 0.0);
     }
 }

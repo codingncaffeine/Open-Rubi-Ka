@@ -2,7 +2,7 @@
 //!
 //! Opened by the Windows menu entry `optionpanel_window` (`ActionMenu/Windows.xml`, `MenuEntry label="#Setting"`) / `/open Settings` (the dvalue toggles it like
 //! every other window, [`super::hud::WindowKind::Options`]). `ModuleActivated` 0xc2b7a builds `OptionWindow_c` (`FUN_100c3c44`): a style-0 `Window(Rect(200,200,600,400), "", "", 0,
-//! 0x1000)` with the tabs "Preferences" (this file), "Fixed keys" and "Key bindings" (`HotKeys.xml`, not ported: hot key rebinding), configured by the `OptionWindowConfig`
+//! 0x1000)` with the tabs "Preferences" (this file), "Fixed keys" and "Key bindings" ([`keypage`]), configured by the `OptionWindowConfig`
 //! archive (`LoadWndConfig`). The Preferences tab is an `OptionCategoryPanel_c` (`FUN_100c1053`: the category tree and the two buttons `Quit2Windows` / `Quit2Login`) next to a
 //! `ViewSelector_c` holding one page per `ScrollView` of `OptionPanel/Root.xml` (`FUN_100c3691`); every control is bound to its variable ([`model`]).
 
@@ -10,13 +10,15 @@ mod keypage;
 pub(super) mod keys;
 mod live;
 mod model;
+#[cfg(test)]
+mod probe;
 
-pub(super) use live::{audio_prefs, voice_gain};
+pub(super) use live::{audio_prefs, login_audio_prefs};
 
 use super::dvalue::{DValues, Variant};
 use ao_formats::screens::{TextDb, CAT_GUI};
-use ao_gui::view::{CanvasItem, ListItem};
-use ao_gui::{xml, Event, GfxId, Gui, InputEvent, MouseButton, WindowId, WindowSize};
+use ao_gui::view::ListItem;
+use ao_gui::{xml, Event, Gui, InputEvent, MouseButton, WindowId, WindowSize};
 use model::{Ctl, Item, Opt, Page};
 use std::path::Path;
 
@@ -29,12 +31,6 @@ const PAGES: &str = "pages";
 const TABS: &str = "tabs";
 /// Style-0 frame insets (docs/gui.md §6.1): client = outer - (10, 31).
 const CHROME: (u32, u32) = (10, 31);
-/// `Slider_c` art: `GFX_GUI_CONTROLCENTER_AGGDEF_SLIDER_BACKGROUND` (id 0x92) and the knob `..._SLIDER` (0x91, 11 x 18, tinted DEFAULT) -- docs/gui.md §10.
-const SLIDER_BG: &str = "GFX_GUI_CONTROLCENTER_AGGDEF_SLIDER_BACKGROUND";
-const SLIDER_KNOB: &str = "GFX_GUI_CONTROLCENTER_AGGDEF_SLIDER";
-const KNOB_W: f32 = 11.0;
-const KNOB_H: f32 = 18.0;
-const DEFAULT_COLOR: u32 = 0x1000000;
 
 /// What a click on `Quit2Windows` / `Quit2Login` asks of the game: the slots `LAB_100c1027` / `LAB_100c103d` send `AFCM::Send(10, 0x133)` / `Send(10, 0x134)`,
 /// the same messages as the chat commands `/quit` (`StartQuitToSystemMessage` 0x10029a0d) and `/camp` (`StartQuitToLoginMessage` 0x10027c74).
@@ -148,11 +144,11 @@ fn levels(label: &str) -> Vec<(String, String, bool)> {
 /// One bound control: the option and the names of its views in the window.
 struct Bound {
     opt: Opt,
+    #[cfg(test)]
     page: usize,
-    /// `c<i>` check box, `r<i>` radio group, `s<i>` slider canvas (value text `v<i>`).
+    /// `c<i>` check box, `r<i>` radio group, `s<i>` native slider (value text `v<i>`).
     name: String,
     shown: Option<f64>,
-    shown_w: u32,
     enabled: Option<bool>,
 }
 
@@ -163,8 +159,6 @@ struct Win {
     leaves: Vec<String>,
     folders: Vec<String>,
     selected: usize,
-    /// The slider being dragged: control index and the grab offset inside the knob (`Slider_c` +0x170 / +0x174).
-    grab: Option<(usize, f32)>,
     tab: i32,
 }
 
@@ -212,12 +206,9 @@ fn page_xml(page: &Page, idx: usize, n: &mut usize) -> String {
                     Ctl::Slider => {
                         *out += &format!(
                             "<View view_layout=\"vertical\"{}{tip}><View view_layout=\"horizontal\"><TextView value=\"{}\"/><HLayoutSpacer/><TextView name=\"v{i}\" value=\"\"/></View>\
-                             <CanvasView name=\"s{i}\" min_size=\"Point({},{})\" max_size=\"Point(16000,{})\"/></View>",
+                             <Slider name=\"s{i}\" min_size=\"Point(11,17)\" max_size=\"Point(16000,17)\"/></View>",
                             borders(&o.borders),
-                            esc(&o.label),
-                            KNOB_W as i32,
-                            KNOB_H as i32 - 1,
-                            KNOB_H as i32 - 1
+                            esc(&o.label)
                         )
                     }
                     Ctl::Radio(rs) => {
@@ -289,6 +280,9 @@ impl HudOptions {
             K::Perks => "esc_perkwindow",
             K::PlanetMap => "esc_planetmap",
             K::Options => "esc_optionpanel",
+            K::Raid => "esc_raid",
+            K::Research => "esc_research",
+            K::Vehicle => "esc_vehicle",
             _ => return,
         };
         if d.flag(var) && !self.esc.contains(&kind) {
@@ -315,8 +309,12 @@ impl HudOptions {
     }
 
     /// The option observers that run for the whole session ([`live`]): `ToggleAllEffects`, the server-side flags, the visual flags.
-    pub(super) fn apply(&mut self, d: &mut DValues, zone: &mut super::zone::Zone, out: &mut Vec<ao_net::frame::Frame>) {
-        self.live.apply(d, zone, out);
+    pub(super) fn apply(&mut self, d: &mut DValues, zone: &mut super::zone::Zone, out: &mut Vec<ao_net::frame::Frame>) -> Option<String> {
+        if self.live.apply(d, zone, out) {
+            self.texts.by_key(110, "Feedback_CantDoThisWhileFighting")
+        } else {
+            None
+        }
     }
 
     /// `ModuleActivated(true)`: nothing happens while the window exists.
@@ -382,7 +380,7 @@ impl HudOptions {
                     Ctl::Slider => format!("s{}", controls.len()),
                     Ctl::Radio(_) => format!("r{}", controls.len()),
                 };
-                controls.push(Bound { opt: o.clone(), page: pi, name, shown: None, shown_w: 0, enabled: None });
+                controls.push(Bound { opt: o.clone(), #[cfg(test)] page: pi, name, shown: None, enabled: None });
             }
             let lv = levels(&label(p));
             for (lid, text, leaf) in &lv {
@@ -406,7 +404,7 @@ impl HudOptions {
                 }
             }
         }
-        self.win = Some(Win { id, controls, leaves, folders, selected, grab: None, tab: cfg.tab });
+        self.win = Some(Win { id, controls, leaves, folders, selected, tab: cfg.tab });
         if let Some(leaf) = self.win.as_ref().and_then(|w| w.leaves.get(w.selected).cloned()) {
             gui.list_select(id, TREE, &leaf, true, false);
         }
@@ -459,8 +457,7 @@ impl HudOptions {
         let id = w.id;
         self.keypages.sync(gui, d, &self.texts);
         self.keypages.refresh_fixed(gui, &keys::FixedKeys::from_prefs(&d.prefs));
-        let dragging = w.grab.map(|g| g.0);
-        for (i, c) in w.controls.iter_mut().enumerate() {
+        for c in &mut w.controls {
             let on = c.opt.enable.is_empty() || ao_gui::expr::truthy(&c.opt.enable, res);
             if c.enabled != Some(on) {
                 c.enabled = Some(on);
@@ -485,13 +482,12 @@ impl HudOptions {
                     }
                 }
                 Ctl::Slider => {
-                    let width = gui.canvas_size(id, &c.name).0;
-                    if c.shown != Some(v) || c.shown_w != width || dragging == Some(i) {
+                    let (lo, hi) = c.opt.range(d);
+                    gui.set_slider_range(id, &c.name, lo, hi);
+                    gui.set_slider_value(id, &c.name, v);
+                    if c.shown != Some(v) {
                         c.shown = Some(v);
-                        c.shown_w = width;
-                        let (lo, hi) = c.opt.range(d);
                         gui.set_text(id, &format!("v{}", &c.name[1..]), &c.opt.value_text(v));
-                        gui.set_canvas(id, &c.name, slider_items(gui, width as f32, v, lo, hi));
                     }
                 }
             }
@@ -533,6 +529,12 @@ impl HudOptions {
                 }
                 true
             }
+            Event::SliderChanged { window, view, value, .. } if *window == w.id => {
+                if let Some(c) = w.controls.iter().find(|c| c.name == *view && c.opt.ctl == Ctl::Slider) {
+                    c.opt.set_value(d, *value);
+                }
+                true
+            }
             Event::ListSelected { window, view, id, selected: true } if *window == w.id && view == TREE => {
                 if let Some(i) = w.leaves.iter().position(|l| l == id) {
                     w.selected = i;
@@ -544,65 +546,14 @@ impl HudOptions {
         }
     }
 
-    /// `Slider_c::MouseDown` / `MouseMove` / `MouseUp` (docs/gui.md §10 "AGG/DEF slider"): a press inside the knob grabs it, moving sets the value from the
-    /// pointer (`(max - min) * (x - grab - left) / travel + min`, clamped) and every step writes the variable (the slot `FUN_100c08c5` -> `SetValue(v, true)`).
-    pub(super) fn input(&mut self, gui: &mut Gui, d: &mut DValues, ev: &InputEvent) {
-        let Some(w) = self.win.as_mut() else { return };
-        match *ev {
-            // the bind dialog takes the middle button as a key (`FUN_100bc58e`: input 9)
-            InputEvent::MouseDown { button: MouseButton::Middle, .. } if self.keypages.capturing() => self.keypages.capture_mouse(gui, 9),
-            InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
-                let page = w.selected;
-                let viewport = gui.view_rect(w.id, &format!("pg{page}"));
-                for (i, c) in w.controls.iter().enumerate().filter(|(_, c)| c.page == page && c.opt.ctl == Ctl::Slider) {
-                    let Some(r) = gui.view_rect(w.id, &c.name) else { continue };
-                    if !viewport.is_some_and(|p| x >= p.l && x <= p.r && y >= p.t && y <= p.b) {
-                        continue;
-                    }
-                    let (lo, hi) = c.opt.range(d);
-                    let left = r.l + knob_x(c.opt.value(d), lo, hi, gui.canvas_size(w.id, &c.name).0 as f32);
-                    if x >= left && x < left + KNOB_W && y >= r.t && y < r.t + KNOB_H {
-                        w.grab = Some((i, x - left));
-                    }
-                }
-            }
-            InputEvent::MouseMove { x, .. } => {
-                if let Some((i, g)) = w.grab {
-                    let c = &w.controls[i];
-                    if let Some(r) = gui.view_rect(w.id, &c.name) {
-                        let (lo, hi) = c.opt.range(d);
-                        let travel = (gui.canvas_size(w.id, &c.name).0 as f32 - KNOB_W).max(1.0);
-                        let v = (f64::from(x - g - r.l) * (hi - lo) / f64::from(travel) + lo).clamp(lo, hi);
-                        c.opt.set_value(d, v);
-                    }
-                }
-            }
-            InputEvent::MouseUp { button: MouseButton::Left, .. } => w.grab = None,
-            _ => {}
+    /// Binding capture remains raw input; native sliders dispatch through their value signal.
+    pub(super) fn input(&mut self, gui: &mut Gui, _d: &mut DValues, ev: &InputEvent) {
+        if self.win.is_some() && self.keypages.capturing() && matches!(ev, InputEvent::MouseDown { button: MouseButton::Middle, .. }) {
+            self.keypages.capture_mouse(gui, 9);
         }
     }
 }
 
-/// `Slider_c::_Layout` 0x10144141: `floor((v - min) * travel / (max - min))`, `travel` = slider width - knob width.
-fn knob_x(v: f64, lo: f64, hi: f64, width: f32) -> f32 {
-    let travel = f64::from((width - KNOB_W).max(0.0));
-    if hi <= lo { 0.0 } else { ((v - lo) * travel / (hi - lo)).floor() as f32 }
-}
-
-/// The paint of a slider: the background art over the whole width and the knob (`BorderView` bg gfx 0x92, `BitmapView` 0x91 tinted DEFAULT).
-fn slider_items(gui: &Gui, width: f32, v: f64, lo: f64, hi: f64) -> Vec<CanvasItem> {
-    let mut items = vec![];
-    if let Some(g) = gui.gfx_id(SLIDER_BG).map(GfxId) {
-        let (w, h) = gui.gfx().size(g);
-        items.push(CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [0.0, 0.0, width, h as f32], alpha: 1.0 });
-    }
-    if let Some(g) = gui.gfx_id(SLIDER_KNOB).map(GfxId) {
-        let (w, h) = gui.gfx().size(g);
-        let x = knob_x(v, lo, hi, width);
-        items.push(CanvasItem::ImageTint { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [x, 0.0, x + w as f32, h as f32], color: DEFAULT_COLOR, alpha: 1.0 });
-    }
-    items
-}
 
 /// Re-serialises a parsed element (the archive of the template) so [`Config::parse`] can read it.
 fn xml_text(e: &xml::Element) -> String {

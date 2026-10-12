@@ -7,8 +7,8 @@
 //!   `N3Msg_EventFeedback(0x3c, {0,0}, {0, stat with the bit set / cleared})` (`FUN_100bfb7e` / `100bfc3a` / `100bfbdc`), Gamecode 0x1001cbb4: a new value sends a
 //!   `CharacterActionIIR_t` of action `0xa5` (identity b `{0, value}`) and stores it in the stat.
 //! * `VisualFlags` = the whole stat `0x2a1`, `VisiblePVPTitle` = `stat >> 7 & 3`; a change (`FUN_100bfd64` / `FUN_100bfe01`, the title with `stat & !0x180 | (v & 3) << 7`) runs
-//!   `N3Msg_EventFeedback(0x46, ..)`: the same message with action `0xa6` (the one `/rp` sends). The branch "bit 5 changes while fighting -> `Feedback_CantDoThisWhileFighting`, the
-//!   DValue falls back to the stat" is not ported (the fighting state `+0x1d4 + 0x44` of the control dynel is not tracked here).
+//!   `N3Msg_EventFeedback(0x46, ..)`: the same message with action `0xa6` (the one `/rp` sends). Gamecode 0x1001cbb4 refuses a bit-5 change while the fight controller is non-idle or stat 0x19a is nonzero;
+//!   GUI 0x100bfd64 then restores the DValue to the stat.
 //! * `OpenNanoWindow`: while true the slot `FUN_100bfc98` is connected to `GlobalSignals+0x10c` and sets the DValue `nano_window` (opens the Programs window) -- the emitter of that
 //!   signal is UNRESOLVED, see docs.
 
@@ -50,6 +50,7 @@ pub(in crate::play) struct Live {
     effects: Option<bool>,
     flags: Option<i32>,
     visual: Option<i32>,
+    visual_request: Option<i32>,
 }
 
 fn set_bool(d: &mut DValues, name: &str, v: bool) {
@@ -61,8 +62,8 @@ fn set_bool(d: &mut DValues, name: &str, v: bool) {
 }
 
 impl Live {
-    /// Per frame: runs the observers whose value changed since the last call. Frames go to `out`.
-    pub fn apply(&mut self, d: &mut DValues, zone: &mut Zone, out: &mut Vec<Frame>) {
+    /// Per frame: run changed observers, append outgoing frames, and return whether the native social-visual refusal needs feedback.
+    pub fn apply(&mut self, d: &mut DValues, zone: &mut Zone, out: &mut Vec<Frame>) -> bool {
         // ToggleAllEffects
         let all = d.flag("ToggleAllEffects");
         if self.effects.is_some_and(|e| e != all) {
@@ -99,20 +100,28 @@ impl Live {
                 d.set_i64("VisualFlags", i64::from(stat));
                 d.set_i64("VisiblePVPTitle", i64::from(stat >> 7 & 3));
                 self.visual = Some(stat);
+                self.visual_request = None;
             } else {
                 let vf = d.get_i64("VisualFlags").unwrap_or(i64::from(stat)) as i32;
                 let title = d.get_i64("VisiblePVPTitle").unwrap_or(i64::from(stat >> 7 & 3)) as i32;
-                let want = if vf != stat { vf } else { stat & !TITLE_MASK | (title & 3) << 7 };
-                if want != stat {
+                let want = if vf != self.visual_request.unwrap_or(stat) { vf } else { vf & !TITLE_MASK | (title & 3) << 7 };
+                if want != stat && self.visual_request != Some(want) {
+                    if (want ^ stat) & 0x20 != 0 && (zone.fight_target.contains_key(&id) || zone.stat(0x19a).unwrap_or(0) != 0) {
+                        d.set_i64("VisualFlags", i64::from(stat));
+                        self.visual_request = None;
+                        return true;
+                    }
                     out.push(event_feedback(id, 0xa6, want));
-                    zone.stats.insert(STAT_VISUAL_FLAGS, want);
-                    // the DValues follow the stored stat again
                     d.set_i64("VisualFlags", i64::from(want));
                     d.set_i64("VisiblePVPTitle", i64::from(want >> 7 & 3));
-                    self.visual = Some(want);
+                    self.visual_request = Some(want);
+                }
+                if want == stat {
+                    self.visual_request = None;
                 }
             }
         }
+        false
     }
 }
 
@@ -135,27 +144,78 @@ pub fn audio_prefs(d: &DValues) -> ao_audio::Prefs {
         fx: f("FXVolume", 1.0),
         music_on: d.get("MusicOn").is_none_or(|_| d.flag("MusicOn")),
         music: f("MusicVolume", 1.0),
+        voice_on: d.get("VoiceSndFxOn").is_none_or(|_| d.flag("VoiceSndFxOn")),
+        voice: f("VoiceSndFxVolume", 1.0),
         battlemusic_mode: d.get_i64("BattlemusicMode").unwrap_or(3) as i32,
     }
 }
 
-/// `SetMasterPlayerFXMute(!VoiceSndFxOn)` / `SetMasterPlayerFXVolume(VoiceSndFxVolume)` (0x100c487a / 0x100c489b): the gain of the voice sounds
-/// (`/voice`, heard voice messages) -- 0 when muted, also by the master `SoundOnOff`.
-pub fn voice_gain(d: &DValues) -> f32 {
-    let p = audio_prefs(d);
-    let on = p.sound_on && d.get("VoiceSndFxOn").is_none_or(|_| d.flag("VoiceSndFxOn"));
-    match d.get("VoiceSndFxVolume") {
-        _ if !on => 0.0,
-        Some(Variant::Float(v)) => v.clamp(0.0, 1.0),
-        _ => 1.0,
+/// Sound preferences needed before the HUD exists (character selection/creation and
+/// CharacterLoggedInMessage). These are the same Main/Login archives loaded by open_user.
+pub fn login_audio_prefs(client: &std::path::Path, prefs: Option<&std::path::Path>, account: Option<&str>) -> ao_audio::Prefs {
+    use super::super::dvalue::{CAT_LOGIN, CAT_MAIN};
+    let mut d = DValues::new(client);
+    if let Some(root) = prefs {
+        if let Ok(text) = std::fs::read_to_string(root.join("Prefs.xml")) {
+            d.load_config(&text, CAT_MAIN, false);
+        }
+        if let Some(account) = account {
+            if let Ok(text) = std::fs::read_to_string(root.join(account).join("Prefs.xml")) {
+                d.load_config(&text, CAT_LOGIN, false);
+            }
+        }
     }
+    audio_prefs(&d)
 }
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ao_net::n3::action::parse_character_action;
 
+    #[test]
+    fn login_sound_preferences_load_before_a_character_hud_exists() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui/Default/LoginPrefs.xml").exists() { return; }
+        let root = std::env::temp_dir().join(format!("aomac-login-audio-prefs-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("account")).unwrap();
+        std::fs::write(root.join("Prefs.xml"), r#"<Root><Value name="SoundOnOff" value="false"/></Root>"#).unwrap();
+        std::fs::write(root.join("account/Prefs.xml"), r#"<Root><Value name="MasterVolume" value="0.25"/><Value name="MusicOn" value="false"/><Value name="VoiceSndFxVolume" value="0.5"/></Root>"#).unwrap();
+        let p = login_audio_prefs(&client, Some(&root), Some("account"));
+        assert_eq!((p.sound_on, p.master, p.music_on, p.voice), (false, 0.25, false, 0.5));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn every_sound_option_restores_from_its_retail_archive() {
+        use super::super::super::dvalue::{CAT_CHAR, CAT_LOGIN, CAT_MAIN};
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui/Default/LoginPrefs.xml").exists() { return; }
+        let mut d = DValues::new(&client);
+        for key in ["SoundOnOff", "SoundFXOn", "MusicOn", "VoiceSndFxOn",
+            "VoiceSndFxHearVicinityOn", "VoiceSndFxHearTeamOn",
+            "VoiceSndFxHearGuildOn", "VoiceSndFxHearFriendsOn"] {
+            d.set_i64(key, i64::from(!d.flag(key)));
+        }
+        for key in ["MasterVolume", "FXVolume", "MusicVolume", "VoiceSndFxVolume"] {
+            d.set(key, Variant::Float(0.25));
+        }
+        d.set_i64("BattlemusicMode", 1);
+        d.set_i64("VoiceSndFxType", 3);
+        let mut restored = DValues::new(&client);
+        for cat in [CAT_MAIN, CAT_LOGIN, CAT_CHAR] {
+            assert!(restored.load_config(&d.save_config(cat), cat, false));
+        }
+        for key in ["SoundOnOff", "MasterVolume", "SoundFXOn", "FXVolume", "MusicOn",
+            "MusicVolume", "BattlemusicMode", "VoiceSndFxOn", "VoiceSndFxVolume",
+            "VoiceSndFxHearVicinityOn", "VoiceSndFxHearTeamOn", "VoiceSndFxHearGuildOn",
+            "VoiceSndFxHearFriendsOn", "VoiceSndFxType"] {
+            assert_eq!(restored.get(key), d.get(key), "{key}");
+        }
+        let p = audio_prefs(&restored);
+        assert_eq!((p.master, p.fx, p.music, p.voice, p.battlemusic_mode), (0.25, 0.25, 0.25, 0.25, 1));
+    }
     fn store() -> DValues {
         let mut d = DValues::default();
         d.load_config(
@@ -173,6 +233,35 @@ mod tests {
         z.stats.insert(STAT_OPTION_FLAGS, 0b01010);
         z.stats.insert(STAT_VISUAL_FLAGS, 31 | 1 << 7);
         z
+    }
+
+    #[test]
+    fn social_visual_flag_refuses_fighting_and_attack_stat_only() {
+        let mut d = store();
+        let mut z = zone();
+        let mut live = Live::default();
+        let mut out = Vec::new();
+        assert!(!live.apply(&mut d, &mut z, &mut out));
+        let original = z.stat(STAT_VISUAL_FLAGS).unwrap();
+        z.fight_target.insert(77, 88);
+        d.set_i64("VisualFlags", i64::from(original ^ 0x20));
+        assert!(live.apply(&mut d, &mut z, &mut out));
+        assert_eq!(d.get_i64("VisualFlags"), Some(i64::from(original)));
+        assert!(out.is_empty());
+        // Other visual bits remain editable in combat.
+        d.set_i64("VisualFlags", i64::from(original ^ 4));
+        assert!(!live.apply(&mut d, &mut z, &mut out));
+        assert_eq!(out.len(), 1);
+        z.fight_target.clear();
+        z.stats.insert(0x19a, 1);
+        let original = z.stat(STAT_VISUAL_FLAGS).unwrap();
+        d.set_i64("VisualFlags", i64::from(original ^ 0x20));
+        assert!(live.apply(&mut d, &mut z, &mut out));
+        assert_eq!(out.len(), 1);
+        z.stats.insert(0x19a, 0);
+        d.set_i64("VisualFlags", i64::from(original ^ 0x20));
+        assert!(!live.apply(&mut d, &mut z, &mut out));
+        assert_eq!(out.len(), 2);
     }
 
     #[test]
@@ -199,14 +288,17 @@ mod tests {
         live.apply(&mut d, &mut z, &mut out);
         let (_, a) = parse_character_action(&out[1].payload).unwrap();
         assert_eq!((a.action, a.identity_b.instance), (0xa6, (31 | 128) & !4));
-        assert_eq!(z.stat(STAT_VISUAL_FLAGS), Some((31 | 128) & !4));
+        assert_eq!(z.stat(STAT_VISUAL_FLAGS), Some(31 | 128), "visual stats wait for the server echo");
+        live.apply(&mut d, &mut z, &mut out);
+        assert_eq!(out.len(), 2, "unchanged pending visual request is not resent");
         // the PvP title radio replaces bits 7..8 only
         d.set_i64("VisiblePVPTitle", 3);
         live.apply(&mut d, &mut z, &mut out);
         let (_, a) = parse_character_action(&out[2].payload).unwrap();
         assert_eq!(a.identity_b.instance, 31 & !4 | 3 << 7);
-        assert_eq!(d.get_i64("VisualFlags"), Some(i64::from(31 & !4 | 3 << 7)), "the VisualFlags DValue follows the stored stat");
+        assert_eq!(d.get_i64("VisualFlags"), Some(i64::from(31 & !4 | 3 << 7)), "the VisualFlags DValue holds the requested value");
         // a server update wins over the DValues
+        z.stats.insert(STAT_VISUAL_FLAGS, 31 & !4 | 3 << 7);
         z.stats.insert(STAT_OPTION_FLAGS, 0);
         live.apply(&mut d, &mut z, &mut out);
         assert!(!d.flag("DisableXPGain") && !d.flag("AutoTargetPvP"));
@@ -235,8 +327,8 @@ mod tests {
         d.load_config(r#"<Root><Value name="SoundOnOff" value="true"/><Value name="MasterVolume" value="0.5"/><Value name="MusicOn" value="false"/><Value name="BattlemusicMode" value="1"/></Root>"#, super::super::super::dvalue::CAT_LOGIN, true);
         let p = audio_prefs(&d);
         assert_eq!((p.sound_on, p.master, p.music_on, p.fx_on, p.battlemusic_mode), (true, 0.5, false, true, 1));
-        assert_eq!(voice_gain(&d), 0.5);
+        assert_eq!((p.voice_on, p.voice), (true, 0.5));
         d.set_i64("SoundOnOff", 0);
-        assert_eq!(voice_gain(&d), 0.0, "the master switch mutes the voices too");
+        assert!(!audio_prefs(&d).sound_on, "the master switch mutes the voices too");
     }
 }

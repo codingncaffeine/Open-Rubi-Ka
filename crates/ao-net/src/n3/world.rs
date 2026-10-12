@@ -300,7 +300,9 @@ pub struct FullCharacter {
     pub list_18: Vec<i32>,
     /// `this+0x24`: 3-byte records (`FUN_1002cfe5`).
     pub triples_24: Vec<[u8; 3]>,
-    /// `this+0x28/0x2C/0x30`.
+    /// `this+0x28/0x2C/0x30`: skill Locks_t, action locks, third controller locks.
+    /// GC10073a2f transfers group0 to the skill controller; id.instance is Stat_e,
+    /// a is original duration, b remaining second pulses (GC10064495).
     pub groups: [EntryGroup; 3],
     /// `this+0x34` / `this+0x38`: `(stat id, i32 value)`; applied in this order.
     pub stats_a: Vec<(u32, i32)>,
@@ -850,6 +852,23 @@ mod tests {
         assert_eq!(c.stat(17), None, "INVALID does not create a stat");
         assert_eq!(c.stat(18), Some(-1), "compact signed values stay signed");
         assert_eq!(c.stat(19), None);
+    }
+
+    #[test]
+    fn native_skill_lock_snapshot_bytes_are_bounded() {
+        let frame = capture_n3().into_iter().find(|f| N3Header::parse(&f.payload).unwrap().0.msg_type == FULL_CHARACTER).unwrap();
+        let (_, mut reader) = N3Header::parse(&frame.payload).unwrap();
+        let body = take_rest(&mut reader).unwrap();
+        let mut bytes = body[..20].to_vec();
+        bytes.extend(1u32.to_be_bytes());
+        // GC1003bb2d: record version, identity, original and remaining duration.
+        bytes.extend([0,0,0,1, 0,0,0,0, 0,0,2,150, 0,0,0,60, 0,0,0,2]);
+        bytes.extend_from_slice(&body[24..]);
+        let parsed = FullCharacter::read(&mut Reader::new(&bytes)).unwrap();
+        assert_eq!(parsed.groups[0].entries, [GroupEntry { ignored: 1, id: Identity { kind: 0, instance: 662 }, a: 60, b: 2 }]);
+        for end in 20..44 { assert!(FullCharacter::read(&mut Reader::new(&bytes[..end])).is_err()); }
+        bytes[20..24].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(FullCharacter::read(&mut Reader::new(&bytes)).is_err());
     }
 
     #[test]

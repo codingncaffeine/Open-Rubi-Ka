@@ -53,39 +53,25 @@ pub fn parse(r: &mut Rd) -> Result<Vec<Water>> {
     Ok(out)
 }
 
-/// How one liquid type is drawn: `VisualWater_t::Create` (DisplaySystem @0x1003ad24) → `FUN_1003a0d6` @0x1003a0d6 picks the
-/// vertex colour (ARGB, `switch (kind)`, odd kinds are the sloped twin of the even one) and a render style, the style's
-/// draw routine (`FUN_1003f3db` @0x1003f3db calls `FUN_1003b5e9` water, `FUN_1003c356` lava, `FUN_1003bebf` acid,
-/// `FUN_1003d1b9` star water, `FUN_1003b411` shallow water) blends textured triangles with `uv = (x, z) / scale`.
+/// Retained independent lava/star stages.
+/// Water/slime/mud/acid/shallow and native default-kind materials use `native_mesh`.
 struct Liquid {
     /// Vertex colour ARGB bytes (sRGB-ish, as D3D: the alpha is the vertex alpha, the water textures are JPEG).
     argb: u32,
     texture: &'static str,
-    /// Metres per texture repeat (`DAT_100aebe4` 40 water, `DAT_100aebec` 8 lava, `DAT_100aebe8` 12 acid, 4 x 40 shallow).
+    /// Metres per texture repeat (40 star, 8 lava).
     scale: f32,
-    /// uv units per second (`FUN_1003b5e9`: `_DAT_10150174 -= dt * 0.01`, added to u, subtracted from v).
-    scroll: [f32; 2],
 }
 
 const WATER_TEX: &str = "water5.png";
-const SCROLL: [f32; 2] = [-0.01, 0.01];
 
-/// Liquid of `kind` (`None` = the client draws nothing: kinds 16/17). Kinds above 19 (`switch` default: the colour is
-/// whatever the stack holds) are drawn like plain water.
-fn liquid(kind: u32) -> Option<Liquid> {
-    let (argb, texture, scale, scroll) = match kind >> 1 {
-        1 => (0xffff_0000, WATER_TEX, 8.0, [0.0; 2]), // lava (+ crust layer, see `build_mesh`)
-        2 => (0xf21f_3a21, WATER_TEX, 40.0, SCROLL),  // slime
-        3 => (0xf727_fc05, "toxicwater.png", 12.0, [0.0; 2]), // acid
-        4 => (0xed66_3b1b, WATER_TEX, 40.0, SCROLL),  // mud
-        5 => (0x9933_997f, WATER_TEX, 40.0, SCROLL),
-        6 => (0xccc8_e6ff, WATER_TEX, 40.0, SCROLL),
-        7 => (0xffff_ffff, "stars01.png", 40.0, [0.0; 2]), // star water
-        8 => return None,
-        9 => (0x3334_9dfa, WATER_TEX, 160.0, [0.0; 2]), // shallow water
-        _ => (0xcc00_186a, WATER_TEX, 40.0, SCROLL),   // water
+fn legacy_liquid(kind: u32) -> Option<Liquid> {
+    let (argb, texture, scale) = match kind >> 1 {
+        1 => (0xffff_0000, WATER_TEX, 8.0),
+        7 => (0xffff_ffff, "stars01.png", 40.0),
+        _ => return None,
     };
-    Some(Liquid { argb, texture, scale, scroll })
+    Some(Liquid { argb, texture, scale })
 }
 
 /// Crust of the lava: `env_lava2.png` (RGBA, alpha 60..255) blended over the lava with its own alpha; the client multiplies the
@@ -108,23 +94,75 @@ fn texture(store: &RecordStore, names: &NameTable, scene: &mut Scene, name: &str
     Some(key)
 }
 
-/// Adds one translucent mesh holding every liquid polygon (scene space, z negated) to `scene`: one submesh per liquid
-/// kind, textured as the client does (uv in metres / `Liquid::scale`, AO x/z); lava gets a second, crust submesh.
-pub fn emit(store: &RecordStore, waters: &[Water], scene: &mut Scene) {
-    let Ok(names) = NameTable::load(store) else { return };
-    let Some(mesh) = build_mesh(waters, &mut |n| texture(store, &names, scene, n)) else { return };
-    scene.meshes.push(mesh);
-    scene.instances.push(Instance { mesh: scene.meshes.len() - 1, transform: IDENTITY });
+/// Emits the client's five style lists in native draw order. RealisticWater controls
+/// geometry refinement of styles 0/2/4 only; lava and star water keep their independent stages.
+pub fn emit(store: &RecordStore, waters: &[Water], scene: &mut Scene) -> Result<()> {
+    let names = NameTable::load(store)?;
+    for style in [0, 2, 1, 3, 4] {
+        let source: Vec<_> = waters.iter().filter(|w| native_style(w.kind) == Some(style) && !w.tris.is_empty()).collect();
+        if source.is_empty() { continue; }
+        let mesh_index = scene.meshes.len();
+        let mesh = if matches!(style, 0 | 2 | 4) {
+            let scale = if style == 2 { 12.0 } else if style == 4 { 160.0 } else { 40.0 };
+            let triangles = source.iter().flat_map(|w| w.tris.iter().map(|t| ao_scene::liquid::SourceTriangle {
+                kind: w.kind,
+                vertices: t.map(|i| { let p = w.verts[i as usize]; Vertex { pos: [p[0], p[1], -p[2]], uv: [p[0] / scale, p[2] / scale], ..Default::default() } }),
+            })).collect();
+            let surface = ao_scene::liquid::Surface::new(mesh_index, style, triangles).map_err(anyhow::Error::msg)?;
+            let Some(camera) = surface.initial_camera() else { continue };
+            let mesh = native_mesh(&surface, camera, &mut |name| texture(store, &names, scene, name))?;
+            scene.liquids.push(surface);
+            mesh
+        } else {
+            let Some(mesh) = legacy_mesh(source, &mut |name| texture(store, &names, scene, name)) else { continue };
+            mesh
+        };
+        scene.meshes.push(mesh);
+        scene.instances.push(Instance { mesh: mesh_index, transform: IDENTITY });
+    }
+    Ok(())
+}
+
+fn native_style(kind: u32) -> Option<u32> {
+    ao_scene::liquid::style(kind)
+}
+
+fn native_mesh(surface: &ao_scene::liquid::Surface, camera: [f32; 3], tex: &mut dyn FnMut(&str) -> Option<TextureKey>) -> Result<Mesh> {
+    let mut mesh = Mesh::default();
+    let (mut indices, mut colors) = (Vec::new(), Vec::new());
+    surface.geometry(camera, false, &mut mesh.vertices, &mut indices, &mut colors);
+    let name = if surface.style == 2 { "toxicwater.png" } else { WATER_TEX };
+    let key = tex(name).ok_or_else(|| anyhow::anyhow!("missing native liquid texture {name}"))?;
+    let mut sub = Submesh::new(indices, Some(key));
+    sub.liquid = true;
+    sub.two_sided = true;
+    sub.blend = Blend::AlphaBlend;
+    match surface.style {
+        0 => { sub.specular = [0.505f32.powf(2.2); 3]; sub.shininess = 10.0; }
+        2 => sub.emissive = [1.0; 3], // native LIGHTING off: texture × authored vertex colour
+        4 => sub.emissive = [0.2f32, 0.3, 0.4].map(|c| c.powf(2.2)),
+        _ => unreachable!("native_mesh only handles styles 0/2/4"),
+    }
+    if surface.style != 4 {
+        let base = mesh.vertices.len() as u32;
+        mesh.vertices.extend_from_within(..);
+        let mut ripple = sub.clone();
+        ripple.indices.iter_mut().for_each(|i| *i += base);
+        mesh.submeshes.extend([sub, ripple]);
+    } else {
+        mesh.submeshes.push(sub);
+    }
+    Ok(mesh)
 }
 
 /// `tex` resolves a texture name to a scene texture.
-fn build_mesh(waters: &[Water], tex: &mut dyn FnMut(&str) -> Option<TextureKey>) -> Option<Mesh> {
+fn legacy_mesh<'a>(waters: impl IntoIterator<Item = &'a Water>, tex: &mut dyn FnMut(&str) -> Option<TextureKey>) -> Option<Mesh> {
     let mut mesh = Mesh::default();
     let mut crust: Vec<u32> = Vec::new();
     let mut by_kind: Vec<(u32, Vec<u32>)> = Vec::new();
-    for w in waters.iter().filter(|w| !w.tris.is_empty()) {
+    for w in waters.into_iter().filter(|w| !w.tris.is_empty()) {
         let key = (w.kind >> 1).min(10);
-        let Some(l) = liquid(w.kind) else { continue };
+        let Some(l) = legacy_liquid(w.kind) else { continue };
         let base = mesh.vertices.len() as u32;
         mesh.vertices.extend(w.verts.iter().map(|v| Vertex { pos: [v[0], v[1], -v[2]], uv: [v[0] / l.scale, v[2] / l.scale], ..Default::default() }));
         let idx = by_kind.iter().position(|(k, _)| *k == key).unwrap_or_else(|| {
@@ -143,11 +181,10 @@ fn build_mesh(waters: &[Water], tex: &mut dyn FnMut(&str) -> Option<TextureKey>)
         return None;
     }
     for (key, indices) in by_kind {
-        let l = liquid(key << 1).expect("kind drawn above");
+        let l = legacy_liquid(key << 1).expect("kind drawn above");
         let mut s = Submesh::new(indices, tex(l.texture));
         s.two_sided = true;
         s.liquid = true; // `VisualLiquid_t` render list 4
-        s.uv_scroll = l.scroll;
         let c = argb_to_linear(l.argb);
         match key {
             // lava: opaque, unlit red water5 + the crust; `prelit` = unlit in the renderer (vertex colour is white)
@@ -166,10 +203,7 @@ fn build_mesh(waters: &[Water], tex: &mut dyn FnMut(&str) -> Option<TextureKey>)
             }
             // star water: the client projects a star field and mist layers with `ONE, INVSRCCOLOR` [not decoded in detail]
             7 => s.blend = Blend::Additive,
-            _ => {
-                s.blend = Blend::AlphaBlend;
-                s.base_color = c;
-            }
+            _ => unreachable!("legacy_liquid only emits lava or star water"),
         }
         mesh.submeshes.push(s);
     }
@@ -204,7 +238,7 @@ mod tests {
         let w = parse(&mut r).unwrap();
         assert_eq!(r.o, d.len());
         assert_eq!(w, vec![Water { kind: 2, verts: vec![[0.0, 5.0, 0.0], [10.0, 5.0, 0.0], [0.0, 5.0, 10.0]], tris: vec![[0, 1, 2]] }]);
-        let m = build_mesh(&w, &mut |n| Some(TextureKey { rdb_type: TEXTURES, id: n.len() as u32 })).unwrap();
+        let m = legacy_mesh(w.iter(), &mut |n| Some(TextureKey { rdb_type: TEXTURES, id: n.len() as u32 })).unwrap();
         assert_eq!(m.vertices.len(), 6); // 3 lava vertices + 3 crust copies
         assert_eq!(m.vertices[2].pos, [0.0, 5.0, -10.0]); // z negated
         assert_eq!(m.vertices[2].uv, [0.0, 10.0 / 8.0]); // z metres / lava scale
@@ -218,12 +252,60 @@ mod tests {
     }
 
     #[test]
+    fn authored_water_style_has_two_native_layers() {
+        let Some(dir) = std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client")).filter(|dir| dir.join("cd_image/rdb.db").exists()) else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let data = store.get(super::super::RECORD, 566).unwrap().unwrap();
+        let record = super::super::record::parse(&data).unwrap();
+        let waters = parse(&mut Rd::new(&data, record.tail)).unwrap();
+        let mut scene = Scene::default();
+        emit(&store, &waters, &mut scene).unwrap();
+        let surface = scene.liquids.iter().find(|surface| surface.style == 0).expect("Newland authored water");
+        let mesh = &scene.meshes[surface.mesh];
+        assert_eq!(mesh.submeshes.len(), 2, "base and inverse-alpha ripple, not one approximate pass");
+        let count = mesh.vertices.len() / 2;
+        assert_eq!(mesh.submeshes[1].indices, mesh.submeshes[0].indices.iter().map(|i| i + count as u32).collect::<Vec<_>>());
+        for sub in &mesh.submeshes {
+            assert_eq!(sub.base_color, [1.0; 4], "packed source colour must not be tinted twice");
+            assert_eq!(sub.texture, Some(TextureKey { rdb_type: TEXTURES, id: 6329 }));
+            assert_eq!(sub.uv_scroll, [0.0; 2], "native UVs are animated by the liquid stage");
+            assert_eq!(sub.shininess, 10.0);
+            assert_eq!(sub.specular, [0.505f32.powf(2.2); 3]);
+            assert!(sub.liquid && sub.two_sided);
+        }
+        assert!(mesh.vertices[..count].iter().all(|v| v.normal[1] >= 0.0));
+        assert!(mesh.vertices[..count].iter().any(|v| v.color[3] > 0.0 && v.color[3] < 1.0));
+        assert!(scene.liquids.iter().all(|surface| matches!(surface.style, 0 | 2 | 4)), "RealisticWater never owns lava/star geometry");
+    }
+
+    #[test]
+    fn native_default_kinds_have_water_material_and_two_layers() {
+        use ao_scene::liquid::{SourceTriangle, Surface};
+        for kind in [338, 960] {
+            let source = SourceTriangle { kind, vertices: [[0.0,0.0,0.0],[80.0,0.0,0.0],[0.0,0.0,-80.0]].map(|pos| Vertex {pos,uv:[pos[0]/40.0,-pos[2]/40.0],..Default::default()}) };
+            let surface = Surface::new(0, native_style(kind).unwrap(), vec![source]).unwrap();
+            let key = TextureKey { rdb_type: TEXTURES, id: 6329 };
+            let mesh = native_mesh(&surface, surface.initial_camera().unwrap(), &mut |_| Some(key)).unwrap();
+            assert_eq!(mesh.submeshes.len(), 2, "native default kind {kind} must not use the legacy single-pass stage");
+            let count = mesh.vertices.len() / 2;
+            assert_eq!(mesh.submeshes[1].indices, mesh.submeshes[0].indices.iter().map(|index| index + count as u32).collect::<Vec<_>>());
+            for sub in &mesh.submeshes {
+                assert_eq!(sub.texture, Some(key));
+                assert_eq!(sub.shininess, 10.0);
+                assert_eq!(sub.specular, [0.505f32.powf(2.2); 3]);
+                assert!(sub.liquid && sub.two_sided);
+            }
+        }
+    }
+
+    #[test]
     fn kinds_follow_create_switch() {
         assert_eq!(argb_to_linear(0xcc00_186a)[3], 0.8); // water: alpha 0xcc
-        assert!(liquid(16).is_none() && liquid(17).is_none()); // not drawn
-        assert_eq!(liquid(1).unwrap().argb, liquid(0).unwrap().argb); // sloped twin
-        assert_eq!(liquid(338).unwrap().argb, liquid(0).unwrap().argb); // switch default
-        assert_eq!(liquid(7).unwrap().texture, "toxicwater.png");
+        assert!(native_style(16).is_none() && native_style(17).is_none());
+        assert_eq!(native_style(1), native_style(0));
+        assert_eq!(native_style(7), Some(2));
+        assert_eq!(native_style(338), Some(0), "native default style consumes RealisticWater despite allocation-dependent colour");
+        assert_eq!(native_style(960), Some(0));
     }
 
     #[test]

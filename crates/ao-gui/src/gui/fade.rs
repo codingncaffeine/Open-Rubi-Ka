@@ -151,6 +151,13 @@ impl Gui {
         Some(self.tree.views[self.find(w, name)?].alpha)
     }
 
+    /// `View::SetAlpha`, used by native per-message FadingTextView timers.
+    pub fn set_view_alpha(&mut self, w: WindowId, name: &str, alpha: f32) {
+        if let Some(v) = self.find(w, name) {
+            self.tree.views[v].alpha = alpha.clamp(0.0, 1.0);
+        }
+    }
+
     /// `ViewSurface_c::SetAlpha` of the black surface behind the named view (see [`View::backdrop`]).
     pub fn set_backdrop(&mut self, w: WindowId, name: &str, alpha: f32) {
         if let Some(v) = self.find(w, name) {

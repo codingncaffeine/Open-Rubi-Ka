@@ -180,8 +180,6 @@ pub(crate) struct Runtime {
     /// voices whose caller stopped re-triggering: (hold seconds left, voice, fade-out seconds)
     dying: Vec<(f32, u64, f32)>,
     rng: Rng,
-    /// `Total_FX` (master x FX x mutes).
-    pub fx: f32,
     /// Weather state floats s0..s6 (rain, fog, cloud, wind, sand, fallout R, fallout G storms); all 0 = clear.
     pub weather: [f32; 7],
     /// Module flag +0xbc: land-control areas of a district with a land-control level use `Landcontrol_neutral`.
@@ -190,6 +188,7 @@ pub(crate) struct Runtime {
     keepalive: HashMap<u32, (u64, f32, f32, f32)>,
     effect_delays: VecDeque<(f32, EffectSound)>,
     effect_children: HashMap<u32, (usize, bool)>,
+    pub(crate) life_dangers: Vec<([f32; 3], f32)>,
 }
 
 /// AFCM103 parameters retained through SI's delayed-command queue.
@@ -205,7 +204,7 @@ pub(crate) struct EffectSound {
 impl Runtime {
     pub fn new(sh: &Arc<Shared>, lib: Library, seed: u64) -> Runtime {
         let music = MusicPlayer::new(sh.clone(), lib.project.clone(), seed);
-        Runtime { lib, music, combat: CombatMusic::new(3), pf: None, eval: 1.0, ambient: HashMap::new(), emitters: Vec::new(), want: None, dying: Vec::new(), rng: Rng(seed.rotate_left(17) | 1), fx: 1.0, weather: [0.0; 7], land_control: false, keepalive: HashMap::new(), effect_delays: VecDeque::new(), effect_children: HashMap::new() }
+        Runtime { lib, music, combat: CombatMusic::new(3), pf: None, eval: 1.0, ambient: HashMap::new(), emitters: Vec::new(), want: None, dying: Vec::new(), rng: Rng(seed.rotate_left(17) | 1), weather: [0.0; 7], land_control: false, keepalive: HashMap::new(), effect_delays: VecDeque::new(), effect_children: HashMap::new(), life_dangers: Vec::new() }
     }
 
     /// Emitters currently inside the camera's radius (or in their 2 s hold).
@@ -216,31 +215,31 @@ impl Runtime {
     /// Plays a definition once, non-positionally, at `Total_FX`.
     pub fn play(&mut self, sh: &Shared, def: &SoundDef) -> Vec<u64> {
         let db = self.lib.sounds.clone();
-        play_def(sh, &db, def, self.fx, &mut self.rng, None)
+        play_def(sh, &db, def, 1.0, &mut self.rng, None, [0.0; 3], &mut self.life_dangers)
     }
 
     /// A positional one-shot (`PlayGameSound(id, pos, material, ..., size)`: doors, fight sounds): the definition once at `Total_FX` times the
     /// distance level of `attenuation` for the listener `d` metres away; nothing beyond the definition's maximum distance. `material` is the game
     /// material argument (`FabricType` of the struck creature, 7 = flesh of a player; 0 = none) and `size` the impact size 0 / 1 / 2 (1 = plain):
     /// a definition with material variants also starts the one `PlaySample` picks ([`variant_of`]).
-    pub fn play_at(&mut self, sh: &Shared, def: &SoundDef, d: f32, material: i32, size: i32) -> Vec<u64> {
+    pub fn play_at(&mut self, sh: &Shared, def: &SoundDef, d: f32, material: i32, size: i32, pos: [f32; 3]) -> Vec<u64> {
         let level = attenuation(d, def.min_dist, def.max_dist, None);
         if level <= 0.0 {
             return Vec::new();
         }
         let db = self.lib.sounds.clone();
         let variant = variant_of(def, material, size).and_then(|v| db.get(v));
-        play_def(sh, &db, def, self.fx * level, &mut self.rng, variant)
+        play_def(sh, &db, def, level, &mut self.rng, variant, pos, &mut self.life_dangers)
     }
 
     /// SI PlaySoundCommand @100071ed: caller volume/radius/probability, material 0, size 1.
-    pub fn play_effect_at(&mut self, sh: &Shared, def: &SoundDef, d: f32, volume: f32, radius: f32, probability: i32) -> Vec<u64> {
+    pub fn play_effect_at(&mut self, sh: &Shared, def: &SoundDef, d: f32, volume: f32, radius: f32, probability: i32, pos: [f32; 3]) -> Vec<u64> {
         if probability != 100 && (self.rng.next() % 200) as i32 >= probability { return Vec::new(); }
         let level = attenuation(d, def.min_dist, def.max_dist, Some(radius)) * volume;
         if level <= 0.0 { return Vec::new(); }
         let db = self.lib.sounds.clone();
         let variant = variant_of(def, 0, 1).and_then(|v| db.get(v));
-        play_def(sh, &db, def, self.fx * level, &mut self.rng, variant)
+        play_def(sh, &db, def, level, &mut self.rng, variant, pos, &mut self.life_dangers)
     }
     pub(crate) fn effect_sound(&mut self, sh: &Shared, sound: EffectSound, listener: [f32; 3]) -> Result<Vec<u64>> {
         let [volume, radius, duration, delay] = sound.parameters;
@@ -264,9 +263,9 @@ impl Runtime {
         if sound.probability != 100 && (self.rng.next() % 200) as i32 >= sound.probability { return Ok(Vec::new()); }
         let level = attenuation(distance, def.min_dist, def.max_dist, Some(radius)) * volume;
         if level <= 0.0 { return Ok(Vec::new()); }
-        self.effect_duration(sh, def, level, duration, 0)
+        self.effect_duration(sh, def, level, duration, 0, sound.pos)
     }
-    fn effect_duration(&mut self, sh: &Shared, def: &SoundDef, level: f32, duration: f32, depth: usize) -> Result<Vec<u64>> {
+    fn effect_duration(&mut self, sh: &Shared, def: &SoundDef, level: f32, duration: f32, depth: usize, pos: [f32; 3]) -> Result<Vec<u64>> {
         anyhow::ensure!(depth < 64, "cyclic or overdeep authored sound graph");
         if def.prob != 100 && self.rng.next() % 200 >= def.prob as u32 { return Ok(Vec::new()); }
         let volume = if def.vol_min == def.vol_max { def.vol_max } else {
@@ -282,7 +281,7 @@ impl Runtime {
         if let Some(path) = def.file.as_deref().and_then(|path| sh.resolve(path)) {
             if hold > 0.0 {
                 let already = self.keepalive.contains_key(&def.id);
-                let voice = self.keepalive_duration(sh, def, if def.vol_max == 0.0 { 0.0 } else { gain / def.vol_max }, hold);
+                let voice = self.keepalive_duration(sh, def, if def.vol_max == 0.0 { 0.0 } else { gain / def.vol_max }, hold, [0.0; 3]);
                 if voice != 0 {
                     if !already && def.fade_in > 0.0 {
                         sh.mixer().fade_from_zero(voice, def.fade_in);
@@ -290,7 +289,7 @@ impl Runtime {
                     voices.push(voice);
                 }
             } else {
-                let voice = sh.play_sample(&path, self.fx * gain, false, def.priority);
+                let voice = sh.play_sample(&path, gain, false, def.priority);
                 if voice != 0 { voices.push(voice); }
             }
         }
@@ -298,7 +297,7 @@ impl Runtime {
         let child_duration = if def.inherit_duration { duration } else { 0.0 };
         let mut child = |runtime: &mut Self, id| -> Result<()> {
             let child = db.get(id).with_context(|| format!("missing authored child sound {id:#x}"))?;
-            voices.extend(runtime.effect_duration(sh, child, gain, child_duration, depth + 1)?);
+            voices.extend(runtime.effect_duration(sh, child, gain, child_duration, depth + 1, [0.0; 3])?);
             Ok(())
         };
         if let Some(id) = variant_of(def, 0, 1) { child(self, id)?; }
@@ -315,6 +314,7 @@ impl Runtime {
             let id = def.children[state.0];
             child(self, id)?;
         }
+        record_life_danger(&mut self.life_dangers, def, pos);
         Ok(voices)
     }
 
@@ -328,12 +328,15 @@ impl Runtime {
 
     /// [`Runtime::keepalive`] with the per-call volume of `PlaySample(handle, .., volume, ..)` (weather: rain/wind levels).
     pub fn keepalive_scaled(&mut self, sh: &Shared, def: &SoundDef, scale: f32) {
-        self.keepalive_duration(sh, def, scale, def.duration_max);
+        self.keepalive_duration(sh, def, scale, def.duration_max, [0.0; 3]);
     }
 
     /// Native PlaySample positive duration override; returns the current looping voice.
-    pub fn keepalive_duration(&mut self, sh: &Shared, def: &SoundDef, scale: f32, duration: f32) -> u64 {
-        let level = def.vol_max * self.fx * scale;
+    pub fn keepalive_duration(&mut self, sh: &Shared, def: &SoundDef, scale: f32, duration: f32, pos: [f32; 3]) -> u64 {
+        let level = def.vol_max * scale;
+        if level > 0.0 || self.keepalive.get(&def.id).is_some_and(|k| k.2 > 0.0) {
+            record_life_danger(&mut self.life_dangers, def, pos);
+        }
         let t = def.fade_out + duration;
         if let Some(k) = self.keepalive.get_mut(&def.id) {
             if sh.mixer().is_playing(k.0) {
@@ -357,6 +360,18 @@ impl Runtime {
         self.emitters = pf.as_ref().map(|p| p.emitters.iter().map(|_| EmitterState::default()).collect()).unwrap_or_default();
         self.pf = pf;
         self.eval = 1.0; // evaluate immediately
+        self.life_dangers.clear();
+    }
+
+    pub(crate) fn restart_device(&mut self) {
+        self.music.restart_device();
+        self.ambient.clear();
+        self.dying.clear();
+        self.keepalive.clear();
+        self.effect_delays.clear();
+        self.effect_children.clear();
+        self.emitters = self.pf.as_ref().map(|p| p.emitters.iter().map(|_| EmitterState::default()).collect()).unwrap_or_default();
+        self.eval = 1.0;
     }
 
     /// Leave the game sound lifecycle without changing the user's volume or combat preferences.
@@ -493,7 +508,7 @@ impl Runtime {
     fn tick_ambience(&mut self, sh: &Shared, dt: f32, t: f32) {
         let Some(id) = self.want else { return };
         for (name, period) in [("Night", Period::Night), ("Dawn", Period::Dawn), ("Day", Period::Day), ("Dusk", Period::Dusk)] {
-            let level = ambience_level(period, t) * self.fx;
+            let level = ambience_level(period, t);
             let key = (id, period);
             let def = self.lib.sounds.get(sound_id(&format!("SM_Sandy_Env_Background{name}_{id}"))).cloned();
             let Some(def) = def else { continue };
@@ -559,7 +574,7 @@ impl Runtime {
                 continue;
             }
             st.idle = 0.0;
-            let level = attenuation(d, def.min_dist, def.max_dist, Some(e.radius)) * (def.vol_min + self.rng.unit() * (def.vol_max - def.vol_min)) * self.fx;
+            let level = attenuation(d, def.min_dist, def.max_dist, Some(e.radius)) * (def.vol_min + self.rng.unit() * (def.vol_max - def.vol_min));
             if !st.started {
                 st.gate -= dt;
                 if st.gate > 0.0 {
@@ -583,6 +598,7 @@ impl Runtime {
                     }
                 }
             }
+            record_life_danger(&mut self.life_dangers, def, e.pos);
             // `AllocateChannel` found nothing (all 13 handles busy, none stealable): not played, asked again next frame
             // while the sound is active
             if st.parent == 0 {
@@ -662,7 +678,7 @@ pub fn variant_of(def: &SoundDef, material: i32, size: i32) -> Option<u32> {
 
 /// A one-shot non-positional sound definition (UI, children): probability gate, randomised volume, the file and
 /// its children per the definition's flags (`play_all`, or one `random_child`).
-pub(crate) fn play_def(sh: &Shared, db: &SoundDb, def: &SoundDef, fx: f32, rng: &mut Rng, variant: Option<&SoundDef>) -> Vec<u64> {
+pub(crate) fn play_def(sh: &Shared, db: &SoundDb, def: &SoundDef, fx: f32, rng: &mut Rng, variant: Option<&SoundDef>, pos: [f32; 3], life_dangers: &mut Vec<([f32; 3], f32)>) -> Vec<u64> {
     if def.prob != 100 && rng.next() % 200 >= def.prob as u32 {
         return Vec::new();
     }
@@ -670,7 +686,7 @@ pub(crate) fn play_def(sh: &Shared, db: &SoundDb, def: &SoundDef, fx: f32, rng: 
     let mut out = Vec::new();
     // `PlaySample` starts the material variant first, at the definition's level (`SandyInterface_t::PlaySample` @0x10002d98, section "variants")
     if let Some(v) = variant {
-        out.extend(play_def(sh, db, v, vol, rng, None));
+        out.extend(play_def(sh, db, v, vol, rng, None, [0.0; 3], life_dangers));
     }
     let mut one = |d: &SoundDef| {
         if let Some(p) = d.file.as_deref().and_then(|f| sh.resolve(f)) {
@@ -690,7 +706,14 @@ pub(crate) fn play_def(sh: &Shared, db: &SoundDb, def: &SoundDef, fx: f32, rng: 
             one(c);
         }
     }
+    record_life_danger(life_dangers, def, pos);
     out
+}
+
+fn record_life_danger(out: &mut Vec<([f32; 3], f32)>, def: &SoundDef, pos: [f32; 3]) {
+    if def.scare_radius > 0.0 && pos != [0.0; 3] {
+        out.push((pos, def.scare_radius));
+    }
 }
 
 #[cfg(test)]
@@ -731,7 +754,7 @@ mod tests {
         for &(i, id) in v {
             variants[i] = id;
         }
-        SoundDef { id: 1, flags: 1, file: None, vol_min: 0.5, vol_max: 0.5, min_dist: 0.0, max_dist: 15.0, fade_in: 0.0, fade_out: 0.0, duration_min: 0.0, duration_max: 0.0, prob: 100, children: vec![], interval_min: 0.0, interval_max: 0.0, play_all: false, sequential: false, random_child: false, priority: 1, inherit_duration: false, variants }
+        SoundDef { id: 1, flags: 1, file: None, vol_min: 0.5, vol_max: 0.5, min_dist: 0.0, max_dist: 15.0, scare_radius: 0.0, fade_in: 0.0, fade_out: 0.0, duration_min: 0.0, duration_max: 0.0, prob: 100, children: vec![], interval_min: 0.0, interval_max: 0.0, play_all: false, sequential: false, random_child: false, priority: 1, inherit_duration: false, variants }
     }
 
     /// `MapGameMaterialToSoundMaterial` [SI 0x10007490] (jump table @0x100074e3) and the variant choice of `PlaySample` [SI 0x10002d98].
@@ -897,11 +920,11 @@ mod tests {
         let mut def = rt.lib.sounds.get(0x35a9ce7d).unwrap().clone();
         def.duration_max = 9.0; // The caller override, not this authored duration, controls lifetime.
         def.fade_out = 0.3;
-        let voice = rt.keepalive_duration(&sh, &def, 0.6, 0.2);
+        let voice = rt.keepalive_duration(&sh, &def, 0.6, 0.2, [0.0; 3]);
         assert_ne!(voice, 0);
         assert!((rt.keepalive[&def.id].1 - 0.5).abs() < 1e-6);
         rt.update(&sh, 0.15, [0.0; 3], 0.0);
-        assert_eq!(rt.keepalive_duration(&sh, &def, 1.0, 0.2), voice);
+        assert_eq!(rt.keepalive_duration(&sh, &def, 1.0, 0.2, [0.0; 3]), voice);
         assert!((rt.keepalive[&def.id].1 - 0.5).abs() < 1e-6);
         let path = sh.resolve(def.file.as_deref().unwrap()).unwrap();
         let frames = sh.load(&path).unwrap().frames();

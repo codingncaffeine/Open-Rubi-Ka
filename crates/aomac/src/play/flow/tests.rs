@@ -12,6 +12,21 @@ fn nano_audio_logs_oneshots_and_refusals_not_successful_rearms() {
     assert!(!log_nano_sound(0.2, &[11]));
 }
 
+#[test]
+fn ground_texture_refresh_discards_superseded_worker_results() {
+    let Some(mut r) = rig() else { return };
+    r.p.screen = Screen::InWorld;
+    r.p.ground_texture_serial = 3;
+    let generation = r.host.scene_generation();
+    r.p.tx.send(Bg::GroundTextures(2, Ok(HashMap::new()))).unwrap();
+    r.p.pump(&mut r.host);
+    assert!(r.host.ground_textures.is_none());
+    r.p.tx.send(Bg::GroundTextures(3, Ok(HashMap::new()))).unwrap();
+    r.p.pump(&mut r.host);
+    assert!(r.host.ground_textures.is_some());
+    assert_eq!(r.host.scene_generation(), generation);
+}
+
 struct Rig {
     p: Play,
     host: Host,

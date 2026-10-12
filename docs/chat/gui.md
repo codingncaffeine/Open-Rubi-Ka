@@ -90,6 +90,23 @@ Chat-server groups: `(type << 32) | id` (hub), type byte = `hi & 0xff`.
 `IgnoreSystem_t::IsCharacterIgnored` is skipped for flagged senders). `ChatIndicator` (IndependentPrefs) flashes the head (`N3Msg_FlashHead`); voice sounds
 `VoiceSndFxHear{Vicinity,Guild,Team}On` are separate.
 
+**Native head flash visual:** Gamecode `N3Msg_FlashHead` `0x1001698d`
+looks up the supplied identity with `n3Dynel_t::GetDynel`; absent dynels do
+nothing, existing dynels call `_EffectHandler_t::CreateEffect2(0x2cf3, dynel, 0)`
+(`0x100d1b1c`; decompilation artifact24587 lines2354–2379).
+The installed `Setupf/gfxtweak.bin` record11507 (file offset20348) is class2011 Highlight, words
+`[3,3,1065353216,1065353216,0,0,0,1065353216,1065353216,1065353216,1065353216,0]`.
+It uses the existing character head material, not a billboard/texture:
+mode3, duration1 second, alpha1 throughout, RGB0→1→0 under the parabola
+`1−(2t/duration−1)²`. GC load/process `0x100e286a`/`0x100e29a7`
+change emissive/specular only on VisualAttractorMesh place0; DisplaySystem
+`0x1007347e`/`0x10071ca2` identify that place as `Attractor01_head`.
+Runtime dispatch is `GameAction::FlashHead` → `Dynels::flash_head` →
+the existing authored Highlight renderer and source-mesh preparation.
+Regression `chat_flash_11507_uses_authored_head_only_material_and_expires`
+asserts the installed record, unaffected root/body, white peak and expiry;
+added but not run by this worker.
+
 ## 5. Line format (`FUN_1009b4cf` 0x1009b4cf = window "add message")
 
 Arguments: group node, sender name, text, kind (1 whisper, 2 shout, 3 emote), colour code (0 = group colour), flags. Output HTML:
@@ -115,8 +132,7 @@ Arguments: group node, sender name, text, kind (1 whisper, 2 shout, 3 emote), co
   * `41000000`, `41000001` (pets): `S` + ": ";
   * everything else (chat-server groups, `4200001a/1b` loot groups): `[` `G` `] ` and, if there is a sender, `S` + `: `.
 * TEXT is inserted unescaped (the handlers pass `RemoteFormat::ParseString` + `HTMLParser_c::ExtractText` output).
-* Each window keeps at most **100** lines (`FUN_10088e92` pops the oldest when `size > 100`), then scrolls to the bottom; window logging (`is_logged`) writes `<window>/Log.txt`
-  (`"\n"`→`<br>` escaped lines) — **not ported**.
+* Each window keeps at most **100** lines (`FUN_10088e92` pops the oldest when `size > 100`), then scrolls to the bottom. Window logging is separate from the displayed HTML: `FUN_1009b4cf` appends native records to `<window>/Log.txt`; see §16.
 * Link rendering: `TextRenderer_c` ctor 0x10163412 sets link colour `0xff2299ff` (+0x1c0), shadow offset Point(1,1) (+0x254), default colour 0xff000000 = view colour.
   `<a>` runs use the link colour when their attribute word has bit 4 (`_RenderLine` 0x10161112: `attrib & 4 → +0x1c0`); `HTMLParser_c::_ParseTag` 0x1015c9ad sets that word to 6 (underline + link colour) only when the
   `style` attribute is absent or not `text-decoration:none`, so names / group names written as `<a style="text-decoration:none" href=..>` keep the line's font colour (corrected: they were blue before;
@@ -231,14 +247,14 @@ Screenshots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac chat_win_shot 
   and *Style_AlwaysOnTop* (0x100). Strings are text-db category 10001 keys (`LDBface::GetText(0x2711, key)`; the keys above are read from the DLL, the texts from `text.mdb`).
 * **Icon / right-click menu** `FUN_10097289` (opened by `FUN_100983b0` on the window's icon menu): the window menu as the first entry (header *ChatWindowMenu_Visual*) + separator;
   `GroupChatView_c::FUN_100ab4dc` inserts *TalkToChannel* ▸, *ChannelSubscribeMenu* ▸, boolean *AutoSubscribeChannels* (`+0x163`), separator, then *ChatConfiguration*, *RenameWindow*, *DeleteWindow*, *NewWindow*
-  (the last four open dialogs and are **not ported**; the relative order of the two inserters is a **GUESS**). Group lists: sorted by name (**GUESS**; the original iterates its group map).
+  (implemented through the shared configuration/dialog operations; the relative order of the two inserters is a **GUESS**). Group lists: sorted by name (**GUESS**; the original iterates its group map).
 * **User-link menu** `FUN_1008e135` (a `user://NAME` link under a right press, `FUN_1008f5dd`): *IgnoreUser*, *OpenChat*, *SendTell* (each present when its `ChatView` flag bit 0x1/0x2/0x4 is set; **GUESS** all three);
   the slots re-emit `NAME` on signals +0x148 / +0x14c / +0x150. Port: IgnoreUser → `/ignore NAME`, OpenChat and SendTell → the tell window / `/tell NAME ` (`WinOut::IgnoreUser` / `OpenTell`).
 * The text view itself shows no menu (`DISABLE_RC_MENU` 0x200 → `TextRenderer_c::MouseDown` button 2 falls through to the parent `View::MouseDown`), so the right press reaches `ChatView`.
 * Port input boundary: `Gui::wants_mouse` captures the entire visible framed window, including empty client space and a root `TextView`, matching `frame_right_down`'s frame/client context dispatch. `Play::input` queries capture **before** GUI dispatch (`flow.rs`), so omitting the root/frame let one right press both queue a world click and open the chat menu. Reported reproduction: DefaultWindow outer `(314,187)..(754,420)`, pointer `(596,384)`, MouseMove/right-down/right-up. Regression: `ao-gui/tests/frame.rs::framed_root_text_right_click_captures_before_context_dispatch`; hidden frames and empty borderless roots retain passthrough. This changes no saved chat visual-mode setting.
 * Port: `ao_gui::MenuItem` (entry / check / separator / submenu / slider), `Gui::open_menu`, `Event::{ContextMenu, FrameIcon, MenuPicked, MenuSlider}`. **UNRESOLVED**: the `PopupMenu_c` skin (the combo popup's
   raised border art is used), the check mark and sub-menu arrow art (a 5 px square and `>`), slider art.
-  Not ported (need dialogs / other windows): *ChatConfiguration*, *RenameWindow*, *DeleteWindow*, *NewWindow*, `chat_group_window`.
+  Configuration and document operations are shared with the native `chat_group_window` panel; see §16.
 
 ## 13. Text selection and copy
 
@@ -289,11 +305,27 @@ Defects found and fixed (all verified against the decompiles above):
 | fade | none (mode 0) | alpha 1.0 | `FUN_10096ec5` |
 
 **Live settings.** `ChatShowOGrpInTitleBar`, `ChatShowOGrpInInputBar`, `ChatFontName`, `ChatFontStyle`, `ChatFontSize` (tenths of a point; `lfHeight = size / 10`, default 140 = 14 px) are read from the HUD's
-`DValues` every frame (`WinPrefs::from_dvalues`, `flow.rs` → `Chat::set_window_prefs` → `ChatWindows::set_prefs`); a change re-titles the tabs / shows or hides the prompt next frame, a font change rebuilds the windows
+`DValues` every frame (`WinPrefs::from_dvalues`, `flow.rs` → `Chat::set_prefs` → `ChatWindows::set_prefs`); a change re-titles the tabs / shows or hides the prompt next frame, a font change rebuilds the windows
 (input bar height = line height + margins). Defaults equal the client's (tested against the shipped templates). `window_transparency_active/inactive`, `show_timestamps` and `visual_mode` are per-window document settings
-(Config.xml, the Window menu) and apply immediately (`alpha_of`, `deliver`). `ChatTextShadowOffset`: the shadow is off in the shipped client (`ChatView::shadow` false, §5). `ChatTextFadeDelay` / `ChatTextFadeTime` are read from the DValues every frame for windows with
-`is_message_fading_enabled` (§5.1).
+(Config.xml, the Window menu) and apply immediately (`alpha_of`, `deliver`). `ChatTextShadowOffset` now follows the character DValue through `WinPrefs`, including frame rebuilds; `FUN_1008d673` maps 0/1/2 to those pixel offsets and other values to 1. The shadow remains off unless the window enables it (`ChatView::shadow` false by default, §5). `ChatTextFadeDelay` / `ChatTextFadeTime` are read from the DValues every frame for windows with `is_message_fading_enabled` (§5.1).
 
 **Verification.** `cargo test --release -p ao-gui --test frame` (tab title width, chat font, hint) and `cargo test --release -p aomac chat::win` (titles, mode XML, prompt, alpha rules, prefs defaults).
 Shots with a world-like backdrop (sky gradient over mottled pavement): `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac -- chat_win_shot chat_frame_shot` → `chat-inactive.png` / `chat-active.png`
 (shipped borderless: black panels, 0.3 / 0.8), `frame-tabs.png`, `frame-default.png` (Normal mode, tabs, prompt), `frame-selection.png`, `frame-menu.png`.
+
+## 16. Native document dialogs and message archives
+
+`chat/win/config_ops.rs` owns the document operations. The configuration panel and existing chat menus call the same manager methods, not shell commands.
+
+* Options button thunks: `LAB_100a0301` tail-jumps to rename `10099629`, `LAB_100a02b3` to clone `10099402`, and `LAB_100a02f1` to remove `10098c73`. New is `1009b1b0`.
+* New/rename/clone use `TextInputDialogForm_c` (`10148307`): category-10001 title `EnterWindowName`, prompt `EnterNameOfNewWindow`, fixed 150-pixel editor (`101c7e34`), prompt bottom border 10. Buttons use category 10000 `MsgBox_OK`/`MsgBox_Cancel`. New starts empty, rename starts with the current name, clone starts with `CopyOf` formatted with the source name. Duplicate names reopen the same form with `WindowWithNameExists` (`1009afc0`, `10098efb`, `100990ea`); rename may retain its own current name.
+* `1009427a` creates the first unused `WindowN` directory. Clone serializes configuration with `1009a77b(..., true)`, which omits identity/name, startup/default flags, tab index and open state; it does not copy chat history or `Log.txt`. New explicitly opens the created document (`1009afc0`); clone remains closed (`10098efb`, reader `1009dc28` initializes open false). Missing style is mode 0. Saved-frame grouping keeps closed clones separate from open source tabs after reload. The intentional fresh-character template policy in §15 is unchanged.
+* Remove uses `Warning` + `Sure2DeleteWindow(name)` with category-10000 Yes/No. `10098c73` protects the **startup** flag at document `+0xd8`, displaying `NotPossible2DeleteDefaultWnd` with OK; this is not the separate default flag at `+0x162`. Cancellation leaves the document intact. Native `10093f15` unlinks `Config.xml` and `Log.txt`, then attempts `_rmdir`; unrelated files such as `InputHistory.xml` survive. The port removes those two files before manager indices, closes the cached log handle/view, preserves unrelated files, and reindexes surviving frame documents so a reload cannot resurrect it.
+* `LogMessages` calls `10098a92` (options thunk `100a02c3`), sets `is_logged`, and closes the cached file when switched off. `1009b4cf` opens `Log.txt` in append-binary mode once, writes and flushes each chat-message record. `100af12a` formats `["group identifier","group name","sender",epoch]body\n`; header fields escape quote/newline, body LF becomes `<br>` and CR is dropped. Client feedback insertion `1009b37f` has no file-log branch. The port follows these separate paths and keeps a cached append handle per logged document.
+* `ShowMessageLog` calls `1009ac7c` (options thunk `100a02da`), constructs `GroupLogWindow_c` (`100b07da`), loads `log_window_config`, and uses `ChatLogViewWindowTitle(name)` for its tab. `LogView_c` (`100afd2a`) has the path above the bordered text and right-aligned `ChatLogView_Button_Refresh`, `ChatLogView_Button_Follow`, `ChatLogView_Button_Clear` controls. Native constants: initial view 639×99 (`101ba818`/`101ba81c`), text minimum width 149 (`101ba814`), maximum 16000 (`101ba4d4`).
+* The viewer initially reads the last 256 KiB (`100af756(0x40000)`), parses group records (`100af226`), and renders `<div indent=wrapped>[group name] sender: body</div>` without adding timestamps. Refresh reads newly appended bytes. Follow is a toggle (`100afcec`), immediately refreshes and polls every 1,000,000 μs (`1026bb70`); only an already-bottom-aligned view follows the bottom (4-pixel threshold, `101b36b0`). Clear asks `Warning:` + category-10000 `PermaDelChatLog` with Yes/No (`100af606`) before truncating the actual archive; it is not a display-only clear. Log-window placement persists independently in `log_window_config`.
+* The options constructor's LogMessages/ShowMessageLog checkboxes are not inserted into the child/layout tree. The configuration window-list context menu (`100a1074`) provides native access: `WindowStyle` → `StyleNormal`/`StyleBorderless`, `ShowChatWindow`, `ShowLogWndow`, `LogMessages`, `Rename`, `Remove`. `HideChannelsInOtherWnd` is a panel tree filter (`100a0c0f`/`100a0620`), not an operation that unsubscribes other documents.
+* Private-channel context entries follow `100a0dbf`: native active-state and owner identity gate group configuration, disband, and leave. Their slots are `100a0af1`/`100a0b52`; the port routes real group operations through the chat hub rather than showing unavailable actions or fabricated success.
+
+Regression checks added (not run by the worker): `message_archive_appends_without_overwriting`, `native_log_header_and_body_round_trip`, `native_document_dialogs_persist_and_remove_archives`; the latter covers duplicate-name prompts, startup removal protection, actual clear/cancel, archive/config persistence, closed-clone reload, and preserving unrelated history on deletion. SettingsChat also added `native_window_menu_and_live_archive` and private-rights regressions. Real-window acceptance is not done (user using Mac); no window, input, screenshot, build or test was launched for this implementation.
+

@@ -185,7 +185,7 @@ impl HudNcu {
     }
 
     /// `FUN_10044c31` -> `N3Msg_RemoveBuff` [GC 0x1001be60].
-    fn remove(&mut self, gui: &mut Gui, zone: &Zone, id: i32) {
+    pub(super) fn remove(&mut self, gui: &mut Gui, zone: &Zone, id: i32) {
         let hostile = self.db.info(gui, id).is_some_and(|i| i.stat(stat::FLAGS).unwrap_or(0) & HOSTILE_FLAGS != 0);
         if hostile {
             self.lines.push("Can't remove hostile timed nanoprogram.".into());

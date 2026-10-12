@@ -127,6 +127,10 @@ pub struct ButtonData {
     pub label: String,
     /// Icon art instead of the 9-slice border: raised, pressed, hover (XML `gfxid_raised/pressed/hover`; `Button_c::SetGfx`). The button is the icon's size.
     pub gfx_override: Option<[GfxId; 3]>,
+    /// `Button_c::SetBackgroundIcon` 0x10127d08; independent of border state art.
+    pub background_icon: Option<GfxId>,
+    pub background_icon_fade: f32,
+    pub background_icon_timer: f32,
     pub pressed: bool,
     pub hover: bool,
 }
@@ -183,6 +187,7 @@ pub struct CcEntryData {
     pub submenu: bool,
     /// `Button_c+0x1dc`: hover fade 0..1 (`SlotFadeTimer` 0x10127c6d, +0.075 per tick while the mouse is inside, −0.075 otherwise).
     pub fade: f32,
+    pub fade_timer: f32,
 }
 
 /// One thing a [`Kind::Canvas`] paints; coordinates are relative to the view's top-left.
@@ -213,6 +218,24 @@ pub struct CanvasData {
     pub down: Point,
 }
 
+/// Native `Slider_c` range and mouse capture (GUI 0x1014448a).
+#[derive(Clone, Debug)]
+pub struct SliderData {
+    pub min: f64,
+    pub max: f64,
+    pub value: f64,
+    pub grab: Option<f32>,
+    pub background: GfxId,
+    pub knob: GfxId,
+}
+
+impl SliderData {
+    pub fn knob_x(&self, width: f32, knob_width: f32) -> f32 {
+        if self.max <= self.min { return 0.0; }
+        ((self.value - self.min) * f64::from((width - knob_width).max(0.0)) / (self.max - self.min)).floor() as f32
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Kind {
     View,
@@ -223,6 +246,7 @@ pub enum Kind {
     Button(ButtonData),
     TextButton(TextButtonData),
     PowerBar(PowerBarData),
+    Slider(SliderData),
     Bitmap { gfx: Vec<GfxId>, index: usize },
     CcEntry(CcEntryData),
     /// Host-painted view (the map windows): the application sets the items with `Gui::set_canvas` and receives
@@ -289,6 +313,8 @@ pub struct View {
     pub flags: u32,
     pub visible: bool,
     pub enabled: bool,
+    /// Application subscription to the native generic View mouse signals; does not change art or flags.
+    pub mouse_listener: bool,
     /// `View::SetColor` (inherited by children, multiplicative) 0xRRGGBB or ColorID.
     pub color: u32,
     /// `View::SetAlpha`.
@@ -314,6 +340,7 @@ impl View {
         View {
             name: String::new(),
             kind,
+            mouse_listener: false,
             parent: None,
             children: Vec::new(),
             frame: Rect::default(),
@@ -565,6 +592,22 @@ fn new_text_view(ctx: &BuildCtx, e: &Element) -> View {
 /// Builds the view for `e` and its subtree; returns `None` for unknown element names handled as skipped.
 pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId> {
     let id = match e.name.as_str() {
+        "Slider" => {
+            let min = f64::from(attr_f32(e, "min_value", 0.0));
+            let max = f64::from(attr_f32(e, "max_value", 0.0)).max(min);
+            let mut v = View::new(Kind::Slider(SliderData {
+                min, max, value: f64::from(attr_f32(e, "default_value", 0.0)),
+                grab: None,
+                background: GfxId(attr_u32(e, "gfxid_background", 0x92)),
+                knob: GfxId(attr_u32(e, "gfxid_slider", 0x91)),
+            }));
+            if let Kind::Slider(s) = &mut v.kind {
+                if s.background.0 == 0 { s.background = GfxId(0x92); }
+                if s.knob.0 == 0 { s.knob = GfxId(0x91); }
+            }
+            apply_view_attrs(&mut v, e, 0);
+            tree.add(v)
+        }
         "View" => {
             let mut v = View::new(Kind::View);
             apply_view_attrs(&mut v, e, 0);
@@ -628,6 +671,9 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
                     let g = |k: &str| e.attr(k).and_then(|n| ctx.gfx.id(n));
                     g("gfxid_raised").map(|r| [r, g("gfxid_pressed").unwrap_or(r), g("gfxid_hover").unwrap_or(r)])
                 },
+                background_icon: None, // Native Button XML constructor does not read bgicon (0x10128c73).
+                background_icon_fade: 0.0,
+                background_icon_timer: 0.0,
                 pressed: false,
                 hover: false,
             }));
@@ -778,7 +824,13 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
         "RadioButton" => {
             let mut v = View::new(Kind::RadioButton { label: ctx.string(e, "label"), value: attr_u32(e, "value", 0) as i32 });
             apply_view_attrs(&mut v, e, 0);
-            tree.add(v)
+            let id = tree.add(v);
+            if !e.children.is_empty() {
+                // XML expresses the native View* label constructor (GUI.dll 0x10140a40).
+                load_children(tree, ctx, id, e);
+                tree.views[id].node = Node::Base;
+            }
+            id
         }
         "RadioButtonGroup" => {
             let mut v = View::new(Kind::RadioGroup { selected: 0 });

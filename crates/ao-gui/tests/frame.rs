@@ -25,6 +25,46 @@ fn framed(g: &mut Gui, pos: (i32, i32), size: (u32, u32)) -> usize {
 }
 
 #[test]
+fn native_tip_view_uses_dock_tab_art_and_bounds() {
+    let dir = ao_gui::client_dir();
+    if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+    let mut g = Gui::new(&dir, None).unwrap();
+    // TipView 100568ac passes View flags 5, not Window style 5.
+    // Its free DockWindow 1003bdd4 uses Window style 0, flags 0x1000.
+    // TipView preferred size 100571bd: Point extents 399/299
+    // (float constants 101b1d18/101b1d1c), hence 400x300 client pixels.
+    let w = g.open_tabbed_window("TipView", "Tips", (100, 50), WindowSize::Fixed(400, 300)).unwrap();
+    g.set_window_frame(w, true, true);
+    assert_eq!(g.window_outer_frame(w), Some((100, 50, 410, 331)));
+    let browser = g.view_rect(w, "BrowserView").unwrap();
+    assert!(browser.l >= 105.0 && browser.t >= 76.0 && browser.r < 505.0 && browser.b < 376.0);
+    let draws = g.frame(0.0);
+    let mut corner = false;
+    let mut tab = false;
+    for cmd in draws.cmds {
+        if let ao_gui::DrawCmd::Gfx { id, dst, .. } = cmd {
+            let name = g.gfx().name(id).unwrap();
+            assert!(!name.starts_with("GFX_GUI_DIALOG_HELP_"), "archived help art is not DockWindow chrome");
+            if name == "GFX_GUI_WINDOW3_BORDER_TL" {
+                assert_eq!((dst[0], dst[1]), (100.0, 50.0));
+                let size = g.gfx().size(id);
+                assert_eq!((dst[2] - dst[0], dst[3] - dst[1]), (size.0 as f32, size.1 as f32));
+                corner = true;
+            }
+            if name == "GFX_GUI_TAB_ACTIVE_LEFT" {
+                assert_eq!((dst[0], dst[1]), (123.0, 57.0));
+                tab = true;
+            }
+        }
+    }
+    assert!(corner && tab, "Tips must retain native outer and tab surfaces");
+    press(&mut g, 300.0, 62.0);
+    drag_to(&mut g, 320.0, 72.0);
+    release(&mut g, 320.0, 72.0);
+    assert_eq!(g.window_outer_frame(w), Some((120, 60, 410, 331)));
+}
+
+#[test]
 fn framed_root_text_right_click_captures_before_context_dispatch() {
     let Some(mut g) = gui() else { return };
     // ChatView is a root TextView: unlike child content it must not rely on covers().

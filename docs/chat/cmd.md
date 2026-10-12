@@ -127,6 +127,10 @@ typed length). A group of exactly the typed length wins alone (the vector is cle
   **Guess**: whether the dialog callback replaces the default message (the decompile continues straight into SetAFK).
 * Auto reply to incoming tells (`ChatCmdFeedback_AFKReplyText`) lives in `HandlePrivateMessage` (0x1008792e), not here.
 
+`AutoAFK` is live: `InputConfig_t::EnableUserInput` (GUI 0x10019ce8) starts the 180-second idle timer; user input (0x1001acd6) restarts it. `ChatGUIModule_c::SlotAutoAFK` (0x10086b7d) respects `IsInvisible` (stat 0xd7), sets `Auto-away` on idle, clears AFK with `AFK_AFKOff` feedback on activity, and suppresses vicinity `/me` announcements while movement mode is 6 (sneak). Editing the `/afk` message dialog sets input-ignore byte +0x1c8, so typing does not clear AFK. Normal accepted non-own tells receive the text-db AFK reply with elapsed wall-clock hours/minutes and message; reply kind 6 prevents recursive replies. Idle battlestation removal is independent of `AutoAFK`: N3 `IsBattleStation` (0x1000c5fa) recognizes playfield identities 0x111c..0x1124, emits cat 10001 `AutoAFKOn`, and sends the bodyless own-character `LeaveBattleIIR_t` (Gamecode 0x100182ec / constructor 0x10131816).
+
+`ChatIndicator` is read live from independent Login preferences. Native `FlashHead` triggers are incoming normal accepted tells (without a visible-window gate), incoming vicinity messages subscribed by at least one visible open chat window (GUI 0x10084f33), and successful outgoing vicinity/tell/group messages. Filtering displayed text occurs after the indicator trigger, as in GUI `HandleVicinityMessage` / `HandlePrivateMessage`.
+
 ### `/ignore` (0x100ba9fc)
 
 Needs `IgnoreSystem_t`. `/ignore list` (case-sensitive) prints "Ignored characters:" and `%d\t%s` per entry. A first

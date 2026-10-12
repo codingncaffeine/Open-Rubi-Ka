@@ -10,6 +10,10 @@ pub(super) struct BuffVisual {
 }
 
 impl Dynels {
+    pub(super) fn target_nanos(&self, who: i32) -> Option<&crate::play::own_nanos::OwnNanos> {
+        self.buff_nanos.get(&who)
+    }
+
     pub fn apply_buff_visuals(&mut self, who: i32, events: impl IntoIterator<Item = VisualEvent>) {
         for event in events {
             let nano = match event { VisualEvent::Add { nano, .. } | VisualEvent::Remove { nano } => nano };

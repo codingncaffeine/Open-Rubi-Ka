@@ -59,6 +59,8 @@ pub enum Event {
     /// A `Button`/`TextButton` was clicked (mouse released inside, or activated through the default button).
     Clicked { window: WindowId, view: String, item: Option<ViewHandle> },
     TextChanged { window: WindowId, view: String, text: String },
+    /// `Slider_c` value signal; false while captured, true on release.
+    SliderChanged { window: WindowId, view: String, value: f64, final_change: bool },
     /// Enter pressed in a `TextInputView` (`TextInputView_c::SlotEnterPressed`).
     EnterPressed { window: WindowId, view: String },
     ComboChanged { window: WindowId, view: String, index: usize, text: String },
@@ -67,6 +69,10 @@ pub enum Event {
     /// Ctrl+V pressed: the app should answer with `InputEvent::Paste`.
     PasteRequested,
     Escape { window: WindowId },
+    /// Generic View mouse-down subscription (native buttons: 1 left, 2 right).
+    ViewMouse { window: WindowId, view: String, button: u8 },
+    /// Pointer entered/left a subscribed View, including its child views.
+    ViewHover { window: WindowId, view: String, entered: bool },
     /// The style-1 frame's close button was released over itself (`WndBorder::SlotCloseButton` 0x10159705
     /// posts message 0x98968b to the window; the application decides: quit for LoginWindow, ignore for the progress window).
     CloseRequested { window: WindowId },

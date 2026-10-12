@@ -9,7 +9,7 @@ fn key(id: u32) -> TextureKey {
 
 fn tex(n: u32, f: impl Fn(u32, u32) -> [u8; 4]) -> Texture {
     let rgba = (0..n * n).flat_map(|i| f(i % n, i / n)).collect();
-    Texture { width: n, height: n, rgba }
+    Texture { source: Default::default(), width: n, height: n, rgba }
 }
 
 fn quad(corners: [[f32; 3]; 4], normal: [f32; 3], uv_max: f32) -> Vec<Vertex> {

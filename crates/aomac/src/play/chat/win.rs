@@ -21,6 +21,9 @@ pub enum WinOut {
     OpenTell(String),
     /// "IgnoreUser" of a user link's menu (`FUN_1008dd24`): toggles ignoring the character (`/ignore NAME`).
     IgnoreUser(String),
+    /// Native ChatConfig private-channel actions (`100a0af1`, `100a0b52`).
+    DisbandGroup,
+    LeaveGroup(u32),
 }
 
 // ------------------------------------------------------------------------------------------------------------ groups
@@ -196,6 +199,8 @@ pub struct Cfg {
     pub set: Vec<u64>,
     /// `chat_window_config/WindowFrame` (l, t, r, b), inclusive.
     pub frame: Option<[f32; 4]>,
+    pub log_frame: Option<[f32; 4]>,
+    pub default_window: bool,
     /// Loaded from the client template / code defaults, not from the character's own saved config (not serialized).
     pub template: bool,
     /// `tab_index`: position of this window among the tabs of its `ChatWindow` (`FUN_100974b5` inserts before the first tab with a greater index).
@@ -212,7 +217,7 @@ impl Cfg {
             name: name.into(),
             window_name: window_name.into(),
             startup: false,
-            open: true,
+            open: false,
             autosubscribe: false,
             fading: false,
             logged: false,
@@ -224,9 +229,11 @@ impl Cfg {
             alpha_active: 0.8,
             alpha_inactive: 0.3,
             output_group: 0,
-            visual_mode: 2,
+            visual_mode: 0,
             set: vec![],
             frame: None,
+            log_frame: None,
+            default_window: false,
             template: false,
             tab_index: 0,
             frontmost: false,
@@ -243,7 +250,7 @@ impl Cfg {
         let f = |n: &str, d: f32| val(n).and_then(|v| v.parse().ok()).unwrap_or(d);
         let mut c = Cfg::blank(&s("name")?, &s("window_name").unwrap_or_default());
         c.startup = b("is_startup_window", false);
-        c.open = b("is_window_open", true);
+        c.open = b("is_window_open", false);
         c.autosubscribe = b("is_autosubscribe_window", false);
         c.fading = b("is_message_fading_enabled", false);
         c.logged = b("is_logged", false);
@@ -254,7 +261,7 @@ impl Cfg {
         c.show_timestamps = b("show_timestamps", false);
         c.alpha_active = f("window_transparency_active", 0.8);
         c.alpha_inactive = f("window_transparency_inactive", 0.3);
-        c.visual_mode = val("visual_mode").and_then(|v| v.parse().ok()).unwrap_or(2);
+        c.visual_mode = val("visual_mode").and_then(|v| v.parse().ok()).unwrap_or(0);
         c.output_group = s("output_group").and_then(|g| parse_ident(&g)).unwrap_or(0);
         if let Some(a) = find("selected_group_ids") {
             c.set = a.children.iter().filter_map(|e| e.attr("value")?.parse().ok()).collect();
@@ -266,6 +273,12 @@ impl Cfg {
                 c.frame = Some([n[0], n[1], n[2], n[3]]);
             }
         }
+        if let Some(w) = find("log_window_config").and_then(|a| a.children.iter().find(|e| e.attr("name") == Some("WindowFrame"))) {
+            let v = w.attr("value")?.trim().strip_prefix("Rect(")?.strip_suffix(')')?;
+            let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if n.len() == 4 { c.log_frame = Some([n[0], n[1], n[2], n[3]]); }
+        }
+        c.default_window = b("is_default_window", false);
         let flag = |k: &str| find("chat_window_config").is_some_and(|a| a.children.iter().any(|e| e.attr("name") == Some(k) && e.attr("value") == Some("true")));
         c.frontmost = flag("is_frontmost");
         c.backmost = flag("is_backmost");
@@ -281,9 +294,11 @@ impl Cfg {
         }
         o += "    </Array>\n    <Array name=\"selected_group_names\">\n";
         for g in &self.set {
-            let _ = writeln!(o, "        <String value='&quot;{}&quot;' />", names(*g));
+            let _ = writeln!(o, "        <String value='&quot;{}&quot;' />", config::escape(&names(*g)));
         }
-        o += "    </Array>\n    <Archive code=\"0\" name=\"log_window_config\" />\n    <Archive code=\"0\" name=\"chat_window_config\">\n";
+        o += "    </Array>\n    <Archive code=\"0\" name=\"log_window_config\">\n";
+        if let Some([l,t,r,b]) = self.log_frame { let _ = writeln!(o, "        <Rect name=\"WindowFrame\" value=\"Rect({l},{t},{r},{b})\" />"); }
+        o += "    </Archive>\n    <Archive code=\"0\" name=\"chat_window_config\">\n";
         if let Some(r) = self.frame {
             let _ = writeln!(o, "        <Rect name=\"WindowFrame\" value=\"Rect({:.6},{:.6},{:.6},{:.6})\" />", r[0], r[1], r[2], r[3]);
         }
@@ -308,10 +323,10 @@ impl Cfg {
             let _ = writeln!(o, "    <Bool name=\"{k}\" value=\"{v}\" />");
         }
         let _ = writeln!(o, "    <Int32 name=\"tab_index\" value=\"{}\" />", self.tab_index);
-        let _ = writeln!(o, "    <String name=\"window_name\" value='&quot;{}&quot;' />", self.window_name);
-        let _ = writeln!(o, "    <Bool name=\"is_default_window\" value=\"false\" />");
+        let _ = writeln!(o, "    <String name=\"window_name\" value='&quot;{}&quot;' />", config::escape(&self.window_name));
+        let _ = writeln!(o, "    <Bool name=\"is_default_window\" value=\"{}\" />", self.default_window);
         let _ = writeln!(o, "    <Bool name=\"is_startup_window\" value=\"{}\" />", self.startup);
-        let _ = writeln!(o, "    <String name=\"name\" value='&quot;{}&quot;' />\n</Archive>", self.name);
+        let _ = writeln!(o, "    <String name=\"name\" value='&quot;{}&quot;' />\n</Archive>", config::escape(&self.name));
         o
     }
 
@@ -329,10 +344,12 @@ fn code_defaults() -> Vec<Cfg> {
     let ids = |l: &[u32]| l.iter().map(|n| 0x4200_0000u64 | *n as u64).collect::<Vec<_>>();
     let mut d = Cfg::blank("Default Window", "Window1");
     d.startup = true;
+    d.open = true;
     d.autosubscribe = true;
     d.output_group = G_VICINITY;
     d.set = [vec![G_OTHERPET], ids(COMBAT_ALL)].concat();
     let mut c = Cfg::blank("Combat", "Window2");
+    c.open = true;
     c.textinput = false;
     c.output_group = 0;
     c.set = ids(COMBAT_WIN);
@@ -449,11 +466,13 @@ pub struct WinPrefs {
     pub font: (String, String, i32),
     /// `ChatTextFadeDelay` / `ChatTextFadeTime` seconds (`FUN_1008f432`; defaults 8.0 / 0.3 of `MainPrefs.xml`): used by windows with `is_message_fading_enabled`.
     pub fade: (f32, f32),
+    /// `FUN_1008d673`: 0/1/2 map to the same pixel offset, other values to 1.
+    pub shadow_offset: i32,
 }
 
 impl Default for WinPrefs {
     fn default() -> Self {
-        WinPrefs { title_group: true, input_group: true, font: ("Verdana".into(), "Regular".into(), 140), fade: (8.0, 0.3) }
+        WinPrefs { title_group: true, input_group: true, font: ("Verdana".into(), "Regular".into(), 140), fade: (8.0, 0.3), shadow_offset: 1 }
     }
 }
 
@@ -476,6 +495,7 @@ impl WinPrefs {
         let secs = |n: &str, def: f32| d.get_f32(n).map_or(def, |v| ((v as f64 * 1e6).trunc() / 1e6) as f32);
         WinPrefs {
             fade: (secs("ChatTextFadeDelay", base.fade.0), secs("ChatTextFadeTime", base.fade.1)),
+            shadow_offset: match d.get_i64("ChatTextShadowOffset").unwrap_or(1) { 0 => 0, 2 => 2, _ => 1 },
             title_group: flag("ChatShowOGrpInTitleBar", base.title_group),
             input_group: flag("ChatShowOGrpInInputBar", base.input_group),
             font: (text("ChatFontName", base.font.0), text("ChatFontStyle", base.font.1), size),
@@ -486,6 +506,8 @@ impl WinPrefs {
 impl ChatWindows {
     /// Closes every chat window frame.
     pub fn close_all(&mut self, gui: &mut Gui) {
+        self.config_ops_close_all(gui);
+        if let Some(win) = self.config.window.take() { gui.close_window(win); }
         for f in self.frames.drain(..) {
             gui.close_window(f.id);
         }
@@ -497,6 +519,7 @@ pub struct ChatWindows {
     frames: Vec<Frame>,
     screen: (u32, u32),
     groups: HashMap<u64, String>,
+    inactive_groups: std::collections::HashSet<u64>,
     text: Option<TextDb>,
     prefs: Option<PathBuf>,
     /// `ChatLastActiveWindow` (`window_name`).
@@ -508,6 +531,23 @@ pub struct ChatWindows {
     menu: Option<menu::Ctx>,
     /// Chat DValues in effect ([`WinPrefs`]).
     pw: WinPrefs,
+    config: config::ConfigWindow,
+    config_ops: Option<config_ops::OperationDialog>,
+    config_logs: HashMap<String, config_ops::LogWindow>,
+    config_log_files: HashMap<String, std::fs::File>,
+}
+
+#[cfg(test)]
+impl ChatWindows {
+    pub(super) fn assert_option_prefs(&self, d: &crate::play::dvalue::DValues) {
+        assert_eq!(self.pw, WinPrefs::from_dvalues(d));
+    }
+}
+
+impl ChatWindows {
+    pub(super) fn active_group_subscribed(&self, group: u64) -> bool {
+        self.wins.iter().find(|w| w.cfg.window_name == self.last_active).is_some_and(|w| w.cfg.shows(group))
+    }
 }
 
 /// `ChatView_c` text view flags 0xe6c (`FUN_100925ff`): ENABLE_SHADOW | FILL_BOTTOM_UP | DISABLE_RC_MENU | WORD_WRAP | MULTILINE |
@@ -517,6 +557,8 @@ const TEXT_FLAGS: &str = "TVF_ENABLE_SHADOW|TVF_FILL_BOTTOM_UP|TVF_DISABLE_RC_ME
 const INPUT_FLAGS: &str = "TVF_ACCEPT_TXT_INPUT|TVF_ACCEPT_MOUSE_INPUT|TVF_ALLOW_TEXT_SELECTION|TVF_ENABLE_SHADOW";
 
 mod menu;
+mod config;
+mod config_ops;
 mod windows;
 
 #[cfg(test)]

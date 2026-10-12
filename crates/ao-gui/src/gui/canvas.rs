@@ -71,6 +71,25 @@ impl Gui {
         }
     }
 
+    /// Replace the hovered canvas tooltip body without repainting its item grid.
+    pub fn set_canvas_tip_body(&mut self, w: WindowId, name: &str, index: Option<usize>, body: &str) {
+        if let Some(v) = self.find(w, name) {
+            if let Kind::Canvas(c) = &mut self.tree.views[v].kind {
+                for (i, tip) in c.tips.iter_mut().enumerate() {
+                    tip.body.clear();
+                    if Some(i) == index { tip.body.push_str(body); }
+                }
+            }
+        }
+    }
+
+    pub fn canvas_tips(&self, w: WindowId, name: &str) -> &[CanvasTip] {
+        match self.find(w, name).map(|v| &self.tree.views[v].kind) {
+            Some(Kind::Canvas(c)) => &c.tips,
+            _ => &[],
+        }
+    }
+
     /// What the `CanvasView` called `name` currently paints (for tests / inspection).
     pub fn canvas_items(&self, w: WindowId, name: &str) -> &[CanvasItem] {
         match self.find(w, name).map(|v| &self.tree.views[v].kind) {

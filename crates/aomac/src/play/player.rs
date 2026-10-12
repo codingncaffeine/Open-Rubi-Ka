@@ -105,11 +105,16 @@ fn set_door(c: &mut Collision, pos: [f32; 3], open: bool, passable: bool) {
 }
 
 impl Player {
+    pub fn set_texture_quality(&self, quality: i32) {
+        self.store.set_other_texture_quality(quality);
+    }
+
     /// `None` until the zone knows the own `SimpleCharFullUpdate`.
     pub fn new(dir: &Path, zone: &Zone, playfield: u32) -> Option<Self> {
         let u = zone.own_update.as_deref()?;
         let built = (|| -> anyhow::Result<Self> {
             let store = RecordStore::open(dir)?;
+            store.set_other_texture_quality(zone.world.texture_quality());
             let avatar = Avatar::new(&store, dir, zone.char_id, u)?;
             let collision = Collision::load(&store, playfield).map_err(|e| eprintln!("collision {playfield}: {e:#}")).ok();
             let mut movement = Movement::new(u.pos, u.yaw().unwrap_or(0.0), u.run_speed);
@@ -178,12 +183,28 @@ impl Player {
         self.camera.set_prefs(p);
     }
 
+    #[cfg(test)]
+    pub(super) fn assert_option_prefs(&self, d: &super::dvalue::DValues) {
+        let expected = ControlPrefs::from_dvalues(d);
+        assert_eq!(self.controls.option_prefs(), &expected, "actual mouse controls");
+        let camera = self.camera.option_prefs();
+        let expected_camera = ControlPrefs { third_person: camera.third_person, preferred_camera_mode: camera.preferred_camera_mode, ..expected };
+        assert_eq!(camera, &expected_camera, "actual camera preference consumer");
+        assert_eq!(self.fade, avatar::Fade::from_prefs(&d.prefs), "actual avatar fade consumer");
+        eprintln!("option runtime mouse={:?} avatar_fade={:?}", self.controls.option_prefs(), self.fade);
+    }
+
     pub fn select_camera_mode(&mut self, mode: u8) {
         self.camera.select_mode(mode);
     }
 
     pub fn camera_mode(&self) -> u8 {
         self.camera.selected_mode()
+    }
+
+    /// N3 0x10020a3c excludes the client character only in first person.
+    pub fn pick_hit(&self, ray: &super::hud_target::Ray, bounding_box: bool) -> Option<f32> {
+        (self.camera_mode() != 0).then(|| self.avatar.pick_hit(ray, bounding_box)).flatten()
     }
 
     /// The shared key binding table (`options/keys.rs`) changed: movement, camera, combat and pick-up keys follow at once.
@@ -215,6 +236,9 @@ impl Player {
     pub fn serial(&self) -> u32 {
         self.serial
     }
+
+    /// Own Vehicle_t ground contact, read by N3Msg_ActivateMech (GC 10079707).
+    pub fn grounded(&self) -> bool { self.movement.grounded() }
 
     /// Movement FSM mode (`FUN_100704e6`; 4 = swimming).
     pub fn mode(&self) -> u32 {
@@ -461,6 +485,7 @@ impl Player {
         });
         self.apply_own_events(zone);
         zone.fight_level = Some(self.fight_level(self.movement.pos()));
+        zone.own_lca = self.fight.as_ref().and_then(|f| f.own_lca(self.movement.pos()));
         // `FUN_10070fee`: the target branch re-runs the Features / district gate every frame and reads the target's `GetRelPos`
         if let Some(t) = self.movement.chase_target() {
             if self.follow_gated() {
@@ -547,6 +572,7 @@ impl Player {
         let head_position = glam::Vec3::from(scene_pos(pos)) + glam::Quat::from_rotation_y(scene_yaw(yaw)) * head_local.unwrap_or(glam::Vec3::ZERO);
         let head_to_camera = head_position - host.camera.pos;
         let alpha = self.fader.step(&self.fade, head_to_camera.length_squared());
+        self.avatar.set_animation_refresh(host.smooth_animations, host.camera.pos, host.previous_visible_actors.contains(&self.char_id));
         if self.camera.show_avatar() {
             let mut frame = self.avatar.frame();
             frame.alpha = alpha;

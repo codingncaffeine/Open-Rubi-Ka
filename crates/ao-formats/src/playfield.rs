@@ -22,6 +22,7 @@ mod statel;
 mod terrain;
 mod water;
 mod zone;
+mod wildlife;
 
 pub use camera::{camera_views, CameraViews};
 pub use record::{parse as parse_resource, CameraAttractor, Record};
@@ -29,6 +30,7 @@ pub use ao_scene::FogVolume;
 pub use sky::{open_weather, sun_dir, SkyClock, DEFAULT_DAY_TIME};
 pub use spawn::{floor_below, scene_bounds, support_below};
 pub use zone::{zone_locator, ZoneLocator};
+pub use wildlife::{wildlife_geometry, WildlifeGeometry};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -43,6 +45,22 @@ use statel::{Layout, Statel};
 const RECORD: u32 = 1_000_001;
 const STATELS: u32 = 1_000_003;
 const TILEMAP: u32 = 1_000_009;
+
+/// GC `AreVehiclesAllowed` 0x10121915 and `IsShadowlandPF` 0x10121906.
+/// Reads the authored resource; a missing/malformed resource is not permission.
+pub fn vehicles_allowed(store: &RecordStore, id: u32) -> Result<bool> {
+    let raw = store.get(RECORD, id)?.with_context(|| format!("vehicle activation: no playfield resource {id}"))?;
+    Ok(record::parse(&raw)?.vehicles_allowed())
+}
+
+/// Native ground texture-quality invalidation without rebuilding world geometry.
+pub fn refresh_ground_textures(store: &RecordStore, id: u32, patches: &[(usize, [i32; 2], usize)]) -> Result<HashMap<ao_scene::TextureKey, ao_scene::Texture>> {
+    let raw = store.get(RECORD, id)?.ok_or_else(|| anyhow!("no playfield {id}"))?;
+    let rec = record::parse(&raw)?;
+    let raw = store.get(TILEMAP, rec.tilemap)?.ok_or_else(|| anyhow!("playfield {id}: no tilemap {}", rec.tilemap))?;
+    let tm = ground::parse(&raw)?;
+    Ok(terrain::refresh_textures(store, &tm, patches))
+}
 /// `VisualCamera_t::GetLengthOfViewcone` (far - near) at the default view distance.
 const LOD_VIEW_LENGTH: f32 = environment::VIEW_DISTANCE - environment::NEAR;
 
@@ -166,7 +184,7 @@ pub fn load_playfield_report_on_day(store: &RecordStore, client_dir: &Path, id: 
         report.ground.start = scene.instances.len();
         grid = Some(dungeon::build(store, &rec, &mut scene)?);
     }
-    water::emit(store, &waters, &mut scene);
+    water::emit(store, &waters, &mut scene)?;
     let fixed = scene.instances.len();
     report.ground.end = fixed;
     if let Some(d) = store.get(STATELS, id)? {

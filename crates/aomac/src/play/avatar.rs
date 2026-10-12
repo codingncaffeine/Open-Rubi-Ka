@@ -107,6 +107,13 @@ pub struct AvatarLook {
     pub scale: f32,
 }
 
+/// GC 0x1004b521: visible cloth is the highest nonzero page (2, 1, 0) for each of five parts.
+pub(super) fn visible_cloth(cloth: &[(i32, i32)]) -> impl Iterator<Item = (i32, i32)> + '_ {
+    (0..5).filter_map(move |part| {
+        (0..3).rev().find_map(|page| cloth.iter().find(|&&(index, texture)| index == page * 5 + part && texture > 0).map(|&(_, texture)| (part, texture)))
+    })
+}
+
 impl AvatarLook {
     /// `skin_of_head` gives the skin race of a head mesh (creation head table), as the select-screen preview does.
     pub fn from_update(u: &SimpleCharFullUpdate, skin_of_head: impl FnOnce(u32) -> Skin) -> Result<Self> {
@@ -114,9 +121,10 @@ impl AvatarLook {
         // Fullupdate's base ClearAttractors only clears bookkeeping (DS 0x10071dd0), not the HeadMesh child.
         let skip_attractors = u.flags & ao_net::n3::dynel::flag::SET_DYNEL_800 != 0;
         let head = (!skip_attractors).then(|| u.attractors.iter().find(|a| a.place == 0).map(|a| a.mesh)).flatten().or(u.head_mesh).filter(|&h| h > 0).map(|h| h as u32);
-        // Worn cloth: page 0 only (`cloth[page * 5 + part]`, docs/zone/dynel.md §1.3); which page the renderer shows is not traced.
+        // GC 0x1004b521 resolves the three cloth pages before uploading textures.
+        let pages: Vec<_> = u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect();
         let cloth = CachedCharacter {
-            cloth: u.cloth.iter().filter(|c| c.page == 0).map(|c| ClothEntry { body_part: c.part(), texture: c.texture, ..Default::default() }).collect(),
+            cloth: visible_cloth(&pages).map(|(body_part, texture)| ClothEntry { body_part, texture, ..Default::default() }).collect(),
             ..Default::default()
         };
         Ok(Self {
@@ -319,10 +327,18 @@ fn attributed_note(note: u32, slot: i32) -> Option<super::combat::notes::FiredNo
 pub struct Avatar {
     id: u32,
     rig: ActorRig,
+    /// Last submitted body pose shared with the renderer, retained for input picking.
+    current_skin: std::cell::RefCell<Option<Arc<Vec<ao_scene::Vertex>>>>,
+    current_bounds: std::cell::Cell<Option<([f32; 3], [f32; 3])>>,
+    current_parts: std::cell::RefCell<Vec<[[f32; 4]; 4]>>,
+    sample_pose: std::cell::Cell<bool>,
+    cadence: ao_formats::character::AnimationCadence,
+    pose_cache: std::cell::RefCell<ao_formats::character::actor::PoseCache>,
     anim_set: &'static str,
     /// What `rig` was built from (full update plus [`Avatar::set_appearance`] deltas).
     look: PlayerLook,
     attachments: Vec<(u8, u32)>,
+    cloth_pages: Vec<(i32, i32)>,
     assets: ActorAssets,
     scale: f32,
     calibration: Calibration,
@@ -358,7 +374,7 @@ impl Avatar {
         let heads = head_table(store, breed, gender, 2)?;
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
         let rig = ActorRig::player(store, &assets, &l.look, &l.attachments)?;
-        let mut a = Self { id, rig, look: l.look, attachments: l.attachments, assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, note_fired: 0, notes: Vec::new(), stance: None, ms: 0.0, transform: Mat4::IDENTITY };
+        let mut a = Self { id, rig, current_skin: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, note_fired: 0, notes: Vec::new(), stance: None, ms: 0.0, transform: Mat4::IDENTITY };
         a.set_pose(store, AvatarPose::default())?;
         a.set_transform([u.pos[0], u.pos[1], -u.pos[2]], u.yaw().map_or(0.0, |y| -y));
         Ok(a)
@@ -377,17 +393,23 @@ impl Avatar {
         attachments.sort_unstable();
         let mut old = self.attachments.clone();
         old.sort_unstable();
+        for c in &appearance.cloth {
+            let index = c.c * 5 + c.id;
+            self.cloth_pages.retain(|p| p.0 != index);
+            if c.b > 0 { self.cloth_pages.push((index, c.b)); }
+        }
         let mut equipment = self.look.equipment;
-        for c in appearance.cloth.iter().filter(|c| c.c == 0) {
-            if let Some(slot) = usize::try_from(c.id).ok().and_then(|i| equipment.0.get_mut(i)) {
-                *slot = (c.b > 0).then_some(c.b as u32);
-            }
+        equipment.0.fill(None);
+        for (part, texture) in visible_cloth(&self.cloth_pages) {
+            equipment.0[part as usize] = Some(texture as u32);
         }
         if head == self.look.head && attachments == old && equipment.0 == self.look.equipment.0 {
             return Ok(false);
         }
         let look = PlayerLook { head, equipment, ..self.look.clone() };
         self.rig = ActorRig::player(store, &self.assets, &look, &attachments)?;
+        *self.current_skin.get_mut() = None;
+        self.current_bounds.set(None);
         self.look = look;
         self.attachments = attachments;
         Ok(true)
@@ -542,6 +564,7 @@ impl Avatar {
 
     /// Advances the clip by `dt` seconds at the pose's speed.
     pub fn update(&mut self, dt: f32) {
+        self.sample_pose.set(true);
         self.ms += dt * 1000.0 * self.rate;
         for action in &mut self.actions {
             action.ms += dt * 1000.0 * action.rate;
@@ -567,19 +590,49 @@ impl Avatar {
         before.iter().map(ActionClip::sample).chain(body).chain(after.iter().map(ActionClip::sample))
     }
 
+    /// Own CAT mesh uses the same native camera-distance refresh policy as remote meshes.
+    pub fn set_animation_refresh(&mut self, smooth: bool, camera: Vec3, previously_visible: bool) {
+        let distance_sq = self.transform.w_axis.truncate().distance_squared(camera);
+        self.sample_pose.set(self.cadence.sample(smooth, distance_sq, self.rig.bounding_radius, previously_visible));
+    }
+
     /// The actor to draw this frame (CPU-skinned pose, never frustum culled).
     pub fn frame(&self) -> ActorFrame {
-        let (skin, parts) = self.rig.pose_composed(self.layers());
-        ActorFrame { id: self.id, model: MODEL_KEY, transform: self.transform.to_cols_array_2d(), parts, part_attractors: self.rig.part_attractors(), skin: Some(skin), always: true, alpha: 1.0, ..Default::default() }
+        if self.sample_pose.replace(false) || self.current_skin.borrow().is_none() {
+            let (skin, parts) = self.rig.pose_composed_cached(self.layers(), &mut self.pose_cache.borrow_mut());
+            self.current_bounds.set(super::hud_pick::bounds_of(skin.iter().map(|vertex| &vertex.pos)));
+            *self.current_skin.borrow_mut() = Some(Arc::new(skin));
+            *self.current_parts.borrow_mut() = parts;
+        }
+        ActorFrame { id: self.id, model: MODEL_KEY, transform: self.transform.to_cols_array_2d(), parts: self.current_parts.borrow().clone(), part_attractors: self.rig.part_attractors(), skin: self.current_skin.borrow().as_ref().map(Arc::clone), always: true, alpha: 1.0, ..Default::default() }
+    }
+
+    /// Native camera selection against the current own body pose, not mounted meshes.
+    pub fn pick_hit(&self, ray: &super::hud_target::Ray, bounding_box: bool) -> Option<f32> {
+        let pose = self.current_skin.borrow();
+        let vertices = pose.as_ref()?;
+        let bounds = self.current_bounds.get()?;
+        let inverse = self.transform.inverse();
+        let origin = inverse.transform_point3(ray.origin);
+        let direction = inverse.transform_vector3(ray.dir);
+        let length = ray.len * direction.length();
+        let body = super::hud_pick::PickBody { id: self.id as i32, bounds, pos: [0.0; 3], yaw: 0.0, scale: 1.0 };
+        if bounding_box {
+            body.hit(origin, direction, length)
+        } else {
+            body.hit_triangles(origin, direction, length, vertices, self.rig.body_triangles())
+        }
     }
 
     /// Current effect anchor in world scene space, including heading and body scale.
     pub fn effect_anchor(&self, id: i32) -> Option<[[f32; 4]; 4]> {
-        self.rig.effect_anchor_composed(id, self.layers()).map(|m| (self.transform * Mat4::from_cols_array_2d(&m)).to_cols_array_2d())
+        let matrix = if self.current_skin.borrow().is_some() { self.rig.cached_effect_anchor(id, &self.pose_cache.borrow()) } else { self.rig.effect_anchor_composed(id, self.layers()) };
+        matrix.map(|m| (self.transform * Mat4::from_cols_array_2d(&m)).to_cols_array_2d())
     }
 
     pub fn weapon_effect_anchor(&self, place: u8) -> Option<[[f32; 4]; 4]> {
-        self.rig.weapon_effect_anchor_composed(place, self.layers()).map(|m| (self.transform * Mat4::from_cols_array_2d(&m)).to_cols_array_2d())
+        let matrix = if self.current_skin.borrow().is_some() { self.rig.cached_weapon_effect_anchor(place, &self.pose_cache.borrow()) } else { self.rig.weapon_effect_anchor_composed(place, self.layers()) };
+        matrix.map(|m| (self.transform * Mat4::from_cols_array_2d(&m)).to_cols_array_2d())
     }
 
     /// `n3Dynel_t::GetBodyCollSphereRadi` (N3 0x10004dd3): the model's torso sphere radius (`VisualCATMesh_t::GetTorsoSphereRadi`), 0.5 when
@@ -631,6 +684,58 @@ pub(super) mod tests {
         frame::Frame,
         n3::{self, dynel::Dynel, N3},
     };
+
+    #[test]
+    fn smooth_animation_toggle_changes_native_refresh_not_clip_time() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let radius = avatar.rig.bounding_radius;
+        let camera = avatar.transform.w_axis.truncate() + Vec3::X * radius * 50.0;
+        let first = avatar.frame().skin.unwrap();
+        let head_anchor = avatar.effect_anchor(2002).expect("authored head attractor");
+        for _ in 0..6 {
+            avatar.update(0.02);
+            avatar.set_animation_refresh(false, camera, true);
+            assert!(Arc::ptr_eq(&first, &avatar.frame().skin.unwrap()), "distant disabled-smooth CAT holds six raster frames");
+            assert_eq!(avatar.effect_anchor(2002), Some(head_anchor), "native effects use the retained skeleton too");
+        }
+        avatar.update(0.02);
+        avatar.set_animation_refresh(true, camera, true);
+        assert!(!Arc::ptr_eq(&first, &avatar.frame().skin.unwrap()), "next native countdown expiry resamples at the current clock");
+        let next = avatar.frame().skin.unwrap();
+        assert!(Arc::ptr_eq(&next, &avatar.frame().skin.unwrap()), "effect source reuses this frame's posed geometry");
+    }
+
+    #[test]
+    fn own_body_pick_uses_posed_triangles_and_world_transform() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        avatar.set_transform([3.0, 2.0, -4.0], 0.7);
+        let actor = avatar.frame();
+        let vertices = actor.skin.as_ref().unwrap();
+        assert!(Arc::ptr_eq(vertices, avatar.current_skin.borrow().as_ref().unwrap()), "renderer and targeting share the same posed allocation");
+        let (lo, hi) = super::super::hud_pick::bounds_of(vertices.iter().map(|v| &v.pos)).unwrap();
+        let mut actual = false;
+        let mut empty_box = false;
+        for x in 1..20 {
+            for y in 1..20 {
+                let origin = Vec3::new(lo[0] + (hi[0] - lo[0]) * x as f32 / 20.0, lo[1] + (hi[1] - lo[1]) * y as f32 / 20.0, hi[2] + 5.0);
+                let ray = super::super::hud_target::Ray {
+                    origin: avatar.transform.transform_point3(origin),
+                    dir: avatar.transform.transform_vector3(-Vec3::Z).normalize(),
+                    len: 100.0,
+                };
+                assert!(avatar.pick_hit(&ray, true).is_some());
+                let hit = avatar.pick_hit(&ray, false);
+                actual |= hit.is_some();
+                empty_box |= hit.is_none();
+            }
+        }
+        assert!(actual, "body triangles are reachable through the transformed own-avatar ray");
+        assert!(empty_box, "bounding-box targeting must not be mistaken for body geometry");
+    }
 
     #[test]
     fn own_action_notes_do_not_replay_retained_weapon_effects() {
@@ -1010,7 +1115,7 @@ pub(super) mod tests {
         let run = a.frame();
         let (i, r) = (idle.skin.as_ref().unwrap(), run.skin.as_ref().unwrap());
         assert_eq!(i.len(), r.len());
-        assert!(i.iter().zip(r).any(|(x, y)| x.pos != y.pos), "run moved nothing");
+        assert!(i.iter().zip(r.iter()).any(|(x, y)| x.pos != y.pos), "run moved nothing");
         assert!(a.height() > 1.4 && a.height() < 2.2, "{}", a.height());
         // jump plays once and reports it
         a.set_pose(&store, AvatarPose::still(Role::JumpStand)).unwrap();
@@ -1048,6 +1153,16 @@ pub(super) mod tests {
         assert_eq!((stance_clip(1, &Role::Walk), stance_clip(8, &Role::Run)), (None, None), "only the rifle overrides walk / run");
         assert_eq!(stance_clip(4, &Role::IdleCombat), None, "AnimSet 4: the lists live in the item record");
     }
+    #[test]
+    fn cloth_pages_choose_highest_nonzero_and_reveal_lower_page() {
+        let mut pages = vec![(1, 10), (6, 20), (11, 30), (2, 40)];
+        assert_eq!(visible_cloth(&pages).collect::<Vec<_>>(), [(1, 30), (2, 40)]);
+        pages.retain(|p| p.0 != 11);
+        assert_eq!(visible_cloth(&pages).collect::<Vec<_>>(), [(1, 20), (2, 40)]);
+        pages.retain(|p| p.0 != 6);
+        assert_eq!(visible_cloth(&pages).collect::<Vec<_>>(), [(1, 10), (2, 40)]);
+    }
+
     #[test]
     fn nano_cast_loop_restarts_and_release_finishes() {
         let Some(dir) = client() else { return };
@@ -1090,6 +1205,10 @@ pub(super) mod tests {
         assert_eq!(held_frame.part_attractors.len(), a.model().meshes.len());
         assert_eq!(held_frame.part_attractors[0], None, "the root body is not an attractor child");
         assert!(!a.set_appearance(&store, &appearance(&[(0, head), (1, 0x3ddf)])).unwrap(), "same set, other order");
+        let mut flags_only = appearance(&[(0, head), (1, 0x3ddf)]);
+        flags_only.visual_flags = 0;
+        assert!(!a.set_appearance(&store, &flags_only).unwrap(), "native meshes follow the returned list, not a guessed flag mask");
+        assert_eq!((a.model().meshes.len(), a.frame().parts.len()), (plain.0 + 1, plain.1 + 1));
         let idle = a.clip_id;
         a.set_stance(Some(3));
         a.set_pose(&store, AvatarPose::still(Role::Idle)).unwrap();
