@@ -631,7 +631,9 @@ impl HudTarget {
         let target = zone.selected_target();
         let mouse = target.filter(|id| hits.contains(id)).or_else(|| hits.first().copied()).and_then(|id| {
             if id.kind != ao_net::n3::outgoing::DYNEL_CHAR {
-                let can = super::interact::Interact::can_of(zone, id)?;
+                // `Can` (stat 0x1e) is often not yet cached for ordinary world items; that must not drop the whole cursor
+                // computation (and with it the shift-to-inspect override, which `choose_object` applies unconditionally).
+                let can = super::interact::Interact::can_of(zone, id).unwrap_or(0);
                 return Some(super::hud_cursor::choose_object(can, host.mods.shift, dblclick));
             }
             let d = zone.dynels.get(&id.instance)?;
