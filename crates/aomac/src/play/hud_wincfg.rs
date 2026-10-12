@@ -71,9 +71,10 @@ pub(super) fn store_of(kind: WindowKind) -> Option<Store> {
     })
 }
 
-/// `DockWindow_c` creates flags-0x1000 windows without the no-resize flags.
+/// `SkillWindow` 0x100fc18e, `PerkWindow_c` 0x1006372d, `PetWindow_c` 0x1007e3ee and
+/// `DockWindow_c` create style-0 flags-0x1000 windows, without either no-resize flag.
 pub(super) fn resizable(kind: WindowKind) -> bool {
-    matches!(store_of(kind), Some(Store::Dock(_)))
+    matches!(store_of(kind), Some(Store::Dock(_) | Store::Value(_)))
 }
 
 fn unquote(s: &str) -> &str {
@@ -377,6 +378,7 @@ impl WinCfgs {
         self.tracked.retain(|t| t.kind != Some(kind));
         let size = resizable(kind);
         gui.set_window_frame(id, true, size);
+        gui.set_window_preferred_size_limits(id, true);
         self.apply(gui, d, Some(kind), id, store, screen);
         // a dock stores `selected_tab` (`~DockWindow_c` 0x1003b672: `Window::GetTabSelection`, 0 for the single tab), a plain window does not
         let tab = matches!(store, Store::Dock(_)).then(|| self.load(d, store).0.tab.unwrap_or(0));
@@ -585,6 +587,29 @@ impl ListCfg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_window_resize_restores_size_and_relayouts_content() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&client, None).unwrap();
+        let mut d = DValues::new(&client);
+        let mut cfgs = WinCfgs::new(&client);
+        for kind in [WindowKind::Skills, WindowKind::Pet, WindowKind::Perks] {
+            assert!(resizable(kind));
+            let w = gui.open_tabbed_window_xml("resize", "Resize", "<root><View name=\"body\" view_layout=\"vertical\" max_size=\"Point(16000,16000)\"><CanvasView name=\"content\" max_size=\"Point(16000,16000)\"/></View></root>", (20, 30), ao_gui::WindowSize::Fixed(200, 120)).unwrap();
+            cfgs.attach(&mut gui, &d, kind, w, (1280, 800));
+            gui.set_window_outer_frame(w, (40, 50, 350, 240));
+            cfgs.update(&gui, &mut d);
+            gui.set_window_outer_frame(w, (20, 30, 210, 151));
+            cfgs.reload(&mut gui, &d, (1280, 800));
+            assert_eq!(gui.window_outer_frame(w), Some((40, 50, 350, 240)));
+            assert_eq!(gui.window_size(w), (340, 209));
+            let content = gui.view_rect(w, "content").unwrap();
+            assert_eq!((content.width() + 1.0, content.height() + 1.0), (340.0, 209.0));
+            gui.close_window(w);
+        }
+    }
 
     #[test]
     fn hud_defaults_are_not_saved_until_moved_and_reload_marks_saved_position() {

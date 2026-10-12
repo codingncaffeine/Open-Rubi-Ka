@@ -1802,6 +1802,20 @@ mod tests {
     }
 
     #[test]
+    fn full_update_restores_logout_posture_and_can_stand() {
+        let mut blob = [0u8; 42];
+        blob[12..22].copy_from_slice(&[mode::SIT_GROUND, 1, 0, 1, 0, 1, 0, 1, 0, 1]);
+        blob[22..26].copy_from_slice(&i32::from(mode::RUN).to_be_bytes());
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.restore_blob(&blob);
+        assert_eq!((m.fsm.mode, m.role()), (mode::SIT_GROUND, Role::SitGround));
+        assert!(m.take_stat_writes().is_empty(), "deserialization does not replay transition stat writes");
+        assert!(m.take_outgoing().is_empty(), "restoring a pose does not send movement");
+        assert!(m.transition(id::LEAVE_SIT));
+        assert_eq!((m.fsm.mode, m.role()), (mode::RUN, Role::Idle));
+    }
+
+    #[test]
     fn walk_straight_stop_and_bytes() {
         let w = Flat(0.0);
         let mut m = Movement::new([100.0, 0.0, 200.0], 0.0, 0);

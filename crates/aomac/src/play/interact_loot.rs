@@ -41,6 +41,8 @@ pub struct LootUi {
     items: Option<Items>,
     open: Vec<Loot>,
     escape_options: Option<[bool; 3]>,
+    pub(super) info_click: bool,
+    pub(super) info_urls: Vec<String>,
 }
 
 fn gap() -> (f32, f32) {
@@ -247,8 +249,24 @@ impl LootUi {
     pub fn event(&mut self, gui: &mut Gui, ev: &Event, now: f32) -> Option<Option<Identity>> {
         match ev {
             Event::Escape { window } if self.open.iter().any(|l| l.window == *window && !l.escape) => Some(None),
+            Event::CanvasPress { window, view, x, y, button, .. } if view == "grid" => {
+                let l = self.open.iter_mut().find(|l| l.window == *window)?;
+                let Some(n) = cell_at_for(*x, *y, l.slots).filter(|&n| n < l.entries.len()) else { return Some(None) };
+                let item = if l.container.kind == 0xdead { Identity { kind: 0x69, instance: l.entries[n].slot as i32 } } else { container_item_identity(l.word, l.entries[n].slot) };
+                if *button == ao_gui::MouseButton::Left && self.info_click {
+                    l.clicked = None;
+                    self.info_urls.push(format!("itemid://{}/{}", item.kind, item.instance));
+                    Some(None)
+                } else if *button == ao_gui::MouseButton::Right {
+                    l.clicked = None;
+                    Some(Some(item))
+                } else {
+                    Some(None)
+                }
+            }
             Event::CanvasClick { window, view, x, y } if view == "grid" => {
                 let l = self.open.iter_mut().find(|l| l.window == *window)?;
+                if self.info_click { return Some(None); }
                 let Some(n) = cell_at_for(*x, *y, l.slots).filter(|&n| n < l.entries.len()) else { return Some(None) };
                 let double = l.clicked.is_some_and(|(c, t)| c == n && now - t <= ao_gui::DOUBLE_CLICK_TIME);
                 l.clicked = if double { None } else { Some((n, now)) };
@@ -312,6 +330,33 @@ mod escape_tests {
 mod tests {
     use super::*;
     use ao_net::n3::world::AcgItem;
+
+    #[test]
+    fn right_click_takes_and_shift_left_only_inspects_bank_and_loot() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&client, None).unwrap();
+        for kind in [0xdead, 0xc76a] {
+            let mut ui = LootUi::default();
+            let c = Identity { kind, instance: 7 };
+            let mut u = update(true, &[3]);
+            u.container = c;
+            ui.update(&mut gui, None, (800, 600), c, "Items", &u, false);
+            let window = ui.window_of(c).unwrap();
+            let (x, y) = cell_origin(0, 0, gap());
+            let item = if kind == 0xdead { Identity { kind: 0x69, instance: 3 } } else { container_item_identity(u.word, 3) };
+            let press = |button| Event::CanvasPress { window, view: "grid".into(), x: x + 2.0, y: y + 2.0, button, clicks: 1 };
+            assert_eq!(ui.event(&mut gui, &press(ao_gui::MouseButton::Right), 1.0), Some(Some(item)));
+            assert!(ui.info_urls.is_empty());
+            ui.info_click = true;
+            assert_eq!(ui.event(&mut gui, &press(ao_gui::MouseButton::Left), 1.1), Some(None));
+            let click = Event::CanvasClick { window, view: "grid".into(), x: x + 2.0, y: y + 2.0 };
+            assert_eq!(ui.event(&mut gui, &click, 1.2), Some(None));
+            assert_eq!(ui.event(&mut gui, &click, 1.3), Some(None));
+            assert_eq!(ui.info_urls, [format!("itemid://{}/{}", item.kind, item.instance)]);
+            ui.close_all(&mut gui);
+        }
+    }
 
     #[test]
     fn grid_is_three_columns_of_cells_and_hit_tests_them() {

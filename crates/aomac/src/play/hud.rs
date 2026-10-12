@@ -666,6 +666,36 @@ impl Hud {
         self.outbox.extend(self.stats.take_outbox());
     }
 
+    #[cfg(test)]
+    pub(super) fn item_screen_pos(&self, gui: &Gui, slot: u32) -> Option<(f32, f32)> {
+        self.stats.item_screen_pos(gui, slot)
+    }
+
+    #[cfg(test)]
+    pub(super) fn ncu_first_point(&self, gui: &Gui) -> Option<(f32, f32)> {
+        self.ncu.first_point(gui)
+    }
+
+    #[cfg(test)]
+    pub(super) fn nano_first_point(&self, gui: &Gui) -> (f32, f32) {
+        self.nano.first_point(gui)
+    }
+
+    #[cfg(test)]
+    pub(super) fn shortcut_slot_pos(&self, gui: &Gui, bar: usize, slot: usize) -> Option<(f32, f32)> {
+        Some(self.shortcuts.get(bar)?.slot_screen_pos(gui, slot))
+    }
+
+    #[cfg(test)]
+    pub(super) fn nano_set_page(&mut self, page: usize) {
+        self.nano.set_page(page);
+    }
+
+    #[cfg(test)]
+    pub(super) fn bar_slot_names(&self, bar: usize) -> Vec<String> {
+        self.shortcuts.get(bar).map(|b| b.slot_names()).unwrap_or_default()
+    }
+
     /// True while the pointer carries an inventory item.
     pub(super) fn item_dragging(&self) -> bool {
         self.stats.dragging_item()
@@ -742,6 +772,7 @@ impl Hud {
         v.extend(self.stats.take_info_urls());
         v.extend(self.notifications.take_urls());
         v.extend(self.target_ncu.take_urls());
+        v.extend(self.nano.take_urls());
         v
     }
     /// Native TipSystem event producer; parameters come from each retail callback.
@@ -919,6 +950,7 @@ impl Hud {
             }
         }
         self.nano.update(gui, zone, _dt);
+        self.start_nano_drag(gui);
         self.ncu.update(gui, zone, _dt);
         self.target_ncu.update(gui, &mut self.dvalues, &mut self.wincfg, zone, self.size, _dt);
         self.notifications.update(gui, &mut self.dvalues, &mut self.wincfg, self.size, _dt);
@@ -988,6 +1020,15 @@ impl Hud {
         }
     }
 
+    fn start_nano_drag(&mut self, gui: &mut Gui) {
+        let Some(id) = self.nano.take_drag() else { return };
+        if let Some((name, icon)) = self.nano.shortcut_info(gui, id) {
+            if let Some(bar) = self.shortcuts.first_mut() {
+                bar.begin_nano_drag(gui, id, &name, icon);
+            }
+        }
+    }
+
     /// Mouse-down outside an open sub menu closes it (the original's popup menus lose focus).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn input(&mut self, gui: &mut Gui, zone: &mut Zone, player: Option<&super::player::Player>, ev: &InputEvent, cam: &ao_render::Camera, lens: &ao_scene::Lens, mods: ao_gui::Modifiers) {
@@ -999,6 +1040,8 @@ impl Hud {
         }
         self.actwin.input(gui, ev, &self.actions.list, mods, &mut self.shortcuts);
         self.uses.extend(self.actwin.take_uses());
+        self.nano.input(gui, ev, mods);
+        self.start_nano_drag(gui);
         // item drag and drop between the wear window and the inventory (hud_stats/item_ui.rs)
         self.stats.input(gui, zone, ev, mods);
         let mut unclaimed = Vec::new();
@@ -1549,6 +1592,9 @@ impl Hud {
     /// (`wear_window` ... = 1) opened and the others closed; a first login keeps the NewChar template's set.
     pub(super) fn prefs_loaded(&mut self, gui: &mut Gui) {
         let Some(chr) = self.dvalues.char_dir().map(Path::to_path_buf) else { return };
+        for (n, bar) in self.shortcuts.iter_mut().enumerate() {
+            bar.load_contents(gui, &ao_gui::client_dir(), &chr, n);
+        }
         if let Ok(src) = std::fs::read_to_string(chr.join("DockAreas/RollupArea.xml")) {
             self.rollup.load_user(gui, &src);
         }
@@ -1572,6 +1618,11 @@ impl Hud {
         self.wincfg.save_docks(&mut self.dvalues, &self.rollup.dock_states(gui));
         self.target_ncu.close(gui);
         self.notifications.close(gui);
+        if let Some(chr) = self.dvalues.char_dir() {
+            for (n, bar) in self.shortcuts.iter().enumerate() {
+                bar.save_contents(chr, n);
+            }
+        }
         if let Some(p) = &self.popup {
             gui.close_window(p.window);
         }
@@ -2398,6 +2449,9 @@ mod tests {
         use super::super::hud_special::template_of;
         let Some((mut s, mut o)) = shot((1280, 800)) else { return };
         // the template's wear / stat pages first sit above it in the rollup column; the Actions page is moved to the top by closing them
+        // the Help floater (`ShowHelpButtonWindow`, shown by default) has no saved frame on a fresh character and defaults near the
+        // top-left corner, overlapping the hotbar's own native default (20,20): close it so this test's hotbar clicks are isolated.
+        s.hud.dvalues.set_i64("ShowHelpButtonWindow", 0);
         for k in [WindowKind::Character, WindowKind::Stat, WindowKind::Team] {
             s.hud.close_kind(&mut s.gui, k);
         }
@@ -2535,6 +2589,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// `Rollup::refresh_groups` records the automatic first-frame content-limit clamp's
+    /// `g.pin`/`g.frame` but must not mark the controller dirty from it: several idle frames
+    /// over a freshly opened, never-touched inventory must not write `DockAreas/DockArea0.xml`.
+    #[test]
+    fn fresh_inventory_never_touched_writes_no_dock_file() {
+        let tmp = std::env::temp_dir().join(format!("aomac-hud-freshdock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let size = (1280, 800);
+        let Some((mut s, mut o)) = shot(size) else { return };
+        s.hud.dvalues.open_user(&tmp, "acct", 7);
+        s.hud.prefs_loaded(&mut s.gui);
+        s.hud.open(&mut s.gui, WindowKind::Inventory);
+        for _ in 0..10 {
+            s.frame(0.016, size, &mut o.host);
+        }
+        s.hud.dvalues.save_user();
+        assert!(!tmp.join("acct/Char7/DockAreas/DockArea0.xml").exists(), "an automatic clamp must not persist an untouched dock");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn inventory_shortcut_drop_and_use() {
         let Some((mut s, _)) = shot((1280, 800)) else { return };
@@ -2567,6 +2641,33 @@ mod tests {
         s.zone.on_frame(&frame);
         s.hud.update(&mut s.gui, &mut s.zone, 0.016);
         assert!(!s.hud.is_open(WindowKind::Nano), "duplicate learned reply is not a new upload");
+    }
+
+    #[test]
+    fn programs_shift_inspect_and_drag_to_hotbar_cast() {
+        let Some((mut s, mut o)) = shot((1280, 800)) else { return };
+        s.hud.dvalues.set_i64("ShortcutNewNanos", 0);
+        let learned = ao_net::n3::action::simple(ao_net::n3::nano::action::LEARNED, Default::default(), ao_net::n3::nano::nano(163449));
+        s.zone.on_frame(&ao_net::n3::outgoing::n3_frame(0, s.zone.char_id, ao_net::n3::action::character_action(s.zone.char_id as i32, &learned)));
+        s.hud.update(&mut s.gui, &mut s.zone, 0.016);
+        s.frame(0.016, (1280, 800), &mut o.host);
+        let (x, y) = s.hud.nano.first_point(&s.gui);
+        s.hud.nano.input(&s.gui, &InputEvent::MouseDown { x, y, button: MouseButton::Left }, ao_gui::Modifiers { shift: true, ..Default::default() });
+        assert_eq!(s.hud.take_info_urls(), ["itemid://53019/163449"]);
+        assert!(s.hud.nano.take_drag().is_none());
+        assert!(s.hud.nano.take_outbox().is_empty());
+        send(&mut s, InputEvent::MouseDown { x, y, button: MouseButton::Left });
+        s.hud.update(&mut s.gui, &mut s.zone, 0.31);
+        let (wx, wy) = s.gui.window_pos(s.hud.shortcuts[0].window);
+        let (bx, by) = (wx as f32 + 43.0 + 36.0 * 5.0 + 17.0, wy as f32 + 19.0);
+        send(&mut s, InputEvent::MouseMove { x: bx, y: by });
+        send(&mut s, InputEvent::MouseUp { x: bx, y: by, button: MouseButton::Left });
+        assert_eq!(s.hud.shortcuts[0].slot_names()[5], "Shadow Touch");
+        s.hud.shortcuts[0].use_slot(5, &s.hud.actions.list);
+        assert_eq!(s.hud.shortcuts[0].take_uses(), [SlotUse::Nano(163449)]);
+        s.zone.set_target(Some(ao_net::msg::Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: s.zone.char_id as i32 }));
+        s.hud.nano.cast(&mut s.gui, &s.zone, 163449);
+        assert_eq!(s.hud.nano.take_outbox().len(), 1);
     }
 
     /// The first-login hotbar: Start Combat / Walk / Sit / Suspended Animation icons from rdb 1010008, the Follow macro, use,

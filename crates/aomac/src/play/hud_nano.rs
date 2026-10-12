@@ -7,9 +7,8 @@
 //! school are on page 5 (Favorites). "HideNano" moves a program to page 6, which has no selector button.
 //!
 //! Interactions: double click = `N3Msg_CastNanoSpell(program, target)` (`FUN_100d3b11`, the target is the selected one), right click = the popup of `FUN_100d3fe4`
-//! (entries "LookAtNano" -> InfoView `itemid://`, "HideNano" / "UnHideNano"), drag = hotbar (`FUN_100d3807`). UNRESOLVED / not ported: the InfoView window ("LookAtNano"
-//! is omitted), dragging a program onto the shortcut bar, the recharge overlay of an icon (`FUN_1003d3ff`), the saved `item_position_map` (free icon positions) and
-//! `selected_school` / `listview_mode` persistence (the prefs store is not wired for window configs).
+//! ("LookAtNano" -> InfoView `itemid://`, "HideNano" / "UnHideNano"), drag = hotbar (`FUN_100d3807`).
+//! UNRESOLVED: recharge overlays and Programs' free icon-position / school / list-mode archives.
 
 use super::hud::WindowKind;
 use super::hud_listview::{self as lv, Column, Hit, ListView, ListWindow, MenuTexts, Mode, Row, Spec};
@@ -38,6 +37,7 @@ const ROWS: usize = 3;
 const MENU_BASE: u32 = 0x4000;
 const MENU_HIDE: u32 = MENU_BASE + 0x40;
 const MENU_UNHIDE: u32 = MENU_BASE + 0x41;
+const MENU_INFO: u32 = MENU_BASE + 0x42;
 /// Padding of a selector button around its label and the gap between two (UNRESOLVED GUESS: the `Button_c` art's own insets; `FUN_100d6478` adds `Point(8, 2)` to the
 /// preferred size and `FUN_100d56d9` flows the buttons).
 const BUTTON_PAD: f32 = 24.0;
@@ -61,6 +61,10 @@ pub(super) struct HudNano {
     built: Option<(u32, usize, usize, Mode, usize)>,
     /// Row of the open context menu.
     ctx: Option<i32>,
+    press: Option<(i32, f32, f32, f32)>,
+    drag: Option<i32>,
+    qualified_click: bool,
+    urls: Vec<String>,
 }
 
 struct Win {
@@ -86,6 +90,10 @@ impl HudNano {
             clock: 0.0,
             built: None,
             ctx: None,
+            press: None,
+            drag: None,
+            qualified_click: false,
+            urls: vec![],
         })
     }
 
@@ -110,6 +118,45 @@ impl HudNano {
 
     pub(super) fn take_casts(&mut self) -> Vec<String> {
         std::mem::take(&mut self.casts)
+    }
+
+    pub(super) fn take_urls(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.urls)
+    }
+
+    pub(super) fn take_drag(&mut self) -> Option<i32> {
+        self.drag.take()
+    }
+
+    /// Native qualified clicks inspect; ordinary held/moved presses emit the nano drag signal.
+    pub(super) fn input(&mut self, gui: &Gui, ev: &ao_gui::InputEvent, mods: ao_gui::Modifiers) {
+        use ao_gui::{InputEvent, MouseButton};
+        match *ev {
+            InputEvent::MouseDown { x, y, .. } if !self.win.as_ref().is_some_and(|w| gui.pointer_owner(x, y) == Some(w.w.win)) => {}
+            InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
+                self.qualified_click = false;
+                self.press = None;
+                let Some(win) = self.win.as_ref() else { return };
+                let Some(id) = win.w.view.row_at(gui, win.w.win, x, y, lv::ICON_32) else { return };
+                self.qualified_click = mods.shift || mods.ctrl;
+                if self.qualified_click {
+                    self.urls.push(format!("itemid://{}/{}", nano::NANO_KIND, id));
+                } else {
+                    self.press = Some((id, x, y, 0.0));
+                }
+            }
+            InputEvent::MouseMove { x, y } => {
+                if let Some((id, px, py, _)) = self.press {
+                    if (x - px).hypot(y - py) > 3.0 {
+                        self.press = None;
+                        self.drag = Some(id);
+                        self.qualified_click = true;
+                    }
+                }
+            }
+            InputEvent::MouseUp { button: MouseButton::Left, .. } => self.press = None,
+            _ => {}
+        }
     }
 
     fn text(&self, key: &str) -> String {
@@ -192,6 +239,9 @@ impl HudNano {
             rollup.close_page(gui, KEY);
         }
         self.built = None;
+        self.press = None;
+        self.drag = None;
+        self.qualified_click = false;
     }
 
     /// Row cells of a program (`FUN_1003d50c`: columns are `N3Msg_GetSkill(nano, stat, 2)`; UNRESOLVED: column 11 "Radius" is `N3Msg_GetFormularRadius`, a
@@ -236,6 +286,14 @@ impl HudNano {
 
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &Zone, dt: f32) {
         self.clock += dt;
+        if let Some((id, _, _, held)) = self.press.as_mut() {
+            *held += dt;
+            if *held >= 0.3 {
+                self.drag = Some(*id);
+                self.press = None;
+                self.qualified_click = true;
+            }
+        }
         let Some(win) = self.win.as_mut() else { return };
         let sig = (zone.nanos.serial, self.page, self.moved.len(), win.w.view.mode, win.w.view.columns.len() * 31 + win.w.view.sort.0 as usize + usize::from(win.w.view.sort.1));
         for (page, _) in SCHOOLS {
@@ -288,6 +346,11 @@ impl HudNano {
             }
             Event::MenuPicked { id } if win.w.owns_menu(*id) => {
                 match *id {
+                    MENU_INFO => {
+                        if let Some(row) = self.ctx.take() {
+                            self.urls.push(format!("itemid://{}/{}", nano::NANO_KIND, row));
+                        }
+                    }
                     MENU_HIDE | MENU_UNHIDE => {
                         if let Some(row) = self.ctx.take() {
                             // `FUN_100d39c4` moves the item to page 6, `FUN_100d3a42` back to the page of its School stat
@@ -315,6 +378,9 @@ impl HudNano {
             }
             _ => {}
         }
+        if self.qualified_click && matches!(ev, Event::CanvasPress { .. } | Event::Clicked { .. }) {
+            return false;
+        }
         let now = self.clock;
         match win.w.view.event(gui, w, ev, now, lv::ICON_32) {
             Some(Hit::Double(id)) => {
@@ -330,7 +396,7 @@ impl HudNano {
                 let hidden = self.moved.get(&id) == Some(&HIDDEN);
                 let (key, mid) = if hidden { ("UnHideNano", MENU_UNHIDE) } else { ("HideNano", MENU_HIDE) };
                 let label = self.text(key);
-                gui.open_menu((at.0, at.1), (self.screen.0 as i32, self.screen.1 as i32), vec![ao_gui::MenuItem::entry(mid, &label)]);
+                gui.open_menu((at.0, at.1), (self.screen.0 as i32, self.screen.1 as i32), vec![ao_gui::MenuItem::entry(MENU_INFO, &self.text("LookAtNano")), ao_gui::MenuItem::entry(mid, &label)]);
                 true
             }
             None => false,
@@ -340,6 +406,12 @@ impl HudNano {
 
 #[cfg(test)]
 impl HudNano {
+    pub(super) fn first_point(&self, gui: &Gui) -> (f32, f32) {
+        let win = self.win.as_ref().unwrap();
+        let r = gui.view_rect(win.w.win, "grid").unwrap();
+        (r.l + lv::BORDER + 16.0, r.t + lv::BORDER + 16.0)
+    }
+
     pub(super) fn set_page(&mut self, page: usize) {
         self.page = page;
         self.built = None;

@@ -128,7 +128,9 @@ impl TradeskillUi {
                 slot_canvases(&mut root);
                 Ok(element_xml(&root))
             };
-            match open().and_then(|s| gui.open_tabbed_window_xml("TradeskillPanel", "Tradeskill Kit", &s, (0, 0), WindowSize::Fixed(300, 400))) {
+            // GUI 0x100de9b8 (TradeSkillView_c ctor): the base `View_c` `Window(Rect())` constructor runs with an empty rect, not an
+            // authored frame; the panel is sized from its own preferred content, like the other unframed-constructor windows in this port.
+            match open().and_then(|s| gui.open_tabbed_window_xml("TradeskillPanel", "Tradeskill Kit", &s, (0, 0), WindowSize::Preferred)) {
                 Ok(w) => {
                     self.win = Some(w);
                     self.escape = d.flag("esc_tradeskill");

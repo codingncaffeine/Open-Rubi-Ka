@@ -111,6 +111,8 @@ pub(super) fn pick_objects(ray: &Ray, zone: &Zone, player: Option<&super::player
         picked.push((distance, Identity { kind: DYNEL_CHAR, instance: zone.char_id as i32 }));
     }
     picked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.instance.cmp(&b.1.instance)));
+    let mut seen = std::collections::HashSet::new();
+    picked.retain(|(_, id)| seen.insert(*id));
     picked.into_iter().map(|(_, identity)| identity).collect()
 }
 

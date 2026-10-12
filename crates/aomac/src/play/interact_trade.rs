@@ -336,7 +336,9 @@ impl Interact {
     }
 
     pub fn take_info_urls(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.trade.info_urls)
+        let mut urls = std::mem::take(&mut self.trade.info_urls);
+        urls.append(&mut self.use_ui.loot.info_urls);
+        urls
     }
 
     /// The pointer is over the splitter of the dialogue (or dragging it).

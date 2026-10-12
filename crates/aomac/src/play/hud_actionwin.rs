@@ -186,6 +186,7 @@ impl HudActionWin {
     /// Press / hold / release of the grid; a drop on a hotbar slot goes to `bars`.
     pub(super) fn input(&mut self, gui: &mut Gui, ev: &InputEvent, list: &SpecialList, mods: ao_gui::Modifiers, bars: &mut [ShortcutBar]) {
         match *ev {
+            InputEvent::MouseDown { x, y, .. } if !self.win.as_ref().is_some_and(|w| gui.pointer_owner(x, y) == Some(w.win)) => {}
             InputEvent::MouseDown { x, y, button: button @ (MouseButton::Left | MouseButton::Right) } => {
                 self.mouse = (x, y);
                 let drag_button = if self.new_mouse { MouseButton::Left } else { MouseButton::Right };

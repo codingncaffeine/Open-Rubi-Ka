@@ -5,7 +5,12 @@
 //! `wait=secs`, `shot=name` (PNG into AOMAC_LIVE_SHOTS), `pos` prints the own position, `press=F8|CTRL+F8|SHIFT+F8` taps keys (camera),
 //! `drag=right:dx:dy` / `drag=left:dx:dy` mouse-look with raw counts, `cam` prints the camera and lens. HUD steps: `ui=u|ctrl+1` window hotkey (Ctrl+1 = Wear in shipped KeyBindings).
 //! `heading=server_yaw` rotates in place through right mouse input to the requested heading (radians), before idle/capture steps.
-//! `move=x:y` hover, `click=x:y`, `clickdyn=<instance>` world click on a dynel, `mdrag=x1:y1:x2:y2` GUI drag, `watch=secs` own-stat changes.
+//! `move=x:y` hover; `click`, `rightclick`, `doubleclick` take `[shift+|ctrl+|alt+]x:y` (prefixes may combine), through GUI mouse input.
+//! `clickdyn=<instance>` world click on a dynel, `mdrag=x1:y1:x2:y2` GUI drag, `watch=secs` own-stat changes.
+//! `rightclickitem=<slot hex>` real right-click on the bag/wear cell currently showing `inv`'s slot (bug 10 equip/unequip/use).
+//! `ncurightclick` real right-click on the NCU window's first row (bug 21 cancel). `dragnano=<bar>:<slot>` drags the
+//! Programs window's first row onto a shortcut bar slot (bug 18); `nanopage=<index>` selects its school tab first. `barnames` prints bar 0's slot names, `clickslot=<bar>:<slot>` real-clicks one.
+//! `nanos` prints learned program IDs; `buffs` prints running buffs and NCU usage.
 //! `down=KEY` / `up=KEY` hold across steps; `clickcorpse` / `rightcorpse` click a visible, GUI-unobscured corpse pick point.
 //! `focuslost` cancels held game input as the host's window-focus-loss event does.
 //! Named GUI keys are delivered before physical game keys, as in the viewer; letters stay physical (no invented layout/IME text).
@@ -837,6 +842,13 @@ fn live_walk() {
                 h.set_dvalue(&mut l.p.gui, d, v != "off");
                 l.tick();
             }
+            // `winopen=<dvalue>[:off]`: any other HUD window dvalue (e.g. `team_view`, `mission_window`), for frame checks.
+            "winopen" => {
+                let (d, state) = v.split_once(':').unwrap_or((v, "on"));
+                let h = l.p.hud.as_mut().expect("hud");
+                h.set_dvalue(&mut l.p.gui, d, state != "off");
+                l.tick();
+            }
             "tab" => {
                 l.p.input(ao_gui::InputEvent::Key { key: ao_gui::Key::Tab, pressed: true, mods: ao_gui::Modifiers::default() }, &mut l.o.host);
                 eprintln!("target {:?}", l.p.zone.target);
@@ -847,6 +859,7 @@ fn live_walk() {
                 eprintln!("stats {}", v.iter().map(|(k, x)| format!("{k}={x}")).collect::<Vec<_>>().join(" "));
             }
             "buffs" => eprintln!("buffs time={} ncu={} entries={:?}", l.p.zone.nanos.time, l.p.zone.nanos.buffs.iter().map(|b| b.ncu_cost).sum::<i32>(), l.p.zone.nanos.buffs),
+            "nanos" => eprintln!("nanos {:?}", l.p.zone.nanos.programs),
             // the spells running on the own character (docs/gui.md §11.14) and the maps they fill
             "spells" => {
                 eprintln!("spells {}", l.p.zone.active_spells.iter().map(|s| format!("{:#x}(stat {} amount {} target {})", s.function, s.stat(0), s.stat(0x27), s.stat(0x20))).collect::<Vec<_>>().join(" "));
@@ -997,18 +1010,94 @@ fn live_walk() {
                 eprintln!("after {step}: {}", l.pos());
             }
             // UI steps: `ui=ctrl+6` / `ui=u` are `press` (a key stroke through `game_input`, where the window hot keys live, with `host.mods`
-            // following the modifier keys), `move=x:y` hover, `click=x:y`, `clickdyn=<instance>` (left-clicks the first screen point whose pick ray
-            // hits the dynel)
-            "move" | "click" => {
-                let (x, y) = v.split_once(':').map(|(x, y)| (x.parse().unwrap(), y.parse().unwrap())).unwrap();
+            // following the modifier keys), `move=x:y` hover, coordinate clicks with optional modifiers, `clickdyn=<instance>`
+            // (left-clicks the first screen point whose pick ray hits the dynel).
+            "move" | "click" | "rightclick" | "doubleclick" => {
+                let value = v.rsplit('+').next().unwrap();
+                let (x, y) = value.split_once(':').map(|(x, y)| (x.parse().unwrap(), y.parse().unwrap())).unwrap();
+                let mods = l.o.host.mods;
+                if k != "move" && v.contains('+') {
+                    l.o.host.mods = ao_gui::Modifiers { shift: v.contains("shift+"), ctrl: v.contains("ctrl+"), alt: v.contains("alt+") };
+                }
                 l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
-                if k == "click" {
-                    for ev in [ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }] {
-                        l.tick();
-                        l.p.input(ev, &mut l.o.host);
+                if k != "move" {
+                    let button = if k == "rightclick" { ao_gui::MouseButton::Right } else { ao_gui::MouseButton::Left };
+                    for _ in 0..if k == "doubleclick" { 2 } else { 1 } {
+                        for ev in [ao_gui::InputEvent::MouseDown { x, y, button }, ao_gui::InputEvent::MouseUp { x, y, button }] {
+                            l.tick();
+                            l.p.input(ev, &mut l.o.host);
+                        }
                     }
                 }
                 l.tick();
+                l.o.host.mods = mods;
+            }
+            // `rightclickitem=<slot hex>` or `rightclickitem=item:<template id>`: real right-click (GUI mouse dispatch,
+            // not a direct command) at the screen cell currently showing the bag/wear item (bug 10 right-click
+            // equip/unequip/use verification). Template selection follows an item through an equip/unequip slot move.
+            "rightclickitem" => {
+                let slot = if let Some(template) = v.strip_prefix("item:") {
+                    let template: i32 = template.parse().expect("rightclickitem item template id");
+                    l.p.zone.inventory.iter().filter(|(_, item)| item.item.low_id == template)
+                        .map(|(slot, _)| *slot).min().expect("rightclickitem item not in inventory")
+                } else {
+                    u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap()
+                };
+                let (x, y) = l.p.hud.as_ref().unwrap().item_screen_pos(&l.p.gui, slot).unwrap_or_else(|| panic!("slot {slot:#x} is not on screen"));
+                l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
+                for ev in [ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Right }, ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Right }] {
+                    l.tick();
+                    l.p.input(ev, &mut l.o.host);
+                }
+                l.tick();
+                eprintln!("rightclickitem {slot:#x} at ({x},{y})");
+            }
+            // `ncurightclick`: real right-click (GUI mouse dispatch) on the first/only row of the NCU window
+            // (bug 21 NCU cancel verification; the harness has only ever needed the one active own nano).
+            "ncurightclick" => {
+                let (x, y) = l.p.hud.as_ref().unwrap().ncu_first_point(&l.p.gui).expect("NCU window not open or empty");
+                l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
+                for ev in [ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Right }, ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Right }] {
+                    l.tick();
+                    l.p.input(ev, &mut l.o.host);
+                }
+                l.tick();
+                eprintln!("ncurightclick at ({x},{y})");
+            }
+            // `dragnano=<bar>:<slot>`: real left-button drag (press, move past the 3 px threshold, release) from the
+            // Programs window's first row to shortcut bar `<bar>` slot `<slot>` (bug 18 drag-to-hotbar verification).
+            "dragnano" => {
+                let (bar, slot) = v.split_once(':').map(|(b, s)| (b.parse().unwrap(), s.parse().unwrap())).unwrap();
+                let (x, y) = l.p.hud.as_ref().unwrap().nano_first_point(&l.p.gui);
+                l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
+                l.tick();
+                l.p.input(ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                l.tick();
+                l.p.input(ao_gui::InputEvent::MouseMove { x: x + 20.0, y }, &mut l.o.host);
+                l.tick();
+                let (bx, by) = l.p.hud.as_ref().unwrap().shortcut_slot_pos(&l.p.gui, bar, slot).expect("shortcut bar/slot out of range");
+                l.p.input(ao_gui::InputEvent::MouseMove { x: bx, y: by }, &mut l.o.host);
+                l.tick();
+                l.p.input(ao_gui::InputEvent::MouseUp { x: bx, y: by, button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                l.tick();
+                eprintln!("dragnano to bar {bar} slot {slot} at ({bx},{by})");
+            }
+            // `nanopage=<index>`: selects the Programs window's school tab (0 Combat, 1 Medical, 2 Prot, 3 Psi, 4 Space, 5 Favorites)
+            // before `dragnano`/a point step, matching the `SchoolSelector_c` button the user would click.
+            "nanopage" => l.p.hud.as_mut().unwrap().nano_set_page(v.parse().unwrap()),
+            // `barnames`: slot names of shortcut bar 0 (verifies a persisted nano/macro/action survives a relog).
+            "barnames" => eprintln!("barnames {:?}", l.p.hud.as_ref().unwrap().bar_slot_names(0)),
+            // `clickslot=<bar>:<slot>`: real left click (press/release, GUI mouse dispatch) activating a shortcut bar slot.
+            "clickslot" => {
+                let (bar, slot) = v.split_once(':').map(|(b, s)| (b.parse().unwrap(), s.parse().unwrap())).unwrap();
+                let (x, y) = l.p.hud.as_ref().unwrap().shortcut_slot_pos(&l.p.gui, bar, slot).expect("shortcut bar/slot out of range");
+                l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
+                for ev in [ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }] {
+                    l.tick();
+                    l.p.input(ev, &mut l.o.host);
+                }
+                l.tick();
+                eprintln!("clickslot bar {bar} slot {slot} at ({x},{y})");
             }
             // `clickdyn=[shift+|ctrl+]<instance>` / `hoverdyn=…`: left-click / hover the first screen point whose pick ray hits the dynel's box
             // with those modifiers held; `hoverdyn` prints the pointer sprites (GFX_GUI_POINTER* 0x135..0x14e) of the frame
@@ -1321,6 +1410,13 @@ fn live_walk() {
                 let p = &mut l.p;
                 let i = p.interact.as_mut().unwrap();
                 eprintln!("feedback {:?}\nloot: {:?}", i.take_feedback(), i.loot_dump(&mut p.gui));
+            }
+            // `windump`: all open window ids, outer position/size and named views, for locating tab/click targets.
+            "windump" => {
+                let p = &l.p;
+                for w in p.gui.window_ids() {
+                    eprintln!("window {w:?} pos={:?} size={:?} views={:?}", p.gui.window_pos(w), p.gui.outer_size(w), p.gui.view_names(w));
+                }
             }
             "grid" => {
                 let p = &l.p;

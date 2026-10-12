@@ -573,9 +573,12 @@ impl Player {
         let head_to_camera = head_position - host.camera.pos;
         let alpha = self.fader.step(&self.fade, head_to_camera.length_squared());
         self.avatar.set_animation_refresh(host.smooth_animations, host.camera.pos, host.previous_visible_actors.contains(&self.char_id));
+        zone.world.set_own_pick(None);
         if self.camera.show_avatar() {
             let mut frame = self.avatar.frame();
             frame.alpha = alpha;
+            zone.world.set_own_pick(frame.skin.as_ref().and_then(|vertices| super::hud_pick::bounds_of(vertices.iter().map(|v| &v.pos)))
+                .map(|bounds| super::hud_pick::PickBody { id: self.char_id as i32, bounds, pos: scene_pos(pos), yaw: scene_yaw(yaw), scale: self.avatar.body_scale() }));
             host.actors.push(frame);
         }
         out
@@ -611,9 +614,10 @@ impl Player {
         out
     }
 
-    /// `MovementChanged(0x1e)` of `N3Msg_StartCamping`.
-    pub fn sit_ground(&mut self) {
+    /// `MovementChanged(0x1e)` of `N3Msg_StartCamping`: drain immediately, before the caller queues stop-attack / camping.
+    pub fn sit_ground(&mut self) -> Vec<ao_net::n3::outgoing::CharMove> {
         self.movement.action(mv::SWITCH_SIT_GROUND, self.clock);
+        self.movement.take_outgoing()
     }
 
     /// Server messages for the own dynel (docs/zone/movement.md §10), in arrival order.

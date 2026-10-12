@@ -107,7 +107,11 @@ pub struct AvatarLook {
     pub scale: f32,
 }
 
-/// GC 0x1004b521: visible cloth is the highest nonzero page (2, 1, 0) for each of five parts.
+/// `Gamecode.dll 0x1004b521` (decompiled): for each of the 5 body parts (0 hands .. 4 legs) it scans pages 2, 1, 0 in that order through a dense
+/// `page*5+part` array and takes the first (highest-page) nonzero slot, independently per part; a part with no nonzero page across any page falls
+/// back to bare skin (`ClothData_t::GetName`, caller `FUN_1004b5ab`). Pages are independent layers of the *same* part, not a filter that drops
+/// entries belonging to a different part: two cloth entries on different parts (e.g. part 1 page 0, part 2 page 1) are both visible, each at its
+/// own part slot; the page only matters when two entries share one part (the higher page then wins).
 pub(super) fn visible_cloth(cloth: &[(i32, i32)]) -> impl Iterator<Item = (i32, i32)> + '_ {
     (0..5).filter_map(move |part| {
         (0..3).rev().find_map(|page| cloth.iter().find(|&&(index, texture)| index == page * 5 + part && texture > 0).map(|&(_, texture)| (part, texture)))
@@ -926,11 +930,12 @@ pub(super) mod tests {
         u.monster_scale = 150;
         u.attractors.push(ao_net::n3::dynel::AttractorMesh { place: 1, mesh: 7796, field: 0, byte: 2 });
         u.cloth.push(ao_net::n3::dynel::ClothData { raw: 1, texture: 154207, page: 0, extra: None });
-        u.cloth.push(ao_net::n3::dynel::ClothData { raw: 2, texture: 99, page: 1, extra: None });
+        u.cloth.push(ao_net::n3::dynel::ClothData { raw: 1, texture: 777, page: 1, extra: None }); // same part, higher page: wins over the page-0 entry
+        u.cloth.push(ao_net::n3::dynel::ClothData { raw: 2, texture: 99, page: 0, extra: None }); // a different part: visible independently, not merged with part 1
         let l = AvatarLook::from_update(&u, |_| Skin::Asian).unwrap();
         assert_eq!((l.look.build, l.scale, l.look.skin), (2, 1.5, Skin::Asian));
         assert_eq!(l.attachments, vec![(1, 7796)]);
-        assert_eq!(l.look.equipment.0, [None, Some(154207), None, None, None]);
+        assert_eq!(l.look.equipment.0, [None, Some(777), Some(99), None, None]);
     }
 
     #[test]

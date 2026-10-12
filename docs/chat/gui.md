@@ -218,8 +218,8 @@ Screenshots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac chat_win_shot 
   adds 5 + 13 px → icon + close = 36 px, so 35 as an extent; **GUESS** that no pin/help button is present). `UpdateMousePointer` 0x101594fc: move = pointer 7, horizontal resize 0xb, vertical 10, diagonals 9 / 8
   (the port uses the OS cursor; shapes **not applied**). Dragging does **not** call `MoveInsideScreen`; `SaveWndConfig` writes `GetFrame` as `WindowFrame`.
 * Port: `Gui::set_window_frame(w, movable, resizable)`, `set_window_size_limits`, `window_outer_frame`, `set_window_outer_frame`, `Event::WindowFrame`; `ChatWindows` keeps `Frame::placed` in sync, writes the frame into every
-  tab's `Config.xml` (`WindowFrame`, `tab_index`), and saves when the pointer is idle (the original saves at shutdown, `FUN_10094a28`; the port has no shutdown hook). `MIN_CLIENT` (50 × 60) is a **GUESS**:
-  `ChatWindow_c` sets no size limits, so the original lets the client shrink to 0 and relies on view minimum sizes.
+  tab's `Config.xml` (`WindowFrame`, `tab_index`), and saves when the pointer is idle (the original saves at shutdown, `FUN_10094a28`; the port has no shutdown hook). The guessed 50×60 client floor was removed:
+  `ChatWindow_c` 0x10097ae3 uses flags 0, so `Window` 0x101563ff does not set preferred-limit root flag 2. The default zero minimum / unlimited maximum remains, with the dynamic border-button width floor applied separately.
 
 ## 11. Tabs (`Window::InsertTab`)
 

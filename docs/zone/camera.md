@@ -46,8 +46,8 @@ Run/walk toggle is Backspace (not a "run" key); the default state is run.
 `9 + 2b` (9/0xB), turn-left `0xC + 2b` (0xC/0xE). The unused 0xA/0xD are the mouse-turn pair (§4).
 
 The forward/back/strafe slots first call `N3Msg_GetMovementMode()`; mode 8 (sitting) sends the AFCM message `0xE3`
-(`MovementWhileSitting`, the GUI stands the character up) before the action. `Controls` cannot know the mode: the lead
-must forward that check to the movement module.
+(`MovementWhileSitting`). Its registered handler [GUI 0x10027d5b, registration 0x1002ada6] only calls `TipSystem_t::Event`;
+it does not stand or toggle sitting. The ordinary movement action still goes through the seated FSM permission table.
 
 **`*_GLOBAL_*` (arrow keys).** `FUN_10027e46` [GUI 0x10027e46]: if the input mode `TextInputMode` (3) is off → active; if on, a
 cursor key moves only when the focused text view is not a single-line `TextRenderer_c` flagged `0x8000` or Ctrl/Alt is held

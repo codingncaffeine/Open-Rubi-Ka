@@ -311,21 +311,16 @@ impl HudTeam {
         let gfx = |id: u32| gui.gfx().name(ao_gui::GfxId(id)).unwrap_or_default().to_string();
         // `TeamBar_c` (`FUN_100791f7`): bars `PowerbarView_c(bounds, 0x1b, 0x1a, 0, 0, right)` (health) and `(0x1d, 0x1c)` (nano); separators `BitmapView_c(0xd6)`
         let (hp, hp_bg, nano, nano_bg, sep) = (gfx(0x1a), gfx(0x1b), gfx(0x1c), gfx(0x1d), gfx(0xd6));
-        // TeamBar's HLayout preferred height comes from its text and two bars,
-        // including the native 2 px top/bottom borders (GUI 0x100791f7).
-        let row_h = (gui.font_height(ao_gui::FontId::Normal) as u32 + 3)
-            .max(gui.gfx().size(ao_gui::GfxId(0x1b)).1 + gui.gfx().size(ao_gui::GfxId(0x1d)).1 + 3);
         let mut rows = vec![];
         for i in 0..ROWS {
             let top = if i == 0 { format!("<BitmapView bitmap_id=\"{sep}\" max_size=\"Point(16000,-1)\"/>") } else { String::new() };
             let src = format!(
                 "<root><View view_layout=\"vertical\" name=\"row{i}\">{top}\
-                 <View view_layout=\"stacked\" min_size=\"Point(-1,{row_h})\" max_size=\"Point(16000,{row_h})\"><CanvasView name=\"hl{i}\"/>\
-                 <View view_layout=\"horizontal\"><TextView name=\"idx{i}\" value=\"{n}\" layout_borders=\"Rect(3,2,0,2)\"/><HLayoutSpacer/>\
+                 <CanvasView name=\"hl{i}\" view_layout=\"horizontal\"><TextView name=\"idx{i}\" value=\"{n}\" layout_borders=\"Rect(3,2,0,2)\"/><HLayoutSpacer/>\
                  <TextView name=\"name{i}\" value=\"\" layout_borders=\"Rect(5,2,5,2)\"/><HLayoutSpacer/>\
                  <View view_layout=\"vertical\" layout_borders=\"Rect(2,2,2,2)\">\
                  <PowerBar name=\"hp{i}\" bg_gfx=\"{hp_bg}\" full_gfx=\"{hp}\" direction=\"right\"/>\
-                 <PowerBar name=\"nano{i}\" bg_gfx=\"{nano_bg}\" full_gfx=\"{nano}\" direction=\"right\"/></View></View></View>\
+                 <PowerBar name=\"nano{i}\" bg_gfx=\"{nano_bg}\" full_gfx=\"{nano}\" direction=\"right\"/></View></CanvasView>\
                  <BitmapView bitmap_id=\"{sep}\" max_size=\"Point(16000,-1)\"/></View></root>",
                 n = i + 1
             );
@@ -333,13 +328,12 @@ impl HudTeam {
         }
         let mut w = Win { window, rows, buttons: (false, false) };
         self.build_buttons(gui, &mut w, true);
-        // `LoadWndConfig` applies the saved `WindowFrame` (the template's size) and ends in `Window::MoveInsideScreen`: the origin comes from a bigger screen
-        // The stacked highlight overlay reserves the native HLayout preferred height.
-        gui.resize_window(w.window, WindowSize::Preferred);
-        let fh = fh.max(gui.outer_size(w.window).1);
-        let (px, py) = (x.min(self.screen.0.saturating_sub(fw) as i32).max(0), y.min(self.screen.1.saturating_sub(fh) as i32).max(0));
-        gui.set_window_outer_frame(w.window, (px, py, fw, fh));
-        gui.set_window_size_limits(w.window, (fw.saturating_sub(10), fh.saturating_sub(31)), (0, 0));
+        // Template WindowFrame is an outer frame, not a preferred-size minimum.
+        // `TeamBar_c` 0x100791f7 measures horizontal text / vertical bar children, not a fixed row height.
+        gui.set_window_preferred_size_limits(w.window, true);
+        gui.set_window_outer_frame(w.window, (x, y, fw, fh));
+        let (px, py, width, height) = gui.window_outer_frame(w.window).unwrap();
+        gui.set_window_pos(w.window, (px.min(self.screen.0.saturating_sub(width) as i32).max(0), py.min(self.screen.1.saturating_sub(height) as i32).max(0)));
         Ok(w)
     }
 

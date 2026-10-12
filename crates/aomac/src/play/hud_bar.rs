@@ -207,6 +207,84 @@ impl ShortcutBar {
         Ok(bar)
     }
 
+    /// Retail `FUN_100d8c12` restores paired item_id/item_pos entries; `FUN_100d7db1` writes the same archive.
+    pub(super) fn load_contents(&mut self, gui: &mut Gui, client: &Path, character: &Path, n: usize) {
+        let path = character.join(format!("Containers/ShortcutBar_{n}.xml"));
+        let src = std::fs::read_to_string(&path).or_else(|err| {
+            if n == 0 && err.kind() == std::io::ErrorKind::NotFound {
+                std::fs::read_to_string(character.join("Containers/ShortcutBar.xml"))
+            } else { Err(err) }
+        });
+        let Ok(src) = src else { return };
+        let result = (|| -> anyhow::Result<()> {
+            let root = ao_gui::xml::parse(&src)?;
+            let map = root.children.iter().find(|e| e.attr("name") == Some("position_map")).ok_or_else(|| anyhow::anyhow!("missing position_map"))?;
+            let ids: Vec<_> = map.children.iter().filter(|e| e.attr("name") == Some("item_id")).collect();
+            let positions: Vec<_> = map.children.iter().filter(|e| e.attr("name") == Some("item_pos")).collect();
+            anyhow::ensure!(ids.len() == positions.len(), "unpaired shortcut positions");
+            let mut entries = Vec::with_capacity(ids.len());
+            for (id, pos) in ids.into_iter().zip(positions) {
+                let [kind, instance] = archive_pair(id.attr("value"), "Identity(")?;
+                let [x, y] = archive_pair(pos.attr("value"), "IPoint(")?;
+                anyhow::ensure!(x < SLOTS as u32 && y < ROWS as u32, "shortcut position outside bar");
+                entries.push((kind, instance, x as usize, y as usize));
+            }
+            let mut nanos = super::hud_nanodb::NanoDb::new(client);
+            let macros = super::chat::macros::TextMacros::open();
+            self.slots = Default::default();
+            self.rows.fill_with(Default::default);
+            for (kind, instance, x, y) in entries {
+                let slot = if kind == KIND_MACRO {
+                    macros.get(instance as i32).map(|m| macro_slot(gui, instance, &m.name, &m.command))
+                } else if kind as i32 == ao_net::n3::nano::NANO_KIND {
+                    nanos.info(gui, instance as i32).map(|info| Slot { kind, instance, name: info.name.clone(), icon: info.icon, text: String::new() })
+                } else if kind == KIND_SPECIAL_ACTION {
+                    self.store.as_ref().and_then(|store| special_action(gui, store, instance))
+                } else { None };
+                let slot = slot.unwrap_or(Slot { kind, instance, name: String::new(), icon: None, text: String::new() });
+                if y == self.row { self.slots[x] = Some(slot); } else { self.rows[y][x] = Some(slot); }
+            }
+            if let Some(primary) = root.children.iter().find(|e| e.attr("name") == Some("IsPrimary")).and_then(|e| e.attr("value")) {
+                self.primary = primary == "true";
+            }
+            if let Some(row) = root.children.iter().find(|e| e.attr("name") == Some("selected_bar")).and_then(|e| e.attr("value")).and_then(|s| s.parse::<usize>().ok()).filter(|&r| r < ROWS) {
+                self.set_row(gui, row);
+            }
+            self.paint(gui);
+            Ok(())
+        })();
+        if let Err(err) = result { eprintln!("prefs: {}: {err}", path.display()); }
+    }
+
+    pub(super) fn save_contents(&self, character: &Path, n: usize) {
+        use ao_gui::xml::Element;
+        let path = character.join(format!("Containers/ShortcutBar_{n}.xml"));
+        let result = (|| -> anyhow::Result<()> {
+            let mut root = match std::fs::read_to_string(&path) {
+                Ok(src) => ao_gui::xml::parse(&src)?,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Element { name: "Archive".into(), attrs: vec![("code".into(), "0".into())], children: vec![] },
+                Err(err) => return Err(err.into()),
+            };
+            let scalar = |tag: &str, name: &str, value: String| Element { name: tag.into(), attrs: vec![("name".into(), name.into()), ("value".into(), value)], children: vec![] };
+            let mut map = Element { name: "Archive".into(), attrs: vec![("code".into(), "0".into()), ("name".into(), "position_map".into())], children: vec![] };
+            let mut macros = super::chat::macros::TextMacros::open();
+            for y in 0..ROWS {
+                let slots = if y == self.row { &self.slots } else { &self.rows[y] };
+                for (x, slot) in slots.iter().enumerate().filter_map(|(x, s)| s.as_ref().map(|s| (x, s))) {
+                    map.children.push(scalar("Identity", "item_id", format!("Identity({},{})", slot.kind, slot.instance)));
+                    map.children.push(scalar("IPoint", "item_pos", format!("IPoint({x},{y})")));
+                    if slot.kind == KIND_MACRO && !slot.text.is_empty() { macros.create(&slot.name, &slot.text, slot.instance as i32, true); }
+                }
+            }
+            root.children.retain(|e| !matches!(e.attr("name"), Some("position_map" | "selected_bar" | "IsPrimary")));
+            root.children.extend([map, scalar("Int32", "selected_bar", self.row.to_string()), scalar("Bool", "IsPrimary", self.primary.to_string())]);
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(&path, super::dvalue::element_xml(&root))?;
+            Ok(())
+        })();
+        if let Err(err) = result { eprintln!("prefs: {}: {err}", path.display()); }
+    }
+
     /// `Window::MoveInsideScreen`.
     fn place(&mut self, gui: &mut Gui, (x, y): (i32, i32), screen: (u32, u32)) {
         let (w, h) = gui.window_size(self.window);
@@ -390,6 +468,7 @@ impl ShortcutBar {
     /// source slot: a drop outside the bar removes the shortcut).
     pub(super) fn input(&mut self, gui: &mut Gui, ev: &InputEvent, list: &SpecialList, mods: ao_gui::Modifiers) {
         match *ev {
+            InputEvent::MouseDown { x, y, .. } if gui.pointer_owner(x, y) != Some(self.window) => {}
             InputEvent::MouseDown { x, y, button: button @ (MouseButton::Left | MouseButton::Right) } => {
                 self.mouse = (x, y);
                 if let Some(d) = (button == MouseButton::Left).then(|| self.row_button(gui, x, y)).flatten() {
@@ -497,6 +576,13 @@ impl ShortcutBar {
         }
     }
 
+    /// `NanoView_c::FUN_100d3807`: drag a known nano as an inventory/nano identity.
+    pub(super) fn begin_nano_drag(&mut self, gui: &mut Gui, id: i32, name: &str, icon: Option<(GfxId, u32, u32)>) {
+        let slot = Slot { kind: ao_net::n3::nano::NANO_KIND as u32, instance: id as u32, name: name.to_owned(), icon, text: String::new() };
+        let (x, y) = self.mouse;
+        self.start_drag(gui, None, slot, x, y);
+    }
+
     /// `FUN_100d82d4` (`/macro`): the new macro `{0xc789, id}` is dragged from no slot; a drop on a slot puts it there, a drop elsewhere discards it.
     pub(super) fn begin_macro_drag(&mut self, gui: &mut Gui, id: i32, name: &str, command: &str) {
         let slot = macro_slot(gui, id as u32, name, command);
@@ -552,6 +638,21 @@ impl ShortcutBar {
         }
         gui.close_window(self.window);
     }
+}
+
+#[cfg(test)]
+impl ShortcutBar {
+    /// Live harness: screen position of the centre of slot `n` of the current row.
+    pub(super) fn slot_screen_pos(&self, gui: &Gui, n: usize) -> (f32, f32) {
+        let (wx, wy) = gui.window_pos(self.window);
+        (wx as f32 + CHROME_W + PITCH * n as f32 + PITCH / 2.0, wy as f32 + BAR_H / 2.0)
+    }
+}
+
+fn archive_pair(value: Option<&str>, prefix: &str) -> anyhow::Result<[u32; 2]> {
+    let body = value.and_then(|v| v.strip_prefix(prefix)).and_then(|v| v.strip_suffix(')')).ok_or_else(|| anyhow::anyhow!("invalid shortcut value"))?;
+    let (a, b) = body.split_once(',').ok_or_else(|| anyhow::anyhow!("invalid shortcut pair"))?;
+    Ok([a.trim().parse()?, b.trim().parse()?])
 }
 
 /// Hotbars of the first login: `NumHotbars` (CharPrefs.xml) = 1.
@@ -620,6 +721,34 @@ mod tests {
         assert!(bar.tooltip_key.is_some(), "recharge repaint retains the cached item information");
         bar.update_tooltip(&mut gui, &zone, &stats, false);
         assert!(bar.tooltip_body.is_empty());
+    }
+
+    #[test]
+    fn nano_contents_survive_restart_and_activate() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let character = std::env::temp_dir().join(format!("aomac-shortcut-nano-{}", std::process::id()));
+        std::fs::create_dir_all(character.join("Containers")).unwrap();
+        let path = character.join("Containers/ShortcutBar_1.xml");
+        std::fs::write(&path, "<Archive code=\"0\"><Rect name=\"WindowFrame\" value=\"Rect(1,2,403,39)\"/><Int32 name=\"bar_orientation\" value=\"0\"/></Archive>").unwrap();
+        let mut gui = Gui::new(&client, None).unwrap();
+        let mut bar = ShortcutBar::new(&mut gui, &client, 1, (1280, 800)).unwrap();
+        bar.set_row(&mut gui, 7);
+        bar.slots[4] = Some(Slot { kind: ao_net::n3::nano::NANO_KIND as u32, instance: 163449, name: "Shadow Touch".into(), icon: None, text: String::new() });
+        bar.save_contents(&character, 1);
+        bar.close(&mut gui);
+        let mut restored = ShortcutBar::new(&mut gui, &client, 1, (1280, 800)).unwrap();
+        restored.load_contents(&mut gui, &client, &character, 1);
+        assert_eq!(restored.row, 7);
+        let slot = restored.slots[4].as_ref().unwrap();
+        assert_eq!((slot.kind, slot.instance), (ao_net::n3::nano::NANO_KIND as u32, 163449));
+        restored.use_slot(4, &SpecialList::new());
+        assert_eq!(restored.take_uses(), vec![SlotUse::Nano(163449)]);
+        let root = ao_gui::xml::parse(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(root.children.iter().any(|e| e.attr("name") == Some("WindowFrame")));
+        assert!(root.children.iter().any(|e| e.attr("name") == Some("bar_orientation")));
+        restored.close(&mut gui);
+        std::fs::remove_dir_all(character).unwrap();
     }
 
     #[test]

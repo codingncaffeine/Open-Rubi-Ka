@@ -445,12 +445,17 @@ fn border_windows_are_fixed_and_the_menu_gives_a_draggable_frame() {
     assert_eq!(again.wins[0].cfg.visual_mode, 0);
     assert_eq!(again.frames[0].placed, moved, "saved WindowFrame reloads at the same place");
     close_all(&mut gui, &again);
-    // resize by the bottom-right corner far past the minimum: clamped to the client floor, top-left fixed
+    // flags 0: no preferred client floor; only the live border-button row constrains width.
     let (x, y, w, h) = ch.frames[0].placed;
     drag(&mut gui, &mut ch, ((x + w as i32 - 2) as f32, (y + h as i32 - 2) as f32), (-5000.0, -5000.0));
     let (nx, ny, nw, nh) = ch.frames[0].placed;
     assert_eq!((nx, ny), (x, y));
-    assert_eq!((nw, nh), (windows::MIN_CLIENT.0 + 10, windows::MIN_CLIENT.1 + 31));
+    assert!(nw < 60, "the invented 50px client floor must not return");
+    assert_eq!(nh, 31, "zero-height client retains only the style-0 frame chrome");
+    ch.update(&mut gui, 0.0);
+    let restored = open_in(&mut gui, &test_dir(), (1280, 800));
+    assert_eq!(restored.frames[0].placed, (nx, ny, nw, nh));
+    close_all(&mut gui, &restored);
     // back to Border through the menu: the frame goes away, rectangle kept
     ch.test_pick(&mut gui, 0, OP_MODE, 2);
     assert_eq!(gui.window_tabs(ch.frames[0].id).0.len(), 0);

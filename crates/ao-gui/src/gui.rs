@@ -308,7 +308,7 @@ impl Gui {
         Ok(id)
     }
 
-    pub(crate) fn frame_tabbed(&mut self, id: WindowId, title: &str) {
+    pub fn frame_tabbed(&mut self, id: WindowId, title: &str) {
         if let Some(Some(w)) = self.windows.get_mut(id) {
             w.framed = true;
             w.title = Some(title.to_string());
@@ -436,6 +436,32 @@ impl Gui {
         })
     }
 
+    /// Root preferred client sizes (`View::_Attached` 0x1014f10e); excludes window chrome.
+    pub fn window_preferred_size_limits(&mut self, w: WindowId) -> Option<((u32, u32), (u32, u32))> {
+        let root = self.windows.get(w)?.as_ref()?.root;
+        let mut env = Env { gfx: &self.gfx, fonts: &mut self.fonts, colors: &self.colors, groups: Default::default(), preferred: Default::default(), group_depth: 0 };
+        let min = layout::pref(&mut env, &self.tree, root, false);
+        let max = layout::pref(&mut env, &self.tree, root, true);
+        Some((((min.x + 1.0).max(0.0) as u32, (min.y + 1.0).max(0.0) as u32),
+              ((max.x + 1.0).max(0.0) as u32, (max.y + 1.0).max(0.0) as u32)))
+    }
+
+    /// Mirrors retail root size constraints and refreshes them when content changes.
+    pub fn set_window_preferred_size_limits(&mut self, w: WindowId, enabled: bool) {
+        if let Some(Some(win)) = self.windows.get_mut(w) {
+            win.fx.preferred_limits = enabled;
+        }
+        self.refresh_window_size_limits(w);
+    }
+
+    fn refresh_window_size_limits(&mut self, w: WindowId) {
+        if self.windows.get(w).and_then(Option::as_ref).is_some_and(|win| win.fx.preferred_limits) {
+            if let Some((min, max)) = self.window_preferred_size_limits(w) {
+                self.set_window_size_limits(w, min, max);
+            }
+        }
+    }
+
     pub fn resize_window(&mut self, w: WindowId, size: WindowSize) {
         let Some(Some(win)) = self.windows.get(w) else { return };
         let root = win.root;
@@ -448,6 +474,7 @@ impl Gui {
             }
         };
         self.relayout(root, Rect::new(0.0, 0.0, cw - 1.0, ch - 1.0));
+        self.refresh_window_size_limits(w);
     }
 
     fn relayout(&mut self, root: ViewId, frame: Rect) {
@@ -466,6 +493,7 @@ impl Gui {
         if let Some(Some(win)) = self.windows.get(w) {
             let (root, f) = (win.root, self.tree.views[win.root].frame);
             self.relayout(root, f);
+            self.refresh_window_size_limits(w);
         }
     }
 
@@ -1562,26 +1590,36 @@ impl Gui {
     /// True when `(x, y)` is over something interactive or any non-root view of a visible window
     /// (a full-screen transparent window such as CharacterSelectionWindow does not count by itself).
     pub fn wants_mouse(&self, x: f32, y: f32) -> bool {
-        if self.interacting() || self.popup.is_some() || self.hit(x, y).is_some() {
-            return true;
+        self.interacting() || self.popup.is_some() || self.pointer_owner(x, y).is_some()
+    }
+
+    /// Topmost window owning a pointer press, including framed empty client space.
+    /// Popup presses belong to the popup, not any underlying window; captured drags
+    /// continue independently of this query.
+    pub fn pointer_owner(&self, x: f32, y: f32) -> Option<WindowId> {
+        if self.popup.is_some() {
+            return None;
         }
         for (window, root, pos) in self.windows_at(x, y) {
+            if self.hit_view(root, x - pos.0 as f32, y - pos.1 as f32, true, 0.0, 0.0, None).is_some() {
+                return Some(window);
+            }
             // WndBorder consumes the whole outer frame, including empty client space
             // and a root TextView (chat). Match frame mouse/context dispatch.
             if self.windows[window].as_ref().is_some_and(|w| w.framed)
                 && self.outer_of(window).is_some_and(|r| r.contains(Point::new(x, y)))
             {
-                return true;
+                return Some(window);
             }
             if self.windows[window].as_ref().and_then(|w| w.fx.move_region)
                 .is_some_and(|r| r.contains(Point::new(x - pos.0 as f32, y - pos.1 as f32))) {
-                return true;
+                return Some(window);
             }
             if self.covers(root, x - pos.0 as f32, y - pos.1 as f32, true, 0.0, 0.0) {
-                return true;
+                return Some(window);
             }
         }
-        false
+        None
     }
 
     fn covers(&self, id: ViewId, x: f32, y: f32, is_root: bool, ox: f32, oy: f32) -> bool {

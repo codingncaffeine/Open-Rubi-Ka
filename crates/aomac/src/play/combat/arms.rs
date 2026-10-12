@@ -208,6 +208,16 @@ impl Armory {
                 self.list(who.instance, npc, &items);
             }
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && a.action == ACTION_UNWIELD => self.unwield_slot(who.instance, a.identity_b.instance),
+            // The server never replicates the own character's already-worn weapon dynel at zone-in the way it does for other
+            // characters (docs/zone/static.md §4; live capture 2026-10-12, Aomacfixr: zero `WeaponItemFullUpdateIIR_t` of the own
+            // character in 587 zone-in frames). `FullCharacterIIR_t::rest` was empty, so `inventory` (`FUN_1002a41a`) is the one
+            // zone-in source left: its elements carry the same `(holder, item id, slot, rdb template)` a live update would, with
+            // no stat overrides. `wield` itself routes anything outside `valid_slot` into the resolvable bag map.
+            N3::World(World::FullCharacter(c)) if who.kind == CHAR_KIND => {
+                for e in &c.inventory {
+                    self.wield(who.instance, e.id.instance, e.slot as i32, Some(e.item.low_id as u32), &[]);
+                }
+            }
             N3::Misc(Misc::ToClientQuit) if who.kind == CHAR_KIND => {
                 self.by.remove(&who.instance);
             }
@@ -332,6 +342,54 @@ mod tests {
         assert_eq!(a.weapon_item(500).unwrap().dtype, PROJECTILE);
         a.unwield(500);
         assert!(a.weapon_item(500).is_none());
+    }
+
+    #[test]
+    fn full_character_inventory_seeds_the_own_weapon_at_zone_in() {
+        use ao_net::msg::Identity;
+        use ao_net::n3::world::{AcgItem, FullCharacter, InventoryEntry};
+        use ao_net::n3::{Message, N3Header};
+        let own = 33588;
+        let msg = |inventory: Vec<InventoryEntry>| Message {
+            header: N3Header { msg_type: 0, target: Identity { kind: CHAR_KIND, instance: own }, flag: 0 },
+            sender: 1,
+            body: N3::World(World::FullCharacter(Box::new(FullCharacter { inventory, ..FullCharacter::default() }))),
+        };
+        // the right-hand weapon-page entry (slot 6) wields exactly like a live `WeaponItemFullUpdateIIR_t` would
+        let mut a = Armory::default();
+        a.on_message(&msg(vec![InventoryEntry {
+            slot: 6, a: 0, b: 1,
+            id: Identity { kind: 0xc74a, instance: 900 },
+            item: AcgItem { low_id: 121569, high_id: 121569, level: 1 },
+        }]), false);
+        assert!(a.slot_item(own, 6).is_some(), "the own right-hand slot resolves without a live WeaponItemFullUpdate");
+        assert!(a.in_attack_range(own, 19.99, 0), "the wielded attack range, not the bare-hands fallback of 2");
+        assert!(!a.in_attack_range(own, 20.0, 0));
+        // a bag entry (slot 0x40, outside `valid_slot`) is not an attack slot: it stays resolvable for a
+        // later explicit wield (CharacterAction 0x83), not inserted into `slots`
+        let mut b = Armory::default();
+        b.on_message(&msg(vec![InventoryEntry {
+            slot: 0x40, a: 0, b: 1,
+            id: Identity { kind: 0xc74a, instance: 901 },
+            item: AcgItem { low_id: 121569, high_id: 121569, level: 1 },
+        }]), false);
+        assert!(b.slot_item(own, 6).is_none(), "a bagged weapon is not worn");
+        assert!(b.weapon_item(901).is_some(), "but it is resolvable for a later explicit wield");
+    }
+
+    /// Real `FullCharacterIIR_t` (Aomacfixr zone-in, 2026-10-12, own char 33588): the rifle (template 121569) is in
+    /// bag slot 0x40, not currently worn. Exercises the real wire parse against the gating this fix relies on.
+    #[test]
+    fn real_zone_in_full_character_inventory_does_not_falsely_wield_a_bagged_item() {
+        let line = include_str!("../../../../../docs/captures/zone_own_full_character_ithaca.rec");
+        let hex = line.split_whitespace().nth(2).unwrap();
+        let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
+        let (frame, _) = ao_net::frame::Frame::decode_with(&bytes, false).unwrap().unwrap();
+        let m = ao_net::n3::decode(&frame).unwrap();
+        let mut a = Armory::default();
+        a.on_message(&m, false);
+        assert_eq!(a.slot_item(33588, 6), None, "not currently worn: the rifle sits in the bag (slot 0x40)");
+        assert!(a.weapon_item(24763172).is_some(), "but the bag item is resolvable for a later explicit wield");
     }
 
     #[test]
