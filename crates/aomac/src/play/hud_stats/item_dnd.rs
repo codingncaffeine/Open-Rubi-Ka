@@ -101,6 +101,55 @@ pub enum Action {
     UseOn { item: Identity, target: Identity },
 }
 
+/// `EquipDelay` (stat 0xd3 / 211, `stat_names.txt`). `N3Msg_MoveItemToInventory` [GC 0x10027a30] calls `FUN_100474a9`/`FUN_1004aed0`
+/// (docs/zone/avatar.md §"Clothing is not a weapon notification"): it reads this stat of the moved item and, when wearing into an
+/// occupied weapon/armor/implant slot, of the item already there, sums them (centiseconds) and registers the client-local item-action
+/// timer `FUN_10047fde`/`FUN_1003d7ce` (the same mechanism `docs/zone/interact.md` §8.8 documents for timed item use).
+pub const STAT_EQUIP_DELAY: u32 = 211;
+
+/// `FUN_100474a9` [GC]: whether moving an item whose own current slot is `item_slot` to absolute `slot` registers the wear-delay timer at
+/// all (weapon/armor/implant page, `0..0x30`, either as the destination (wearing) or the item's own current slot (unwearing); the social
+/// page and bag-to-bag moves are never timed), and if so `FUN_1004aed0`'s summed duration in seconds (the moved item's own `EquipDelay`,
+/// plus the occupant's when wearing over one).
+pub fn wear_delay(moved: &Info, item_slot: i32, slot: i32, occupant: Option<&Info>) -> Option<f32> {
+    let worn_page = |s: i32| (0..0x30).contains(&s);
+    if !worn_page(slot) && !worn_page(item_slot) {
+        return None;
+    }
+    let mut cs = moved.stat(STAT_EQUIP_DELAY).unwrap_or(0).max(0);
+    if worn_page(slot) {
+        cs += occupant.and_then(|o| o.stat(STAT_EQUIP_DELAY)).unwrap_or(0).max(0);
+    }
+    (cs > 0).then(|| cs as f32 / 100.0)
+}
+
+/// Client-local countdown of [`wear_delay`], keyed by the moved item's identity: purely cosmetic (paints the same
+/// `GFX_GUI_ICONFADER32` wipe the hotbar recharge uses, `hud_bar.rs`/`hud_listview.rs`). The server's own `ContainerAddItemIIR_t` moves
+/// the item when it actually answers; this never gates or fabricates that move.
+#[derive(Default)]
+pub struct WearTimers {
+    pending: Vec<(Identity, f32, f32)>,
+}
+
+impl WearTimers {
+    pub fn start(&mut self, item: Identity, seconds: f32) {
+        self.pending.retain(|(i, ..)| *i != item);
+        self.pending.push((item, seconds, seconds));
+    }
+
+    pub fn tick(&mut self, dt: f32) {
+        for e in &mut self.pending {
+            e.1 -= dt;
+        }
+        self.pending.retain(|(_, remaining, _)| *remaining > 0.0);
+    }
+
+    /// Remaining fraction (1.0 = just started, 0.0 = about to clear) of the item's timer, if any.
+    pub fn progress(&self, item: Identity) -> Option<f32> {
+        self.pending.iter().find(|(i, ..)| *i == item).map(|(_, remaining, total)| (remaining / total).clamp(0.0, 1.0))
+    }
+}
+
 /// Press / drag state.
 #[derive(Default)]
 pub struct Dnd {
@@ -165,5 +214,41 @@ mod tests {
         assert!(!can_join(&s, &s, true, 5, 6));
         assert!(!can_join(&s, &s, false, 5, 5));
         assert!(!can_join(&s, &info(&[]), true, 5, 5));
+    }
+
+    /// `N3Msg_MoveItemToInventory`'s `FUN_100474a9`/`FUN_1004aed0`: weapon/armor/implant wear sums the moved item's `EquipDelay` with the
+    /// slot's current occupant (a weapon swap); unwearing out of those pages times only the unworn item; the social page and bag moves
+    /// (both ends `>= 0x30`) are never timed.
+    #[test]
+    fn wear_delay_follows_gamecodes_summed_centiseconds() {
+        let belt = info(&[(STAT_EQUIP_DELAY, 2000)]);
+        let old_weapon = info(&[(STAT_EQUIP_DELAY, 500)]);
+        // wearing into an empty armor slot (implants: 0x20..0x2f, NCU belt page): only the moved item's delay
+        assert_eq!(wear_delay(&belt, 0x40, 0x22, None), Some(20.0));
+        // wearing over an occupied weapon slot (0..0xf): both items' delays sum
+        assert_eq!(wear_delay(&old_weapon, 0x40, 3, Some(&belt)), Some(25.0));
+        // unwearing (source < 0x30, dest the "any free bag slot" >= 0x30): only the unworn item's delay, no occupant lookup
+        assert_eq!(wear_delay(&belt, 0x22, 0x6f, Some(&old_weapon)), Some(20.0));
+        // social page (0x30..0x3f) and plain bag-to-bag moves: never timed
+        assert_eq!(wear_delay(&belt, 0x40, 0x31, None), None);
+        assert_eq!(wear_delay(&belt, 0x40, 0x41, None), None);
+        // no EquipDelay stat at all: no timer
+        assert_eq!(wear_delay(&info(&[]), 0x40, 3, None), None);
+    }
+
+    #[test]
+    fn wear_timers_count_down_and_clear() {
+        let mut t = WearTimers::default();
+        let item = Identity { kind: 0x66, instance: 0x12 };
+        assert_eq!(t.progress(item), None);
+        t.start(item, 2.0);
+        assert_eq!(t.progress(item), Some(1.0));
+        t.tick(1.5);
+        assert_eq!(t.progress(item), Some(0.25));
+        // restarting (a weapon swapped back in) resets to full
+        t.start(item, 2.0);
+        assert_eq!(t.progress(item), Some(1.0));
+        t.tick(2.0);
+        assert_eq!(t.progress(item), None, "elapsed timers clear themselves");
     }
 }

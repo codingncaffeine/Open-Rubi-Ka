@@ -23,6 +23,7 @@ use ao_formats::{screens::TextDb, stats};
 use ao_gui::{CanvasItem, CanvasTip, Event, Gui, ViewHandle, WindowId, WindowSize};
 use ao_net::frame::Frame;
 use ao_net::msg::Identity;
+use ao_net::n3::inventory::item_identity;
 use items::Items;
 use skill_model::{is_disabled, Model};
 use stat_view::StatView;
@@ -56,6 +57,22 @@ const WEAR_KEY: &str = "wear_window";
 
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// `FUN_10040001` [GUI]: the same `GFX_GUI_ICONFADER32` wipe the hotbar recharge paints (`hud_bar.rs`/`hud_listview.rs`), over a wear/bag
+/// slot cell whose item has a pending [`item_dnd::WearTimers`] entry.
+fn wear_fader(gui: &mut Gui, progress: f32, x: f32, y: f32) -> Option<CanvasItem> {
+    let g = gui.gfx_id("GFX_GUI_ICONFADER32").map(ao_gui::GfxId)?;
+    let o = (items::SLOT - items::ICON) / 2.0;
+    let shrink = (items::ICON - 1.0) * 0.5 * (1.0 - progress.clamp(0.0, 1.0));
+    let (l, t) = (x + o, y + o);
+    Some(CanvasItem::ImageTint {
+        id: g,
+        src: [shrink, 0.0, items::ICON - 2.0 * shrink, items::ICON],
+        dst: [l + shrink, t + shrink, l + items::ICON - shrink, t + items::ICON - shrink],
+        color: 0,
+        alpha: 1.0,
+    })
 }
 
 /// `FUN_100f8f93`: colour of a skill's name by `GetSkillCostLevel` (the cost factor): the cheaper the skill for the profession, the greener.
@@ -162,6 +179,8 @@ pub(super) struct HudStats {
     item_hold_delay: f32,
     item_hold: Option<(f32, f32)>,
     item_button: ao_gui::MouseButton,
+    /// `FUN_10047fde`/`FUN_1003d7ce` [GC]: the client-local wear/unwear busy timer ([`item_dnd::wear_delay`]).
+    wear_timers: item_dnd::WearTimers,
 }
 
 /// Value of the first `<Bool name=NAME value=..>` below `e`.
@@ -226,6 +245,7 @@ impl HudStats {
             item_hold_delay: 0.3,
             item_hold: None,
             item_button: ao_gui::MouseButton::Left,
+            wear_timers: Default::default(),
         })
     }
 
@@ -746,6 +766,13 @@ impl HudStats {
         let Some(t) = self.wear.as_mut() else { return };
         let mut sig = signature(zone);
         sig.push((u32::MAX - 2, hover_code(self.dnd.hover)));
+        for cell in 0..15 {
+            if let Some(slot) = items::wear_slot(t.tab, cell) {
+                if let Some(p) = self.wear_timers.progress(item_identity(slot)) {
+                    sig.push((0x2000_0000 | slot, (p * 100.0) as i32));
+                }
+            }
+        }
         if t.drawn == sig {
             return;
         }
@@ -759,6 +786,9 @@ impl HudStats {
             let (x, y) = items::wear_origin(c, r);
             if let Some(e) = zone.inventory.get(&slot) {
                 cmds.extend(self.items.picture(gui, e, x, y));
+                if let Some(p) = self.wear_timers.progress(item_identity(slot)) {
+                    cmds.extend(wear_fader(gui, p, x, y));
+                }
                 if let Some(i) = self.items.info(gui, e.item.low_id) {
                     tips.push(CanvasTip { rect: [x, y, x + items::SLOT, y + items::SLOT], title: i.name.clone(), body: String::new() });
                 }
@@ -825,6 +855,7 @@ impl HudStats {
         sig.push((u32::MAX - 2, hover_code(self.dnd.hover)));
         sig.extend(slots.iter().filter_map(|&s| inv.positions.get(s).map(|c| (0x8000_0000 | s, (c.0 * 100 + c.1) as i32))));
         sig.extend(slots.iter().map(|&slot| (0x4000_0000 | slot, i32::from(zone.inventory[&slot].b))));
+        sig.extend(slots.iter().filter_map(|&s| self.wear_timers.progress(item_identity(s)).map(|p| (0x1000_0000 | s, (p * 100.0) as i32))));
         if inv.drawn == sig {
             return;
         }
@@ -887,6 +918,9 @@ impl HudStats {
                 }
                 if let Some(e) = item {
                     cmds.extend(self.items.picture(gui, e, x, y));
+                    if let Some(p) = self.wear_timers.progress(item_identity(e.slot)) {
+                        cmds.extend(wear_fader(gui, p, x, y));
+                    }
                     if let Some(info) = self.items.info(gui, e.item.low_id) {
                         tips.push(CanvasTip { rect: [x, y, x + items::SLOT, y + items::SLOT], title: info.name.clone(), body: String::new() });
                     }
@@ -959,6 +993,7 @@ impl HudStats {
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &mut Zone, _dt: f32) {
         self.dnd.clock += _dt;
         self.advance_item_hold(gui, zone, _dt);
+        self.wear_timers.tick(_dt);
         self.refresh_stats(zone);
         self.update_skills(gui, zone);
         self.update_wear(gui, zone);
@@ -1657,6 +1692,42 @@ mod tests {
             let want = ao_net::n3::misc::GenericCmd { state: 0, seq, cmd, args: ao_net::n3::misc::GenericArgs::ItemOnItem { flag: 0, actor: own, item: inv::item_identity(0x41), target } };
             assert_eq!(payload(&mut s), [ao_net::n3::misc::Misc::GenericCmd(want).encode(own, 1)]);
         }
+    }
+
+    /// The real NCU belt (rdb 1000020 id 36777, "Belt Component Platform 300X": `EquipDelay` 7000 cs = 70 s, `ItemClass` 1 weapon, `Placement`
+    /// bit 7 only -- the weapon page's Belt slot): wearing it starts the client-local wear-delay fader (`item_dnd::WearTimers`, user bug "no
+    /// bar is showing up" for long unequip actions like NCU belts), which counts down and clears on its own; the server's own confirmation
+    /// still moves the item regardless of the local timer.
+    #[test]
+    fn ncu_belt_equip_starts_and_counts_down_the_wear_delay_bar() {
+        use ao_net::n3::inventory as inv;
+        let Some((mut s, mut o)) = shot() else { return };
+        if ao_rdb::RecordStore::open(&ao_gui::client_dir()).is_err() {
+            return;
+        }
+        let me = s.zone.char_id as i32;
+        let mine = Identity { kind: 0xC350, instance: me };
+        s.zone.inventory.insert(0x40, item(0x40, 36777, 1));
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Character);
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Inventory);
+        o.frame(&mut s, 0.016);
+        let belt = inv::item_identity(0x40);
+        assert_eq!(s.hud.wear_timers.progress(belt), None, "no timer before the item is touched");
+        // drag the belt onto its only fitting weapon-page cell (Placement bit 7 -> id 7)
+        dnd!(s, o, bag_xy(&s, (0, 0)), wear_xy(&s, 0, 7));
+        let payload: Vec<_> = s.hud.take_outbox().into_iter().map(|f| f.payload).collect();
+        assert_eq!(payload, [inv::move_item_to_inventory(me, belt, 7)]);
+        let started = s.hud.wear_timers.progress(belt).expect("the 70 s EquipDelay bar just started");
+        assert!(started > 0.99, "{started}");
+        o.frame(&mut s, 35.0);
+        let half = s.hud.wear_timers.progress(belt).expect("still counting down halfway through");
+        assert!((half - 0.5).abs() < 0.01, "{half}");
+        // the server's own answer moves the item regardless of the local cosmetic timer
+        s.zone.apply_inventory(&inv::InventoryMsg::ContainerAdd { item: belt, container: mine, slot: 7 });
+        o.frame(&mut s, 0.016);
+        assert!(s.zone.inventory.contains_key(&7) && !s.zone.inventory.contains_key(&0x40));
+        o.frame(&mut s, 35.0);
+        assert_eq!(s.hud.wear_timers.progress(belt), None, "the bar clears itself once the 70 s elapse");
     }
 
     /// The real `Hud`: the menu toggles open the windows, the frame close button (and `Close`) clears the menu state again; the NewChar template's

@@ -294,6 +294,17 @@ impl HudStats {
                 if let (Some(Place::Bag { cell }), Some(i)) = (dest, self.inventory.as_mut()) {
                     i.pending_drop = Some(cell);
                 }
+                // `FUN_1004aed0`/`FUN_10047fde` [GC]: the client-local wear-delay timer (`EquipDelay` of the moved item plus, when
+                // wearing into an occupied weapon/armor/implant slot, the occupant's), purely cosmetic -- the item itself only
+                // moves once the server answers.
+                if let Some(src) = zone.inventory.get(&(item.instance as u32)) {
+                    if let Some(moved) = self.items.cached(src.item.low_id) {
+                        let occupant = zone.inventory.get(&(slot as u32)).and_then(|e| self.items.cached(e.item.low_id));
+                        if let Some(seconds) = dnd::wear_delay(moved, item.instance, slot, occupant) {
+                            self.wear_timers.start(item, seconds);
+                        }
+                    }
+                }
                 inv::move_item_to_inventory(char_id, item, slot)
             }
             Action::Join { from, onto } => inv::join_items(char_id, onto, from),
