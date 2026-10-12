@@ -69,6 +69,10 @@ pub enum Blend {
     /// ONE / INVSRCALPHA (DisplaySystem Cylinder 0x100109a4, states 19=2, 20=6).
     /// The source is already native shaded colour; do not premultiply it in the shader.
     PremultipliedAlpha,
+    /// SRCCOLOR / ONE (`Tweak_Rubi-Ka_HorizonClouds.txt` `HorizonCloudsRim` StateBlob: `SRCBLEND SRCCOLOR`, `DESTBLEND ONE`).
+    /// Self-modulated additive glow: the source colour weights its own contribution, so dark texels fade to nothing instead
+    /// of washing the destination at full strength like a `SRCALPHA` [`Additive`] would when the alpha source is just 1.0.
+    SourceColorOne,
 }
 
 /// Triangle list sharing the parent mesh's vertex buffer.

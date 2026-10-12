@@ -169,8 +169,12 @@ const ENV_BLEND_PIPE: usize = 14;
 const FADE_PIPE: usize = 16;
 const SPRITE_PIPE: usize = 20;
 const NATIVE_BLEND_PIPE: usize = 22;
-const MESH_EFFECT_PIPE: usize = 28;
-const MESH_EFFECT_STRIDE: usize = 28;
+/// The sky-only `SourceColorOne` pipe (`fs_sky_blend` + the native `(Src, One)` blend state): sky draws key their pipe off
+/// `SKY_PIPE + blend as usize`, which only covers the four contiguous base blends (`Opaque`..`Additive`); this native blend
+/// sits after `PremultipliedAlpha` in the enum, so it gets its own slot appended at the end of `pipe_specs` instead.
+const SKY_GLOW_PIPE: usize = NATIVE_BLEND_PIPE + 8;
+const MESH_EFFECT_PIPE: usize = SKY_GLOW_PIPE + 1;
+const MESH_EFFECT_STRIDE: usize = SKY_GLOW_PIPE + 1;
 
 fn native_blend_state(blend: Blend) -> wgpu::BlendState {
     use wgpu::BlendFactor::*;
@@ -179,6 +183,7 @@ fn native_blend_state(blend: Blend) -> wgpu::BlendState {
         Blend::ZeroSourceColor => (Zero, Src),
         Blend::DestinationColorSourceColor => (Dst, Src),
         Blend::PremultipliedAlpha => (One, OneMinusSrcAlpha),
+        Blend::SourceColorOne => (Src, One),
         _ => unreachable!("not a native effect blend"),
     };
     let component = wgpu::BlendComponent { src_factor, dst_factor, operation: wgpu::BlendOperation::Add };
@@ -624,7 +629,7 @@ impl Renderer {
                 Blend::AlphaTest => ("fs_test", None, true),
                 Blend::AlphaBlend => ("fs_blend", Some(wgpu::BlendState::ALPHA_BLENDING), false),
                 Blend::Additive => ("fs_add", Some(wgpu::BlendState { color: add, alpha: wgpu::BlendComponent::OVER }), false),
-                Blend::ZeroSourceColor | Blend::DestinationColorSourceColor | Blend::PremultipliedAlpha => ("fs_blend", Some(native_blend_state(blend)), false),
+                Blend::ZeroSourceColor | Blend::DestinationColorSourceColor | Blend::PremultipliedAlpha | Blend::SourceColorOne => ("fs_blend", Some(native_blend_state(blend)), false),
             };
             let fs = if sky {
                 match blend {
@@ -706,7 +711,11 @@ impl Renderer {
             .chain([Blend::Opaque, Blend::AlphaTest].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, true))))
             .map(|(b, two, sky, env, fade)| (b, two, sky, env, fade, false))
             .chain([false, true].map(|two| (Blend::AlphaBlend, two, false, false, false, true)))
-            .chain([Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, false, false))));
+            .chain([Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha, Blend::SourceColorOne].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, false, false))))
+            // sky draws key their pipe off `SKY_PIPE + blend as usize`, only valid for the four contiguous base blends;
+            // `SourceColorOne` is not contiguous with them (it sits after the other native blends), so it gets a lone
+            // dedicated sky slot at the very end of the table (`SKY_GLOW_PIPE`) instead.
+            .chain(std::iter::once((Blend::SourceColorOne, true, true, false, false, false)));
         let pipes = pipe_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false, 0))
             .chain((12..=13).map(|effect| mk(Blend::AlphaBlend, true, false, false, false, false, false, effect))).collect();
         let actor_pipes = (0..=7).flat_map(|effect| pipe_specs.clone().map(move |spec| (effect, spec)))
@@ -1090,7 +1099,8 @@ impl Renderer {
                     }));
                     sky.mats.len() - 1
                 });
-                ranges.push(Draw { mesh: mi, first_index: first, count, mat, pipe: SKY_PIPE + s.blend as usize });
+                let pipe = if s.blend == Blend::SourceColorOne { SKY_GLOW_PIPE } else { SKY_PIPE + s.blend as usize };
+                ranges.push(Draw { mesh: mi, first_index: first, count, mat, pipe });
             }
             let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&indices), usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST });
             sky.meshes.push(Some((vb, ib)));

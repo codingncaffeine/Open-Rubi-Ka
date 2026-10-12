@@ -400,12 +400,7 @@ impl Builder<'_> {
             s.uv_scroll = uv_scroll;
             s.uv_wave = uv_wave;
             s.two_sided = true;
-            s.blend = match (o.flag("ALPHABLENDENABLE"), o.states.get("DESTBLEND").map(String::as_str)) {
-                (Some(true), Some("e_D3DBLEND_ONE")) => Blend::Additive,
-                (Some(true), _) => Blend::AlphaBlend,
-                (Some(false), _) => Blend::Opaque,
-                (None, _) => s.blend,
-            };
+            s.blend = object_blend(o, s.blend);
             if !lit {
                 s.base_color = WHITE;
             }
@@ -559,6 +554,22 @@ impl Builder<'_> {
         }
         mesh.submeshes.push(Submesh { two_sided: true, blend: Blend::Additive, ..Submesh::new(idx, Some(key)) });
         Some(mesh)
+    }
+}
+
+/// The submesh blend a `StateBlob` selects, keyed off its own `ALPHABLENDENABLE`/`SRCBLEND`/`DESTBLEND`: `prev` (the mesh's
+/// own baked blend) is kept when the object sets no `ALPHABLENDENABLE` at all (never observed for a sky `StateBlob`, kept
+/// for parity with every other caller of this match). `SRCBLEND SRCCOLOR` self-modulates by the (already `MODULATE2X`-
+/// doubled) source colour before adding: a soft glow that fades out in dark texture regions, unlike a flat `SRCALPHA`
+/// additive wash when alpha is just 1.0 (`Tweak_Rubi-Ka_HorizonClouds.txt` `HorizonCloudsRim`: `jobe_cloudlayers_regular_rim.abiff`
+/// is fully opaque, alpha 255 everywhere, so only the colour-weighted blend fades its silhouette).
+fn object_blend(o: &Obj, prev: Blend) -> Blend {
+    match (o.flag("ALPHABLENDENABLE"), o.states.get("SRCBLEND").map(String::as_str), o.states.get("DESTBLEND").map(String::as_str)) {
+        (Some(true), Some("e_D3DBLEND_SRCCOLOR"), Some("e_D3DBLEND_ONE")) => Blend::SourceColorOne,
+        (Some(true), _, Some("e_D3DBLEND_ONE")) => Blend::Additive,
+        (Some(true), _, _) => Blend::AlphaBlend,
+        (Some(false), _, _) => Blend::Opaque,
+        (None, _, _) => prev,
     }
 }
 
@@ -733,5 +744,27 @@ Object VortexHorizon
         assert!((spins[0].degrees.abs() - 4.0).abs() < 1e-3, "{}", spins[0].degrees);
         assert_eq!(uv_wave(&objs[1], &ctx), [0.0, 0.005, 1.0, 0.005]);
         assert!(wave_spins(&objs[1], &ctx).is_empty());
+    }
+
+    fn real_tweaks(id: u32) -> Option<super::super::Tweaks> {
+        let dir = std::path::PathBuf::from(std::env::var_os("HOME")?).join("Games/ProjectRubiKa/client");
+        super::super::Tweaks::load(&dir, id, true)
+    }
+
+    /// `Tweak_Rubi-Ka_HorizonClouds.txt` (pf 4582 `!include`s it): `HorizonClouds`' own `StateBlob` sets no `SRCBLEND`/
+    /// `DESTBLEND`, so it stays a plain `SRCALPHA` alpha blend through its own (soft) texture alpha; `HorizonCloudsRim`'s
+    /// explicit `SRCBLEND SRCCOLOR`/`DESTBLEND ONE` must select the self-modulated glow, not a flat `SRCALPHA` additive wash
+    /// (the regression for the hard-edged saturated-blue night wall at ICC pf 4582).
+    #[test]
+    fn real_horizon_clouds_rim_self_modulates_while_the_base_layer_alpha_blends() {
+        let Some(t) = real_tweaks(4582) else { return };
+        let objs = t.objects();
+        let clouds = objs.iter().find(|o| o.name == "HorizonClouds").expect("HorizonClouds");
+        let rim = objs.iter().find(|o| o.name == "HorizonCloudsRim").expect("HorizonCloudsRim");
+        assert_eq!(clouds.states.get("SRCBLEND"), None);
+        assert_eq!(rim.states.get("SRCBLEND").map(String::as_str), Some("e_D3DBLEND_SRCCOLOR"));
+        assert_eq!(rim.states.get("DESTBLEND").map(String::as_str), Some("e_D3DBLEND_ONE"));
+        assert_eq!(object_blend(clouds, Blend::Opaque), Blend::AlphaBlend);
+        assert_eq!(object_blend(rim, Blend::Opaque), Blend::SourceColorOne);
     }
 }

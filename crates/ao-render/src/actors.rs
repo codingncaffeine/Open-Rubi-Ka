@@ -404,7 +404,7 @@ fn env_pipe(blend: Blend, two_sided: bool) -> usize {
 
 /// Whether a draw belongs to the blended actor phase (client render list 6) rather than the opaque one (list 3).
 fn blended_pipe(pipe: usize) -> bool {
-    matches!(pipe / 2, 2 | 3) && pipe < SKY_PIPE || (ENV_BLEND_PIPE..ENV_BLEND_PIPE + 2).contains(&pipe) || (SPRITE_PIPE..NATIVE_BLEND_PIPE + 6).contains(&pipe)
+    matches!(pipe / 2, 2 | 3) && pipe < SKY_PIPE || (ENV_BLEND_PIPE..ENV_BLEND_PIPE + 2).contains(&pipe) || (SPRITE_PIPE..NATIVE_BLEND_PIPE + 8).contains(&pipe)
 }
 
 /// Each delta state overrides only the native states it owns; mode 3 clears depth before its draw.
@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn env_layer_follows_the_phase_of_its_submesh() {
-        for (blend, blended) in [(Blend::Opaque, false), (Blend::AlphaTest, false), (Blend::AlphaBlend, true), (Blend::Additive, true), (Blend::ZeroSourceColor, true), (Blend::DestinationColorSourceColor, true), (Blend::PremultipliedAlpha, true)] {
+        for (blend, blended) in [(Blend::Opaque, false), (Blend::AlphaTest, false), (Blend::AlphaBlend, true), (Blend::Additive, true), (Blend::ZeroSourceColor, true), (Blend::DestinationColorSourceColor, true), (Blend::PremultipliedAlpha, true), (Blend::SourceColorOne, true)] {
             for two in [false, true] {
                 let base = material_pipe(&ao_scene::Submesh { blend, two_sided: two, ..ao_scene::Submesh::new(vec![], None) });
                 assert_eq!(blended_pipe(base), blended);
@@ -617,11 +617,12 @@ mod tests {
     #[test]
     fn native_effect_factors_match_display_system_states() {
         use wgpu::BlendFactor::*;
-        // Sprite3 0x100283ec: raw D3DBLEND 1/3 and 9/3; Cylinder 0x100109a4: 2/6.
+        // Sprite3 0x100283ec: raw D3DBLEND 1/3 and 9/3; Cylinder 0x100109a4: 2/6; HorizonCloudsRim (Tweak_Rubi-Ka_HorizonClouds.txt) 3/2.
         for (blend, src, dst, pipe) in [
             (Blend::ZeroSourceColor, Zero, Src, 22),
             (Blend::DestinationColorSourceColor, Dst, Src, 24),
             (Blend::PremultipliedAlpha, One, OneMinusSrcAlpha, 26),
+            (Blend::SourceColorOne, Src, One, 28),
         ] {
             let state = native_blend_state(blend);
             assert_eq!((state.color.src_factor, state.color.dst_factor), (src, dst));
