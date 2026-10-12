@@ -959,6 +959,46 @@ mod tests {
         assert!(max_displacement < 1e-3, "idle eye displacement exceeds float tolerance: {max_displacement}");
     }
 
+    /// Regression for the `fs_blend` pipeline crash on zoning into ICC Shuttleport (4582): `Renderer::update_liquids`
+    /// (`native_liquid.rs`) retargets `self.gpu.liquid` draws onto the `effect` 12/13 pipes the moment a liquid's camera
+    /// cell is built, and since the ground-detail commit those pipes used the 3-group `holo_pipeline_layout` for every
+    /// `effect >= 8`; the liquid draw loop in `Renderer::render` never binds group 2, so wgpu validation rejects the draw.
+    /// Runs the real offscreen path (`Renderer::render`, not just `update_liquids`) with a wgpu validation error scope so
+    /// a missing bind group fails the test instead of only surfacing as a panic in the user's windowed `aomac play`.
+    #[test]
+    fn icc_shuttleport_liquid_draw_has_no_missing_bind_group_validation_error() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() {
+            return;
+        }
+        let store = RecordStore::open(&dir).unwrap();
+        let scene = ao_formats::playfield::load_playfield_at(&store, &dir, 4582, ao_formats::playfield::DEFAULT_DAY_TIME).unwrap();
+        assert!(!scene.liquids.is_empty(), "ICC Shuttleport (4582) must carry an authored liquid surface for this regression");
+        let center = scene.liquids[0].initial_camera().expect("liquid surface has a source triangle");
+        let eye = [center[0], center[1] + 3.0, center[2]];
+        let look_at = [center[0] + 1.0, center[1], center[2]];
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = ao_render::Renderer::new(&instance, None).unwrap();
+        r.upload(&scene);
+        let targets = ao_render::Targets::new(&r, 64, 64);
+        let out = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: r.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let scope = r.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        r.render(&out.create_view(&Default::default()), &targets, &ao_render::Camera::look_at(eye.into(), look_at.into()));
+        r.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        if let Some(error) = pollster::block_on(scope.pop()) {
+            panic!("liquid draw raised a wgpu validation error (missing bind group 2 for the `fs_blend` pipeline is the known crash): {error}");
+        }
+    }
+
     #[test]
     fn armed_camera_caches_first_animated_head_sample() {
         let dir = ao_gui::client_dir();

@@ -273,6 +273,8 @@ dependencies = [
  "clap",
  "glam",
  "image",
+ "pollster",
+ "wgpu",
 ]
 
 [[package]]

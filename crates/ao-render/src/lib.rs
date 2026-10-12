@@ -655,7 +655,10 @@ impl Renderer {
             };
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fs),
-                layout: Some(if effect == 1 || effect >= 8 { &holo_pipeline_layout } else { &layout }),
+                // Ground effects 8-11 sample `ground_palette` (holo0) at bind group 2; liquids (12/13) reuse the plain
+                // `fs_blend` shader, which never samples group 2, so they must stay on the 2-group layout (no draw path
+                // for `self.gpu.liquid` binds a group 2 - `DisplaySystem_t::Render`'s liquid list carries no palette texture).
+                layout: Some(if effect == 1 || (8..=11).contains(&effect) { &holo_pipeline_layout } else { &layout }),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some(if (8..=11).contains(&effect) { "vs_ground" } else if matches!(effect, 12 | 13) { "vs_liquid" } else if actor && matches!(effect, 1 | 2 | 4..=6) { "vs_actor" } else if sky { "vs_sky" } else if env { "vs_env" } else if actor { "vs_actor" } else { "vs" }),
