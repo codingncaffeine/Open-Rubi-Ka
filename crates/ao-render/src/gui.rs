@@ -326,3 +326,64 @@ impl GuiRenderer {
         r.queue.submit([enc.finish()]);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Renderer;
+
+    /// Leak follow-up: `GuiRenderer::draw` creates a brand-new vertex buffer, globals uniform buffer and one bind
+    /// group per clip/texture batch *every call* (not just once); a busy screen (many windows, heavy chat text, lots
+    /// of distinct glyphs/clip regions -> many batches) could plausibly allocate far more per frame than the earlier
+    /// lightning-actor-only measurement did. Drives the real `draw()` path in a tight loop against a busy synthetic
+    /// screen (five windows, ~2000 characters of varied text each, so many distinct glyphs and clip batches) with a
+    /// long-lived `Renderer`/`GuiRenderer` (like the live session) and samples real process RSS.
+    #[test]
+    #[ignore = "real GPU + client data; run explicitly: cargo test --release -p ao-render -- --ignored gui_draw_loop_rss_stays_flat_with_busy_text --nocapture"]
+    fn gui_draw_loop_rss_stays_flat_with_busy_text() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = ao_gui::Gui::new(&dir, None).unwrap();
+        let blob: String = (0..2000).map(|i| char::from(b'!' + (i % 94) as u8)).collect();
+        for i in 0..5 {
+            let win = gui.open_window_xml(&format!("busy{i}"), "<root><ScrollView name=\"sv\" min_size=\"Point(300,500)\" max_size=\"Point(300,500)\"><ScrollViewChild name=\"svc\"><TextView name=\"text\" min_size=\"Point(280,4000)\" max_size=\"Point(280,4000)\"/></ScrollViewChild></ScrollView></root>", (i * 40, i * 40), ao_gui::WindowSize::Fixed(300, 500)).unwrap();
+            gui.set_text(win, "text", &blob);
+        }
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).unwrap();
+        r.upload(&ao_scene::Scene::default());
+        let (w, h) = (1280u32, 800u32);
+        let out = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: r.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = out.create_view(&Default::default());
+        let mut gr = GuiRenderer::new(&r, &gui);
+        let rss = |pid: u32| -> u64 {
+            let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+        };
+        let pid = std::process::id();
+        let mut samples = Vec::new();
+        const FRAMES: usize = 3000; // 50 simulated seconds at 60 fps: a lot of GUI-only draws, run as fast as possible
+        for i in 0..FRAMES {
+            let list = gui.frame(1.0 / 60.0);
+            gr.draw(&r, &view, (w, h), 1, &gui, &list);
+            let _ = r.device.poll(wgpu::PollType::Poll);
+            if i % 300 == 0 { samples.push((i, rss(pid))); }
+        }
+        samples.push((FRAMES, rss(pid)));
+        eprintln!("rss samples (frame, KB): {samples:?}");
+        let (warm, last) = (samples[1].1 as f64, samples.last().unwrap().1 as f64);
+        let growth = last - warm;
+        let per_frame = growth / (FRAMES - 300) as f64;
+        eprintln!("growth after warm-up: {growth:.0} KB over {} frames ({per_frame:.2} KB/frame)", FRAMES - 300);
+        assert!(growth < 50_000.0, "GUI draw-loop RSS grew {growth:.0} KB ({per_frame:.2} KB/frame) over {} frames: real leak in GuiRenderer::draw's per-frame buffer/bind-group creation", FRAMES - 300);
+    }
+}

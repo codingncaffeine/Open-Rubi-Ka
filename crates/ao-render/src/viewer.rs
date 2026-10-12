@@ -895,6 +895,8 @@ impl Offscreen {
         self.r.set_ground_rendering(self.host.ground_rendering);
         if let Some(textures) = self.host.ground_textures.take() { self.r.refresh_ground_textures(&textures); }
         self.host.apply_actors(&mut self.r);
+        // No swapchain/present here to drive wgpu's own resource reclaim, so poll explicitly like the real loop does.
+        let _ = self.r.device.poll(wgpu::PollType::Poll);
         list
     }
 

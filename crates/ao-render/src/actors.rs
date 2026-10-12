@@ -69,6 +69,17 @@ pub(crate) struct ActorLayer {
     cap: usize,
     items: Vec<Item>,
     commands: Vec<(i32, Option<usize>, i32, bool, usize)>,
+    /// Evicted actors' skin vertex buffers, by model: every actor of a model shares its vertex count/byte size (see
+    /// `set_actors`'s `s.len() == body.nverts` filter), so a freed buffer is safe to hand straight to the next new
+    /// actor of that model (short-lived combat/footstep/lightning effect actors otherwise create and drop one GPU
+    /// buffer per spawn, which under real in-world churn -- 60+ animating dynels, each firing footstep/swish/impact
+    /// effects a few times a second -- creates thousands of buffers a second and floods IOAccelerator (confirmed live
+    /// at ICC: 18k+ outstanding Metal buffers, 623 MB resident, within ~13s).
+    vb_pool: HashMap<u64, Vec<wgpu::Buffer>>,
+    /// Actor skin vertex buffers actually created (not reused from `vb_pool`), since the layer started: a regression
+    /// counter, not drained. In steady state with a stable set of models this must stop climbing (every further skin
+    /// write reuses a pooled or already-owned buffer).
+    pub(crate) vb_created: u64,
 }
 
 impl ActorLayer {
@@ -77,6 +88,7 @@ impl ActorLayer {
         self.actors.retain(|_, actor| actor.model != key);
         self.frames.retain(|frame| frame.model != key);
         self.items.retain(|item| item.model != key);
+        self.vb_pool.remove(&key);
         // Instance buffers are shared scratch space, rebuilt from frames before each draw.
     }
 }
@@ -238,7 +250,7 @@ impl Renderer {
             let Some(body) = self.act.models.get(&f.model).and_then(|m| m.meshes.first()).and_then(Option::as_ref) else { continue };
             let a = self.act.actors.entry(f.id).or_insert(ActorGpu { vb: None, seen: tick, model: f.model, skin: None });
             a.seen = tick;
-            if a.model != f.model { a.vb = None; a.skin = None; }
+            if a.model != f.model { if let Some(vb) = a.vb.take() { self.act.vb_pool.entry(a.model).or_default().push(vb); } a.skin = None; }
             a.model = f.model;
             if let Some(skin) = f.skin.take().filter(|s| s.len() == body.nverts) {
                 if a.skin.as_ref().is_some_and(|previous| std::sync::Arc::ptr_eq(previous, &skin)) { continue; }
@@ -246,19 +258,31 @@ impl Renderer {
                 match &a.vb {
                     Some(vb) => self.queue.write_buffer(vb, 0, &bytes),
                     None => {
-                        a.vb = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: None,
-                            contents: &bytes,
-                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                        }));
+                        let reused = self.act.vb_pool.get_mut(&f.model).and_then(Vec::pop);
+                        a.vb = Some(match reused {
+                            Some(vb) => { self.queue.write_buffer(&vb, 0, &bytes); vb }
+                            None => { self.act.vb_created += 1; self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: None,
+                                contents: &bytes,
+                                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                            }) }
+                        });
                     }
                 }
                 a.skin = Some(skin);
             }
         }
-        self.act.actors.retain(|_, a| a.seen == tick);
+        let (keep, evicted): (HashMap<_, _>, HashMap<_, _>) = std::mem::take(&mut self.act.actors).into_iter().partition(|(_, a)| a.seen == tick);
+        self.act.actors = keep;
+        for (_, a) in evicted {
+            if let Some(vb) = a.vb { self.act.vb_pool.entry(a.model).or_default().push(vb); }
+        }
         self.act.frames = frames;
     }
+
+    /// Actor skin vertex buffers actually created (not reused from the pool) since this `Renderer` started; for
+    /// leak regressions: in steady state (a stable actor population) this must stop climbing.
+    pub fn actor_vb_creations(&self) -> u64 { self.act.vb_created }
 
     /// Previous rasterization's body visibility feeds native CAT animation refresh counters.
     pub fn visible_actor_ids(&self, out: &mut std::collections::HashSet<u32>) {
@@ -634,5 +658,41 @@ mod tests {
                 assert!(blended_pipe(material_pipe(&sub)));
             }
         }
+    }
+
+    /// Leak regression: a steady population of short-lived actors sharing one model (a footstep/swish/impact effect
+    /// quad, or a lightning fan/bolt segment -- every one of them spawns a brand new `ActorFrame::id` each time) must
+    /// not keep creating new GPU skin buffers forever. Simulates 60 "dynels" each retiring and respawning one effect
+    /// actor (a fresh id) every frame: confirmed live at ICC, this exact pattern created 18k+ outstanding Metal
+    /// buffers (623 MB resident) in ~13 unthrottled seconds before pooling.
+    #[test]
+    fn short_lived_actor_churn_reuses_pooled_buffers_after_warmup() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("resource regression requires GPU");
+        let model = 0xfac2_0000_0000_0000u64;
+        let mut scene = Scene::default();
+        scene.meshes.push(ao_scene::Mesh { vertices: vec![ao_scene::Vertex::default(); 4], submeshes: vec![ao_scene::Submesh::new(vec![0, 1, 2, 1, 3, 2], None)] });
+        renderer.add_actor_model(model, &scene);
+        let skin = || std::sync::Arc::new(vec![ao_scene::Vertex::default(); 4]);
+        let mut next_id = 0u32;
+        for frame in 0..600 {
+            let actors = (0..60)
+                .map(|_| { next_id += 1; ActorFrame { id: next_id, model, transform: ao_scene::IDENTITY, skin: Some(skin()), always: true, ..Default::default() } })
+                .collect();
+            renderer.set_actors(actors);
+            if frame == 119 {
+                // one pass of 60 actors each frame for 2 "seconds" (120 frames) must have created at most their peak
+                // concurrent count worth of buffers, not kept growing with the cumulative spawn count (7200 by now).
+                assert!(renderer.actor_vb_creations() <= 120, "warm-up created {} buffers, pooling isn't reusing them", renderer.actor_vb_creations());
+            }
+        }
+        let warm = renderer.actor_vb_creations();
+        for _ in 0..600 {
+            let actors = (0..60)
+                .map(|_| { next_id += 1; ActorFrame { id: next_id, model, transform: ao_scene::IDENTITY, skin: Some(skin()), always: true, ..Default::default() } })
+                .collect();
+            renderer.set_actors(actors);
+        }
+        assert_eq!(renderer.actor_vb_creations(), warm, "steady-state churn of {} more spawns created {} more buffers instead of reusing the pool", 600 * 60, renderer.actor_vb_creations() - warm);
     }
 }
