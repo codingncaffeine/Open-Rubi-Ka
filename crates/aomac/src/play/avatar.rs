@@ -1164,6 +1164,32 @@ pub(super) mod tests {
         assert!((a.head_height().unwrap() / ys[29] - 2.0).abs() < 1e-3);
     }
 
+    /// The idle clip keeps playing and looping while the character stands still: `Player::frame` calls `Avatar::update`
+    /// unconditionally every frame and `anim_rate` falls back to the authored rate 1.0 at zero speed (not 0), so the body
+    /// pose must keep changing over several seconds of idle instead of freezing on its first sampled frame; confirmed with
+    /// an offscreen render sequence (`AVATAR_IDLE_SEQ=<dir>`, not part of this test) showing the authored breathing /
+    /// weight-shift motion directly.
+    #[test]
+    fn own_idle_clip_keeps_advancing_and_wraps_over_several_seconds() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut a = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        assert_eq!(a.rate, 1.0, "zero speed falls back to the authored playback rate, not a stall");
+        let duration = a.clip.as_ref().expect("retail idle clip resolves").duration;
+        assert!(duration > 1000.0, "retail idle-stand is a multi-second authored clip, not a single pose");
+        let mut prev = a.frame().skin.as_ref().unwrap().iter().map(|v| v.pos).collect::<Vec<_>>();
+        let mut moved_every_sample = true;
+        let steps = (duration / 100.0).ceil() as usize + 10;
+        for _ in 0..steps {
+            a.update(0.1);
+            let pos = a.frame().skin.as_ref().unwrap().iter().map(|v| v.pos).collect::<Vec<_>>();
+            moved_every_sample &= pos.iter().zip(&prev).any(|(x, y)| x != y);
+            prev = pos;
+        }
+        assert!(moved_every_sample, "the idle pose must keep changing every 0.1 s, not freeze at one frame");
+        assert!(a.ms > duration, "playback must wrap past the clip's own duration");
+    }
+
     /// Real model: roles pick different clips, a pose moves the body, the frame is transformed by position + heading.
     /// With `AVATAR_SHOT=<png>` it also renders the character in the Arrival Hall (4604) offscreen, 3 m in front of it.
     #[test]
