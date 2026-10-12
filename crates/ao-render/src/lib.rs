@@ -1708,6 +1708,17 @@ fn render_to_png_effects(scene: &Scene, models: &[(u64, Scene)], actors: Vec<ao_
 
 /// Reads back a `r.format` texture and writes it as PNG.
 pub(crate) fn texture_to_png(r: &Renderer, out: &wgpu::Texture, width: u32, height: u32, path: &Path) -> Result<()> {
+    let pixels = texture_to_rgba(r, out, width, height)?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(path)?), width, height);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()?.write_image_data(&pixels)?;
+    Ok(())
+}
+
+/// Reads back a `r.format` texture as raw RGBA8 bytes (row-major, no padding): shared by [`texture_to_png`] and
+/// visual-regression tests that diff pixels directly instead of round-tripping through a PNG file.
+pub(crate) fn texture_to_rgba(r: &Renderer, out: &wgpu::Texture, width: u32, height: u32) -> Result<Vec<u8>> {
     let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     let buf = r.device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
@@ -1731,11 +1742,7 @@ pub(crate) fn texture_to_png(r: &Renderer, out: &wgpu::Texture, width: u32, heig
     for y in 0..height {
         pixels.extend_from_slice(&mapped[(y * row) as usize..(y * row + width * 4) as usize]);
     }
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(path)?), width, height);
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    enc.write_header()?.write_image_data(&pixels)?;
-    Ok(())
+    Ok(pixels)
 }
 
 fn storage<T: bytemuck::Pod>(device: &wgpu::Device, data: &[T]) -> wgpu::Buffer {

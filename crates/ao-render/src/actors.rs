@@ -5,6 +5,9 @@
 use super::*;
 use ao_scene::ActorFrame;
 
+/// `(mat, pipe, env (mat, pipe))`: see `ModelMesh::submesh_mats`.
+type SubmeshMat = (usize, usize, Option<(usize, usize)>);
+
 /// Extra radius around the bind-pose sphere of mesh 0: limbs reach out of it in animation.
 const POSE_MARGIN: f32 = 1.0;
 
@@ -22,8 +25,17 @@ pub(super) struct ActorInstance {
 struct ModelMesh {
     vb: wgpu::Buffer,
     ib: wgpu::Buffer,
+    /// Current GPU buffer sizes in bytes (next power of two of the largest `nverts`/index count seen since the
+    /// last full rebuild): `update_actor_model`'s fast path writes into the existing buffer in place and only
+    /// recreates it when a frame's geometry no longer fits (mirrors `native_liquid.rs`'s `vertex_capacity`).
+    vertex_capacity: u64,
+    index_capacity: u64,
     nverts: usize,
     draws: Vec<Draw>,
+    /// `(mat, pipe, env (mat, pipe))` per submesh, in `scene.meshes[i].submeshes` order: the fast path reuses these
+    /// bind-group/pipeline indices as-is (it only runs once `same_material` has confirmed every submesh's material
+    /// inputs are still the ones these indices were built for) and only recomputes `draws`' triangle ranges.
+    submesh_mats: Vec<SubmeshMat>,
     /// Bind-pose bounding sphere.
     sphere: (Vec3, f32),
 }
@@ -80,6 +92,15 @@ pub(crate) struct ActorLayer {
     /// counter, not drained. In steady state with a stable set of models this must stop climbing (every further skin
     /// write reuses a pooled or already-owned buffer).
     pub(crate) vb_created: u64,
+    /// `update_actor_model` calls that fell through to a full `upload_actor_model` rebuild (new GPU buffers and
+    /// bind groups for the whole model), since the layer started: a regression counter, not drained. In steady
+    /// state with stable materials and a capacity that already fits the largest frame seen, this must stop
+    /// climbing even while vertex/index *counts* keep varying frame to frame.
+    pub(crate) model_rebuilds: u64,
+    /// `ModelMesh` vertex/index GPU buffers actually (re)created by `ensure_capacity` growing past the previous
+    /// capacity, since the layer started: a regression counter, not drained. Converges once the actor's largest
+    /// frame has been seen; a model whose geometry size never exceeds its first frame never grows at all.
+    pub(crate) mesh_buffer_grows: u64,
 }
 
 impl ActorLayer {
@@ -100,44 +121,91 @@ impl Renderer {
         self.upload_actor_model(key, scene, false);
     }
 
-    /// Replaces dynamic geometry while retaining the model's already uploaded textures.
+    /// Replaces dynamic geometry while retaining the model's already uploaded textures and bind groups.
     /// Any newly referenced texture must be supplied in `scene.textures`.
-    // ponytail: the fast path below only reuses the GPU buffers when vertex/index *counts* stay exactly the same
-    // (`model.topology` comparison); a submesh whose count varies frame to frame (dynamic buff/particle-count
-    // geometry) falls through to a full `upload_actor_model` every call. Measured in isolation (not live-confirmed
-    // this is the dominant remaining contributor at ICC, but it is additive to the fixed causes in this file):
-    // ~8.5 KB of real RSS growth per call even with the device polled every call, so it is real allocator/driver
-    // overhead from the repeated create+destroy, not just an unreclaimed backlog -- polling does not fix it.
-    // Upgrade path: give `ModelMesh` a byte capacity (like `native_liquid.rs`'s `vertex_capacity`/`index_capacity`),
-    // over-allocate on rebuild, and let this fast path accept any vertex/index *count* that still fits, reusing the
-    // old `Draw`'s `mat`/`pipe` (valid as long as untouched per-submesh material fields -- texture, blend, tint --
-    // really are unchanged, which must be checked explicitly instead of relying on `Submesh`'s derived `PartialEq`
-    // that also compares `indices`). Needs a live aomac play session to verify the visual output stays correct.
+    ///
+    /// Fast path: as long as every submesh's material inputs are unchanged ([`same_material`]) and every
+    /// referenced texture is already uploaded, this writes the new vertex/index data into the existing GPU
+    /// buffers in place (growing them, capacity-doubled, only when a frame needs more room than before) and
+    /// recomputes the draw ranges from the cached bind-group indices -- no buffer or bind group is created for
+    /// dynamic buff/particle/effect geometry whose vertex or index *count* merely varies frame to frame. A
+    /// changed material (a different texture, blend, tint, ...) still falls through to a full rebuild, which is
+    /// the only place bind groups are created.
     pub fn update_actor_model(&mut self, key: u64, scene: &Scene) {
-        if let Some(model) = self.act.models.get_mut(&key) {
-            if scene.textures.keys().all(|key| model.view_of.contains_key(key))
+        let eligible = self.act.models.get(&key).is_some_and(|model| {
+            scene.textures.keys().all(|k| model.view_of.contains_key(k))
                 && model.topology.len() == scene.meshes.len()
-                && model.topology.iter().zip(&scene.meshes).all(|((count, subs), mesh)| *count == mesh.vertices.len() && *subs == mesh.submeshes)
-            {
-                for (gpu, mesh) in model.meshes.iter_mut().zip(&scene.meshes) {
-                    let Some(gpu) = gpu else { continue };
-                    model.vertex_scratch.clear();
-                    for vertex in &mesh.vertices {
-                        model.vertex_scratch.extend_from_slice(&[
-                            vertex.pos[0], vertex.pos[1], vertex.pos[2],
-                            vertex.normal[0], vertex.normal[1], vertex.normal[2],
-                            vertex.uv[0], vertex.uv[1],
-                            vertex.color[0], vertex.color[1], vertex.color[2], vertex.color[3],
-                        ]);
-                    }
-                    self.queue.write_buffer(&gpu.vb, 0, bytemuck::cast_slice(&model.vertex_scratch));
-                    let (lo, hi) = mesh.vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| (l.min(Vec3::from(v.pos)), h.max(Vec3::from(v.pos))));
-                    let center = (lo + hi) * 0.5;
-                    gpu.sphere = (center, mesh.vertices.iter().map(|v| (Vec3::from(v.pos) - center).length()).fold(0.0, f32::max));
+                && model.meshes.len() == scene.meshes.len()
+                && model.topology.iter().zip(&scene.meshes).zip(&model.meshes).all(|(((_, subs), mesh), gpu)| {
+                    subs.len() == mesh.submeshes.len()
+                        && subs.iter().zip(&mesh.submeshes).all(|(a, b)| same_material(a, b))
+                        && gpu.is_some() == (!mesh.vertices.is_empty() && mesh.submeshes.iter().map(|s| s.indices.len()).sum::<usize>() > 0)
+                })
+        });
+        if eligible {
+            let device = &self.device;
+            let queue = &self.queue;
+            let model = self.act.models.get_mut(&key).unwrap();
+            let grows = &mut self.act.mesh_buffer_grows;
+            for (i, mesh) in scene.meshes.iter().enumerate() {
+                let Some(gpu) = model.meshes[i].as_mut() else {
+                    model.topology[i] = (mesh.vertices.len(), mesh.submeshes.clone());
+                    continue;
+                };
+                model.vertex_scratch.clear();
+                for vertex in &mesh.vertices {
+                    model.vertex_scratch.extend_from_slice(&[
+                        vertex.pos[0], vertex.pos[1], vertex.pos[2],
+                        vertex.normal[0], vertex.normal[1], vertex.normal[2],
+                        vertex.uv[0], vertex.uv[1],
+                        vertex.color[0], vertex.color[1], vertex.color[2], vertex.color[3],
+                    ]);
                 }
-                return;
+                let vbytes = (model.vertex_scratch.len() * 4) as u64;
+                if ensure_capacity(device, &mut gpu.vb, &mut gpu.vertex_capacity, vbytes, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, "actor body vertices") {
+                    *grows += 1;
+                }
+                if vbytes > 0 {
+                    queue.write_buffer(&gpu.vb, 0, bytemuck::cast_slice(&model.vertex_scratch));
+                }
+
+                let mut indices = Vec::with_capacity(mesh.submeshes.iter().map(|s| s.indices.len()).sum());
+                let mut draws = Vec::with_capacity(gpu.submesh_mats.len());
+                let nv = mesh.vertices.len() as u32;
+                for (s, &(mat, pipe, env)) in mesh.submeshes.iter().zip(&gpu.submesh_mats) {
+                    let first = indices.len() as u32;
+                    for t in s.indices.as_chunks::<3>().0 {
+                        if t.iter().all(|&idx| idx < nv) {
+                            indices.extend_from_slice(t.as_slice());
+                        }
+                    }
+                    let count = indices.len() as u32 - first;
+                    if count == 0 {
+                        continue;
+                    }
+                    draws.push(Draw { mesh: i, first_index: first, count, mat, pipe });
+                    if let Some((emat, epipe)) = env {
+                        draws.push(Draw { mesh: i, first_index: first, count, mat: emat, pipe: epipe });
+                    }
+                }
+                let ibytes = (indices.len() * 4) as u64;
+                if ensure_capacity(device, &mut gpu.ib, &mut gpu.index_capacity, ibytes, wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST, "actor body indices") {
+                    *grows += 1;
+                }
+                if ibytes > 0 {
+                    queue.write_buffer(&gpu.ib, 0, bytemuck::cast_slice(&indices));
+                }
+
+                gpu.draws = draws;
+                gpu.nverts = mesh.vertices.len();
+                let (lo, hi) = mesh.vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| (l.min(Vec3::from(v.pos)), h.max(Vec3::from(v.pos))));
+                let center = (lo + hi) * 0.5;
+                gpu.sphere = (center, mesh.vertices.iter().map(|v| (Vec3::from(v.pos) - center).length()).fold(0.0, f32::max));
+                model.topology[i] = (mesh.vertices.len(), mesh.submeshes.clone());
             }
+            return;
         }
+        self.act.model_rebuilds += 1;
         self.upload_actor_model(key, scene, true);
     }
 
@@ -174,12 +242,13 @@ impl Renderer {
                 meshes.push(None);
                 continue;
             }
-            let vb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&vertex_bytes(&mesh.vertices)),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            let vbytes = vertex_bytes(&mesh.vertices);
+            let vertex_capacity = ((vbytes.len() * 4) as u64).next_power_of_two().max(1);
+            let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None, size: vertex_capacity, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
             });
-            let (mut indices, mut draws) = (Vec::with_capacity(idx_total), vec![]);
+            self.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&vbytes));
+            let (mut indices, mut draws, mut submesh_mats) = (Vec::with_capacity(idx_total), vec![], Vec::with_capacity(mesh.submeshes.len()));
             let nv = mesh.vertices.len() as u32;
             for s in &mesh.submeshes {
                 let first = indices.len() as u32;
@@ -189,9 +258,6 @@ impl Renderer {
                     }
                 }
                 let count = indices.len() as u32 - first;
-                if count == 0 {
-                    continue;
-                }
                 let view = s.texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0);
                 let mut bind = |view: usize, clamp: bool, u: [f32; 20]| {
                     *mat_of.entry((view, clamp, u.map(f32::to_bits))).or_insert_with(|| {
@@ -212,23 +278,30 @@ impl Renderer {
                         mats.len() - 1
                     })
                 };
+                // bound regardless of this frame's triangle count, so `submesh_mats` stays index-aligned with
+                // `mesh.submeshes` for `update_actor_model`'s fast path even if a submesh is briefly empty
                 let mat = bind(view, s.texture_clamp, mat_uniform(s));
-                draws.push(Draw { mesh: meshes.len(), first_index: first, count, mat, pipe: material_pipe(s) });
+                let pipe = material_pipe(s);
                 // the env layer redraws the same triangles right after them, in the same phase (`FUN_10056ed6`)
-                if let Some(ev) = s.env_texture.and_then(|k| view_of.get(&k).copied()) {
-                    let mat = bind(ev, false, [0.0; 20]);
-                    draws.push(Draw { mesh: meshes.len(), first_index: first, count, mat, pipe: env_pipe(s.blend, s.two_sided) });
+                let env = s.env_texture.and_then(|k| view_of.get(&k).copied()).map(|ev| (bind(ev, false, [0.0; 20]), env_pipe(s.blend, s.two_sided)));
+                submesh_mats.push((mat, pipe, env));
+                if count == 0 {
+                    continue;
+                }
+                draws.push(Draw { mesh: meshes.len(), first_index: first, count, mat, pipe });
+                if let Some((emat, epipe)) = env {
+                    draws.push(Draw { mesh: meshes.len(), first_index: first, count, mat: emat, pipe: epipe });
                 }
             }
-            let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&indices),
-                usage: wgpu::BufferUsages::INDEX,
+            let index_capacity = ((indices.len() * 4) as u64).next_power_of_two().max(1);
+            let ib = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None, size: index_capacity, usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
             });
+            self.queue.write_buffer(&ib, 0, bytemuck::cast_slice(&indices));
             let (lo, hi) = mesh.vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| (l.min(Vec3::from(v.pos)), h.max(Vec3::from(v.pos))));
             let c = (lo + hi) * 0.5;
             let r = mesh.vertices.iter().map(|v| (Vec3::from(v.pos) - c).length()).fold(0.0, f32::max);
-            meshes.push(Some(ModelMesh { vb, ib, nverts: mesh.vertices.len(), draws, sphere: (c, r) }));
+            meshes.push(Some(ModelMesh { vb, ib, vertex_capacity, index_capacity, nverts: mesh.vertices.len(), draws, submesh_mats, sphere: (c, r) }));
         }
         let topology = scene.meshes.iter().map(|mesh| (mesh.vertices.len(), mesh.submeshes.clone())).collect();
         let vertex_scratch = Vec::with_capacity(scene.meshes.iter().map(|mesh| mesh.vertices.len() * 12).max().unwrap_or(0));
@@ -294,6 +367,15 @@ impl Renderer {
     /// Actor skin vertex buffers actually created (not reused from the pool) since this `Renderer` started; for
     /// leak regressions: in steady state (a stable actor population) this must stop climbing.
     pub fn actor_vb_creations(&self) -> u64 { self.act.vb_created }
+
+    /// `update_actor_model` calls since the layer started that fell through to a full model rebuild (new GPU
+    /// buffers and bind groups), for leak regressions: in steady state with stable materials this must stop
+    /// climbing even as vertex/index counts keep varying frame to frame.
+    pub fn actor_model_rebuilds(&self) -> u64 { self.act.model_rebuilds }
+
+    /// `ModelMesh` vertex/index GPU buffers actually (re)created by capacity growth since the layer started,
+    /// for leak regressions: converges once the largest frame of each model's dynamic geometry has been seen.
+    pub fn actor_mesh_buffer_grows(&self) -> u64 { self.act.mesh_buffer_grows }
 
     /// Previous rasterization's body visibility feeds native CAT animation refresh counters.
     pub fn visible_actor_ids(&self, out: &mut std::collections::HashSet<u32>) {
@@ -437,6 +519,30 @@ fn env_pipe(blend: Blend, two_sided: bool) -> usize {
     (if blended_material(blend) { ENV_BLEND_PIPE } else { ENV_PIPE }) + two_sided as usize
 }
 
+/// Grows `buf` to `needed` bytes (next power of two), in place, only when it no longer fits (returns `true`);
+/// a no-op otherwise (returns `false`). Mirrors `native_liquid.rs`'s `vertex_capacity`/`index_capacity` buffers.
+fn ensure_capacity(device: &wgpu::Device, buf: &mut wgpu::Buffer, capacity: &mut u64, needed: u64, usage: wgpu::BufferUsages, label: &str) -> bool {
+    if needed <= *capacity {
+        return false;
+    }
+    *capacity = needed.next_power_of_two().max(1);
+    *buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: *capacity, usage, mapped_at_creation: false });
+    true
+}
+
+/// Whether two submeshes need the same GPU bind group and pipeline: every `Submesh` field except `indices` (the
+/// triangle list, which varies frame to frame for dynamic actor geometry -- buff auras, particle effects -- and
+/// never affects which bind group/pipeline a draw uses). Strips `indices` and reuses the struct's derived
+/// `PartialEq` for the rest, so a new `Submesh` field is automatically covered here instead of silently ignored.
+fn same_material(a: &ao_scene::Submesh, b: &ao_scene::Submesh) -> bool {
+    let strip = |s: &ao_scene::Submesh| {
+        let mut s = s.clone();
+        s.indices.clear();
+        s
+    };
+    strip(a) == strip(b)
+}
+
 /// Whether a draw belongs to the blended actor phase (client render list 6) rather than the opaque one (list 3).
 fn blended_pipe(pipe: usize) -> bool {
     matches!(pipe / 2, 2 | 3) && pipe < SKY_PIPE || (ENV_BLEND_PIPE..ENV_BLEND_PIPE + 2).contains(&pipe) || (SPRITE_PIPE..NATIVE_BLEND_PIPE + 8).contains(&pipe)
@@ -515,11 +621,12 @@ mod tests {
         assert_eq!(mesh.ib, ib);
         assert_eq!(model.mats[0], mat);
         assert_eq!(mesh.sphere.0.x, 1.5, "vertex update refreshes culling bounds");
-        // Equal index counts are insufficient: actual connectivity must trigger a rebuild.
+        // Equal index counts with the same material: connectivity changing alone (dynamic buff/particle/effect
+        // geometry) is not a material change, so the fast path rewrites the existing index buffer in place.
         scene.meshes[0].submeshes[0].indices.swap(1, 2);
         renderer.update_actor_model(7, &scene);
         let mesh = renderer.act.models[&7].meshes[0].as_ref().unwrap();
-        assert_ne!(mesh.ib, ib);
+        assert_eq!(mesh.ib, ib, "same-material connectivity change reuses the index buffer in place");
         let changed = mesh.vb.clone();
         scene.meshes[0].submeshes[0].texture_clamp = true;
         renderer.update_actor_model(7, &scene);
@@ -538,6 +645,153 @@ mod tests {
         assert_eq!(actor_priority(None, false, 1, true), 5);
         assert_eq!(actor_priority(None, false, 5, false), 6);
         assert_eq!(actor_priority(Some(7), false, 0, true), 7);
+    }
+    #[test]
+    fn same_material_covers_every_submesh_field_but_indices() {
+        let base = ao_scene::Submesh::new(vec![0, 1, 2], Some(TextureKey { rdb_type: 1, id: 1 }));
+        // Indices alone (the triangle list, which dynamic buff/particle/effect geometry varies every frame)
+        // never make two submeshes incompatible for GPU resource reuse.
+        let mut only_indices = base.clone();
+        only_indices.indices = vec![2, 1, 0];
+        assert!(same_material(&base, &only_indices));
+        // Every other field is material-relevant: listed explicitly so a new `Submesh` field that is never
+        // exercised here is a visible gap in this test, not a silent correctness hole in `same_material`.
+        let variants: Vec<fn(&mut ao_scene::Submesh)> = vec![
+            |s| s.texture = Some(TextureKey { rdb_type: 1, id: 2 }),
+            |s| s.texture_clamp = true,
+            |s| s.blend = Blend::AlphaBlend,
+            |s| s.sprite_alpha_test = true,
+            |s| s.base_color = [0.0, 0.0, 0.0, 1.0],
+            |s| s.two_sided = true,
+            |s| s.emissive = [1.0, 0.0, 0.0],
+            |s| s.glow_mask = true,
+            |s| s.prelit = true,
+            |s| s.uv_scroll = [1.0, 0.0],
+            |s| s.sky_fog = true,
+            |s| s.uv_wave = [1.0, 0.0, 0.0, 0.0],
+            |s| s.sun_flicker = true,
+            |s| s.specular = [1.0, 0.0, 0.0],
+            |s| s.shininess = 10.0,
+            |s| s.env_texture = Some(TextureKey { rdb_type: 1, id: 3 }),
+            |s| s.liquid = true,
+        ];
+        for change in &variants {
+            let mut other = base.clone();
+            change(&mut other);
+            assert!(!same_material(&base, &other), "a changed material field must compare as a different material");
+        }
+    }
+
+    /// Leak regression (user report, ICC pf 4582, 60 dynels): `update_actor_model`'s old fast path only reused
+    /// GPU buffers when vertex/index *counts* matched exactly, so dynamic buff/particle/effect geometry -- whose
+    /// counts vary every frame -- fell through to a full rebuild (new vb/ib/bind groups) on every call. With
+    /// capacity-based buffers, a same-material actor whose geometry size oscillates must create zero further
+    /// buffers or bind groups once its largest frame has been seen.
+    #[test]
+    fn dynamic_counts_stop_creating_buffers_once_capacity_covers_the_largest_frame() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("resource regression requires GPU");
+        let key = TextureKey { rdb_type: 1010004, id: 1 };
+        let mesh_of = |n: usize| {
+            let mut scene = Scene::default();
+            scene.textures.insert(key, ao_scene::Texture { source: Default::default(), width: 1, height: 1, rgba: vec![255; 4] });
+            let indices: Vec<u32> = (0..n as u32 * 3).map(|i| i % n as u32).collect();
+            scene.meshes.push(ao_scene::Mesh { vertices: vec![ao_scene::Vertex::default(); n], submeshes: vec![ao_scene::Submesh::new(indices, Some(key))] });
+            scene
+        };
+        renderer.add_actor_model(9, &mesh_of(4));
+        assert_eq!(renderer.actor_model_rebuilds(), 0);
+        // Warm-up: grow to the largest frame this actor will ever submit, with counts varying every call.
+        for n in [4usize, 8, 3, 10, 2, 10, 6, 10] {
+            renderer.update_actor_model(9, &mesh_of(n));
+        }
+        let (rebuilds, grows) = (renderer.actor_model_rebuilds(), renderer.actor_mesh_buffer_grows());
+        assert_eq!(rebuilds, 0, "same-material geometry count churn must never fall back to a full rebuild");
+        assert!(grows > 0, "capacity must have grown at least once to reach the largest warm-up frame");
+        // Steady state: further frames whose counts vary but never exceed the warm-up maximum create nothing.
+        for n in [5usize, 2, 9, 1, 10, 4, 7] {
+            renderer.update_actor_model(9, &mesh_of(n));
+        }
+        assert_eq!(renderer.actor_model_rebuilds(), 0);
+        assert_eq!(renderer.actor_mesh_buffer_grows(), grows, "steady state with varying counts must create zero further buffers");
+    }
+
+    /// Visual-correctness proof: `update_actor_model`'s capacity-buffer fast path must render byte-identical
+    /// pixels to a full rebuild of the same geometry, across vertex/index counts that grow and shrink (dynamic
+    /// buff/particle/effect geometry, a Body Boost-style pulsing aura or a remote character's animated
+    /// attachment), and a material (texture) change must still fall through to a full rebuild and visibly pick
+    /// up the new texture (a remote character's equipment/texture change), proving bind groups refresh.
+    #[test]
+    fn dynamic_geometry_fast_path_renders_identically_to_a_full_rebuild() {
+        let (w, h) = (64u32, 64u32);
+        let (eye, look_at) = ([0.0, 0.0, 0.0], [0.0, 0.0, -1.0]);
+        let (key_a, key_b) = (TextureKey { rdb_type: 1010004, id: 1 }, TextureKey { rdb_type: 1010004, id: 2 });
+        // A fixed, always-visible 1x1m emissive red quad (indices 0,1,2,0,2,3) plus `extra` churn vertices and
+        // triangles placed far behind the camera (world z ~= 995, well outside the view frustum): they exercise
+        // dynamic vertex/index counts without ever contributing a rasterized pixel, so any pixel difference can
+        // only come from the fast path mishandling the capacity buffers, not from the churn geometry itself.
+        let mesh_of = |extra: usize, key: TextureKey| {
+            let mut vertices = vec![
+                ao_scene::Vertex { pos: [-0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0], color: [1.0; 4], ..Default::default() },
+                ao_scene::Vertex { pos: [0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0], color: [1.0; 4], ..Default::default() },
+                ao_scene::Vertex { pos: [0.5, 0.5, 0.0], normal: [0.0, 0.0, 1.0], color: [1.0; 4], ..Default::default() },
+                ao_scene::Vertex { pos: [-0.5, 0.5, 0.0], normal: [0.0, 0.0, 1.0], color: [1.0; 4], ..Default::default() },
+            ];
+            let mut indices = vec![0u32, 1, 2, 0, 2, 3];
+            for i in 0..extra {
+                vertices.push(ao_scene::Vertex { pos: [0.0, 0.0, 1000.0 + i as f32], normal: [0.0, 0.0, 1.0], color: [1.0; 4], ..Default::default() });
+            }
+            for i in 0..extra / 3 {
+                let base = (4 + i * 3) as u32;
+                indices.extend_from_slice(&[base, base + 1, base + 2]);
+            }
+            let sub = ao_scene::Submesh { emissive: [1.0, 0.0, 0.0], base_color: [1.0; 4], two_sided: true, ..ao_scene::Submesh::new(indices, Some(key)) };
+            let mut scene = Scene::default();
+            scene.textures.insert(key_a, ao_scene::Texture { source: Default::default(), width: 1, height: 1, rgba: vec![255, 0, 0, 255] });
+            scene.textures.insert(key_b, ao_scene::Texture { source: Default::default(), width: 1, height: 1, rgba: vec![0, 255, 0, 255] });
+            scene.meshes.push(ao_scene::Mesh { vertices, submeshes: vec![sub] });
+            scene
+        };
+        let frame = ActorFrame { id: 1, model: 1, transform: { let mut t = ao_scene::IDENTITY; t[3][2] = -5.0; t }, ..Default::default() };
+        let capture = |r: &mut Renderer| -> Vec<u8> {
+            r.set_actors(vec![frame.clone()]);
+            let targets = Targets::new(r, w, h);
+            let out = r.device.create_texture(&wgpu::TextureDescriptor {
+                label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
+                dimension: wgpu::TextureDimension::D2, format: r.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+            });
+            r.render(&out.create_view(&Default::default()), &targets, &Camera::look_at(eye.into(), look_at.into()));
+            super::texture_to_rgba(r, &out, w, h).unwrap()
+        };
+        let new_renderer = || {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            Renderer::new(&instance, None).expect("visual regression requires GPU")
+        };
+        let extras = [0usize, 9, 3, 12, 6, 12];
+        // Reference: a brand-new `Renderer` every frame, so `add_actor_model` always does a full rebuild.
+        let reference: Vec<Vec<u8>> = extras.iter().map(|&n| {
+            let mut r = new_renderer();
+            r.add_actor_model(1, &mesh_of(n, key_a));
+            capture(&mut r)
+        }).collect();
+        // Fast path: one `Renderer`, `add_actor_model` once, `update_actor_model` for every further frame.
+        let mut r = new_renderer();
+        for (i, &n) in extras.iter().enumerate() {
+            if i == 0 { r.add_actor_model(1, &mesh_of(n, key_a)); } else { r.update_actor_model(1, &mesh_of(n, key_a)); }
+            let pixels = capture(&mut r);
+            assert_eq!(pixels, reference[i], "frame {i} (extra={n}): fast path must render identically to a full rebuild");
+        }
+        assert_eq!(r.actor_model_rebuilds(), 0, "same-material geometry churn must never fall back to a full rebuild");
+        // Texture swap (a remote character's equipment/texture change): same connectivity, different material;
+        // must trigger a full rebuild and visibly pick up the new texture, proving bind groups refresh.
+        let before_swap = capture(&mut r);
+        r.update_actor_model(1, &mesh_of(*extras.last().unwrap(), key_b));
+        let after_swap = capture(&mut r);
+        assert_eq!(r.actor_model_rebuilds(), 1, "a material change must fall through to a full rebuild (new bind groups)");
+        assert_ne!(after_swap, before_swap, "a texture swap must change the rendered pixels");
+        let mut reference_swap = new_renderer();
+        reference_swap.add_actor_model(1, &mesh_of(*extras.last().unwrap(), key_b));
+        assert_eq!(capture(&mut reference_swap), after_swap, "the rebuilt (texture-swapped) frame must also match a from-scratch render");
     }
 
     #[test]
