@@ -2055,6 +2055,17 @@ impl Dynels {
                     self.pending_weapons.push((w.parent.instance, hand, static_instance(&stats), stats));
                 }
             }
+            // Same zone-in gap as `Armory::on_message` (docs/zone/static.md §4): seed the hand `AnimSet` resolution pipeline
+            // (normally fed by a live `WeaponItemFullUpdateIIR_t`, line above) from the `FullCharacterIIR_t` inventory so the
+            // own character's attack animation resolves after a fresh login too.
+            N3::World(World::FullCharacter(c)) if who.kind == CHAR_KIND => {
+                for e in &c.inventory {
+                    if let Some(hand) = match e.slot { 6 => Some(0), 8 => Some(1), _ => None } {
+                        self.weapons.insert(e.id.instance, (who.instance, hand));
+                        self.pending_weapons.push((who.instance, hand, Some(e.item.low_id as u32), Vec::new()));
+                    }
+                }
+            }
             // `AppearanceUpdateIIR_c::Activate` for any character (`FUN_10058e36` only tests the identity kind 50000): cloth, stat 0x2A1 `VisualFlags`,
             // attractors; the model is rebuilt through the worker (the look's key changes) and replaces the drawn one when it is ready
             N3::World(World::Appearance(a)) if who.kind == CHAR_KIND => {
@@ -3571,6 +3582,44 @@ mod variant_tests {
         assert!(!pump(&mut z, Some(100), &|w| w.wielded_set(own).is_some()));
         wear(&mut z, 2);
         assert!(pump(&mut z, None, &|w| w.wielded_set(own) == Some(3)));
+    }
+
+    /// Same zone-in gap as `Armory` (`combat/arms.rs` test `full_character_inventory_seeds_the_own_weapon_at_zone_in`):
+    /// a `FullCharacterIIR_t` inventory entry in the right-hand weapon-page slot resolves the own avatar's hand
+    /// `AnimSet` and swing animation without a live `WeaponItemFullUpdateIIR_t` (the same rifle template 121569 as
+    /// `zone_wear_rifle_borealis.rec`, so the expected AnimSet 3 / shot anim 0x3ff / delay 100 are already evidenced).
+    #[test]
+    fn full_character_inventory_seeds_the_own_wield_at_zone_in() {
+        use ao_net::msg::Identity;
+        use ao_net::n3::world::{AcgItem, FullCharacter, InventoryEntry};
+        use ao_net::n3::N3Header;
+        let Some(dir) = client() else { return };
+        let own = 0x82e8;
+        let mut z = Zone::new(own as u32);
+        z.world.start(dir, own);
+        let m = Message {
+            header: N3Header { msg_type: 0, target: Identity { kind: CHAR_KIND, instance: own }, flag: 0 },
+            sender: 1,
+            body: N3::World(World::FullCharacter(Box::new(FullCharacter {
+                inventory: vec![InventoryEntry {
+                    slot: 6, a: 0, b: 1,
+                    id: Identity { kind: 0xc74a, instance: 900 },
+                    item: AcgItem { low_id: 121569, high_id: 121569, level: 1 },
+                }],
+                ..FullCharacter::default()
+            }))),
+        };
+        z.world.on_message(&m);
+        let mut host = ao_render::Host::headless();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        while z.world.wielded_set(own) != Some(3) {
+            z.world.update_with_collision(0.02, [0.0; 3], [0.0, 0.0, -1.0], &mut host, None, |_| None);
+            assert!(std::time::Instant::now() < deadline, "own rifle {own} not resolved: weapons={:?} pending={}", z.world.weapons, z.world.pending_weapons.len());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(z.world.arms.slot_item(own, 6).map(|i| i.dtype), Some(0x5a), "Armory sees the same seed");
+        let (anim, delay, key) = z.world.pick_swing(own, canim::list::ATTACK).unwrap();
+        assert_eq!((anim, delay, key), (0x3ff, 100, canim::list::ATTACK), "rifle shot");
     }
 
     /// Opt-in real-renderer evidence of unmodified captured remote-player looks.
