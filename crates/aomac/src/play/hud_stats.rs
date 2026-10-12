@@ -474,7 +474,7 @@ impl HudStats {
                 let xml = format!(
                     "<root><View view_layout=\"horizontal\">\
                      <TextButton name=\"name\" text=\"{}\" color=\"0x{color:06X}\" hover_color=\"TEXT_HOVER\" pressed_color=\"TEXT_SELECTED\" layout_borders=\"Rect(3,0,0,0)\"/>\
-                     <HLayoutSpacer/><TextView name=\"value\" value=\"0\" layout_borders=\"Rect(0,0,3,0)\"/>\
+                     <HLayoutSpacer/><TextView name=\"value\" value=\"0\" min_size=\"Point(40,-1)\" max_size=\"Point(40,-1)\" layout_borders=\"Rect(0,0,3,0)\"/>\
                      <CanvasView name=\"btn{st}\" min_size=\"Point({bw},{dh})\" max_size=\"Point({bw},{dh})\" layout_borders=\"Rect(3,3,3,3)\"/>\
                      <PowerBar name=\"bar{st}\" bg_gfx=\"GFX_GUI_HOR_BAR_SMALL_EMPTY\" full_gfx=\"GFX_GUI_HOR_BAR_SMALL_BLUE\" direction=\"right\" layout_borders=\"Rect(0,0,5,0)\"/>\
                      </View></root>",
