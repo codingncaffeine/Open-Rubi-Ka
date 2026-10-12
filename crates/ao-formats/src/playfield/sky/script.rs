@@ -242,7 +242,16 @@ fn primary(b: &[u8], p: &mut usize, var: &dyn Fn(&str) -> Option<f32>, nest: u32
             while *p < b.len() && (b[*p].is_ascii_alphanumeric() || b[*p] == b'_' || b[*p] == b'.') {
                 *p += 1;
             }
-            var(std::str::from_utf8(&b[st..*p]).ok()?)
+            let name = std::str::from_utf8(&b[st..*p]).ok()?;
+            skip_ws(b, p);
+            if b.get(*p) == Some(&b'[') {
+                *p += 1;
+                let index = binary(b, p, var, nest + 1)?;
+                skip_ws(b, p);
+                (b.get(*p) == Some(&b']')).then(|| *p += 1)?;
+                return var(&format!("{name}[{}]", index.max(0.0).round() as i64));
+            }
+            var(name)
         }
         _ => None,
     }
@@ -401,6 +410,14 @@ fn variable(obj: &Obj, ctx: &Ctx, name: &str, depth: u32) -> Option<f32> {
         _ if name.ends_with(".Counter") => {
             let key = name.strip_prefix("This.").map_or_else(|| name.to_string(), |f| format!("{}.{f}", obj.name));
             Some(ctx.counters.get(&key).map_or(0.0, |rate| rate * ctx.delta_time))
+        }
+        // `This.Field[idx]` (array type declarations, e.g. `Float WaterLightR [2]: 0.25,0.75`); the index was
+        // already resolved to an integer literal by `primary`'s `[ .. ]` handling.
+        _ if name.contains('[') => {
+            let (base, idx) = name.split_once('[')?;
+            let idx: usize = idx.strip_suffix(']')?.parse().ok()?;
+            let field = base.strip_prefix("This.").unwrap_or(base);
+            obj.field(field)?.split(',').nth(idx)?.trim().parse().ok()
         }
         _ => {
             let field = name.strip_prefix("This.")?;

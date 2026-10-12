@@ -22,6 +22,7 @@ pub struct Layer {
 
 impl Layer {
     /// Bilinear lookup at texel coordinates (texel centres at +0.5), clamped to the image.
+    #[cfg(test)]
     pub fn sample(&self, x: f32, y: f32) -> f32 {
         let (fx, fy) = ((x - 0.5).clamp(0.0, (self.w - 1) as f32), (y - 0.5).clamp(0.0, (self.h - 1) as f32));
         let (x0, y0) = (fx as usize, fy as usize);

@@ -61,7 +61,7 @@ impl ConfigWindow {
 }
 
 impl ChatWindows {
-    pub(super) fn config_own_id(&mut self, id: u32) { self.config.own_id = id; }
+    pub(crate) fn config_own_id(&mut self, id: u32) { self.config.own_id = id; }
     pub(super) fn config_clear_menu(&mut self) { self.config.menu_doc = None; self.config.menu_group = None; }
 
     pub(super) fn config_take_outputs(&mut self) -> Vec<WinOut> { std::mem::take(&mut self.config.pending) }

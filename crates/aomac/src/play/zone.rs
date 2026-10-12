@@ -96,8 +96,8 @@ pub struct Zone {
     /// Global research side timers, merged by id as in GC 1002bea2.
     pub research: std::collections::BTreeMap<i32, [i32; 3]>,
     /// Native Locks_t vector, FullCharacter +0x28; unknown until its server snapshot.
-    skill_locks: Option<Vec<ao_net::n3::world::GroupEntry>>,
-    lock_second: f32,
+    pub skill_locks: Option<Vec<ao_net::n3::world::GroupEntry>>,
+    pub lock_second: f32,
     /// Inverse Root BoundingBoxTargeting Variant; native default true means triangles default off.
     pub triangle_targeting: bool,
     pub dynels: HashMap<i32, DynelState>,
@@ -108,7 +108,7 @@ pub struct Zone {
     pub frames: u32,
     pub in_play_sent: bool,
     /// `GameDayTime` (0..6480 s) at the last [`Zone::tick`], from the last `GameTimeIIR_t` (see [`day_time_of`]).
-    clock: Option<f32>,
+    pub clock: Option<f32>,
     /// `GameTime_t+0x4C`, the game day (`GameTimeIIR_t.arg3`); seeds the weather schedule (docs/zone/world.md §10).
     pub game_day: i32,
     /// The own character's raw stats: `FullCharacterIIR_t` (stats_a, stats_b, u8, i16) then every own `StatIIR_t`.
@@ -128,7 +128,7 @@ pub struct Zone {
     pub mission_alternatives: HashMap<Identity, ao_net::n3::quest::Quest>,
     pub quests: HashMap<Identity, ao_net::n3::quest::Quest>,
     /// GameTime's server unix clock, advanced with frame time (GC GameTime_t +0xb4).
-    server_unix: Option<f64>,
+    pub server_unix: Option<f64>,
     /// The own inventory by slot (`FullCharacterIIR_t` inventory; slots 0..0x3f equipment pages, 0x40.. bag; docs/gui.md §11.5).
     pub inventory: HashMap<u32, ao_net::n3::world::InventoryEntry>,
     /// The contents of the chests / corpses the server sent (`InventoryUpdateIIR_t`, `FUN_100a040e`): container identity -> (`word`, entries by slot).
@@ -139,7 +139,7 @@ pub struct Zone {
     /// Character projection of `InputConfig_t+0xc0`; character-only combat/skill consumers use this.
     pub target: Option<i32>,
     /// Non-character projection of the same selection; only one projection is populated.
-    object_target: Option<Identity>,
+    pub object_target: Option<Identity>,
     /// The own dynel's last `SimpleCharFullUpdateIIR_t` (the avatar's appearance) and how many arrived (a new one = placed again).
     pub own_update: Option<Box<ao_net::n3::dynel::SimpleCharFullUpdate>>,
     pub own_serial: u32,
@@ -167,7 +167,7 @@ pub struct Zone {
     /// `RelocateDynelsIIR_t`: `(child, parent)` links (`n3Dynel_t::RelocateDynel`), cleared with the playfield.
     pub parents: Vec<(Identity, Identity)>,
     /// Position and heading of each parented character relative to its parent (the vehicle's `+0x58` / `+0x80`).
-    child_rel: HashMap<i32, ([f32; 3], f32)>,
+    pub child_rel: HashMap<i32, ([f32; 3], f32)>,
     /// The own nano programs and timed nano effects (`own_nanos.rs`, the Programs / NCU windows).
     pub nanos: super::own_nanos::OwnNanos,
     /// Ordered modifier undo phases awaiting the in-world stat projection.

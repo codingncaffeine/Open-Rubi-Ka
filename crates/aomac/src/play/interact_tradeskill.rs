@@ -132,7 +132,6 @@ impl TradeskillUi {
                     self.escape = d.flag("esc_tradeskill");
                     self.state = Analyzer::fresh();
                     self.dirty = true;
-                    gui.set_window_movable(w, true);
                     self.config.attach_hud(gui, d, w, Store::Value("TradeSkillViewConfig"), screen);
                     gui.set_slider_value(w, "TradeskillSlider", 100.0);
                 }
@@ -233,7 +232,7 @@ impl TradeskillUi {
             Some(Feedback::Quality(q)) => fmt("X_MustBeLvl_Y_ToCombineWithZZ", &[Arg::S(names[0].clone()), Arg::N(q), Arg::S(names[1].clone()), Arg::N(items[1].map_or(0, |a| a.level))]),
             Some(Feedback::Skill(stat, required)) => {
                 let skill = ao_formats::stats::name(stat as u32).unwrap_or_default().to_string();
-                fmt("YouNeedAtLeastSkill", &[Arg::N(required), Arg::S(skill.clone()), Arg::S(skill), Arg::N(zone.skill_value(stat).unwrap_or(0))])
+                fmt("YouNeedAtLeastSkill", &[Arg::N(required), Arg::S(skill.clone()), Arg::S(skill), Arg::N(zone.skill_value(stat as u32).unwrap_or(0))])
             }
             None => String::new(),
         };

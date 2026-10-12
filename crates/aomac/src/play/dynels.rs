@@ -4086,7 +4086,7 @@ mod variant_tests {
         let player = *players.first()?;
         // The worker builds one FIFO queue; capture props and HashMap-ordered characters
         // must not put unrelated models ahead of the two this fixture waits for.
-        z.world.pending.splice(0..0, [z.world.chars[&player].look.clone(), z.world.chars[&leet].look.clone()]);
+        z.world.pending.splice(0..0, [(z.world.chars[&player].key, z.world.chars[&player].look.clone()), (z.world.chars[&leet].key, z.world.chars[&leet].look.clone())]);
         let mut host = Host::headless();
         let (eye, fwd) = (scene_pos(z.own()?.pos), [0.0, 0.0, -1.0]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);

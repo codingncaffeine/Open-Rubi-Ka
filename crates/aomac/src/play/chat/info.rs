@@ -10,7 +10,7 @@ mod character;
 #[path = "info_fields.rs"]
 mod fields;
 #[path = "info_template_spells.rs"]
-mod template_spells;
+pub(crate) mod template_spells;
 #[path = "info_tower_interpolation.rs"]
 mod tower_interpolation;
 #[path = "quest_info.rs"]
@@ -24,7 +24,7 @@ mod item_info_combat;
 #[path = "item_requirements.rs"]
 mod item_requirements;
 #[path = "item_eligibility.rs"]
-mod item_eligibility;
+pub(crate) mod item_eligibility;
 pub(crate) use item_eligibility::{PerkCriteria, PerkEquipment};
 #[path = "item_info_building.rs"]
 mod item_info_building;
@@ -40,7 +40,7 @@ pub enum ItemRequest {
 }
 
 /// `N3Msg_GetPerkDescription`: the catalogue item's authored description, not the full item-info panel.
-pub(super) fn item_description(record: &[u8]) -> anyhow::Result<Option<String>> {
+pub(crate) fn item_description(record: &[u8]) -> anyhow::Result<Option<String>> {
     Ok(template_spells::data(record, 0)?.description)
 }
 

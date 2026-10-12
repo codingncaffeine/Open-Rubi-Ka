@@ -416,7 +416,7 @@ impl Audio {
         let db = rt.lib.sounds.clone();
         let Some(def) = db.get(id) else { return Vec::new() };
         let d = if pos == [0.0; 3] { 0.0 } else { (0..3).map(|i| (pos[i] - listener[i]).powi(2)).sum::<f32>().sqrt() };
-        rt.play_at(&self.sh, def, d, material, size)
+        rt.play_at(&self.sh, def, d, material, size, pos)
     }
 
     /// CharCastNano's per-frame positional duration override (SI PlaySample 10002d98).
@@ -438,14 +438,22 @@ impl Audio {
             return Vec::new();
         } // SI10002d98 returns before re-arming an out-of-range source.
         if duration <= 0.0 {
-            return rt.play_effect_at(&self.sh, def, d, volume, 0.0, 100);
+            return rt.play_effect_at(&self.sh, def, d, volume, 0.0, 100, pos);
         }
         let level = crate::game::attenuation(d, def.min_dist, def.max_dist, None) * volume;
-        let voice = rt.keepalive_duration(&self.sh, def, level, duration);
+        let voice = rt.keepalive_duration(&self.sh, def, level, duration, pos);
         if voice == 0 {
             if audio_log() { eprintln!("audio rejection id={id:#x} reason=keepalive-sample sample={:?} resolved={:?}", def.file, def.file.as_deref().and_then(|f| self.sh.resolve(f))); }
             Vec::new()
         } else { vec![voice] }
+    }
+
+    /// Drains the positional sound-danger spheres recorded since the last call (GC100b85a3 reads these once per
+    /// `Life::Run` pass). Positions are in the same scene-space coordinates passed to `play_game_sound*`.
+    pub fn take_life_dangers(&self) -> Vec<([f32; 3], f32)> {
+        let mut g = self.rt();
+        let Some(rt) = g.as_mut() else { return Vec::new() };
+        std::mem::take(&mut rt.life_dangers)
     }
 
     /// GC4000 / SI100071ed command, including native delay and duration overrides.

@@ -362,7 +362,7 @@ mod tests {
         let store = ao_rdb::RecordStore::open(&ao_gui::client_dir()).unwrap();
         let record = store.get(ao_formats::dynel_visual::ITEM_TEMPLATE_TYPE, 49573).unwrap().unwrap();
         let item = ao_formats::dynel_visual::parse_item_template(&record).unwrap();
-        assert_eq!(events, [("OnLookatItem", item.name)]);
+        assert_eq!(events, [("OnLookatItem", item.name.unwrap_or_default())]);
         for (event, data) in events {
             tips.trigger(&mut gui, &mut values, (1280, 828), event, &data);
         }

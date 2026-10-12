@@ -67,6 +67,8 @@ mod logout;
 mod options;
 mod own_nanos;
 mod movement;
+mod native_life;
+mod native_life_spawn;
 mod native_life_render;
 mod player;
 mod prefs;

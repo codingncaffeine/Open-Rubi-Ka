@@ -114,6 +114,7 @@ impl Dialogs {
     }
 
     pub fn esc_closes(&self) -> bool { self.open.iter().any(|o| o.escape) }
+    #[cfg(test)]
     pub fn is_open(&self) -> bool {
         !self.open.is_empty()
     }

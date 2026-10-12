@@ -514,8 +514,14 @@ impl BuildCtx<'_> {
             s.to_string()
         }
     }
+    /// Resolves a `bg_gfx`/`full_gfx`/... attribute: a name into the skin atlas, or a `id:<n>` literal GFX id
+    /// (the numeric index into the client's `GFX_*` constant table, [`crate::gfx::Gfx::id`]'s `by_name` seed).
     fn gfx_attr(&self, e: &Element, key: &str) -> Option<GfxId> {
-        e.attr(key).filter(|s| !s.is_empty()).and_then(|n| self.gfx.id(n))
+        let s = e.attr(key).filter(|s| !s.is_empty())?;
+        match s.strip_prefix("id:").and_then(|n| n.parse::<u32>().ok()) {
+            Some(n) => Some(GfxId(n)),
+            None => self.gfx.id(s),
+        }
     }
 }
 

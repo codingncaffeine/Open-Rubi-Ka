@@ -572,7 +572,7 @@ mod tests {
         let mut layer = ActorLayer::default();
         for (id, model) in [(1, 7), (2, 8), (3, 7)] {
             layer.models.entry(model).or_insert_with(|| Model { meshes: vec![], mats: vec![], holo: None, views: vec![], view_of: HashMap::new(), topology: vec![], vertex_scratch: vec![] });
-            layer.actors.insert(id, ActorGpu { vb: None, seen: 1, model });
+            layer.actors.insert(id, ActorGpu { vb: None, seen: 1, model, skin: None });
             layer.frames.push(ActorFrame { id, model, skin: Some(std::sync::Arc::new(vec![ao_scene::Vertex::default()])), ..Default::default() });
             layer.items.push(Item { actor: id, model, mesh: 0, bucket: 0, faded: false, rendering_effect: 0, priority: None });
         }

@@ -10,7 +10,7 @@ pub(super) struct BuffVisual {
 }
 
 impl Dynels {
-    pub(super) fn target_nanos(&self, who: i32) -> Option<&crate::play::own_nanos::OwnNanos> {
+    pub(crate) fn target_nanos(&self, who: i32) -> Option<&crate::play::own_nanos::OwnNanos> {
         self.buff_nanos.get(&who)
     }
 

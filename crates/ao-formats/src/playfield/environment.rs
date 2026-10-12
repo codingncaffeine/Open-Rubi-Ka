@@ -69,11 +69,6 @@ pub fn srgb_to_linear(c: f32) -> f32 {
     c.powf(2.2)
 }
 
-/// Inverse of [`srgb_to_linear`]: a scene-contract colour back to the client's gamma-space (framebuffer) value.
-pub fn linear_to_srgb(c: f32) -> f32 {
-    c.max(0.0).powf(1.0 / 2.2)
-}
-
 fn lin(c: [u8; 3]) -> [f32; 3] {
     c.map(|b| srgb_to_linear(b as f32 / 255.0))
 }

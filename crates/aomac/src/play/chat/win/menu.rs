@@ -8,11 +8,11 @@ use ao_gui::MenuItem;
 /// What the open menu acts on.
 pub(super) struct Ctx {
     /// Frame the menu was opened on (its selected window is the one the entries change).
-    frame: usize,
+    pub(super) frame: usize,
     /// Groups behind the talk-to / subscribe entries (`id & 0xffff` = index).
-    groups: Vec<u64>,
+    pub(super) groups: Vec<u64>,
     /// `user://NAME` link menu.
-    user: Option<String>,
+    pub(super) user: Option<String>,
 }
 
 // menu ids: `op << 16 | arg`
@@ -42,7 +42,7 @@ fn id(op: u32, arg: u32) -> u32 {
 
 impl ChatWindows {
     /// Text of a `text.mdb` 10001 key (`LDBface::GetText(0x2711, key)`); the key itself when the database lacks it.
-    fn label(&self, key: &str) -> String {
+    pub(crate) fn label(&self, key: &str) -> String {
         self.text.as_ref().and_then(|d| d.by_key(10001, key)).filter(|s| !s.is_empty()).unwrap_or_else(|| key.to_string())
     }
 

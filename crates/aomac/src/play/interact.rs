@@ -297,6 +297,7 @@ impl Interact {
     /// CityClientInterface model 1/2 before CityTerminalView ctor 100e6f11 reads ESC.
     /// The city.dll service emitter/model payload is not decoded by this client.
     /// This guarded constructor-policy reader deliberately creates no fake window.
+    #[allow(dead_code, reason = "dormant until city.dll's CityClientInterface model/service emitter is decoded; exercised by its regression")]
     pub fn city_terminal_constructor_policy(values: &super::dvalue::DValues, city_model: Option<u32>) -> Option<bool> {
         matches!(city_model, Some(1 | 2)).then(|| values.get_i64("esc_cityterminal").unwrap_or(1) != 0)
     }

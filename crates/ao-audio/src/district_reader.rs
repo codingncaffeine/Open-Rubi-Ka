@@ -21,8 +21,13 @@ impl<'a> Reader<'a> {
     }
     fn spawn(&mut self, rotation: bool) -> Result<()> {
         let x = self.float()?; let y = self.float()?; let z = self.float()?; let radius = self.float()?;
-        ensure!(x > 0.0 && y >= 0.0 && z > 0.0 && radius >= 0.0, "invalid district spawn point");
-        if rotation { ensure!(self.short()? < 360 && self.short()? <= 360, "invalid spawn rotation"); }
+        // Native GD 0x1000a464 requires x,z > 0, but real records (e.g. pf 111 "District" hash "CLLN", pf 953's
+        // first plain spawn point) carry an origin-centred (0, y, 0) point with otherwise well-formed metadata.
+        ensure!(((x > 0.0 && z > 0.0) || (x == 0.0 && z == 0.0)) && y >= 0.0 && radius >= 0.0, "invalid district spawn point");
+        if rotation {
+            // Native GD 0x1000a29a (RotationSpawnPoint_t): angle < 360, angle width <= 360.
+            ensure!(self.short()? < 360 && self.short()? <= 360, "invalid spawn rotation");
+        }
         Ok(())
     }
     fn criteria(&mut self, sized: bool) -> Result<()> {
@@ -57,6 +62,7 @@ impl<'a> Reader<'a> {
         let flags = self.byte()?;
         self.short()?; // respawn seconds
         if ver >= 7 { self.int()?; }
+        // Native GD 0x1000640f: hash nonzero, min/max level in 1..=1000, chance <= 100.
         ensure!(hash != 0 && (1..=1000).contains(&min) && (1..=1000).contains(&max) && chance <= 100, "invalid hash spawn metadata");
         if flags & 1 != 0 { self.take(4)?; }
         if flags & 2 != 0 { let n = self.byte()?; for _ in 0..n { self.spawn(true)?; } }
@@ -85,7 +91,8 @@ pub(crate) fn parse(data: &[u8]) -> Result<Districts> {
     let ver = r.short()?;
     ensure!((5..=7).contains(&ver), "unsupported district version {ver}");
     let nz = r.int()? as usize; let nd = r.byte()? as usize;
-    ensure!(nz > 0 && nd > 0 && nz <= data.len(), "invalid district counts");
+    // A playfield may legitimately define zero zones/districts (e.g. unused system/admin playfields).
+    ensure!(nz <= data.len(), "invalid district counts");
     let mut districts = Vec::with_capacity(nd);
     for _ in 0..nd {
         let centre = [r.float()?, r.float()?, r.float()?];
@@ -95,8 +102,10 @@ pub(crate) fn parse(data: &[u8]) -> Result<Districts> {
         let sound_id = r.short()?;
         let mut music = [0; 8]; for id in &mut music { *id = r.short()?; }
         let (npc_lvl, lc_lvl) = if ver >= 6 { ((r.short()?, r.short()?), (r.short()?, r.short()?)) } else { r.take(4)?; ((r.byte()? as u16, r.byte()? as u16), (0, 0)) };
-        ensure!([npc_lvl, lc_lvl].iter().all(|&(a,b)| a <= b && b <= 1024 && ((a == 0) == (b == 0))), "invalid district level ranges");
-        ensure!(r.byte()? <= 100 && r.int()? as i32 >= -1, "invalid district respawn metadata");
+        // Native GD 0x49be: each pair independently has min <= max <= 1024; min/max are not required to be zero together.
+        ensure!([npc_lvl, lc_lvl].iter().all(|&(a, b)| a <= b && b <= 1024), "invalid district level ranges");
+        let respawn_pct = r.byte()?; let respawn_time = r.int()? as i32;
+        ensure!(respawn_pct <= 100 && respawn_time >= -1, "invalid district respawn metadata");
         let fight_mode = r.byte()?; ensure!(fight_mode < 5, "invalid district fight mode");
         let hashes = r.byte()? as usize;
         let legacy = if ver < 6 { r.byte()? as usize } else { 0 };

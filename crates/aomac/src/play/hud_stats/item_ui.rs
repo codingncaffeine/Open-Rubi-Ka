@@ -347,7 +347,7 @@ impl HudStats {
         handled
     }
 
-    pub(super) fn tooltip_body(&self, zone: &Zone, id: Identity) -> String {
+    pub(crate) fn tooltip_body(&self, zone: &Zone, id: Identity) -> String {
         match super::super::chat::item_html(zone, &super::super::chat::ItemRequest::Identity { id, shop: false, container: Identity::default() }, &self.db) {
             Ok(body) => body.unwrap_or_default(),
             Err(error) => { eprintln!("item tooltip: {error:#}"); String::new() }

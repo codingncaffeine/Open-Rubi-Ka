@@ -543,7 +543,7 @@ fn live_walk() {
             a.set_output_gain(0.0);
         }
     });
-    let mut p = Play::new(dir, None, Some("Ithaca".into()), audio).unwrap();
+    let mut p = Play::new(dir.clone(), None, Some("Ithaca".into()), audio).unwrap();
     p.start_backdrop();
     p.servers = Some(ao_net::client::fetch_servers().map_err(|e| e.to_string()));
     let o = Offscreen::new(&p, (1280, 800)).unwrap();

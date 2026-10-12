@@ -1447,6 +1447,11 @@ impl Frontend for Play {
                 self.player.as_ref().and_then(|player| player.effect_surface()),
                 self.world_life.as_mut(),
             ) {
+                if let Some(a) = &self.audio {
+                    self.life_dangers.extend(a.take_life_dangers().into_iter().map(|(pos, radius)| {
+                        super::native_life::CharacterSensor { pos: glam::Vec3::new(pos[0], pos[1], -pos[2]), radius }
+                    }));
+                }
                 self.zone.world.life_sensors(control, &mut self.life_characters, &mut self.life_dead);
                 life.tick(dt, control, &surface.borrow(), &self.life_characters, &self.life_dangers, &self.life_dead, glam::Vec3::from_array(host.effect_wind));
                 self.life_dangers.clear(); // GC100b85a3, after the complete Life::Run pass

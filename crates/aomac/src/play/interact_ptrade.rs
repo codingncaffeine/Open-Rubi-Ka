@@ -617,6 +617,10 @@ mod tests {
         Trade { op, a, b }
     }
 
+    fn flag(n: i32) -> Identity {
+        Identity { kind: 0, instance: n }
+    }
+
     #[test]
     fn trade_description_tooltip_is_lazy_and_clears_when_disabled() {
         let Some(mut gui) = rig() else { return };

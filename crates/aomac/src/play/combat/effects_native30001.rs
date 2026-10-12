@@ -119,7 +119,7 @@ impl Deformer {
             v.pos=p.to_array();
         }
     }
-    pub(super) fn apply_actor(&self,actors:&mut[ActorFrame],original:&[Vertex]) {if self.mode()!=4 {if let Some(actor)=actors.iter_mut().find(|a|Some(a.id)==self.actor) {if let Some(v)=actor.skin.as_mut() {self.deform(std::sync::Arc::make_mut(v),original);}}}}
+    pub(super) fn apply_actor(&self,actors:&mut[ActorFrame],original:&[Vertex]) {if self.mode()!=4 {if let Some(actor)=actors.iter_mut().find(|a|Some(a.id)==self.actor) {if let Some(v)=actor.skin.as_mut() {self.deform(std::sync::Arc::make_mut(v).as_mut_slice(),original);}}}}
     pub(super) fn morph_fraction(&self)->f32 {let rise=f32::from_bits(self.t.word(12).unwrap_or(0));let hold=f32::from_bits(self.t.word(13).unwrap_or(0));if self.elapsed<rise {self.elapsed/rise}else if self.elapsed<=rise+hold {1.0}else{1.0-(self.elapsed-rise-hold)/rise}}
     pub(super) fn morph_alpha(&self)->f32 {self.morph_fraction()*0.7+0.15}
     pub(super) fn morph_child_should_stop(&self)->bool {self.elapsed>f32::from_bits(self.t.word(12).unwrap_or(0))+f32::from_bits(self.t.word(13).unwrap_or(0))}

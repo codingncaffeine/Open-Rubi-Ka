@@ -1,7 +1,6 @@
 //! Native chat document operations and persistent message logs.
 use super::*;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::fmt::Write as _;
 
 pub(super) struct OperationDialog {
     window: WindowId,

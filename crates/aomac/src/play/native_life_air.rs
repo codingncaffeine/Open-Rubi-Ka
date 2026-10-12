@@ -1,5 +1,5 @@
 //! Gamecode air-life steering: 10118330, 101198dc, 10119e57, 1011cace.
-use super::native_life::{Context, Species, Steering};
+use super::{Context, Species, Steering};
 use ao_formats::wildlife::LifeKind;
 use glam::Vec3;
 
@@ -213,14 +213,15 @@ mod tests {
         assert_eq!(LifeKind::from_native(10), Some(LifeKind::Pollen));
     }
     struct Sensors { ground: f32, water: Option<f32>, corpses: Vec<Vec3> }
-    impl super::super::native_life::Environment for Sensors {
+    impl super::super::Environment for Sensors {
         fn ground(&self, p: Vec3) -> Option<(Vec3, Vec3)> { Some((Vec3::new(p.x, self.ground, p.z), Vec3::Y)) }
         fn ground_ray(&self, p: Vec3) -> Option<(Vec3, Vec3)> { self.ground(p) }
         fn alignment(&self, _: Vec3) -> Vec3 { Vec3::Y }
         fn liquid(&self, _: Vec3) -> Option<f32> { self.water }
         fn district(&self, _: Vec3) -> Option<usize> { Some(0) }
-        fn obstacle(&self, _: Vec3, _: Vec3) -> Option<Vec3> { None }
-        fn characters(&self) -> &[super::super::native_life::CharacterSensor] { &[] }
+        fn obstacle(&self, _: Vec3, _: Vec3) -> Option<(Vec3, Vec3)> { None }
+        fn characters(&self) -> &[super::super::CharacterSensor] { &[] }
+        fn dangers(&self) -> &[super::super::CharacterSensor] { &[] }
         fn corpses(&self) -> &[Vec3] { &self.corpses }
         fn wind(&self) -> Vec3 { Vec3::ZERO }
         fn landing(&self, _: Vec3, _: f32) -> Option<Vec3> { None }

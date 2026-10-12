@@ -227,7 +227,7 @@ mod tests {
                 .context("standalone environment particle was removed")?;
             assert!(active.config.source_identity.is_none());
             assert_eq!(active.particle2.as_ref().unwrap().environment_time,Some(3240.0));
-            noon_alpha=host.actors.iter().filter_map(|a|a.skin.as_ref()).flatten()
+            noon_alpha=host.actors.iter().filter_map(|a|a.skin.as_ref()).flat_map(|v|v.iter())
                 .map(|v|v.color[3]).fold(0.0,f32::max);
             if noon_alpha>4.0/255.0 {break;}
         }
@@ -240,7 +240,7 @@ mod tests {
             .context("standalone environment particle was removed at midnight")?;
         assert!(active.config.source_identity.is_none());
         assert_eq!(active.particle2.as_ref().unwrap().environment_time,Some(0.0));
-        let midnight_alpha=host.actors.iter().filter_map(|a|a.skin.as_ref()).flatten()
+        let midnight_alpha=host.actors.iter().filter_map(|a|a.skin.as_ref()).flat_map(|v|v.iter())
             .map(|v|v.color[3]).fold(0.0,f32::max);
         assert!(midnight_alpha>0.0 && midnight_alpha<noon_alpha,
             "native midnight fade must dim the same visible particles: noon={noon_alpha}, midnight={midnight_alpha}");

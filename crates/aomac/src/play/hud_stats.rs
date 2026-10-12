@@ -22,6 +22,7 @@ use super::zone::Zone;
 use ao_formats::{screens::TextDb, stats};
 use ao_gui::{CanvasItem, CanvasTip, Event, Gui, ViewHandle, WindowId, WindowSize};
 use ao_net::frame::Frame;
+use ao_net::msg::Identity;
 use items::Items;
 use skill_model::{is_disabled, Model};
 use stat_view::StatView;
@@ -912,7 +913,7 @@ impl HudStats {
         self.drop_dialogs.configure_escape(d);
         self.item_description_tips = d.flag("ItemDescriptionTooltips");
         self.new_mouse = d.flag("UseNewMouseFunc");
-        self.item_hold_delay = d.get_f32("MouseButtonHoldDelay");
+        self.item_hold_delay = d.get_f32("MouseButtonHoldDelay").unwrap_or(0.3);
         if let Some(s) = self.stat.as_mut() { s.configure(d); }
     }
 

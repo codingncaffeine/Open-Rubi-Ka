@@ -21,7 +21,7 @@ pub(super) fn spells(record: &[u8], list: u32) -> Result<Vec<Spell>> {
 type SkillPairs = Vec<(u32, i32)>;
 
 #[derive(Default, Clone)]
-pub(super) struct Data {
+pub(crate) struct Data {
     pub spells: Vec<Spell>,
     pub name: Option<String>,
     pub description: Option<String>,
@@ -29,7 +29,7 @@ pub(super) struct Data {
     pub criteria: Vec<(u32, u32, Vec<[i32; 3]>)>,
 }
 
-pub(super) fn data(record: &[u8], list: u32) -> Result<Data> {
+pub(crate) fn data(record: &[u8], list: u32) -> Result<Data> {
     let mut r = Reader::little_endian(record);
     let kind = r.u32()?;
     ensure!(kind >= 10000, "invalid item kind {kind}");

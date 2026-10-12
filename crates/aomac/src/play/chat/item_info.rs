@@ -75,7 +75,7 @@ fn html_request(zone:&Zone,request:&ItemRequest,texts:&TextDb,price:Option<i32>)
     let combat=super::item_info_combat::fields(&template,&spells,zone,texts)?;
     let mut out=String::new();
     render(&mut out,&template,&data,id,shop,container,zone,texts,&sections,&combat,&low,high,ql,&store)?;
-    Ok(Some((out,template.name)))
+    Ok(Some((out,template.name.unwrap_or_default())))
 }
 
 fn interpolated_data(low:&[u8],high:&[u8],ql:i32,aq:i32,bq:i32)->Result<Data> {

@@ -5,7 +5,7 @@
 mod cmd;
 mod dialog;
 mod filter;
-mod info;
+pub(super) mod info;
 mod line;
 mod macros;
 pub(super) mod log;
@@ -452,7 +452,7 @@ impl Chat {
         }
     }
 
-    pub fn configure_escape(&mut self, values: &DValues) {
+    pub fn configure_escape(&mut self, values: &super::dvalue::DValues) {
         self.info.configure_escape(values);
         self.dialogs.configure_escape(values);
     }

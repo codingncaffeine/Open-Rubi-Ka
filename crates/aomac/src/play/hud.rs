@@ -961,7 +961,7 @@ impl Hud {
         let changes = self.actions.list.take_changes();
         let locked = self.dvalues.flag("LockHotbars");
         let timers = (self.dvalues.flag("IconTimers"), self.dvalues.flag("IconTimerText"));
-        let hold_delay = self.dvalues.get_f32("MouseButtonHoldDelay");
+        let hold_delay = self.dvalues.get_f32("MouseButtonHoldDelay").unwrap_or(0.3);
         let new_mouse = self.dvalues.flag("UseNewMouseFunc");
         let long_tips = !self.dvalues.flag("ShortcutShortTooltips") && self.dvalues.flag("ItemDescriptionTooltips");
         self.actwin.hold_delay = hold_delay;
@@ -1692,7 +1692,7 @@ mod tests {
             hud.dvalues.set_i64("esc_wear", i64::from(close));
             hud.open(&mut gui, WindowKind::Character);
             zone.set_target(Some(ao_net::msg::Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: 456 }));
-            hud.input(&mut gui, &mut zone, &ev, &cam, &lens, ao_gui::Modifiers::default());
+            hud.input(&mut gui, &mut zone, None, &ev, &cam, &lens, ao_gui::Modifiers::default());
             assert_eq!(zone.selected_target(), None);
             assert_eq!(hud.is_open(WindowKind::Character), !close);
         }
@@ -1701,7 +1701,7 @@ mod tests {
         assert!(gui.text_focused());
         let selected = ao_net::msg::Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: 456 };
         zone.set_target(Some(selected));
-        hud.input(&mut gui, &mut zone, &ev, &cam, &lens, ao_gui::Modifiers::default());
+        hud.input(&mut gui, &mut zone, None, &ev, &cam, &lens, ao_gui::Modifiers::default());
         assert_eq!(zone.selected_target(), Some(selected));
         assert!(hud.is_open(WindowKind::Character));
     }
@@ -2092,6 +2092,7 @@ mod tests {
         assert_eq!(s.gui.text(w, "buffed"), "<div align=\"right\">8</div>");
         assert_eq!(s.gui.text(w, "remaining_ip"), "1480");
         assert!(s.hud.take_outbox().is_empty());
+    }
     #[test]
     fn toolbar_native_tip_only_when_hiding_a_visible_window() {
         let Some((mut s, _)) = shot((1280, 800)) else { return };

@@ -135,7 +135,7 @@ impl HudResearchVehicle {
             }));
         }
         if self.request {
-            self.outbox.push(Frame::n3(research::request(zone.char_id as i32)));
+            self.outbox.push(outgoing::n3_frame(0, zone.char_id, research::request(zone.char_id as i32)));
             self.request = false;
         }
         let armor_changed = match perks.store.as_ref().ok_or_else(|| anyhow::anyhow!("research requires client RDB")).and_then(|store| self.equipment.refresh(store, zone)) { Ok(changed) => changed, Err(e) => { eprintln!("research equipment: {e:#}"); return; } };
@@ -283,7 +283,7 @@ impl HudResearchVehicle {
         Ok(())
     }
 
-    fn set_stat(&mut self, zone: &Zone, stat: i32, value: i32) { self.outbox.push(Frame::n3(outgoing::set_stat(zone.char_id as i32, stat, value))); }
+    fn set_stat(&mut self, zone: &Zone, stat: i32, value: i32) { self.outbox.push(outgoing::n3_frame(0, zone.char_id, outgoing::set_stat(zone.char_id as i32, stat, value))); }
 
     pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone, perks: &mut HudPerks, dvalues: &mut super::dvalue::DValues) -> bool {
         let w = match ev {
@@ -338,7 +338,7 @@ impl HudResearchVehicle {
                                 self.items.get(&id).ok_or_else(|| anyhow::anyhow!("missing selected vehicle catalogue item {id}")).and_then(|item| self.eligible(item, zone))
                             };
                             match eligible {
-                                Ok(true) => self.outbox.push(Frame::n3(research::spawn_mech(zone.char_id as i32, id as i32))),
+                                Ok(true) => self.outbox.push(outgoing::n3_frame(0, zone.char_id, research::spawn_mech(zone.char_id as i32, id as i32))),
                                 Ok(false) => {}
                                 Err(e) => eprintln!("vehicle eligibility: {e:#}"),
                             }
