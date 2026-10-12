@@ -218,6 +218,14 @@ impl Runtime {
         play_def(sh, &db, def, 1.0, &mut self.rng, None, [0.0; 3], &mut self.life_dangers)
     }
 
+    /// Plays a definition once, non-positionally, at a caller-supplied gain instead of `Total_FX`
+    /// (`FUN_100b9850`'s own `1 − 0.5 · distance / extent` lightning-audio formula, not the generic distance
+    /// attenuation curve [`attenuation`] applies).
+    pub fn play_scaled(&mut self, sh: &Shared, def: &SoundDef, gain: f32) -> Vec<u64> {
+        let db = self.lib.sounds.clone();
+        play_def(sh, &db, def, gain, &mut self.rng, None, [0.0; 3], &mut self.life_dangers)
+    }
+
     /// A positional one-shot (`PlayGameSound(id, pos, material, ..., size)`: doors, fight sounds): the definition once at `Total_FX` times the
     /// distance level of `attenuation` for the listener `d` metres away; nothing beyond the definition's maximum distance. `material` is the game
     /// material argument (`FabricType` of the struck creature, 7 = flesh of a player; 0 = none) and `size` the impact size 0 / 1 / 2 (1 = plain):

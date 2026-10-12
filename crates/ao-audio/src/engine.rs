@@ -403,6 +403,22 @@ impl Audio {
         }
     }
 
+    /// `SM_Sandy_Env_NearLightning` (`FUN_100b9850`, `ao_formats::lightning::Strike::audio`): a one-shot at the
+    /// caller's own gain, non-positionally — the native handler computes `volume` itself from the strike's distance
+    /// and extent, not the generic attenuation curve [`Audio::play_game_sound`] uses. `volume <= 0.0` plays nothing.
+    pub fn play_lightning_cue(&self, volume: f32) -> Vec<u64> {
+        if volume <= 0.0 {
+            return Vec::new();
+        }
+        let mut g = self.rt();
+        let Some(rt) = g.as_mut() else { return Vec::new() };
+        let db = rt.lib.sounds.clone();
+        match db.by_name("SM_Sandy_Env_NearLightning") {
+            Some(def) => rt.play_scaled(&self.sh, def, volume),
+            None => Vec::new(),
+        }
+    }
+
     /// `SandyInterfaceModule_t::PlayGameSound(sound id, position)`: a one-shot of the sound definition `id` at `pos`, heard from `listener`
     /// (both in scene space; the level only depends on the distance, `game::attenuation`). Returns the voices started.
     pub fn play_game_sound(&self, id: u32, pos: [f32; 3], listener: [f32; 3]) -> Vec<u64> {
@@ -576,6 +592,17 @@ mod tests {
         assert!(audio.play_game_sound_with(0x94bb7805, [1.0, 0.0, 0.0], listener, 0, 1).is_empty());
         assert!(audio.play_game_sound_duration(0x35a9ce7d, [1.0, 0.0, 0.0], listener, 0.2, 1.0).is_empty());
         assert!(!audio.play_game_sound_duration(0x35a9ce7d, [0.0; 3], listener, 0.2, 1.0).is_empty());
+    }
+
+    #[test]
+    fn lightning_cue_plays_at_the_given_gain_and_nothing_at_zero() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        if !dir.join("cd_image/sound/SourceFiles/SM_Sandy_Game_Dummy.sbf").exists() { return; }
+        let audio = Audio::offline(&dir, 44100);
+        assert!(audio.play_lightning_cue(0.0).is_empty());
+        assert!(audio.play_lightning_cue(-1.0).is_empty());
+        assert!(!audio.play_lightning_cue(0.8).is_empty());
     }
 
     #[test]

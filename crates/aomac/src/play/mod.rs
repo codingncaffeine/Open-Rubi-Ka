@@ -39,6 +39,7 @@ mod hud_map;
 mod hud_mission;
 mod hud_listview;
 mod hud_nano;
+mod lightning;
 mod hud_keys;
 mod hud_nanodb;
 mod hud_ncu;
@@ -232,6 +233,8 @@ struct Play {
     /// Live sky of the loading/loaded playfield, installed in the viewer when the world appears.
     world_sky: Option<ao_formats::playfield::SkyClock>,
     world_weather: Option<ao_formats::weather::Weather>,
+    /// Native storm schedules + fan render/audio state, reset on zone load (`start_world_load`).
+    world_lightning: lightning::LightningFx,
     world_life: Option<(native_life_spawn::LifeWorld, native_life_render::LifeModels)>,
     wildlife_enabled: bool,
     life_characters: Vec<native_life::CharacterSensor>,
@@ -362,6 +365,7 @@ impl Play {
             world_ground: None,
             world_sky: None,
             world_weather: None,
+            world_lightning: lightning::LightningFx::default(),
             world_life: None,
             life_characters: Vec::new(),
             life_dead: Vec::new(),

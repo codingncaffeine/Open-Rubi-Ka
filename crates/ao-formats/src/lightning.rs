@@ -85,15 +85,16 @@
 //!   backs a different native path (GC effect kind 3032 "GroundShake",
 //!   `aomac::play::combat::effects_aux`); feeding it a guessed direction/magnitude here would not
 //!   be faithful, so [`Strike::audio`] only reports `camera_impulse: bool` and applies nothing.
-//! * Live wiring: `aomac`'s zone flow does not load the per-playfield heightfield `Tilemap` (rdb
-//!   1000009, `ao_formats::playfield::ground::Tilemap`) at all today, so the `extent` this module
-//!   needs (`tile size * playfield scale * 6.0`) has no live source yet; that loader is a
-//!   separate prerequisite. `aomac`'s effect renderer (`aomac::play::combat::effects`) is also
-//!   bound 1:1 to RDB-templated, dynel-addressed GC effect classes — FX8/FX9 have no RDB template
-//!   (pure native weather code) and are not bound to a dynel, so routing them through it would
-//!   mean fabricating a template that does not exist. This module produces the exact native
-//!   timing/geometry ([`Strike`], [`Fan`]) ready for a future live-flow + render integration once
-//!   those two prerequisites exist.
+//! * Live wiring (`aomac::play::lightning::LightningFx`): `extent` comes from `Collision::tile_size()` (the same
+//!   `Tilemap` already retained for terrain collision — no second rdb 1000009 load) through [`extent`]. `aomac`'s
+//!   effect renderer (`aomac::play::combat::effects`) is bound 1:1 to RDB-templated, dynel-addressed GC effect
+//!   classes — FX8/FX9 have no RDB template (pure native weather code) and are not bound to a dynel, so `LightningFx`
+//!   draws fan quads as a small parallel list of transient additive actors alongside it instead of fabricating a
+//!   template that does not exist. `SM_Sandy_Env_NearLightning`'s `delay = distance / 100` s is approximated as
+//!   immediate playback: the one native per-frame delayed-command queue found in `ao_audio` (`game::Runtime::
+//!   effect_delays`) backs a different system (AFCM103 authored effect sounds) with its own variant-selection and
+//!   one-due-record-per-frame throttling, so reusing it here would misrepresent two different native subsystems as
+//!   one, and a second lightning-only queue was judged disproportionate for a sub-second offset.
 
 use crate::weather::{CrtRand, Schedule, R250};
 
@@ -111,6 +112,21 @@ const EVENT_INTS: usize = 16;
 
 /// `_DAT_10158ba0`: tile size * playfield scale * 6.0 is the strike-position extent.
 pub const EXTENT_FACTOR: f32 = 6.0;
+/// `FUN_100b16a7`/`FUN_100b17c7` (newly decompiled for this port): `n3Playfield_t +0x50`, a runtime *object* field (int,
+/// cast to float) — distinct from the on-disk `RDBPlayfield_t +0x50` `flags` field ([`crate::playfield::record::Record::flags`]).
+/// No corresponding field exists in the decoded playfield record (whose own fields are version/id/name/tilemap/
+/// zone_size/count/flags/vehicle_flags — none semantically a scale) or in `playfield::environment::Env`, and no
+/// named tweak/cvar string ("Scale"-prefixed, searched in both N3.dll and Gamecode.dll) ties a scale to a playfield;
+/// the setter of this runtime field was not traced. Treated as the engine default `1.0` for this port (every PRK
+/// playfield observed uses it unscaled).
+pub const PLAYFIELD_SCALE: f32 = 1.0;
+
+/// `tile size * playfield scale * 6.0` (`_DAT_10158ba0`): the strike-position extent fed to [`Lightning::advance`] and
+/// [`Strike::audio`]. `tile_size` is `ao_formats::playfield::collision::Collision::tile_size()` (outdoor only; `None`
+/// there means `extent` should be `0.0`, which fires nothing).
+pub fn extent(tile_size: f32) -> f32 {
+    tile_size * PLAYFIELD_SCALE * EXTENT_FACTOR
+}
 /// `_DAT_10155f00`: the wrap threshold is half the extent.
 const WRAP_HALF: f32 = 0.5;
 /// `_DAT_101600e8`: the source sits this far above the camera.
@@ -439,5 +455,12 @@ mod tests {
     fn zero_extent_fires_nothing() {
         let mut lightning = Lightning::default();
         assert!(lightning.advance(100.0, [0.0, 0.0, 0.0], 0.0, 0.0).is_empty());
+    }
+
+    #[test]
+    fn extent_is_tile_size_times_scale_times_six() {
+        assert_eq!(PLAYFIELD_SCALE, 1.0);
+        assert_eq!(extent(10.0), 60.0);
+        assert_eq!(extent(0.0), 0.0);
     }
 }

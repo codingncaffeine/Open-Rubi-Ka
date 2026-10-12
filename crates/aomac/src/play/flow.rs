@@ -675,6 +675,7 @@ impl Play {
     fn start_world_load(&mut self, id: u32) {
         self.world_sky = None;
         self.world_weather = None;
+        self.world_lightning = super::lightning::LightningFx::default();
         self.world_life = None;
         self.life_dangers.clear();
         let (dir, tx, want_audio) = (self.dir.clone(), self.tx.clone(), self.audio.is_some());
@@ -1408,6 +1409,17 @@ impl Frontend for Play {
             if let Some(weather) = &mut self.world_weather {
                 weather.update(self.zone.game_day as u32, self.zone.day_time() as f64, dt);
                 host.effect_wind = weather.state().wind;
+                let enabled = weather.state().lightning_enabled();
+                let extent = self.player.as_ref().and_then(|p| p.effect_surface()).and_then(|c| c.borrow().tile_size()).map(ao_formats::lightning::extent).unwrap_or(0.0);
+                let controlled = host.camera.pos.to_array();
+                let strikes = self.world_lightning.tick(enabled, dt, controlled, extent, controlled[1]);
+                if let Some((key, scene)) = self.world_lightning.take_model_upload() { host.actor_models.push((key, scene)); }
+                host.actors.extend(self.world_lightning.actors());
+                if let Some(audio) = &self.audio {
+                    for strike in &strikes {
+                        audio.play_lightning_cue(strike.audio(controlled, extent).volume);
+                    }
+                }
             }
             host.effect_day_time = Some(self.zone.day_time());
             host.effect_game_seconds = self.zone.game_seconds();

@@ -494,6 +494,13 @@ impl Collision {
         terrain.texture_at(x, z).map_or(0, ground::ground_material)
     }
 
+    /// Outdoor heightfield cell size (`ground::Tilemap::cell_size`), for callers that need the native lightning
+    /// `extent` formula (`ao_formats::lightning::extent`, `tile size * playfield scale * 6.0`) without a second rdb
+    /// 1000009 load. `None` for dungeons (no tilemap).
+    pub fn tile_size(&self) -> Option<f32> {
+        self.terrain.as_ref().map(|t| t.tm.cell_size)
+    }
+
     /// Liquid at the ground point `p` (`liquid_probe` with the point itself as the probed height).
     pub fn liquid_at(&self, p: [f32; 3]) -> Option<Liquid> {
         self.liquid_probe(p, p[1], self.rooms.as_ref().and_then(|_| self.room_at(p, -1)))
