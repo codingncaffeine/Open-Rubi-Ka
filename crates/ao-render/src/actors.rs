@@ -102,6 +102,17 @@ impl Renderer {
 
     /// Replaces dynamic geometry while retaining the model's already uploaded textures.
     /// Any newly referenced texture must be supplied in `scene.textures`.
+    // ponytail: the fast path below only reuses the GPU buffers when vertex/index *counts* stay exactly the same
+    // (`model.topology` comparison); a submesh whose count varies frame to frame (dynamic buff/particle-count
+    // geometry) falls through to a full `upload_actor_model` every call. Measured in isolation (not live-confirmed
+    // this is the dominant remaining contributor at ICC, but it is additive to the fixed causes in this file):
+    // ~8.5 KB of real RSS growth per call even with the device polled every call, so it is real allocator/driver
+    // overhead from the repeated create+destroy, not just an unreclaimed backlog -- polling does not fix it.
+    // Upgrade path: give `ModelMesh` a byte capacity (like `native_liquid.rs`'s `vertex_capacity`/`index_capacity`),
+    // over-allocate on rebuild, and let this fast path accept any vertex/index *count* that still fits, reusing the
+    // old `Draw`'s `mat`/`pipe` (valid as long as untouched per-submesh material fields -- texture, blend, tint --
+    // really are unchanged, which must be checked explicitly instead of relying on `Submesh`'s derived `PartialEq`
+    // that also compares `indices`). Needs a live aomac play session to verify the visual output stays correct.
     pub fn update_actor_model(&mut self, key: u64, scene: &Scene) {
         if let Some(model) = self.act.models.get_mut(&key) {
             if scene.textures.keys().all(|key| model.view_of.contains_key(key))
