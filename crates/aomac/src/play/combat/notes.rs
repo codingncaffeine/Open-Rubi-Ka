@@ -29,6 +29,9 @@ pub mod id {
     pub const STEP: u32 = 0x26;
     /// `land`: the jump-landing clip's foot-down event (same ground-material block, silent while still submerged).
     pub const LAND: u32 = 0x85;
+    /// `swim`: a swim-stroke event of the swim clip (same ground-material block; `swimfast`/`stepfast` share the earlier
+    /// `step`/`swim` prefix test in `FUN_10075c84` and are retail-unreachable, like the data's `swich_kick` misspelling).
+    pub const SWIM: u32 = 0x38;
 }
 
 /// `FUN_10075c84` [DS 0x10075c84]: the note id of an event name, in the function's order with its `strncmp(name, literal, len(literal))` prefix tests
@@ -138,13 +141,15 @@ pub fn swish_name(note: u32) -> Option<&'static str> {
     })
 }
 
-/// `SM_Sandy_Game_Feet_Man_{Walk,Land}` (`AnimHolder_t` ctor `FUN_10044702` members `+0x00` / `+0x20`, played by notes `STEP` / `LAND`
-/// when the character has no NPC record). Every breed and sex shares these same two samples: the ctor's third foot sound,
-/// `SM_Sandy_Game_Feet_Atrox_Land` (`+0x24`), is dead data with no reader in `FUN_10045069`.
+/// `SM_Sandy_Game_Feet_Man_{Walk,Run,Swim,SwimFast,Land}` (`AnimHolder_t` ctor `FUN_10044702` members `+0x00/+0x04/+0x08/+0x0c/+0x20`, played
+/// by notes `STEP`/`LAND`/`SWIM` when the character has no NPC record; `+0x04` "Run" (note `0x36`) and `+0x0c` "SwimFast" (note `0x39`) are
+/// dead data like the Atrox land sample: `0x36`/`0x39` are retail-unreachable, shadowed by the earlier `step`/`swim` prefix tests).
+/// Every breed and sex shares these same samples: the ctor's `SM_Sandy_Game_Feet_Atrox_Land` (`+0x24`) is dead data with no reader.
 pub fn footstep_name(note: u32) -> Option<&'static str> {
     Some(match note {
         id::STEP => "SM_Sandy_Game_Feet_Man_Walk",
         id::LAND => "SM_Sandy_Game_Feet_Man_Land",
+        id::SWIM => "SM_Sandy_Game_Feet_Man_Swim",
         _ => return None,
     })
 }
@@ -247,6 +252,8 @@ mod tests {
             ("left", 0x26),
             ("right", 0x26),
             ("land", 0x85),
+            ("swim", 0x38),
+            ("swimfast", 0x38), // retail-unreachable 0x39: "swim" matches the 4-char prefix of "swimfast" first
             ("idle_combat", 0xf),
             ("enter_combat", 0x80),
             ("itemshow_b", 0x41),
@@ -262,6 +269,7 @@ mod tests {
     fn footstep_sounds_are_the_shared_man_samples_whatever_breed_or_sex() {
         assert_eq!(footstep_name(id::STEP), Some("SM_Sandy_Game_Feet_Man_Walk"));
         assert_eq!(footstep_name(id::LAND), Some("SM_Sandy_Game_Feet_Man_Land"));
+        assert_eq!(footstep_name(id::SWIM), Some("SM_Sandy_Game_Feet_Man_Swim"));
         assert_eq!(footstep_name(id::ATTACK), None);
     }
 

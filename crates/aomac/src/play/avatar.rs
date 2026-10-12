@@ -365,6 +365,8 @@ pub struct Avatar {
     /// Local clip time ([`clip_time`]) as of the last [`Avatar::update`], to detect a looping clip's wrap and re-arm
     /// `note_fired` for its next cycle (the own walk/run/jump clip's own step/land notes, not just the swing overlays).
     body_phase: f32,
+    /// `Vehicle_t+0x52` (`FUN_10045069`'s own guard): no step/swim/land note plays while airborne (`Player::set_airborne`).
+    airborne: bool,
     notes: Vec<super::combat::notes::FiredNote>,
     /// `AnimSet` of the wielded weapon ([`Avatar::set_stance`]).
     stance: Option<i32>,
@@ -389,7 +391,7 @@ impl Avatar {
         let heads = head_table(store, breed, gender, 2)?;
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
         let rig = ActorRig::player(store, &assets, &l.look, &l.attachments)?;
-        let mut a = Self { id, rig, current_skin: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, note_fired: 0, body_phase: 0.0, notes: Vec::new(), stance: None, ms: 0.0, prev_clip: None, prev_ms: 0.0, prev_rate: 1.0, prev_fade_elapsed: 0.0, prev_fade_ms: 0.0, transform: Mat4::IDENTITY };
+        let mut a = Self { id, rig, current_skin: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, note_fired: 0, body_phase: 0.0, airborne: false, notes: Vec::new(), stance: None, ms: 0.0, prev_clip: None, prev_ms: 0.0, prev_rate: 1.0, prev_fade_elapsed: 0.0, prev_fade_ms: 0.0, transform: Mat4::IDENTITY };
         a.set_pose(store, AvatarPose::default())?;
         a.set_transform([u.pos[0], u.pos[1], -u.pos[2]], u.yaw().map_or(0.0, |y| -y));
         Ok(a)
@@ -560,6 +562,11 @@ impl Avatar {
         self.clip_scale = scale;
     }
 
+    /// `Vehicle_t+0x52` (`FUN_10045069`): no step/swim/land note plays while airborne.
+    pub fn set_airborne(&mut self, airborne: bool) {
+        self.airborne = airborne;
+    }
+
 
     /// The notes (`combat::notes`) the swing clip reached since the last call.
     pub fn take_notes(&mut self) -> Vec<super::combat::notes::FiredNote> {
@@ -616,7 +623,11 @@ impl Avatar {
             if local < self.body_phase {
                 self.note_fired = 0;
             }
-            self.notes.extend(super::combat::notes::fire(&clip.events, local, &mut self.note_fired).filter_map(|id| attributed_note(id, -1)));
+            let airborne = self.airborne;
+            use super::combat::notes::id as note;
+            self.notes.extend(super::combat::notes::fire(&clip.events, local, &mut self.note_fired)
+                .filter_map(|id| attributed_note(id, -1))
+                .filter(|n| !(airborne && matches!(n.id, note::STEP | note::LAND | note::SWIM))));
             self.body_phase = local;
         }
         // keep the counter bounded; looping clips wrap by themselves, one-shots stop at the end
@@ -904,6 +915,22 @@ pub(super) mod tests {
             landed += avatar.take_notes().iter().filter(|n| n.id == super::super::combat::notes::id::LAND).count();
         }
         assert_eq!(landed, 1, "the jump-landing clip's land marker fires exactly once");
+    }
+
+    /// `Vehicle_t+0x52` (`FUN_10045069`'s own guard): no step note while airborne, even while the walk clip keeps looping.
+    #[test]
+    fn step_notes_are_silent_while_airborne() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        avatar.set_pose(&store, AvatarPose { role: Role::Walk, speed: 1.5, ref_speed: 1.5 }).unwrap();
+        avatar.set_airborne(true);
+        let mut steps = 0;
+        for _ in 0..200 {
+            avatar.update(0.05);
+            steps += avatar.take_notes().iter().filter(|n| n.id == super::super::combat::notes::id::STEP).count();
+        }
+        assert_eq!(steps, 0, "airborne suppresses every step note, however many loops the clip crosses");
     }
 
     /// `VisualCATMesh_t::SetAnimation` (DS 0x10073f23) always blends the new clip in over 200..300 ms instead of popping

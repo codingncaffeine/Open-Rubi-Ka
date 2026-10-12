@@ -541,12 +541,8 @@ impl Player {
         // the clip's own `land` note then plays the ground-material footstep thud (`FUN_10045069`).
         let grounded = self.movement.grounded();
         if self.was_airborne == Some(true) && grounded && self.cast_loop.is_none() {
-            let name = match role {
-                Role::Walk | Role::Sneak | Role::WalkBack | Role::WalkLeft | Role::WalkRight => "jump-land-walk",
-                Role::Run => "jump-land-run",
-                _ => "jump-land-idle",
-            };
-            self.play(Role::Clip(name.into()), false);
+            let two_h = zone.world.wielded_set(self.char_id as i32) == Some(super::combat::anim::anim_set::RIFLE);
+            self.play(Role::Clip(jump_land_clip(&role, two_h).into()), false);
         }
         self.was_airborne = Some(!grounded);
         // emotes and swings end with their clip or when the character moves; a death clip holds until `stand`
@@ -563,6 +559,7 @@ impl Player {
         self.avatar.set_stance(zone.world.wielded_set(self.char_id as i32));
         self.avatar.set_clip_scale(self.transient.as_ref().and(self.clip_scale));
         self.avatar.set_cast_loop(self.cast_loop == Some(true));
+        self.avatar.set_airborne(!grounded);
         if std::mem::take(&mut self.cast_restart) { self.avatar.restart_cast_clip(); }
         if let Err(e) = self.avatar.set_pose(&self.store, pose) {
             eprintln!("avatar pose: {e:#}");
@@ -771,10 +768,31 @@ pub(super) fn effect_collision(c: &Collision, p: ao_render::Vec3) -> Option<(ao_
     Some((ao_render::Vec3::from_array(point), ao_render::Vec3::from_array(hit.normal)))
 }
 
+/// Jump-landing clip name for the resuming movement intent (`combat::anim::ANIMS` 185..190, `FUN_10045069`'s `land` note
+/// lives in these, never in the takeoff `jump-stand`/`jump-forward` clips): walk / run / idle, `-2h` while a rifle is
+/// wielded (the only `AnimSet` with its own walk/run locomotion clips, [`super::avatar`]'s `wield_walk_run`).
+fn jump_land_clip(role: &Role, two_h: bool) -> &'static str {
+    match role {
+        Role::Walk | Role::Sneak | Role::WalkBack | Role::WalkLeft | Role::WalkRight => if two_h { "jump-land-walk-2h" } else { "jump-land-walk" },
+        Role::Run => if two_h { "jump-land-run-2h" } else { "jump-land-run" },
+        _ => if two_h { "jump-land-idle-2h" } else { "jump-land-idle" },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn jump_land_clip_picks_walk_run_idle_and_the_rifle_2h_variant() {
+        assert_eq!(jump_land_clip(&Role::Walk, false), "jump-land-walk");
+        assert_eq!(jump_land_clip(&Role::Run, false), "jump-land-run");
+        assert_eq!(jump_land_clip(&Role::Idle, false), "jump-land-idle");
+        assert_eq!(jump_land_clip(&Role::Walk, true), "jump-land-walk-2h");
+        assert_eq!(jump_land_clip(&Role::Run, true), "jump-land-run-2h");
+        assert_eq!(jump_land_clip(&Role::Idle, true), "jump-land-idle-2h");
+    }
     #[test]
     fn effect_collision_uses_surface_normal_and_never_lowers_the_rock() {
         use ao_scene::{Instance, Mesh, Scene, Submesh, Vertex, IDENTITY};

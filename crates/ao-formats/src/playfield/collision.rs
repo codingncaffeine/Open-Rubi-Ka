@@ -480,11 +480,23 @@ impl Collision {
         self.closest(p, -1).map(|c| c.pos[1])
     }
 
-    /// Footstep/landing ground material at `p` (`FUN_10045069` [GC 0x10045069] `local_8`, fed to `PlayGameSound`'s material
-    /// argument): the outdoor tile's ground-texture material ([`ground::ground_material`]) only while `p` is at or within
-    /// `GROUND_MATERIAL_TOLERANCE` (`_DAT_1015def8` = 0.1 m) above the terrain surface; indoors, off the heightfield, or
-    /// higher above it (mid-jump), the client's own default material 5.
+    /// Footstep/landing/swim ground material at `p` (`FUN_10045069` [GC 0x10045069] `local_8`, fed to `PlayGameSound`'s
+    /// material argument): submerged in liquid (`p` below the surface [`Collision::liquid_at`]) selects material 10 for
+    /// calm lava (`kind & 0x1f == 2`), 11 for calm acid (`== 6`), else 8 (water/slime/mud) or 9 within 0.35 m of the
+    /// surface (`_DAT_1015def4`); else the outdoor tile's ground-texture material ([`ground::ground_material`]) only
+    /// while `p` is at or within `GROUND_MATERIAL_TOLERANCE` (`_DAT_1015def8` = 0.1 m) above the terrain surface;
+    /// indoors, off the heightfield, or higher above it (mid-jump), the client's own default material 5.
     pub fn ground_material(&self, p: [f32; 3]) -> i32 {
+        if let Some(liquid) = self.liquid_at(p) {
+            let depth = liquid.level - p[1];
+            if depth > 0.0 {
+                return match liquid.kind & 0x1f {
+                    2 => 10,
+                    6 => 11,
+                    _ => if depth <= 0.35 { 9 } else { 8 },
+                };
+            }
+        }
         let Some(terrain) = &self.terrain else { return 5 };
         let (x, z) = (p[0], -p[2]);
         let Some((h, _)) = terrain.at(x, z) else { return 5 };
@@ -936,6 +948,19 @@ mod tests {
         assert_eq!(c.ground_material([-1.0, 0.05, -1.0]), 5, "outside the map: the default material");
         let indoor = Collision::build(Vec::new(), None, None, Vec::new());
         assert_eq!(indoor.ground_material([1.0, 0.05, -1.0]), 5, "no outdoor terrain (dungeon): always the default material");
+    }
+
+    #[test]
+    fn ground_material_is_the_liquid_material_while_submerged() {
+        let water: Vec<(Tri, u32)> = quad(1.0, -10.0, 10.0, -10.0, 10.0).into_iter().map(|t| (t, 0)).collect();
+        let c = Collision::build(Vec::new(), None, None, water);
+        assert_eq!(c.ground_material([5.0, 0.5, -8.0]), 8, "deep water (> 0.35 m below the surface)");
+        assert_eq!(c.ground_material([5.0, 0.9, -8.0]), 9, "shallow water (<= 0.35 m below the surface)");
+        assert_eq!(c.ground_material([5.0, 1.5, -8.0]), 5, "above the surface: not submerged, the default material");
+        let lava: Vec<(Tri, u32)> = quad(1.0, -10.0, 10.0, -10.0, 10.0).into_iter().map(|t| (t, 2)).collect();
+        assert_eq!(Collision::build(Vec::new(), None, None, lava).ground_material([5.0, 0.5, -8.0]), 10, "calm lava");
+        let acid: Vec<(Tri, u32)> = quad(1.0, -10.0, 10.0, -10.0, 10.0).into_iter().map(|t| (t, 6)).collect();
+        assert_eq!(Collision::build(Vec::new(), None, None, acid).ground_material([5.0, 0.5, -8.0]), 11, "calm acid");
     }
 
     #[test]

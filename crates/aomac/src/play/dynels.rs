@@ -1771,7 +1771,7 @@ impl Dynels {
                     self.weapon_hit(who, note, h);
                 }
             }
-            id::STEP | id::LAND => self.footstep(who, note),
+            id::STEP | id::LAND | id::SWIM => self.footstep(who, note),
             _ => {}
         }
     }
@@ -2620,7 +2620,12 @@ impl Dynels {
                     c.note_fired = 0;
                 }
                 let note_id = *id;
-                self.notes.extend(super::combat::notes::fire(&a.events, local, &mut c.note_fired).filter_map(|note| (note != super::combat::notes::id::ATTACK).then_some(super::combat::notes::FiredNote { id: note, slot: -1 })).map(|note| (note_id, note)));
+                let airborne = matches!(state, AnimState::JumpStand | AnimState::JumpForward);
+                use super::combat::notes::id as note;
+                self.notes.extend(super::combat::notes::fire(&a.events, local, &mut c.note_fired)
+                    .filter_map(|n| (n != note::ATTACK).then_some(super::combat::notes::FiredNote { id: n, slot: -1 }))
+                    .filter(|n| !(airborne && matches!(n.id, note::STEP | note::LAND | note::SWIM)))
+                    .map(|note| (note_id, note)));
                 c.body_phase = local;
             }
             c.actions.retain_mut(|action| {
@@ -4585,6 +4590,17 @@ mod variant_tests {
             assert_eq!(got.len(), usize::from(!want.is_empty()), "note {note:#x}: {want:?}");
             assert!(got.iter().all(|g| want.contains(&g.id) && g.pos == lp && g.material == 5), "a creature plays its own list, not the player's sample, at the same default material");
         }
+    }
+
+    /// `swim` (0x38): a player plays `SM_Sandy_Game_Feet_Man_Swim`, a creature its own record list, same as step/land.
+    #[test]
+    fn swim_notes_play_the_shared_swim_sample_or_the_creatures_own_list() {
+        use crate::play::combat::notes::id;
+        let Some((mut z, player, _)) = fight_zone() else { return };
+        let pp = scene_pos(z.world.chars[&player].pose.pos);
+        let sid = ao_audio::sbf::sound_id;
+        z.world.note_sounds(player, id::SWIM, -1);
+        assert_eq!(z.world.take_sounds(), [GameSound { id: sid("SM_Sandy_Game_Feet_Man_Swim"), pos: pp, material: 5, size: 1 }]);
     }
 
     /// The Beach Leet's authored attack notes fire once per independent holder node.
