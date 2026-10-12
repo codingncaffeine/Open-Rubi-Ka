@@ -41,8 +41,9 @@
 //!   functions) — `FUN_100508bd` with the fired event's own seed (`FUN_100b0e88` ≡
 //!   `Schedule::active_seed`), `FUN_10050d3e` with a fresh CRT `rand()` (not reproducible from
 //!   the event — matches the client's own non-determinism, ported with [`CrtRand`] like the rest
-//!   of this crate's native `rand()` uses) — leave fan slot 0 untouched (see "Not reproduced")
-//!   and for fan slots 1..=9: `cx = rand() % 70 − 35` (`FUN_100508bd`) or `rand() % 30 − 15`
+//!   of this crate's native `rand()` uses) — fan slot 0 is untouched by both (its position is a
+//!   construction-time constant, see the dedicated bullet after this list) and for fan slots
+//!   1..=9: `cx = rand() % 70 − 35` (`FUN_100508bd`) or `rand() % 30 − 15`
 //!   (`FUN_10050d3e`), same formula for `cz`; `half = rand() % 20 + 25`; the 4 corners are
 //!   `(cx∓half, 0, cz∓half)`, the 5th vertex is the center `(cx, 0, cz)` ([`Fan::vertices`]); a
 //!   `rand() % 100 < 40` roll additionally starts a companion flash (undecoded `VisualEnvFX_t`
@@ -60,13 +61,16 @@
 //!   every draw call — the flicker ([`flicker_alpha`]). `FUN_10050bc3`: lifetime starts at 1.0 s
 //!   (`0x3f800000`, set at activation), counts down by `dt`, expires below 0.01 s (`_DAT_
 //!   1008ae90`, confirmed `float 0.01`) ([`FAN_LIFETIME`], [`fan_expired`]).
+//! * Fan slot 0 (the strike's own fixed "anchor" fan, resolved this session): `FUN_100516ce`'s
+//!   pre-loop block (before the `rand()`-driven slots 1..=9 loop) writes its 4 corners directly
+//!   from two file-constant floats, not `rand()`: `_DAT_1008dcc4 = -55.0` / `_DAT_1008dcc0 =
+//!   +55.0` (DisplaySystem.dll, confirmed by a raw float read of both addresses), giving corners
+//!   `(∓55, 0, ∓55)` and center `(0, 0, 0)` — a fixed half-size of 55 (vs. slots 1..=9's
+//!   `rand() % 20 + 25` = 25..44) centered on the strike's own position, consuming no RNG draws
+//!   ([`ANCHOR_HALF_SIZE`], [`build_fans`]). Neither `FUN_100508bd` nor `FUN_10050d3e` ever
+//!   touches it, matching a value set once at construction and never re-rolled per strike.
 //!
 //! # Not reproduced (UNRESOLVED)
-//! * Fan slot 0 (the strike's own "anchor" fan): neither `FUN_100516ce` (construction) nor
-//!   `FUN_100508bd`/`FUN_10050d3e` (activation) ever write its 5 vertices — only slots 1..=9 are
-//!   algorithmically positioned. Slot 0's position/size most likely come from the FX8 FXS
-//!   resource template (loaded via `FXS_t::GetInstance()` in `FUN_10065675`), which was not
-//!   traced. [`Strike::fans`] therefore holds only the 9 algorithmically-derived extra fans.
 //! * FX kind 9 (`VisualEnvFX_t::StartFX(9)`), the companion lightning-bolt/flash visual paired
 //!   with the strike and with each fan that rolls one: only the call site is known
 //!   (`SetFXPos`/`SetFXGroundPos`/`StartFX`); `VisualEnvFX_t`'s own construction/geometry/
@@ -90,11 +94,11 @@
 //!   effect renderer (`aomac::play::combat::effects`) is bound 1:1 to RDB-templated, dynel-addressed GC effect
 //!   classes — FX8/FX9 have no RDB template (pure native weather code) and are not bound to a dynel, so `LightningFx`
 //!   draws fan quads as a small parallel list of transient additive actors alongside it instead of fabricating a
-//!   template that does not exist. `SM_Sandy_Env_NearLightning`'s `delay = distance / 100` s is approximated as
-//!   immediate playback: the one native per-frame delayed-command queue found in `ao_audio` (`game::Runtime::
-//!   effect_delays`) backs a different system (AFCM103 authored effect sounds) with its own variant-selection and
-//!   one-due-record-per-frame throttling, so reusing it here would misrepresent two different native subsystems as
-//!   one, and a second lightning-only queue was judged disproportionate for a sub-second offset.
+//!   template that does not exist. `SM_Sandy_Env_NearLightning`'s `delay = distance / 100` s is now routed through
+//!   the same per-frame delayed-command queue as GC4000 authored effect sounds (`ao_audio::Audio::play_effect_sound`
+//!   / `game::Runtime::effect_delays`), which already matches the native SI10003f61/SI1000567d replay semantics
+//!   (probability reset to 100, radius/velocity reset to 0, cleared on logout) and is a correct reuse once `pos ==
+//!   listener` makes the generic attenuation curve a no-op, leaving only this module's own distance-based volume.
 
 use crate::weather::{CrtRand, Schedule, R250};
 
@@ -225,9 +229,9 @@ pub struct Strike {
     pub source: [f32; 3],
     /// `source + (0, -70, 0)`.
     pub ground: [f32; 3],
-    /// The 9 randomized extra fans (`FUN_100508bd`'s loop, fan slots 1..=9); fan slot 0 is not
-    /// reproduced here, see the module doc.
-    pub fans: [Fan; 9],
+    /// The 10 fans: slot 0 is the fixed "anchor" ([`ANCHOR_HALF_SIZE`], never re-rolled), slots
+    /// 1..=9 are `FUN_100508bd`'s randomized extra fans.
+    pub fans: [Fan; 10],
     /// Indices into [`Strike::fans`] whose `rand() % 100 < 40` roll also started a companion
     /// flash at `source + (fan.center.x, 0, fan.center.y)` (ground offset likewise).
     pub companions: Vec<usize>,
@@ -282,13 +286,21 @@ impl Lightning {
     }
 }
 
-/// `FUN_100508bd`/`FUN_10050d3e`'s shared fan-building loop: 9 fans (`cx`/`cz` from
-/// `offset_range`/`offset_min`, `half` from `rand() % 20 + 25`), plus each fan's `rand() % 100 <
-/// 40` companion-flash roll.
-fn build_fans(mut next: impl FnMut() -> i32, offset_range: i32, offset_min: i32) -> ([Fan; 9], Vec<usize>) {
-    let mut fans = [Fan { center: [0.0, 0.0], half_size: 0.0 }; 9];
+/// `FUN_100516ce`'s construction-time corners for fan slot 0 (the strike's own fixed "anchor"
+/// fan): native floats `_DAT_1008dcc4 = -55.0` / `_DAT_1008dcc0 = +55.0` (DisplaySystem.dll,
+/// confirmed by a raw float read), giving corners `(∓55, 0, ∓55)` around the strike's own
+/// position. Unlike slots 1..=9, this half-size is a constant, not `rand() % 20 + 25`, and is
+/// never touched by `FUN_100508bd`/`FUN_10050d3e` (those only write slots 1..=9).
+pub const ANCHOR_HALF_SIZE: f32 = 55.0;
+
+/// `FUN_100508bd`/`FUN_10050d3e`'s shared fan-building loop: the fixed anchor at slot 0, then 9
+/// fans (`cx`/`cz` from `offset_range`/`offset_min`, `half` from `rand() % 20 + 25`) at slots
+/// 1..=9, plus each of those 9 fans' `rand() % 100 < 40` companion-flash roll.
+fn build_fans(mut next: impl FnMut() -> i32, offset_range: i32, offset_min: i32) -> ([Fan; 10], Vec<usize>) {
+    let mut fans = [Fan { center: [0.0, 0.0], half_size: 0.0 }; 10];
+    fans[0] = Fan { center: [0.0, 0.0], half_size: ANCHOR_HALF_SIZE };
     let mut companions = Vec::new();
-    for (i, fan) in fans.iter_mut().enumerate() {
+    for (i, fan) in fans.iter_mut().enumerate().skip(1) {
         let cx = (next() % offset_range + offset_min) as f32;
         let cz = (next() % offset_range + offset_min) as f32;
         let half = (next() % 20 + 25) as f32;
@@ -300,7 +312,7 @@ fn build_fans(mut next: impl FnMut() -> i32, offset_range: i32, offset_min: i32)
     (fans, companions)
 }
 
-/// `FUN_100b9850`'s per-fired-event body (strike position, source/ground, the 9 extra fans).
+/// `FUN_100b9850`'s per-fired-event body (strike position, source/ground, the anchor plus 9 extra fans).
 fn fire(storm: &mut Schedule, controlled: [f32; 3], extent: f32, camera_y: f32) -> Strike {
     let qx = quantize(controlled[0], extent);
     let qz = quantize(controlled[2], extent);
@@ -320,7 +332,7 @@ fn fire(storm: &mut Schedule, controlled: [f32; 3], extent: f32, camera_y: f32) 
 /// this instead of reusing the primary one depends on `FXS_t`'s resource-pool occupancy, which
 /// is not decompiled here (see the module doc's "Not reproduced"); this function only reproduces
 /// the fan math so a future pool-aware caller can use it.
-pub fn additional_instance_fans(crt: &mut CrtRand) -> ([Fan; 9], Vec<usize>) {
+pub fn additional_instance_fans(crt: &mut CrtRand) -> ([Fan; 10], Vec<usize>) {
     let mut gen = R250::new(crt.rand() as u32);
     build_fans(|| gen.next_u32() as i32, 30, -15)
 }
@@ -375,13 +387,14 @@ mod tests {
     }
 
     #[test]
-    fn fan_offsets_stay_in_the_decompiled_range_and_nine_fans_are_produced() {
+    fn fan_offsets_stay_in_the_decompiled_range_and_the_anchor_plus_nine_fans_are_produced() {
         let mut storm = Schedule::new(&[0x85c19], 600.0, 0.1, 20.0, EVENT_INTS);
         let t0 = storm.times().next().unwrap();
         assert!(storm.step(t0));
         let strike = fire(&mut storm, [0.0, 0.0, 0.0], 60.0, 0.0);
-        assert_eq!(strike.fans.len(), 9);
-        for fan in &strike.fans {
+        assert_eq!(strike.fans.len(), 10);
+        assert_eq!(strike.fans[0], Fan { center: [0.0, 0.0], half_size: ANCHOR_HALF_SIZE });
+        for fan in &strike.fans[1..] {
             // `rand() % 70 - 35` on a signed 32-bit DisplaySystem R250 draw (not CrtRand, so the
             // dividend can be negative): truncating `%` gives -(70-1)..=(70-1), so -104..=34.
             assert!((-104.0..=34.0).contains(&fan.center[0]), "{fan:?}");
@@ -389,7 +402,7 @@ mod tests {
             // `rand() % 20 + 25`, same signed-draw reasoning: -(20-1)+25..=(20-1)+25 = 6..=44.
             assert!((6.0..=44.0).contains(&fan.half_size), "{fan:?}");
         }
-        assert!(strike.companions.iter().all(|&i| i < 9));
+        assert!(strike.companions.iter().all(|&i| (1..10).contains(&i)));
     }
 
     #[test]
@@ -417,14 +430,15 @@ mod tests {
     fn additional_instance_fans_use_the_narrower_offset_range() {
         let mut crt = CrtRand::default();
         let (fans, companions) = additional_instance_fans(&mut crt);
-        assert_eq!(fans.len(), 9);
-        for fan in &fans {
+        assert_eq!(fans.len(), 10);
+        assert_eq!(fans[0], Fan { center: [0.0, 0.0], half_size: ANCHOR_HALF_SIZE });
+        for fan in &fans[1..] {
             // `rand() % 30 - 15` on a signed 32-bit draw: -(30-1)-15..=(30-1)-15 = -44..=14.
             assert!((-44.0..=14.0).contains(&fan.center[0]), "{fan:?}");
             assert!((-44.0..=14.0).contains(&fan.center[1]), "{fan:?}");
             assert!((6.0..=44.0).contains(&fan.half_size), "{fan:?}");
         }
-        assert!(companions.iter().all(|&i| i < 9));
+        assert!(companions.iter().all(|&i| (1..10).contains(&i)));
         // two calls with the same CrtRand stream reseed R250 differently each time (fresh rand()
         // seed per FUN_10050d3e call) and so do not reproduce the same fans.
         let (fans2, _) = additional_instance_fans(&mut crt);

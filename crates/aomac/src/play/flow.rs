@@ -1417,7 +1417,10 @@ impl Frontend for Play {
                 host.actors.extend(self.world_lightning.actors());
                 if let Some(audio) = &self.audio {
                     for strike in &strikes {
-                        audio.play_lightning_cue(strike.audio(controlled, extent).volume);
+                        let cue = strike.audio(controlled, extent);
+                        if let Err(error) = audio.play_lightning_cue(cue.volume, cue.delay) {
+                            eprintln!("lightning cue: {error:#}");
+                        }
                     }
                 }
             }

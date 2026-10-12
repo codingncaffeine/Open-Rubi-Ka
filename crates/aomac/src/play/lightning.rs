@@ -1,8 +1,9 @@
 //! Live wiring of `ao_formats::lightning` into the zone flow: ticks the native storm schedules every frame, turns
 //! fired [`ao_formats::lightning::Strike`]s into transient additive fan quads (FX8's `VisualCloudlight_t`; see the
 //! module doc of `ao_formats::lightning` for why these are not routed through `combat::effects` — FX8/FX9 have no
-//! RDB template and are not bound to a dynel). `SM_Sandy_Env_NearLightning`'s `delay = distance / 100` s is played
-//! immediately (approximated, see the `ao_formats::lightning` module doc).
+//! RDB template and are not bound to a dynel). `SM_Sandy_Env_NearLightning`'s `delay = distance / 100` s goes
+//! through `ao_audio::Audio::play_lightning_cue`'s own delayed-command queue (see its doc for why that reuse is
+//! faithful, not an approximation).
 
 use std::sync::Arc;
 
@@ -126,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_eventually_fires_and_renders_nine_fans_per_strike() {
+    fn enabled_eventually_fires_and_renders_the_anchor_plus_nine_fans_per_strike() {
         let mut fx = LightningFx::default();
         let mut strikes = Vec::new();
         for _ in 0..2000 {
@@ -136,8 +137,8 @@ mod tests {
             }
         }
         assert!(!strikes.is_empty(), "storm 1 (period 600 s) never fired over 1000 s");
-        assert_eq!(fx.fan_count(), strikes.iter().map(|s| s.fans.len()).sum::<usize>(), "9 fans queued per strike, nothing expired yet");
-        assert!(fx.fan_count() >= 9, "9 fans per strike should be queued");
+        assert_eq!(fx.fan_count(), strikes.iter().map(|s| s.fans.len()).sum::<usize>(), "anchor + 9 fans queued per strike, nothing expired yet");
+        assert!(fx.fan_count() >= 10, "anchor + 9 fans per strike should be queued");
         let actors = fx.actors();
         assert_eq!(actors.len(), fx.fan_count());
         for actor in &actors {

@@ -405,18 +405,18 @@ impl Audio {
 
     /// `SM_Sandy_Env_NearLightning` (`FUN_100b9850`, `ao_formats::lightning::Strike::audio`): a one-shot at the
     /// caller's own gain, non-positionally — the native handler computes `volume` itself from the strike's distance
-    /// and extent, not the generic attenuation curve [`Audio::play_game_sound`] uses. `volume <= 0.0` plays nothing.
-    pub fn play_lightning_cue(&self, volume: f32) -> Vec<u64> {
+    /// and extent, not the generic attenuation curve [`Audio::play_game_sound`] uses. Routed through the same
+    /// SI10003f61/SI1000567d delayed-command queue as other authored effect sounds (`Audio::play_effect_sound`
+    /// / `game::Runtime::effect_delays`), so `delay` (`AudioCue::delay` = distance / 100 s) is honored exactly like
+    /// GC4000 effect delays, including being cleared on logout (`Runtime::reset`); `pos == listener == [0,0,0]`
+    /// keeps the generic attenuation curve a no-op (distance 0), leaving only this module's own volume.
+    /// `volume <= 0.0` plays nothing (not even queued).
+    pub fn play_lightning_cue(&self, volume: f32, delay: f32) -> Result<Vec<u64>> {
         if volume <= 0.0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let mut g = self.rt();
-        let Some(rt) = g.as_mut() else { return Vec::new() };
-        let db = rt.lib.sounds.clone();
-        match db.by_name("SM_Sandy_Env_NearLightning") {
-            Some(def) => rt.play_scaled(&self.sh, def, volume),
-            None => Vec::new(),
-        }
+        let id = crate::sbf::sound_id("SM_Sandy_Env_NearLightning");
+        self.play_effect_sound(id, [0.0; 3], [0.0; 3], [0.0; 3], [volume, 0.0, 0.0, delay], 100)
     }
 
     /// `SandyInterfaceModule_t::PlayGameSound(sound id, position)`: a one-shot of the sound definition `id` at `pos`, heard from `listener`
@@ -600,9 +600,33 @@ mod tests {
         let dir = PathBuf::from(home).join("Games/ProjectRubiKa/client");
         if !dir.join("cd_image/sound/SourceFiles/SM_Sandy_Game_Dummy.sbf").exists() { return; }
         let audio = Audio::offline(&dir, 44100);
-        assert!(audio.play_lightning_cue(0.0).is_empty());
-        assert!(audio.play_lightning_cue(-1.0).is_empty());
-        assert!(!audio.play_lightning_cue(0.8).is_empty());
+        assert!(audio.play_lightning_cue(0.0, 0.0).unwrap().is_empty());
+        assert!(audio.play_lightning_cue(-1.0, 0.0).unwrap().is_empty());
+        assert!(!audio.play_lightning_cue(0.8, 0.0).unwrap().is_empty(), "delay 0 plays immediately");
+    }
+
+    #[test]
+    fn lightning_cue_delay_queues_then_plays_and_is_cleared_on_logout() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        if !dir.join("cd_image/sound/SourceFiles/SM_Sandy_Game_Dummy.sbf").exists() { return; }
+        let audio = Audio::offline(&dir, 44100);
+        assert!(audio.play_lightning_cue(0.8, 0.4).unwrap().is_empty(), "a nonzero delay queues, nothing plays yet");
+        audio.update(0.1, [0.0; 3], 0.0);
+        let mut samples = vec![0.0; 4410 * 2];
+        audio.render(&mut samples);
+        assert!(samples.iter().all(|&s| s == 0.0), "still queued before the delay elapses");
+        audio.update(0.35, [0.0; 3], 0.0);
+        audio.render(&mut samples);
+        assert!(samples.iter().any(|&s| s != 0.0), "the delayed cue must play once its delay elapses");
+        // logout clears any still-pending delayed cue (`Runtime::reset`, the same queue GC4000
+        // effect delays use).
+        assert!(audio.play_lightning_cue(0.8, 10.0).unwrap().is_empty());
+        audio.reset();
+        audio.update(20.0, [0.0; 3], 0.0);
+        let mut samples2 = vec![0.0; 4410 * 2];
+        audio.render(&mut samples2);
+        assert!(samples2.iter().all(|&s| s == 0.0), "reset must drop the pending delayed cue");
     }
 
     #[test]
