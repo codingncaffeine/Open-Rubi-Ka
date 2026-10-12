@@ -1414,6 +1414,11 @@ impl Hud {
     }
 
     #[cfg(test)]
+    pub(super) fn inventory_gap(&self) -> Option<(f32, f32)> {
+        self.stats.inventory_gap()
+    }
+
+    #[cfg(test)]
     pub(super) fn is_open(&self, kind: WindowKind) -> bool {
         self.open.contains(&kind)
     }

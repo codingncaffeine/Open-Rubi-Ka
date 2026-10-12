@@ -1210,6 +1210,60 @@ fn live_walk() {
                     eprintln!("inv slot {slot:#x}: {e:?}");
                 }
             }
+            // `weapon`: dump the own Armory slots 6/8 (ranged/melee) and the matching inventory entries, for weapon-equip debugging
+            "weapon" => {
+                let own = l.p.zone.char_id as i32;
+                for slot in [6, 8] {
+                    let item = l.p.zone.world.arms.slot_item(own, slot);
+                    eprintln!("weapon slot {slot}: {item:?}");
+                }
+                let mut inv: Vec<_> = l.p.zone.inventory.iter().collect();
+                inv.sort_by_key(|e| *e.0);
+                for (slot, e) in inv {
+                    eprintln!("weapon inv {slot:#x}: low_id={} {e:?}", e.item.low_id);
+                }
+            }
+            // `quests`: the own quest list text (id, name, description), as the zone state holds it
+            "quests" => {
+                let mut v: Vec<_> = l.p.zone.quests.values().collect();
+                v.sort_by_key(|q| (q.id.kind, q.id.instance));
+                for q in v {
+                    eprintln!("quest {:?} {:?}: {:?}", q.id, q.name, q.description);
+                }
+            }
+            // `weardrag=<bag_col>:<bag_row>:<tab>:<wear_id>`: drags a bag cell onto a Character-window wear slot, like a real GUI drag
+            "weardrag" => {
+                use super::super::hud::WindowKind;
+                use super::super::hud_stats::{inv_grid, items};
+                let mut it = v.split(':');
+                let (col, row, tab, id): (usize, usize, usize, u32) = (
+                    it.next().unwrap().parse().unwrap(),
+                    it.next().unwrap().parse().unwrap(),
+                    it.next().unwrap().parse().unwrap(),
+                    it.next().unwrap().parse().unwrap(),
+                );
+                let hud = l.p.hud.as_ref().expect("hud");
+                let iw = hud.stats_window(WindowKind::Inventory).expect("inventory window not open");
+                let (ir, gap) = (l.p.gui.view_rect(iw, "grid").expect("inventory grid"), hud.inventory_gap().expect("inventory state"));
+                let (ox, oy) = inv_grid::cell_origin(col, row, gap);
+                let from = (ir.l + ox + 24.0, ir.t + oy + 24.0);
+                let cw = hud.stats_window(WindowKind::Character).expect("character window not open");
+                let cr = l.p.gui.view_rect(cw, "items").expect("character items");
+                let cell = (0..15).find(|&c| items::wear_slot(tab, c).is_some_and(|sl| sl % 16 == id)).expect("no such wear slot");
+                let (wc, wrow) = items::wear_cell(tab, cell);
+                let (wx, wy) = items::wear_origin(wc, wrow);
+                let to = (cr.l + wx + 27.0, cr.t + wy + 27.0);
+                eprintln!("weardrag {from:?} -> {to:?}");
+                l.p.input(ao_gui::InputEvent::MouseMove { x: from.0, y: from.1 }, &mut l.o.host);
+                l.p.input(ao_gui::InputEvent::MouseDown { x: from.0, y: from.1, button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                for i in 1..=10 {
+                    l.tick();
+                    let t = i as f32 / 10.0;
+                    l.p.input(ao_gui::InputEvent::MouseMove { x: from.0 + (to.0 - from.0) * t, y: from.1 + (to.1 - from.1) * t }, &mut l.o.host);
+                }
+                l.p.input(ao_gui::InputEvent::MouseUp { x: to.0, y: to.1, button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                l.tick();
+            }
             // `zc=secs`: runs frames for that long and prints the zone change state whenever it changes and every 0.5 s (playfield, teleporting, awaiting
             // the CharInPlay echo, world ready, own position, dynel count) and writes a frame at every change (`zc<n>`, at most 14)
             "zc" => {
