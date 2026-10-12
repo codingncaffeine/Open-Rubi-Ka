@@ -232,6 +232,15 @@ impl PTradeUi {
     pub(super) fn configure_escape(&mut self, values: &super::dvalue::DValues) {
         self.confirm.configure_escape(values);
     }
+
+    /// Shift-hover support (`MP_TradeItem_Icon`): true over a filled slot of either list, same coordinate convention
+    /// as [`PTrade::update_tooltip`] (canvas-local `x - r.l`, `y - r.t`).
+    pub(super) fn icon_hover_at(&self, gui: &Gui, x: f32, y: f32) -> bool {
+        let Some(t) = self.trade.as_ref() else { return false };
+        ["our_items", "partner_items"].iter().enumerate().any(|(list, view)| {
+            gui.view_rect(t.win, view).is_some_and(|r| x >= r.l && x < r.r && y >= r.t && y < r.b && t.entry_at(list, x - r.l, y - r.t).is_some())
+        })
+    }
     pub fn set_texts(&mut self, yes: String, no: String) {
         self.buttons = [yes, no];
     }
@@ -760,6 +769,19 @@ mod tests {
         assert!(i.ptrade.trade.is_some());
         i.on_trade(&mut gui, msg(trade::START, BOB, ZERO), ME, &z);
         assert_eq!(i.ptrade.take_feedback(), ["Feedback_YouAreAlreadyInATrade"]);
+    }
+
+    #[test]
+    fn icon_hover_reports_a_filled_own_item_slot() {
+        let Some(mut gui) = rig() else { return };
+        let z = zone();
+        let mut i = open(&mut gui, &z);
+        i.on_trade(&mut gui, msg(trade::ADD_ITEM, ME, Identity { kind: 0x68, instance: 0x40 }), ME, &z);
+        let p = i.ptrade.trade.as_ref().unwrap();
+        let r = gui.view_rect(p.win, "our_items").unwrap();
+        let (cx, cy) = cell(0);
+        assert!(i.icon_hover_at(&gui, r.l + cx + 2.0, r.t + cy + 2.0));
+        assert!(!i.icon_hover_at(&gui, r.l - 50.0, r.t - 50.0));
     }
 
     #[test]

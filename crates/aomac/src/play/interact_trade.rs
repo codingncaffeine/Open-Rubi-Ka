@@ -100,6 +100,15 @@ impl TradeWin {
         gui.view_rect(self.win, "items").is_some_and(|r| x >= r.l && x <= r.r + 1.0 && y >= r.t && y <= r.b + 1.0)
     }
 
+    /// The item under a canvas-local point of the `"items"` grid, or `None` out of bounds / past the last filled slot
+    /// (the same index math as `event`'s `CanvasPress` arm; the container has no scroll offset to add).
+    pub fn item_at(&self, x: f32, y: f32) -> Option<usize> {
+        if x < 0.0 || y < 0.0 { return None; }
+        let (cols, _) = grid(self.max);
+        let idx = (y / CELL) as usize * cols as usize + (x / CELL) as usize;
+        (idx < self.items.len()).then_some(idx)
+    }
+
     fn paint(&self, gui: &mut Gui) {
         let (cols, rows) = grid(self.max);
         let slot = gui.gfx().id(SLOT_GFX);
@@ -196,6 +205,12 @@ impl TradeUi {
         if let Some(t) = self.win.take() {
             gui.close_window(t.win);
         }
+    }
+
+    /// Shift-hover support (`MP_TradeItem_Icon`, the NPC trade bar): true over a filled slot of the container.
+    pub(super) fn icon_hover_at(&self, gui: &Gui, x: f32, y: f32) -> bool {
+        let Some(t) = self.win.as_ref() else { return false };
+        gui.view_rect(t.win, "items").is_some_and(|r| t.item_at(x - r.l, y - r.t).is_some())
     }
 }
 
@@ -672,6 +687,20 @@ mod tests {
         }
         assert_eq!(sent(&mut i), vec![Knubot::Trade { npc: NPC, op: 1, a: Identity::default(), b: Identity { kind: 0x68, instance: 0x40 } }]);
         assert!(i.trade.win.as_ref().unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn icon_hover_reports_a_filled_container_slot() {
+        let Some(mut gui) = rig() else { return };
+        let mut z = zone();
+        let mut i = open(&mut gui, &mut z, true, true);
+        feed(&mut i, &mut gui, &mut z, Knubot::StartTrade { npc: NPC, value: 2, text: "x".into() });
+        gui.frame(0.0);
+        let r = gui.view_rect(i.trade.win.as_ref().unwrap().win, "items").unwrap();
+        let (x, y) = (r.l + 10.0, r.t + 10.0);
+        assert!(i.trade_drop(&mut gui, 0x40, x, y, ("Thing".into(), None)));
+        assert!(i.icon_hover_at(&gui, x, y));
+        assert!(!i.icon_hover_at(&gui, r.l - 100.0, r.t));
     }
 
     #[test]

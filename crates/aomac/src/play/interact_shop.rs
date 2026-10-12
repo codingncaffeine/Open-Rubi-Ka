@@ -108,6 +108,16 @@ impl ShopUi {
         }
     }
 
+    /// Shift-hover support (`MP_ShopItem_Icon`): true over a filled slot of any of the shop's icon grids, mirroring
+    /// `Shop::grid_hit`'s own coordinate convention (canvas-local, `"{view}_grid"`).
+    pub(super) fn icon_hover_at(&self, gui: &Gui, x: f32, y: f32) -> bool {
+        let Some(s) = self.shop.as_ref() else { return false };
+        LISTS.iter().take(if s.cash_shop { 3 } else { 2 }).any(|view| {
+            let canvas = format!("{view}_grid");
+            gui.is_visible(s.win, &canvas) && gui.view_rect(s.win, &canvas).is_some_and(|r| s.grid_hit(&canvas, x - r.l, y - r.t).is_some())
+        })
+    }
+
     fn save_config(&mut self, d: &mut DValues) {
         let Some(config) = self.pending_config.take() else { return };
         let mut root = match d.get("ShopViewConfig") {
@@ -782,6 +792,18 @@ mod tests {
     use super::*;
     use crate::play::zone::Zone;
     use ao_net::frame::Frame;
+
+    #[test]
+    fn icon_hover_reports_a_filled_shop_grid_slot() {
+        let Some(mut gui) = rig() else { return };
+        let mut z = Zone::new(OWN);
+        let i = open(&mut gui, &mut z);
+        let s = i.shop.shop.as_ref().unwrap();
+        let r = gui.view_rect(s.win, GRIDS[0]).unwrap();
+        let tip = gui.canvas_tips(s.win, GRIDS[0])[0].rect;
+        assert!(i.icon_hover_at(&gui, r.l + tip[0] + 2.0, r.t + tip[1] + 2.0));
+        assert!(!i.icon_hover_at(&gui, r.l - 50.0, r.t - 50.0));
+    }
 
     #[test]
     fn shop_config_saves_stock_mode_and_retains_partner_archive() {
