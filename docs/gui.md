@@ -274,6 +274,7 @@ instance API for repeated rows (`add_view`, `remove_children`, `*_in(handle, nam
 `wants_mouse` (does the GUI own this pointer position), `resize_window`, `relayout_window`.
 Events: `Clicked`, `TextChanged`, `EnterPressed`, `ComboChanged`, `Copy`, `PasteRequested`, `Escape`, `CloseRequested`.
 Pointer ownership includes the whole visible framed-window outer rectangle (empty client space and root TextViews included), matching frame/context dispatch, and remains captured during engine frame/tab/menu interactions. Unframed transparent root views still do not capture the full screen. The parent-observed Brandon right-click at `(596,384)` opened both NPC dialogue and Chat's context menu because the old `covers` path excluded Chat's root TextView while context dispatch accepted its frame. Regression `ao-gui/tests/frame.rs::framed_root_text_right_click_captures_before_context_dispatch` covers that coordinate, the bottom/title frame, hidden windows, transparent roots, and capture during a frame drag. This author did not run it; chat `is_clickthrough` remains stored-only (no pre-existing engine routing was changed).
+Raw inventory/wear, Programs, Actions and shortcut-bar press initiation uses `Gui::pointer_owner`, the same clipped window z-order and per-window interactive/framed/move-region/cover rules as `wants_mouse`; an empty framed Chat above an item cannot inspect, activate or arm a drag beneath it. Popup presses have no underlying window owner. Existing captured drag movement/releases remain independent of press ownership. Regression: `hud_stats::tests::item_inspection_and_right_activation_inventory_and_wear` adds an empty framed Chat covering a filled inventory cell and asserts ordinary/qualified/right presses produce no item effects. This regression is added but not run here; the parent observed the raw right-click leak during offscreen item acceptance.
 
 ## 9. UNRESOLVED (summary)
 
@@ -443,9 +444,10 @@ Not done / UNRESOLVED: Knowledge window consumer of the mini toolbar; fade timer
 * Ours: `ShortcutBar` paints the bar canvas (chrome + 10 slot frames + icons) under ten 36 × 38 `slotN` canvases (+ `labelN` text views) that carry tooltip (item name, the `ShortcutShortTooltips` = true form; long form UNRESOLVED), click and the drag source/target. A left press+release within 3 px on a slot = **use** (`SlotUse` queue → the flow runs macros through `Chat::run_line`; special actions are queued with their `Action_e`). Drag past 3 px with the left button starts a drag (ghost window with the icon), drop on another slot swaps them, drop outside deletes (`LockHotbars` honoured). Tests: `hud::tests::hotbar_first_login_and_interaction`.
 * `/macro` drag (`GlobalSignals+0x1a0`, slot `FUN_100d82d4` of `ShortcutBarWindow_c`): `CreateMacro(name, command, 0, true)` then `View::BeginDrag(DragObject_c "inventory/textmacro" {item_id = Identity{0xC789, id}})`. Ours: `Chat` queues `Requests::macro_drag`, the flow calls `Hud::begin_macro_drag` → `ShortcutBar::begin_macro_drag`, which starts the slot-drag ghost (`GFX_GUI_ICON_MACRO`, source slot none) at the mouse; releasing on a slot stores the macro there (label = name, use runs the command through the macro path, an occupant is replaced: the original's displaced-item re-drag is UNRESOLVED), releasing outside the bar discards the drag (the macro stays in `TextMacro.bin`). Test: `hud::tests::macro_drag_drops_on_slot_or_is_discarded`.
 * Inventory shortcuts: inventory/wear releases routed through `HudStats::take_drops` are claimed by the shortcut cell under the real pointer. They retain the inventory slot identity, template name and rdb icon without moving the item. Activation uses the same `GenericCmd` 3 path as inventory item use, not the double-click wear/unwear policy (`FUN_100d79c9`, type 1). Regression: `hud::tests::inventory_shortcut_drop_and_use`; real-window acceptance is reported separately.
+* **Programs drag and restart (bug 18):** GUI `FUN_100d3807` begins a nano drag, `FUN_100d38ef` emits its `itemid://` inspection URL, and `FUN_100d3b11` casts. Programs qualified clicks inspect instead of casting; held/moved ordinary presses start the existing shortcut drag. `programs_shift_inspect_and_drag_to_hotbar_cast` covers this path. Retail `ShortcutBarWindow_c` ctor `0x100d94e9` loads `Containers/ShortcutBar_<n>.xml` (bar 0 also tries the old `ShortcutBar.xml`); `ShortcutBarView_c` ctor `0x100d8c12` reads `position_map` as repeated `Identity item_id` / `IPoint item_pos` pairs. Save helper `0x100d7db1` writes every identity/grid position, `selected_bar`, `bar_orientation` and `IsPrimary`. The port loads character contents after preferences and saves all rows on HUD close, retaining the existing archive's WindowFrame/orientation children; nano identities resolve through NanoDb and still activate as `SlotUse::Nano` after restart. Regression `nano_contents_survive_restart_and_activate` covers row 7, native nano identity, cast dispatch and unrelated archive preservation. No tests/builds/live checks run for this change.
 * **Rendering notes** (headless `hud-hotbar.png`, 4x crop inspected): the special-action icons are the real rdb 1010008 art (crosshair, red footprints, sitting figure, "EXIT"); the Follow macro icon is `GFX_GUI_ICON_MACRO` (0xe3, `Graphics.uvga` offset 919300, 32 × 32, extracted and viewed): it really is a **black square with grey text lines**, with the yellow macro name over its centre. Two layout bugs were fixed: (a) the slot row's `layout_borders` is ignored under the `stacked` parent (`layout::layout` sets stacked children to the parent bounds), so the 43 px chrome offset was lost and the 10 cells spread over the whole bar at a 40 px pitch (the painted icons are on the 36 px grid, so labels / hit canvases sat up to 30 px off) — the offset is now a fixed 42 px spacer view; (b) a `TextView` draws from the top of its frame, so each label sits in a vertical layout whose child frame is one `SMALL` line high (centred). Tests: `hud_bar::tests::slot_views_follow_the_painted_grid`.
 * **Use consumers** (`play/hud_use.rs`, run each frame after `Hud::update`): the slot's `Action_e` is stat 59 of its rdb 1000020 template (read from the install: Use 3, Start/End Combat 0xb, Walk 0x11, Run 0x12, Sneak 0x13, Trade 0x4b, Sit 0x4c, Stand 0x4d, Pick-Up 1 — matching `FUN_1004256c`'s table), except the perk / skill templates 0x14120.. (Fling Shot … Suspended Animation … Tutor) which all hold the default 0x11 (UNRESOLVED: real id is in the server-filled special-action list; "Suspended Animation" is mapped to camping 0x51 by name, `hud_bar::perk_action`). `FUN_1004256c` consumers: 0xb / 0x4e → `combat::Module::special_action` (`DefaultAttack(target, false)`, `AttackIIR_t`, docs/zone/combat-net.md §2.1); 0x4c / 0x4d → `Play::fight_sit` (`N3Msg_SitToggle`: stop attack, `CharDCMove` 0x1e or `CharacterActionIIR_t` 0x57); 0x11 / 0x12 → `Player::toggle_walk` (`MovementChanged(0x18 / 0x19)`, the same call as the Backspace key; [INFERENCE] one toggle for both ids); 0x51 → `action::start_camping` (docs/zone/actions.md §3: chat refusal `Feedback_CantLogOutInAFight` / `Feedback_YouMustBeSitting`, else sit, stop attack, `CharacterActionIIR_t` 0x78), 0x52 → action 0x79. The hostile dock's Attack button queues `SpecialAction(0xb)` too. Ids with no consumer (sneak 0x13, crawl, forage …) log `hud: special action … has no consumer yet`. Macros (type 7) run through `Chat::run_line`.
-* **Remaining gaps**: (1) the character's special-action list (`+0x84`, server-filled, also decides enabled / disabled) is in no capture and `N3Msg_GetCorrectActionID` (`FUN_100d7575`) is not evaluated, see above for the perk templates; (2) use fires on press+release (`CanvasClick`), the DLL's press/release split in `FUN_10040a17` (`UseNewMouseFunc` true, a `+0x319` flag) was not fully resolved; (3) displaced-item re-drag, Shift+click info window (no info view), icon timers / disabled tint and content persistence (`position_map` / `IconPositions.bin` / `TextMacro.bin` writing) are not implemented; hotbar position persistence and arrow cycling are described above; (4) item (type 1) and nano (type 4) slots need an inventory / nano list we do not have, so only types 6 and 7 render; (5) CTRL / ALT + click `N3Msg_SwitchTarget` needs modifier state in mouse events (`InputEvent::MouseUp` carries none).
+* **Remaining gaps**: displaced-item re-drag and the legacy `IconPositions.bin` fallback are not implemented. Shortcut contents now use the native character-owned `position_map` archive (§10.3 above); special-action list/recharge and current press/release semantics are described in §10.5/§10.7. Inventory shortcuts retain their identity on restart, but their live item metadata refresh is not yet wired into the persisted-slot loader.
 
 ## 13. Tooltips (`ao-gui` `gui/tooltip.rs`) and the target controls (`play/hud_target.rs`)
 
@@ -1010,3 +1012,68 @@ iterator. LFT is a plain movable/resizable Window (`0x100f03fb`, style 0, flags 
 with `LoadWndConfig` and destructor `0x100efb97` `SaveWndConfig`. Social content/frame/pin
 archives are character-local. Chat's close button now routes `CloseRequested` to the window
 owner; closed documents retain history/configuration and reopen through Enter.
+
+### Running NCU cancellation (bug 21)
+
+`HudNcu` routes a running row's right click, as well as double click, to cancellation.
+GUI `FUN_10044c31` only calls `N3Msg_RemoveBuff` for the own NCU view
+(`+0x370/+0x374` both zero), printing “Deactivating friendly timed nanoprogram.”
+on success and “Can't remove hostile timed nanoprogram.” on rejection.
+Gamecode `N3Msg_RemoveBuff` `0x1001be60` rejects `Flags & 0xc100`, then sends
+`CharacterActionIIR_t` action `0x41`, param zero, identity A `{0,0}`,
+identity B `{0xcf1b,nano_id}`, empty text, under the controlled character identity
+through `FUN_1007253f` and `SendIIRToObservers`. The existing byte encoder matches
+this layout. Requesting cancellation does not remove a local row or modify NCU:
+server `BuffIIR` kind zero removes the lifecycle entry (`GC 0x10050afd`).
+Regressions cover hostile bits, decoded request identities, right-click feedback,
+retaining the row until server removal, and refreshing afterward. Headless
+read-only GUI/Gamecode decompilation supplied this evidence; tests/live gates
+are owned by the parent and were not run here.
+
+Running NCU is not a hotbar drag source in retail: `NCUListView_c` constructor
+`0x10045354` connects info at `+0x2e4` (`0x10045405`), tooltip at `+0x140`
+(`0x10045418`), cancellation at `+0x2e0` (`0x1004542b`), and context menu at
+`+0x2e8` (`0x1004543e`); neither it nor `NCUView_c` constructor `0x100d6dd6`
+connects the base `+0x2d8` BeginDrag signal to a payload producer. Programs
+explicitly connects that signal to `0x100d3807`. Native NCU rows therefore do
+not produce shortcut payloads; Programs rows do. The cancellation regression
+selects an installed timed template whose Flags pass the retail friendly mask,
+rather than assuming the existing duration-only fixture is friendly.
+
+### Own-character world selection and shift inspection (bugs 17 / 10)
+
+The own avatar now supplies its current posed body box to the shared world picker
+in third person, and clears it in first person. This follows N3 `FUN_10020a3c`:
+the client character is eligible when `camera+0x1ec` is set (see `hud_pick.rs`).
+Previously `Dynels::pick_bodies` unconditionally excluded it despite that evidence.
+The box comes from the same CPU-skinned frame submitted for drawing, with the
+avatar's live position, heading and body scale, not the remote own-character pose.
+
+Read-only GUI decompilation of `FUN_1002c469` confirms left release checks character
+attack qualifiers `&0xc` first, then inspect qualifiers `&3`: character inspection
+calls `ShowURL("charid://50000/id")`; other dynels use `itemid://kind/id`, without
+changing selection. The port now preserves that precedence when both are held.
+Existing HUD-to-InfoView routing handles players, NPCs and world object identities.
+Regressions cover own-body ray selection, inspection leaving selection unchanged,
+first-person exclusion, and mixed modifier precedence. No build/test/live gate was
+run by this worker; the parent owns those gates.
+
+### Item activation and inspection (bug 10)
+
+Inventory/wear grid and list pointer input now shares `use_slot`: right press
+wears/uses a bag item or moves a worn item back to the bag; modifier-left requests
+InfoView only and clears the drag press and double-click history. Bank and loot
+canvas presses request the existing server-authoritative take path on right;
+modifier-left opens the item's identity URL and suppresses the release action.
+
+Native evidence: `FUN_10040a17` tests left qualifiers `&3` and emits list signal
+`+0x2e4` (assembly `10040ae4`), connected by `FUN_100cc1b3` at `100cc2ae`
+to `FUN_100c9afc` (`InfoViewModule::ShowURL`). The legacy right branch
+`10040b31 -> 10040af5` emits `+0x2e0`, connected at `100cc278` to
+`FUN_100ca1e7`: external container (`+0x14c == 0`) or bank (`+0x140 == 0xdead`)
+calls `MoveItemToInventory`; owned inventory calls `N3Msg_UseItem(false)`.
+The new-mouse right branch `10040acc` emits `+0x2e8` through `FUN_10041c66`;
+`100cc293` connects this to `FUN_100ca2d3`, a popup menu, not direct inspection.
+The requested observed right-use behavior is retained without inventing a
+mouse-mode setting. Regressions cover inventory grid/list, worn items, bank and
+loot right activation and modifier-left inspection. Worker did not run gates.

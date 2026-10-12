@@ -1317,7 +1317,7 @@ mod tests {
     }
 
     #[test]
-    fn item_inspection_does_not_use_or_drag_inventory_and_wear() {
+    fn item_inspection_and_right_activation_inventory_and_wear() {
         let dir = ao_gui::client_dir();
         if !dir.join("cd_image/gui").exists() { return; }
         let mut gui = Gui::new(&dir, None).unwrap();
@@ -1336,24 +1336,49 @@ mod tests {
             let w = hud.window(kind).unwrap();
             let r = gui.view_rect(w, view).unwrap();
             let (x, y) = (r.l + local.0 + 4.0, r.t + local.1 + 4.0);
-            for (button, mods) in [
-                (ao_gui::MouseButton::Left, ao_gui::Modifiers { shift: true, ..Default::default() }),
-                (ao_gui::MouseButton::Right, ao_gui::Modifiers::default()),
-            ] {
-                hud.input(&mut gui, &zone, &InputEvent::MouseDown { x, y, button }, mods);
-                hud.input(&mut gui, &zone, &InputEvent::MouseMove { x: x + 20.0, y }, mods);
-                assert!(hud.dnd.drag.is_none() && hud.dnd.press.is_none());
-                hud.input(&mut gui, &zone, &InputEvent::MouseUp { x, y, button }, mods);
-                if button == ao_gui::MouseButton::Left {
-                    hud.event(&mut gui, &Event::CanvasClick { window: w, view: view.into(), x: local.0 + 4.0, y: local.1 + 4.0 }, &zone);
-                }
-                let id = ao_net::n3::inventory::item_identity(slot);
-                assert_eq!(hud.take_info_urls(), [format!("itemid://{}/{}", id.kind, id.instance)]);
-                assert!(hud.take_outbox().is_empty());
-            }
+            let button = ao_gui::MouseButton::Left;
+            let mods = ao_gui::Modifiers { shift: true, ..Default::default() };
+            hud.input(&mut gui, &zone, &InputEvent::MouseDown { x, y, button }, mods);
+            hud.input(&mut gui, &zone, &InputEvent::MouseMove { x: x + 20.0, y }, mods);
+            assert!(hud.dnd.drag.is_none() && hud.dnd.press.is_none());
+            hud.input(&mut gui, &zone, &InputEvent::MouseUp { x, y, button }, mods);
+            hud.event(&mut gui, &Event::CanvasClick { window: w, view: view.into(), x: local.0 + 4.0, y: local.1 + 4.0 }, &zone);
+            let id = ao_net::n3::inventory::item_identity(slot);
+            assert_eq!(hud.take_info_urls(), [format!("itemid://{}/{}", id.kind, id.instance)]);
+            assert!(hud.take_outbox().is_empty());
+            hud.input(&mut gui, &zone, &InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Right }, Default::default());
+            assert!(hud.take_info_urls().is_empty());
+            assert_eq!(hud.take_outbox().len(), 1, "right click activates the same wear/use policy");
+            assert!(hud.dnd.press.is_none() && hud.dnd.drag.is_none());
         }
         let w = hud.window(WindowKind::Inventory).unwrap();
         let r = gui.view_rect(w, "grid").unwrap();
+        let cell0 = inv_grid::cell_origin(0, 0, hud.inventory.as_ref().unwrap().gap);
+        let (x, y) = (r.l + cell0.0 + 4.0, r.t + cell0.1 + 4.0);
+        let chat = gui.open_window_xml("Chat", r#"<root><TextView name="chat" value=""/></root>"#,
+            (x as i32 - 10, y as i32 - 10), ao_gui::WindowSize::Fixed(120, 80)).unwrap();
+        gui.frame_tabbed(chat, "Chat");
+        assert_eq!(gui.pointer_owner(x, y), Some(chat), "empty framed Chat owns the covered inventory cell");
+        for (button, mods) in [
+            (ao_gui::MouseButton::Right, Default::default()),
+            (ao_gui::MouseButton::Left, ao_gui::Modifiers { shift: true, ..Default::default() }),
+            (ao_gui::MouseButton::Left, Default::default()),
+        ] {
+            hud.input(&mut gui, &zone, &InputEvent::MouseDown { x, y, button }, mods);
+            hud.input(&mut gui, &zone, &InputEvent::MouseMove { x: x + 20.0, y }, mods);
+            assert!(hud.take_info_urls().is_empty() && hud.take_outbox().is_empty());
+            assert!(hud.dnd.press.is_none() && hud.dnd.drag.is_none(), "covered presses cannot begin an item drag");
+            hud.input(&mut gui, &zone, &InputEvent::MouseUp { x, y, button }, mods);
+        }
+        gui.set_window_visible(chat, false);
+        assert_eq!(gui.pointer_owner(x, y), Some(w));
+        hud.input(&mut gui, &zone, &InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, Default::default());
+        gui.set_window_visible(chat, true);
+        hud.input(&mut gui, &zone, &InputEvent::MouseMove { x: x + 20.0, y }, Default::default());
+        assert_eq!(hud.dnd.drag.as_ref().map(|d| d.slot), Some(0x40), "an owned press keeps its drag capture across covering windows");
+        gui.close_window(chat);
+        hud.input(&mut gui, &zone, &InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }, Default::default());
+        assert!(hud.dnd.drag.is_none());
         let empty = inv_grid::cell_origin(1, 0, hud.inventory.as_ref().unwrap().gap);
         hud.input(&mut gui, &zone, &InputEvent::MouseDown { x: r.l + empty.0 + 4.0, y: r.t + empty.1 + 4.0, button: ao_gui::MouseButton::Right }, Default::default());
         assert!(hud.take_info_urls().is_empty() && hud.take_outbox().is_empty());
@@ -1362,8 +1387,8 @@ mod tests {
         let w = hud.window(WindowKind::Inventory).unwrap();
         let r = gui.view_rect(w, "item64").unwrap();
         hud.input(&mut gui, &zone, &InputEvent::MouseDown { x: r.l + 2.0, y: r.t + 2.0, button: ao_gui::MouseButton::Right }, Default::default());
-        assert_eq!(hud.take_info_urls().len(), 1);
-        assert!(hud.take_outbox().is_empty());
+        assert!(hud.take_info_urls().is_empty());
+        assert_eq!(hud.take_outbox().len(), 1, "list rows share right-click activation");
         hud.input(&mut gui, &zone, &InputEvent::MouseDown { x: r.l + 2.0, y: r.t + 2.0, button: ao_gui::MouseButton::Left }, Default::default());
         hud.input(&mut gui, &zone, &InputEvent::MouseMove { x: r.l + 22.0, y: r.t + 2.0 }, Default::default());
         assert_eq!(hud.dnd.drag.as_ref().map(|d| d.slot), Some(0x40), "list rows share the inventory drag route");

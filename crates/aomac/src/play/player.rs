@@ -547,9 +547,12 @@ impl Player {
         let head_position = glam::Vec3::from(scene_pos(pos)) + glam::Quat::from_rotation_y(scene_yaw(yaw)) * head_local.unwrap_or(glam::Vec3::ZERO);
         let head_to_camera = head_position - host.camera.pos;
         let alpha = self.fader.step(&self.fade, head_to_camera.length_squared());
+        zone.world.set_own_pick(None);
         if self.camera.show_avatar() {
             let mut frame = self.avatar.frame();
             frame.alpha = alpha;
+            zone.world.set_own_pick(frame.skin.as_ref().and_then(|vertices| super::hud_pick::bounds_of(vertices.iter().map(|v| &v.pos)))
+                .map(|bounds| super::hud_pick::PickBody { id: self.char_id as i32, bounds, pos: scene_pos(pos), yaw: scene_yaw(yaw), scale: self.avatar.body_scale() }));
             host.actors.push(frame);
         }
         out

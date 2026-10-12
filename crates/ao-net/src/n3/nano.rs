@@ -34,7 +34,12 @@ pub fn cast_nano(char_id: i32, nano_id: i32, target: Identity) -> Vec<u8> {
     character_action(char_id, &simple(action::CAST, target, nano(nano_id)))
 }
 
-/// `N3Msg_RemoveBuff(nano)`: the NCU window's double click on an active timed nano.
+/// Retail `N3Msg_RemoveBuff` rejects any of the hostile `Flags` bits [GC 0x1001be60].
+pub fn can_remove_buff(flags: i32) -> bool {
+    flags & 0xc100 == 0
+}
+
+/// `N3Msg_RemoveBuff(nano)`: request cancellation of an active timed nano; removal awaits the server's BuffIIR.
 pub fn remove_buff(char_id: i32, nano_id: i32) -> Vec<u8> {
     character_action(char_id, &simple(action::REMOVE_BUFF, Identity::default(), nano(nano_id)))
 }
@@ -80,6 +85,21 @@ mod tests {
         );
         assert_eq!(remove_buff(0x6584, 163449), hex("5e477770 0000c350 00006584 00  00000041 00000000 00000000 00000000 0000cf1b 00027e79 0000"));
         assert_eq!(delete_nano(0x6584, 163449), hex("5e477770 0000c350 00006584 00  000000d3 00000000 0000cf1b 00027e79 00000000 00000000 0000"));
+    }
+
+    #[test]
+    fn cancellation_rejects_each_hostile_flag_and_encodes_only_a_request() {
+        assert!(can_remove_buff(0));
+        assert!(can_remove_buff(0x10000));
+        for flag in [0x100, 0x4000, 0x8000, 0xc100] {
+            assert!(!can_remove_buff(flag));
+        }
+        let (header, action) = parse_character_action(&remove_buff(7, 25982)).unwrap();
+        assert_eq!(header.target, Identity { kind: 0xc350, instance: 7 });
+        assert_eq!(action.action, action::REMOVE_BUFF);
+        assert_eq!(action.identity_a, Identity::default());
+        assert_eq!(action.identity_b, nano(25982));
+        assert_eq!(action.param, 0);
     }
 
     #[test]

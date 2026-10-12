@@ -5,7 +5,9 @@
 //! `wait=secs`, `shot=name` (PNG into AOMAC_LIVE_SHOTS), `pos` prints the own position, `press=F8|CTRL+F8|SHIFT+F8` taps keys (camera),
 //! `drag=right:dx:dy` / `drag=left:dx:dy` mouse-look with raw counts, `cam` prints the camera and lens. HUD steps: `ui=u|ctrl+1` window hotkey (Ctrl+1 = Wear in shipped KeyBindings).
 //! `heading=server_yaw` rotates in place through right mouse input to the requested heading (radians), before idle/capture steps.
-//! `move=x:y` hover, `click=x:y`, `clickdyn=<instance>` world click on a dynel, `mdrag=x1:y1:x2:y2` GUI drag, `watch=secs` own-stat changes.
+//! `move=x:y` hover; `click`, `rightclick`, `doubleclick` take `[shift+|ctrl+|alt+]x:y` (prefixes may combine), through GUI mouse input.
+//! `clickdyn=<instance>` world click on a dynel, `mdrag=x1:y1:x2:y2` GUI drag, `watch=secs` own-stat changes.
+//! `nanos` prints learned program IDs; `buffs` prints running buffs and NCU usage.
 //! `down=KEY` / `up=KEY` hold across steps; `clickcorpse` / `rightcorpse` click a visible, GUI-unobscured corpse pick point.
 //! `focuslost` cancels held game input as the host's window-focus-loss event does.
 //! Named GUI keys are delivered before physical game keys, as in the viewer; letters stay physical (no invented layout/IME text).
@@ -803,6 +805,7 @@ fn live_walk() {
                 eprintln!("stats {}", v.iter().map(|(k, x)| format!("{k}={x}")).collect::<Vec<_>>().join(" "));
             }
             "buffs" => eprintln!("buffs time={} ncu={} entries={:?}", l.p.zone.nanos.time, l.p.zone.nanos.buffs.iter().map(|b| b.ncu_cost).sum::<i32>(), l.p.zone.nanos.buffs),
+            "nanos" => eprintln!("nanos {:?}", l.p.zone.nanos.programs),
             // the spells running on the own character (docs/gui.md §11.14) and the maps they fill
             "spells" => {
                 eprintln!("spells {}", l.p.zone.active_spells.iter().map(|s| format!("{:#x}(stat {} amount {} target {})", s.function, s.stat(0), s.stat(0x27), s.stat(0x20))).collect::<Vec<_>>().join(" "));
@@ -953,18 +956,27 @@ fn live_walk() {
                 eprintln!("after {step}: {}", l.pos());
             }
             // UI steps: `ui=ctrl+6` / `ui=u` are `press` (a key stroke through `game_input`, where the window hot keys live, with `host.mods`
-            // following the modifier keys), `move=x:y` hover, `click=x:y`, `clickdyn=<instance>` (left-clicks the first screen point whose pick ray
-            // hits the dynel)
-            "move" | "click" => {
-                let (x, y) = v.split_once(':').map(|(x, y)| (x.parse().unwrap(), y.parse().unwrap())).unwrap();
+            // following the modifier keys), `move=x:y` hover, coordinate clicks with optional modifiers, `clickdyn=<instance>`
+            // (left-clicks the first screen point whose pick ray hits the dynel).
+            "move" | "click" | "rightclick" | "doubleclick" => {
+                let value = v.rsplit('+').next().unwrap();
+                let (x, y) = value.split_once(':').map(|(x, y)| (x.parse().unwrap(), y.parse().unwrap())).unwrap();
+                let mods = l.o.host.mods;
+                if k != "move" && v.contains('+') {
+                    l.o.host.mods = ao_gui::Modifiers { shift: v.contains("shift+"), ctrl: v.contains("ctrl+"), alt: v.contains("alt+") };
+                }
                 l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
-                if k == "click" {
-                    for ev in [ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }] {
-                        l.tick();
-                        l.p.input(ev, &mut l.o.host);
+                if k != "move" {
+                    let button = if k == "rightclick" { ao_gui::MouseButton::Right } else { ao_gui::MouseButton::Left };
+                    for _ in 0..if k == "doubleclick" { 2 } else { 1 } {
+                        for ev in [ao_gui::InputEvent::MouseDown { x, y, button }, ao_gui::InputEvent::MouseUp { x, y, button }] {
+                            l.tick();
+                            l.p.input(ev, &mut l.o.host);
+                        }
                     }
                 }
                 l.tick();
+                l.o.host.mods = mods;
             }
             // `clickdyn=[shift+|ctrl+]<instance>` / `hoverdyn=…`: left-click / hover the first screen point whose pick ray hits the dynel's box
             // with those modifiers held; `hoverdyn` prints the pointer sprites (GFX_GUI_POINTER* 0x135..0x14e) of the frame

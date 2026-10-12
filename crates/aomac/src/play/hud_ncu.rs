@@ -7,9 +7,9 @@
 //! `MaxNCU` (0xb5) (`FUN_100d6d14`, run on both stat signals). Template placement: the `DockTabbedWindow` `DockArea2` (`prefs/NewChar/DockAreas/DockArea2.xml`,
 //! `WindowFrame` Rect(1838, 1078, 2030, 1171), authored on a larger screen: `Window::MoveInsideScreen` pulls it to the bottom right).
 //!
-//! Interactions: double click = `N3Msg_RemoveBuff` (`FUN_10044c31`): a friendly effect (`Flags & 0xc100 == 0`) is cancelled and "Deactivating friendly timed nanoprogram."
-//! goes to the System window, otherwise "Can't remove hostile timed nanoprogram."; the tooltip (`FUN_1004518b`) is the name, "NCU usage: %d", "Remaining: hh:mm:ss" and the
-//! modifier list. UNRESOLVED / not ported: the "Modifies:" text (`N3Msg_GetModifierString`), the right-click menu (only "LookAtNano" -> InfoView), and the Type column (8) text.
+//! Interactions: right click or double click = `N3Msg_RemoveBuff` (`FUN_10044c31`): a friendly effect (`Flags & 0xc100 == 0`) requests cancellation and
+//! "Deactivating friendly timed nanoprogram." goes to the System window, otherwise "Can't remove hostile timed nanoprogram."; the tooltip (`FUN_1004518b`) is
+//! the name, "NCU usage: %d", "Remaining: hh:mm:ss" and the modifier list. UNRESOLVED / not ported: "Modifies:" (`N3Msg_GetModifierString`) and Type column (8).
 //! Effect timing and removal belong to `OwnNanos`; opening this window never expires or removes effects.
 
 use super::hud::WindowKind;
@@ -26,8 +26,6 @@ use std::path::Path;
 const MENU_BASE: u32 = 0x5000;
 const STAT_NCU_USED: u32 = 0xb4;
 const STAT_NCU_MAX: u32 = 0xb5;
-/// `Flags` bits of a hostile program (`N3Msg_RemoveBuff` [GC 0x1001be60]: `GetSkill(nano, 0, 2) & 0xc100 == 0` is removable).
-const HOSTILE_FLAGS: i32 = 0xc100;
 
 pub(super) struct HudNcu {
     db: NanoDb,
@@ -94,7 +92,7 @@ impl HudNcu {
         std::mem::take(&mut self.outbox)
     }
 
-    /// System-window lines the double click produced (`GlobalSignals+0x17c`).
+    /// System-window lines the cancellation request produced (`GlobalSignals+0x17c`).
     pub(super) fn take_lines(&mut self) -> Vec<String> {
         std::mem::take(&mut self.lines)
     }
@@ -186,8 +184,8 @@ impl HudNcu {
 
     /// `FUN_10044c31` -> `N3Msg_RemoveBuff` [GC 0x1001be60].
     fn remove(&mut self, gui: &mut Gui, zone: &Zone, id: i32) {
-        let hostile = self.db.info(gui, id).is_some_and(|i| i.stat(stat::FLAGS).unwrap_or(0) & HOSTILE_FLAGS != 0);
-        if hostile {
+        let flags = self.db.info(gui, id).and_then(|i| i.stat(stat::FLAGS)).unwrap_or(0);
+        if !nano::can_remove_buff(flags) {
             self.lines.push("Can't remove hostile timed nanoprogram.".into());
         } else {
             let payload = nano::remove_buff(zone.char_id as i32, id);
@@ -218,7 +216,7 @@ impl HudNcu {
         }
         let now = self.clock;
         match win.view.event(gui, w, ev, now, lv::ICON_32) {
-            Some(Hit::Double(id)) => {
+            Some(Hit::Double(id) | Hit::Context(id, _)) => {
                 self.remove(gui, zone, id);
                 true
             }
@@ -226,7 +224,6 @@ impl HudNcu {
                 self.built = None;
                 true
             }
-            Some(Hit::Context(..)) => true,
             None => false,
         }
     }
@@ -251,6 +248,50 @@ impl HudNcu {
 mod tests {
     use super::*;
     use super::super::own_nanos::Buff;
+
+    #[test]
+    fn right_click_requests_cancellation_and_waits_for_server_removal() {
+        use ao_net::msg::Identity;
+        use ao_net::n3::{misc::{self, Misc}, N3};
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() || !dir.join("cd_image/gui").exists() {
+            return;
+        }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut ncu = HudNcu::new(&dir, (1100, 760)).unwrap();
+        // The existing duration fixture 25982 is not necessarily removable.
+        // Select a real friendly timed template rather than treating timing as friendliness.
+        let store = ao_rdb::RecordStore::open(&dir).unwrap();
+        let id = store.ids(super::super::hud_nanodb::NANO_RDB_TYPE).unwrap().into_iter().find_map(|id| {
+            let id = i32::try_from(id).ok()?;
+            let info = ncu.db.info(&mut gui, id)?;
+            (info.total_time() > 0 && nano::can_remove_buff(info.stat(stat::FLAGS).unwrap_or(0))).then_some(id)
+        }).expect("installed friendly timed nanoprogram");
+        let mut zone = Zone::new(7);
+        zone.nanos.buffs.push(Buff { nano: id, total_cs: 90000, ..Default::default() });
+        ncu.open(&mut gui);
+        ncu.update(&mut gui, &zone, 0.0);
+        let w = ncu.window().unwrap();
+        let r = gui.view_rect(w, "grid").unwrap();
+        assert!(ncu.event(&mut gui, &Event::ContextMenu { window: w, x: r.l as i32 + lv::BORDER as i32 + 2, y: r.t as i32 + lv::BORDER as i32 + 2, link: None }, &zone));
+        assert_eq!(ncu.take_outbox(), [outgoing::n3_frame(0, 7, nano::remove_buff(7, id))]);
+        assert_eq!(ncu.take_lines(), ["Deactivating friendly timed nanoprogram."]);
+        ncu.update(&mut gui, &zone, 0.0);
+        assert_eq!(ncu.shown(), [id], "request must not optimistically remove the icon");
+        let own = Identity { kind: 0xc350, instance: 7 };
+        let removal = N3::Misc(Misc::Buff(misc::Buff { kind: 0, nano: Some(nano::nano(id)), rest: vec![] }));
+        zone.nanos.on_message(own, own, &removal, 100);
+        ncu.update(&mut gui, &zone, 0.0);
+        assert!(ncu.shown().is_empty(), "server removal refreshes the NCU list");
+        zone.nanos.buffs.push(Buff { nano: 25982, total_cs: 90000, ..Default::default() });
+        zone.nanos.serial += 1;
+        ncu.update(&mut gui, &zone, 0.0);
+        let r = gui.view_rect(w, "grid").unwrap();
+        assert!(ncu.event(&mut gui, &Event::ContextMenu { window: w, x: r.l as i32 + lv::BORDER as i32 + 2, y: r.t as i32 + lv::BORDER as i32 + 2, link: None }, &zone));
+        assert!(ncu.take_outbox().is_empty(), "hostile timed template cannot send cancellation");
+        assert_eq!(ncu.take_lines(), ["Can't remove hostile timed nanoprogram."]);
+        assert_eq!(ncu.shown(), [25982]);
+    }
 
     #[test]
     fn window_reads_runtime_duration_without_owning_expiry() {

@@ -102,6 +102,9 @@ impl Play {
     pub(super) fn interact_mouse(&mut self, ev: &InputEvent, host: &Host) {
         if let Some(i) = self.interact.as_mut() {
             i.shop.quick = host.mods.shift || host.mods.ctrl;
+            if matches!(ev, InputEvent::MouseDown { button: MouseButton::Left, .. }) {
+                i.use_ui.loot.info_click = host.mods.shift || host.mods.ctrl;
+            }
             if let InputEvent::MouseMove { x, y } = ev {
                 i.trade.mouse = (*x, *y);
             }

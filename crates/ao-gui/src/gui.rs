@@ -307,7 +307,7 @@ impl Gui {
         Ok(id)
     }
 
-    pub(crate) fn frame_tabbed(&mut self, id: WindowId, title: &str) {
+    pub fn frame_tabbed(&mut self, id: WindowId, title: &str) {
         if let Some(Some(w)) = self.windows.get_mut(id) {
             w.framed = true;
             w.title = Some(title.to_string());
@@ -1533,26 +1533,36 @@ impl Gui {
     /// True when `(x, y)` is over something interactive or any non-root view of a visible window
     /// (a full-screen transparent window such as CharacterSelectionWindow does not count by itself).
     pub fn wants_mouse(&self, x: f32, y: f32) -> bool {
-        if self.interacting() || self.popup.is_some() || self.hit(x, y).is_some() {
-            return true;
+        self.interacting() || self.popup.is_some() || self.pointer_owner(x, y).is_some()
+    }
+
+    /// Topmost window owning a pointer press, including framed empty client space.
+    /// Popup presses belong to the popup, not any underlying window; captured drags
+    /// continue independently of this query.
+    pub fn pointer_owner(&self, x: f32, y: f32) -> Option<WindowId> {
+        if self.popup.is_some() {
+            return None;
         }
         for (window, root, pos) in self.windows_at(x, y) {
+            if self.hit_view(root, x - pos.0 as f32, y - pos.1 as f32, true, 0.0, 0.0, None).is_some() {
+                return Some(window);
+            }
             // WndBorder consumes the whole outer frame, including empty client space
             // and a root TextView (chat). Match frame mouse/context dispatch.
             if self.windows[window].as_ref().is_some_and(|w| w.framed)
                 && self.outer_of(window).is_some_and(|r| r.contains(Point::new(x, y)))
             {
-                return true;
+                return Some(window);
             }
             if self.windows[window].as_ref().and_then(|w| w.fx.move_region)
                 .is_some_and(|r| r.contains(Point::new(x - pos.0 as f32, y - pos.1 as f32))) {
-                return true;
+                return Some(window);
             }
             if self.covers(root, x - pos.0 as f32, y - pos.1 as f32, true, 0.0, 0.0) {
-                return true;
+                return Some(window);
             }
         }
-        false
+        None
     }
 
     fn covers(&self, id: ViewId, x: f32, y: f32, is_root: bool, ox: f32, oy: f32) -> bool {

@@ -7,7 +7,7 @@ mod dialog;
 mod filter;
 mod info;
 mod line;
-mod macros;
+pub(super) mod macros;
 pub(super) mod log;
 mod net;
 mod social;

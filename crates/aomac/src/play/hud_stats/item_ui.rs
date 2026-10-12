@@ -36,10 +36,11 @@ impl HudStats {
     }
 
     fn info_slot_at(&self, gui: &Gui, zone: &Zone, x: f32, y: f32) -> Option<u32> {
-        if let Some(slot) = self.place_at(gui, x, y).and_then(|p| self.slot_of(p)) {
+        let owner = gui.pointer_owner(x, y)?;
+        if let Some(slot) = self.place_at_window(gui, x, y, Some(owner)).and_then(|p| self.slot_of(p)) {
             return Some(slot);
         }
-        let i = self.inventory.as_ref().filter(|i| i.list)?;
+        let i = self.inventory.as_ref().filter(|i| i.list && i.window == owner)?;
         let vp = gui.view_rect(i.window, "scrollview")?;
         if x < vp.l || x >= vp.r || y < vp.t || y >= vp.b { return None; }
         zone.inventory.keys().copied().find(|slot| {
@@ -57,14 +58,18 @@ impl HudStats {
 
     /// The cell under the screen position (wear window first, then the inventory grid).
     pub(super) fn place_at(&self, gui: &Gui, x: f32, y: f32) -> Option<Place> {
-        if let Some(t) = &self.wear {
+        self.place_at_window(gui, x, y, None)
+    }
+
+    fn place_at_window(&self, gui: &Gui, x: f32, y: f32, owner: Option<ao_gui::WindowId>) -> Option<Place> {
+        if let Some(t) = self.wear.as_ref().filter(|t| owner.is_none_or(|w| w == t.window)) {
             if let Some(r) = gui.view_rect(t.window, "items") {
                 if x >= r.l && x < r.r && y >= r.t && y < r.b {
                     return self.wear_cell_at(t.tab, x - r.l, y - r.t);
                 }
             }
         }
-        if let Some(i) = &self.inventory {
+        if let Some(i) = self.inventory.as_ref().filter(|i| owner.is_none_or(|w| w == i.window)) {
             if !i.list {
                 // only the visible part of the scrolled grid counts
                 let (g, vp) = (gui.view_rect(i.window, "grid"), gui.view_rect(i.window, "scrollview"));
@@ -109,20 +114,26 @@ impl HudStats {
     /// Raw pointer events (`Hud::input`): press on an item, drag, drop.
     pub(in crate::play) fn input(&mut self, gui: &mut Gui, zone: &Zone, ev: &InputEvent, mods: ao_gui::Modifiers) {
         match *ev {
+            InputEvent::MouseDown { x, y, .. } if !gui.pointer_owner(x, y).is_some_and(|owner|
+                self.wear.as_ref().is_some_and(|w| w.window == owner)
+                    || self.inventory.as_ref().is_some_and(|i| i.window == owner)) => {}
             InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
                 self.info_click = mods.shift || mods.ctrl;
                 if self.info_click {
                     self.dnd.press = None;
+                    self.dnd.last_click = None;
                     if let Some(slot) = self.info_slot_at(gui, zone, x, y) {
                         self.inspect_slot(zone, slot);
                     }
                     return;
                 }
-                self.dnd.press = self.place_at(gui, x, y).filter(|&p| self.slot_of(p).is_some_and(|s| zone.inventory.contains_key(&s))).map(|p| (p, x, y));
+                self.dnd.press = self.place_at_window(gui, x, y, gui.pointer_owner(x, y)).filter(|&p| self.slot_of(p).is_some_and(|s| zone.inventory.contains_key(&s))).map(|p| (p, x, y));
             }
             InputEvent::MouseDown { x, y, button: MouseButton::Right } => {
+                self.dnd.press = None;
+                self.dnd.last_click = None;
                 if let Some(slot) = self.info_slot_at(gui, zone, x, y) {
-                    self.inspect_slot(zone, slot);
+                    self.use_slot(zone, slot);
                 }
             }
             InputEvent::MouseMove { x, y } => {

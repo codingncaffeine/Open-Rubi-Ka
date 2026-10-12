@@ -482,10 +482,12 @@ impl HudTarget {
     fn click_identities(&mut self, zone: &mut Zone, list: &[Identity], mods: ao_gui::Modifiers) -> Option<WorldClick> {
         let current = zone.selected_target();
         let under = object_under(list, current)?;
-        if mods.shift {
+        // GUI 0x1002c469 checks the character attack qualifier before the inspect qualifier.
+        let attack = (mods.ctrl || mods.alt) && under.kind == DYNEL_CHAR;
+        if mods.shift && !attack {
             return Some(if under.kind == DYNEL_CHAR { WorldClick::Info(under.instance) } else { WorldClick::ObjectInfo(under) });
         }
-        let id = if (mods.ctrl || mods.alt) && under.kind == DYNEL_CHAR { under } else { click_target(list, current)? };
+        let id = if attack { under } else { click_target(list, current)? };
         self.select_identity(zone, Some(id));
         (id.kind == DYNEL_CHAR).then_some(WorldClick::Select(id.instance))
     }
@@ -923,15 +925,34 @@ mod tests {
     }
 
     #[test]
+    fn own_third_person_body_is_selectable_and_inspect_does_not_select() {
+        let mut z = Zone::new(1);
+        z.dynels.insert(1, dyn_at("Me", [0.0; 3], false, 1));
+        z.world.set_own_pick(Some(body(1, -5.0)));
+        let cam = Camera::look_at(Vec3::new(0.0, 1.2, 1.0), Vec3::new(0.0, 1.2, -10.0));
+        let mut h = HudTargetLite::default();
+        let lens = Lens::default();
+        assert_eq!(h.0.world_click(&mut z, &cam, &lens, (800, 600), (400.0, 300.0), Default::default()), Some(WorldClick::Select(1)));
+        assert_eq!(z.target, Some(1));
+        h.0.select(&mut z, None);
+        assert_eq!(h.0.world_click(&mut z, &cam, &lens, (800, 600), (400.0, 300.0), Modifiers { shift: true, ..Default::default() }), Some(WorldClick::Info(1)));
+        assert_eq!(z.target, None);
+        z.world.set_own_pick(None);
+        assert_eq!(h.0.world_click(&mut z, &cam, &lens, (800, 600), (400.0, 300.0), Default::default()), None, "first person must not pick the hidden own body");
+    }
+
+    #[test]
     fn modifier_clicks_follow_the_release_handler() {
         let mut z = Zone::new(1);
         z.dynels.insert(2, dyn_at("Near", [0.0, 0.0, 5.0], true, 2));
         z.dynels.insert(3, dyn_at("Far", [0.0, 0.0, 12.0], true, 2));
+        z.dynels.insert(4, dyn_at("Player", [0.0, 0.0, 15.0], false, 1));
         let mut h = HudTargetLite::default();
         z.target = Some(2);
         // Shift: the info page of the object under the pointer (the current target if it is hit); the selection stays
         assert_eq!(h.0.click_list(&mut z, &[2, 3], Modifiers { shift: true, ..Default::default() }), Some(WorldClick::Info(2)));
         assert_eq!(h.0.click_list(&mut z, &[3], Modifiers { shift: true, ..Default::default() }), Some(WorldClick::Info(3)));
+        assert_eq!(h.0.click_list(&mut z, &[4], Modifiers { shift: true, ..Default::default() }), Some(WorldClick::Info(4)));
         assert_eq!(h.0.click_list(&mut z, &[], Modifiers { shift: true, ..Default::default() }), None);
         assert_eq!(z.target, Some(2));
         // Ctrl / Alt: that object itself (not the next one), the caller attacks it
@@ -939,6 +960,7 @@ mod tests {
         assert_eq!(h.0.click_list(&mut z, &[2, 3], ctrl), Some(WorldClick::Select(2)));
         assert_eq!(h.0.click_list(&mut z, &[3], Modifiers { alt: true, ..Default::default() }), Some(WorldClick::Select(3)));
         assert_eq!(z.target, Some(3));
+        assert_eq!(h.0.click_list(&mut z, &[2], Modifiers { shift: true, ctrl: true, ..Default::default() }), Some(WorldClick::Select(2)));
     }
 
     #[test]

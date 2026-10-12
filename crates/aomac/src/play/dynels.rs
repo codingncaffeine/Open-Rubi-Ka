@@ -714,6 +714,7 @@ pub struct Dynels {
     dir: Option<PathBuf>,
     worker: Option<Worker>,
     own: i32,
+    own_pick: Option<super::hud_pick::PickBody>,
     pub chars: HashMap<i32, Char>,
     /// Non-character dynels by `(identity kind, instance)`.
     props: HashMap<(i32, i32), Prop>,
@@ -849,6 +850,7 @@ impl Default for Dynels {
             dir: None,
             worker: None,
             own: 0,
+            own_pick: None,
             chars: HashMap::new(),
             props: HashMap::new(),
             next_prop: PROP_ID_BASE,
@@ -2622,14 +2624,19 @@ impl Dynels {
         self.tags.frame(gui, host, &tags);
     }
 
-    /// The characters the camera's selection line can hit (`FUN_10020a3c`): every dynel but the client character, with the
-    /// box of its last pose ([`super::hud_pick`]); dynels not posed yet have no box and are skipped.
+    /// The camera's selection line hits visible posed dynels; the own body is supplied by Player only in third person
+    /// (`FUN_10020a3c`, N3: client character permitted when `camera+0x1ec` is set).
     pub fn pick_bodies(&self, own: i32) -> Vec<super::hud_pick::PickBody> {
         self.chars
             .iter()
             .filter(|(id, _)| **id != own)
             .filter_map(|(id, c)| Some(super::hud_pick::PickBody { id: *id, bounds: c.bounds?, pos: scene_pos(c.pose.pos), yaw: scene_yaw(c.pose.yaw), scale: c.scale }))
+            .chain(self.own_pick.filter(|body| body.id == own))
             .collect()
+    }
+
+    pub fn set_own_pick(&mut self, body: Option<super::hud_pick::PickBody>) {
+        self.own_pick = body;
     }
 
     /// `(Flags (stat 0), Features (stat 0xe0) of the NPC record)` of `id`: what `InputConfig_t::CheckObjectUnderMouse` reads for the pointer.
