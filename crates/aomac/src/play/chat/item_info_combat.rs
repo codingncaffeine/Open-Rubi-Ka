@@ -29,9 +29,15 @@ fn delay(template: &ItemTemplate, stat: u32, initiative: i32, agg_def: i32, rech
 
 pub(super) fn fields(template: &ItemTemplate, spells: &[Spell], zone: &Zone, _texts: &TextDb) -> Result<Fields> {
     let mut out = Fields::default();
-    // GC 10026dd7 / 1004e3e1: own player's raw cost multiplier, breed floor.
+    // GC 10026dd7 N3Msg_GetNanoCostModifier -> 1004e3e1: own player's raw cost multiplier (stat 0x13e,
+    // holder mode 0, GC 10058e52 -> 1006554c/100654e1/1006460b), breed floor. The underlying raw
+    // StatHolder getter (GC 1002e46a) has no small-value fallback for an index past its own vector:
+    // it returns the 0x499602d2 "unset" sentinel, which retail never surfaces because the own
+    // FullCharacter dump always streams stat 0x13e before any InfoView can query it. Our zone may
+    // still be mid-stream, so an absent stat uses 0 (no raw multiplier) rather than leaking the raw
+    // sentinel into the breed-floor max(); the floor then supplies the effective value on its own.
     let multiplier = if zone.char_id == 0 { 0 } else {
-        let value = zone.stats.get(&318).copied().unwrap_or(INVALID);
+        let value = zone.stats.get(&318).copied().unwrap_or(0);
         // GC 100583eb/10058415: Flags bit 0x10000000 sets/clears actor+21c.
         if zone.stats.get(&0).is_some_and(|v| v & 0x10000000 != 0) { value }
         else { match zone.stat(4) { Some(1 | 2) => value.max(50), Some(3) => value.max(45), Some(4) => value.max(55), _ => value } }
@@ -100,4 +106,21 @@ fn nano_damage_record_fixture() {
     zone.stats.insert(0, 0x10000000);
     assert_eq!(fields(&template, &spells, &zone, &texts).unwrap().nano_cost, 1, "NPC flag skips breed floor");
     assert!(super::template_spells::spells(&record[..record.len() - 1], 0).is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn absent_own_nano_cost_modifier_uses_the_breed_floor_not_the_raw_sentinel() {
+    // Bug 19: Aomacfixr (breed 1 Solitus) InfoView of a nano with raw NanoCost 11 (template 29091
+    // "Body Boost") showed "135802467 (11)" when own stat 0x13e had not streamed yet: the old code
+    // substituted ao_formats::stats::INVALID (0x499602d2 = 1234567890) for the missing raw value and
+    // fed it straight into the multiplier, truncating 11 * 1234567890 / 100 = 135802467.
+    let template = ItemTemplate { kind: 0xc76b, stats: vec![(8, 1800000), (407, 11)], name: None, sounds: vec![] };
+    let texts = TextDb::parse(b"MMDB\0\0\0\0".to_vec()).unwrap();
+    let mut zone = Zone::default();
+    zone.char_id = 1;
+    zone.stats.insert(4, 1); // breed 1 Solitus, no entry for stat 318
+    let out = fields(&template, &[], &zone, &texts).unwrap();
+    assert_eq!(out.nano_cost, 5, "breed-1 floor 50%: truncate(11 * 50 / 100)");
+    assert_ne!(out.nano_cost, 135802467);
 }
