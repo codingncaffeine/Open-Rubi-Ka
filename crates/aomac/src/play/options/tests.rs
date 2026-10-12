@@ -357,6 +357,9 @@ fn every_retail_option_roundtrips_through_its_native_store() {
     let mut restored = DValues::new(&dir);
     restored.open_user(&tmp, "test", 7);
     for option in pages.iter().flat_map(model::Page::opts) {
+        // Server-driven session values (e.g. AutoTargetMOB/AutoTargetPvP/DisableXPGain, stat 0x15d bits) are never
+        // written to disk (`DValues::persists`); only variables SaveConfig actually persists must round-trip.
+        if !values.persists(&option.var) { continue; }
         assert_eq!(option.value(&restored), option.value(&values), "{} ({:?}, {:?})", option.var, option.ty, option.kind);
     }
     std::fs::remove_dir_all(tmp).unwrap();

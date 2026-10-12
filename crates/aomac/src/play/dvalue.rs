@@ -298,6 +298,12 @@ impl DValues {
         self.nodes.contains_key(name)
     }
 
+    /// Whether `SaveConfig` writes this variable back (`Node::persist`; session-only values like the server-driven
+    /// `AutoTargetMOB`/`AutoTargetPvP`/`DisableXPGain` do not).
+    pub fn persists(&self, name: &str) -> bool {
+        self.nodes.get(name).is_some_and(|n| n.persist)
+    }
+
     pub fn get(&self, name: &str) -> Option<&Variant> {
         self.nodes.get(name).map(|n| &n.value)
     }

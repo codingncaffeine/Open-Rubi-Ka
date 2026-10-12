@@ -128,7 +128,9 @@ fn parse_log_record(record: &str) -> Result<String> {
     }
     let (epoch,body) = remaining.split_once(']').ok_or_else(|| anyhow::anyhow!("missing chat log body"))?;
     epoch.parse::<u32>()?;
-    parse_ident(&fields[0]).ok_or_else(|| anyhow::anyhow!("invalid chat log group"))?;
+    // Log records always write the group as `#{:016x}#` (`log_record`); reject anything else, including bare hex.
+    let group = &fields[0];
+    anyhow::ensure!(group.len() == 18 && group.starts_with('#') && group.ends_with('#') && group[1..17].bytes().all(|b| b.is_ascii_hexdigit()), "invalid chat log group");
     Ok(log_html(&fields[1], &fields[2], body))
 }
 impl ChatWindows {
