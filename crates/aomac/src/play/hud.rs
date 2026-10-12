@@ -787,7 +787,9 @@ impl Hud {
     pub(super) fn draw_cursor(&mut self, gui: &Gui, zone: &Zone, player: Option<&super::player::Player>, host: &mut ao_render::Host, list: &mut ao_gui::DrawList) {
         let mode = self.dvalues.get_i64("MouseCursorMode").unwrap_or(2);
         let dblclick = self.dvalues.get_i64("DoubleclickAction").is_none_or(|v| v != 0);
-        self.target.draw_cursor(gui, zone, player, host, list, self.size, mode, dblclick, self.help_button.help_mode());
+        let (mx, my) = self.target.mouse_pos();
+        let gui_item_hover = host.mods.shift && self.stats.info_slot_at(gui, zone, mx, my).is_some();
+        self.target.draw_cursor(gui, zone, player, host, list, self.size, mode, dblclick, self.help_button.help_mode(), gui_item_hover);
     }
 
     pub(super) fn take_uses(&mut self) -> Vec<SlotUse> {

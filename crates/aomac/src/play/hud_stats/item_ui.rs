@@ -35,7 +35,7 @@ impl HudStats {
         }
     }
 
-    fn info_slot_at(&self, gui: &Gui, zone: &Zone, x: f32, y: f32) -> Option<u32> {
+    pub(in crate::play) fn info_slot_at(&self, gui: &Gui, zone: &Zone, x: f32, y: f32) -> Option<u32> {
         let owner = gui.pointer_owner(x, y)?;
         if let Some(slot) = self.place_at_window(gui, x, y, Some(owner)).and_then(|p| self.slot_of(p)) {
             return Some(slot);

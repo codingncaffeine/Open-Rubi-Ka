@@ -485,6 +485,11 @@ impl HudTarget {
         self.click_identities(zone, &list, mods)
     }
 
+    /// The last mouse position (`self.mouse`), for `draw_cursor`'s caller to hit-test something else at it (a GUI item slot).
+    pub(super) fn mouse_pos(&self) -> (f32, f32) {
+        self.mouse
+    }
+
     /// [`HudTarget::world_click`] on a given hit list.
     fn click_identities(&mut self, zone: &mut Zone, list: &[Identity], mods: ao_gui::Modifiers) -> Option<WorldClick> {
         let current = zone.selected_target();
@@ -614,10 +619,23 @@ impl HudTarget {
     /// `CheckObjectUnderMouse`), appended to `list`, and the request to hide the OS cursor. The pointer is the game's own only over
     /// the world (not while the camera looks and not over a GUI window), where the OS cursor stays hidden.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn draw_cursor(&self, gui: &Gui, zone: &Zone, player: Option<&super::player::Player>, host: &mut ao_render::Host, list: &mut ao_gui::DrawList, vp: (u32, u32), mode: i64, dblclick: bool, help_mode: bool) {
+    pub(super) fn draw_cursor(&self, gui: &Gui, zone: &Zone, player: Option<&super::player::Player>, host: &mut ao_render::Host, list: &mut ao_gui::DrawList, vp: (u32, u32), mode: i64, dblclick: bool, help_mode: bool, gui_item_hover: bool) {
         let (x, y) = self.mouse;
         host.hide_cursor = false;
-        if x < 0.0 || y < 0.0 || host.look || gui.wants_mouse(x, y) {
+        if x < 0.0 || y < 0.0 || host.look {
+            return;
+        }
+        if gui.wants_mouse(x, y) {
+            // `InputConfig_t::FrameProcess` 0x1001ae14: with Shift held, `CheckMode` of any of `MP_Item_Icon`..`MP_Macro_Icon`
+            // (0x25..0x2c; an item/ref/spell/quest/trade-item/shop-item/action/macro icon is under the mouse) unconditionally sets
+            // the LOOKAT left detail (`SetMousePointerLeftDetail`, `Detail_e` 3) unless `HelpMode` (0x39) is active — independent of
+            // `CheckObjectUnderMouse`'s world-only `Can`-stat path (that one only runs outside any GUI window). The port's
+            // equivalent of "mouse is over an item icon" for the Wear/Inventory/trade/shop windows is `HudStats::info_slot_at`,
+            // supplied by the caller as `gui_item_hover`.
+            if gui_item_hover && !help_mode {
+                super::hud_cursor::draw(|g| gui.gfx().size(g), mode, (x, y), super::hud_cursor::Mouse { left: Some(super::hud_cursor::Detail::Lookat), ..Default::default() }, list);
+                host.hide_cursor = true;
+            }
             return;
         }
         // `CheckObjectUnderMouse` 10019f00 and `FrameProcess` 1001ae14 suppress dynel/Shift cursor changes in static mode 0x39.
@@ -1272,10 +1290,40 @@ mod tests {
         let mut host = ao_render::Host::headless();
         host.mods.shift = true;
         let mut list = ao_gui::DrawList::default();
-        target.draw_cursor(&gui, &Zone::default(), None, &mut host, &mut list, (1280, 800), 2, true, true);
+        target.draw_cursor(&gui, &Zone::default(), None, &mut host, &mut list, (1280, 800), 2, true, true, false);
         assert!(host.hide_cursor);
         assert_eq!(list.cmds.len(), 1);
         assert!(matches!(list.cmds[0], ao_gui::DrawCmd::Gfx { id: ao_gui::GfxId(0x135), .. }));
+    }
+
+    /// Shift held over a GUI item/ref/spell/.. icon (`MP_Item_Icon`..`MP_Macro_Icon`, `InputConfig_t::FrameProcess` 0x1001ae14)
+    /// shows the LOOKAT detail unconditionally, independent of `CheckObjectUnderMouse`'s world/`Can`-stat path.
+    #[test]
+    fn shift_over_a_gui_item_icon_shows_the_lookat_cursor() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        // Any open window at the test point makes `gui.wants_mouse` true, matching being "over a GUI window" (Wear/Inventory).
+        gui.open_window_xml("probe", "<root><CanvasView name=\"w\" min_size=\"Point(100,100)\" max_size=\"Point(100,100)\"/></root>", (380, 280), WindowSize::Fixed(100, 100)).unwrap();
+        let mut target = HudTargetLite::default().0;
+        target.mouse = (400.0, 300.0);
+        assert!(gui.wants_mouse(400.0, 300.0));
+        let mut host = ao_render::Host::headless();
+        host.mods.shift = true;
+        let mut list = ao_gui::DrawList::default();
+        // `gui_item_hover` mirrors `Hud::draw_cursor`'s `HudStats::info_slot_at(..).is_some()` for a filled item slot under the
+        // mouse; this unit covers `draw_cursor`'s own branch in isolation.
+        target.draw_cursor(&gui, &Zone::default(), None, &mut host, &mut list, (1280, 800), 2, true, false, true);
+        assert!(host.hide_cursor);
+        assert_eq!(list.cmds.len(), 3, "pointer + LOOKAT detail + click overlay sprite: {list:?}");
+        assert!(list.cmds.iter().any(|c| matches!(c, ao_gui::DrawCmd::Gfx { id: ao_gui::GfxId(0x148), .. })), "no LOOKAT (0x148) sprite: {list:?}");
+
+        // without a hovered item icon (gui_item_hover false) nothing is drawn and the OS cursor stays (hide_cursor stays false).
+        host.hide_cursor = false;
+        let mut list2 = ao_gui::DrawList::default();
+        target.draw_cursor(&gui, &Zone::default(), None, &mut host, &mut list2, (1280, 800), 2, true, false, false);
+        assert!(!host.hide_cursor);
+        assert!(list2.cmds.is_empty());
     }
 
     /// `HudTarget` without windows, for the state-machine tests.
