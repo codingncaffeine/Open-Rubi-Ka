@@ -896,7 +896,11 @@ impl Offscreen {
         self.r.set_ground_rendering(self.host.ground_rendering);
         if let Some(textures) = self.host.ground_textures.take() { self.r.refresh_ground_textures(&textures); }
         self.host.apply_actors(&mut self.r);
-        // No swapchain/present here to drive wgpu's own resource reclaim, so poll explicitly like the real loop does.
+        // No swapchain/present here to drive wgpu's own resource reclaim; queue.write_buffer/write_texture calls
+        // (sky ticks, actor skin updates, GUI) stage pending writes that wgpu only flushes/frees on the next
+        // queue.submit, so an explicit empty submit every tick (matching the real windowed loop's per-frame
+        // render+submit) is required before poll, not just poll by itself.
+        self.r.queue.submit([]);
         let _ = self.r.device.poll(wgpu::PollType::Poll);
         list
     }
@@ -932,6 +936,49 @@ mod tests {
         assert_eq!(present_mode(false), wgpu::PresentMode::AutoNoVsync);
         assert_eq!(present_mode(true), wgpu::PresentMode::AutoVsync);
         assert_eq!(Host::headless().wait_for_vert_sync, None);
+    }
+
+    /// Leak regression: `queue.write_buffer`/`write_texture` (e.g. a ticking `LiveSky`) stage pending writes that
+    /// wgpu only flushes/frees on the next `queue.submit`; `Offscreen::frame` has no swapchain/present to provide
+    /// one, so it must submit explicitly every tick, not just poll (confirmed live: without the submit, real
+    /// IOAccelerator GPU memory grew ~170 MB/s while merely idling, invisible to wgpu-object creation counters).
+    /// Paced at real time (the backlog only manifests over real seconds, not a tight unthrottled loop) with a
+    /// live sky ticking every `Offscreen::frame` call for 20 real seconds; RSS after the first couple of seconds
+    /// of settling must stay flat.
+    #[test]
+    #[ignore = "real GPU + client data, real-time paced; run explicitly: cargo test --release -p ao-render -- --ignored offscreen_frame_with_live_sky_rss_stays_flat_paced --nocapture"]
+    fn offscreen_frame_with_live_sky_rss_stays_flat_paced() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        struct Idle(ao_gui::Gui);
+        impl Frontend for Idle {
+            fn gui(&self) -> &ao_gui::Gui { &self.0 }
+            fn input(&mut self, _: ao_gui::InputEvent, _: &mut Host) {}
+            fn frame(&mut self, dt: f32, _: (u32, u32), _: &mut Host) -> ao_gui::DrawList { self.0.frame(dt) }
+        }
+        let gui = ao_gui::Gui::new(&dir, None).unwrap();
+        let mut fe = Idle(gui);
+        let mut o = Offscreen::new(&fe, (320, 200)).unwrap();
+        o.host.live_sky = Some(Some(LiveSky { start: 100.0, scale: 10.0, source: Box::new(|t| Scene { spawn: Some([t, 0.0, 0.0]), ..Scene::default() }) }));
+        let rss = || -> u64 {
+            let pid = std::process::id();
+            let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+        };
+        let t0 = Instant::now();
+        let mut samples = Vec::new();
+        while t0.elapsed().as_secs() < 20 {
+            o.frame(&mut fe, 0.016);
+            std::thread::sleep(Duration::from_millis(16));
+            let el = t0.elapsed().as_secs();
+            if samples.last() != Some(&el) { samples.push(el); eprintln!("t={el} rss_kb={}", rss()); }
+        }
+        let warm = rss();
+        std::thread::sleep(Duration::from_secs(2));
+        for _ in 0..125 { o.frame(&mut fe, 0.016); std::thread::sleep(Duration::from_millis(16)); }
+        let after = rss();
+        eprintln!("warm={warm} after={after}");
+        assert!((after as i64 - warm as i64) < 200_000, "RSS grew {} KB over 2 further real seconds of idle sky-ticking Offscreen::frame calls: pending GPU writes are not being reclaimed", after as i64 - warm as i64);
     }
 
     #[test]
