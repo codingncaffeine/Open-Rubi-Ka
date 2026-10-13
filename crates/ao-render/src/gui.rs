@@ -12,6 +12,7 @@ use crate::Renderer;
 use ao_gui::{DrawCmd, DrawList, Gui};
 use bytemuck::{Pod, Zeroable};
 use crate::gpu_stats::{GpuStatsExt, TextureViewStatsExt};
+use std::collections::HashMap;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -41,6 +42,23 @@ pub struct GuiRenderer {
     glyph_view: wgpu::TextureView,
     glyph_version: u64,
     glyph_size: (u32, u32),
+    /// Persistent capacity-based vertex buffer (grown in place, like `actors`/`set_sky`): every `draw` call has a
+    /// different vertex count (text/window layout changes every frame), but the GPU buffer object itself only needs
+    /// to grow, never be recreated, once the screen's largest frame has been seen.
+    vb: Option<wgpu::Buffer>,
+    vb_cap: u64,
+    /// Persistent globals uniform buffer, created once in `new` and updated in place via `queue.write_buffer`.
+    globals: wgpu::Buffer,
+    /// Bind groups cached by extra-image slot (`None` = glyph atlas): the glyph/extra-image textures, the glyph
+    /// sampler and the globals buffer are all stable GPU objects for the renderer's whole lifetime, so a bind group
+    /// only needs to be created once per distinct key, not every `draw` call.
+    bind_groups: HashMap<Option<usize>, wgpu::BindGroup>,
+    /// Vertex buffers actually (re)created by capacity growth, since the layer started: a regression counter, not
+    /// drained. In steady state (a busy screen whose vertex count has a stable ceiling) this must stop climbing.
+    pub(crate) vb_created: u64,
+    /// Bind groups actually created (new cache entries), since the layer started: a regression counter. Converges
+    /// once every distinct texture (glyph atlas + each extra image) a screen uses has been seen once.
+    pub(crate) bg_created: u64,
 }
 
 /// (scissor, extra-image slot, vertex range)
@@ -156,6 +174,12 @@ impl GuiRenderer {
             glyph_view,
             glyph_version: 0,
             glyph_size: (ga.width, ga.height),
+            vb: None,
+            vb_cap: 0,
+            globals: device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("gui globals"), size: std::mem::size_of::<Globals>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
+            bind_groups: HashMap::new(),
+            vb_created: 0,
+            bg_created: 0,
         }
     }
 
@@ -273,30 +297,39 @@ impl GuiRenderer {
             return;
         }
         let device = &r.device;
-        let vb = device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor { label: Some("gui verts"), contents: bytemuck::cast_slice(&verts), usage: wgpu::BufferUsages::VERTEX });
-        let globals = device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
-            label: Some("gui globals"),
-            contents: bytemuck::bytes_of(&Globals { screen: [size.0 as f32, size.1 as f32], _pad: [0.0; 2] }),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let mk_bg = |extra: Option<usize>| {
-            let (view, samp) = match extra {
-                Some(k) => (&self.extras[k].1, if gui.extra_images()[k].smooth { &self.linear } else { &self.sampler }),
-                None => (&self.glyph_view, &self.sampler),
-            };
-            device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
-                label: Some("gui"),
-                layout: &self.layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.gfx_view) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.glyph_view) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(samp) },
-                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(view) },
-                ],
-            })
-        };
-        let bgs: Vec<wgpu::BindGroup> = batches.iter().map(|b| mk_bg(b.1)).collect();
+        // Bind groups are cached by extra-image slot: the glyph/extra textures, samplers, layout and the globals
+        // buffer below are all stable for the renderer's lifetime, so each distinct key only needs one bind group
+        // ever, not one per `draw` call (leak follow-up: this used to rebuild every batch's bind group every frame).
+        for &(_, extra, _) in &batches {
+            if !self.bind_groups.contains_key(&extra) {
+                let (view, samp) = match extra {
+                    Some(k) => (&self.extras[k].1, if gui.extra_images()[k].smooth { &self.linear } else { &self.sampler }),
+                    None => (&self.glyph_view, &self.sampler),
+                };
+                let bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
+                    label: Some("gui"),
+                    layout: &self.layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: self.globals.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.gfx_view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.glyph_view) },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(samp) },
+                        wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(view) },
+                    ],
+                });
+                self.bind_groups.insert(extra, bg);
+                self.bg_created += 1;
+            }
+        }
+        // Persistent capacity-based vertex buffer (like `actors`/`set_sky`): grown in place only when the batch
+        // outgrows the current capacity, written in place every call otherwise (leak follow-up: this used to
+        // recreate a brand-new vertex buffer and globals uniform buffer every `draw` call).
+        let needed = (verts.len() * std::mem::size_of::<Vertex>()) as u64;
+        let (vb, created) = crate::ensure_buf(device, self.vb.take(), &mut self.vb_cap, needed, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, "gui verts");
+        self.vb_created += created as u64;
+        r.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&verts));
+        r.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&Globals { screen: [size.0 as f32, size.1 as f32], _pad: [0.0; 2] }));
+        let bgs: Vec<&wgpu::BindGroup> = batches.iter().map(|b| self.bind_groups.get(&b.1).expect("bind group cached above")).collect();
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gui") });
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -309,7 +342,7 @@ impl GuiRenderer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_vertex_buffer(0, vb.slice(..));
-            for ((c, _, range), bg) in batches.into_iter().zip(bgs.iter()) {
+            for ((c, _, range), bg) in batches.into_iter().zip(bgs) {
                 pass.set_bind_group(0, bg, &[]);
                 match c {
                     Some([x0, y0, x1, y1]) => {
@@ -324,6 +357,7 @@ impl GuiRenderer {
             }
         }
         r.queue.submit([enc.finish()]);
+        self.vb = Some(vb);
     }
 }
 
@@ -331,6 +365,56 @@ impl GuiRenderer {
 mod tests {
     use super::*;
     use crate::Renderer;
+
+    /// Leak follow-up (the real window renders the GUI every frame; the offscreen harness used to verify the sky
+    /// fix does not): `GuiRenderer::draw` used to create a brand-new vertex buffer, globals uniform buffer and one
+    /// bind group per clip/texture batch on *every* call instead of just once, a second steady per-frame GPU-object
+    /// leak alongside the sky rebuild. Drives the real `draw()` path against a busy synthetic screen (five windows,
+    /// ~2000 characters of varied text each: as many distinct glyphs/clip batches as a busy chat window plus
+    /// several open HUD windows) and counts actual GPU object creations via the renderer's own regression counters
+    /// (not an RSS bound). After warm-up (the steady vertex-count ceiling and every distinct texture seen once),
+    /// further frames must create zero further vertex buffers or bind groups.
+    #[test]
+    fn gui_draw_creates_zero_gpu_objects_in_steady_state_with_a_busy_screen() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = ao_gui::Gui::new(&dir, None).unwrap();
+        let blob: String = (0..2000).map(|i| char::from(b'!' + (i % 94) as u8)).collect();
+        for i in 0..5 {
+            let win = gui.open_window_xml(&format!("busy{i}"), "<root><ScrollView name=\"sv\" min_size=\"Point(300,500)\" max_size=\"Point(300,500)\"><ScrollViewChild name=\"svc\"><TextView name=\"text\" min_size=\"Point(280,4000)\" max_size=\"Point(280,4000)\"/></ScrollViewChild></ScrollView></root>", (i * 40, i * 40), ao_gui::WindowSize::Fixed(300, 500)).unwrap();
+            gui.set_text(win, "text", &blob);
+        }
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).expect("resource regression requires GPU");
+        r.upload(&ao_scene::Scene::default());
+        let (w, h) = (1280u32, 800u32);
+        let out = r.device.create_texture_tracked(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: r.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = out.create_view_tracked(&Default::default());
+        let mut gr = GuiRenderer::new(&r, &gui);
+        for _ in 0..30 {
+            let list = gui.frame(1.0 / 60.0);
+            gr.draw(&r, &view, (w, h), 1, &gui, &list);
+            let _ = r.device.poll(wgpu::PollType::Poll);
+        }
+        let (vb_warm, bg_warm) = (gr.vb_created, gr.bg_created);
+        eprintln!("warm-up (30 frames): vb_created={vb_warm} bg_created={bg_warm}");
+        for _ in 0..30 {
+            let list = gui.frame(1.0 / 60.0);
+            gr.draw(&r, &view, (w, h), 1, &gui, &list);
+            let _ = r.device.poll(wgpu::PollType::Poll);
+        }
+        assert_eq!(gr.vb_created, vb_warm, "steady-state busy-screen draws created {} more vertex buffers instead of reusing the capacity buffer", gr.vb_created - vb_warm);
+        assert_eq!(gr.bg_created, bg_warm, "steady-state busy-screen draws created {} more bind groups instead of reusing the cache", gr.bg_created - bg_warm);
+    }
 
     /// Leak follow-up: `GuiRenderer::draw` creates a brand-new vertex buffer, globals uniform buffer and one bind
     /// group per clip/texture batch *every call* (not just once); a busy screen (many windows, heavy chat text, lots
