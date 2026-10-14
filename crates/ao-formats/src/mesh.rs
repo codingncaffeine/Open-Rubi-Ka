@@ -69,7 +69,7 @@ pub fn load_animated_mesh(store: &RecordStore, id: u32) -> Result<Option<(Scene,
             };
             let mut builder = Builder {
                 ar, mesh: Mesh::default(), groups: HashMap::new(), have_texture: &mut textures,
-                visited: vec![], object_space: true, overrides: &[], slot: 0,
+                visited: vec![], object_space: true, overrides: &[], slot: 0, last_tex: None,
             };
             let state = node.ref1("delta_state").and_then(|i| ar.objects.get(i));
             for mesh in ar.objects[data].refs("mesh") {
@@ -101,7 +101,7 @@ pub fn decode_mesh_into(store: &RecordStore, id: u32, scene: &mut Scene) -> Resu
 
 /// Like [`decode_mesh_into`] for an explicit mesh record type ([`MESH_TYPE`] or [`MESH_LOW_TYPE`]).
 pub fn decode_record_into(store: &RecordStore, rdb_type: u32, id: u32, scene: &mut Scene) -> Result<Option<usize>> {
-    decode_record(store, rdb_type, id, scene, false, &[])
+    decode_record(store, rdb_type, id, scene, false, &[], None)
 }
 
 /// Texture used by statel attribute overrides: `NewTextureData_t` ids are 1010004 records (`acg_tiles_metal_corroded_plain.png`, ...).
@@ -111,19 +111,26 @@ const OVERRIDE_TEXTURES: u32 = 1_010_004;
 /// `SimpleMesh` (counted over the whole node tree in traversal order, empty ones included). Statel attributes are
 /// `std::vector<NewTextureData_t>` (`{i32 slot, u32 texture}`, 8 bytes) handed to `VisualMesh_t::SetMesh` (DisplaySystem
 /// @0x1006b623) -> `AsyncMesh` (@0x1007125c) -> `FUN_100714c2`; see `docs/formats.md` § playfields.
-pub fn decode_statel_mesh(store: &RecordStore, rdb_type: u32, id: u32, overrides: &[(u32, u32)], scene: &mut Scene) -> Result<Option<usize>> {
-    decode_record(store, rdb_type, id, scene, false, overrides)
+///
+/// `inherited`: the diffuse texture bound by whatever the native renderer last drew before this statel (`RVisual_t::ApplyStateChanges`
+/// @0x1004cbe1 / `RViewPort_t::SetMaterial`'s material delta-state apply `FUN_10040aa0`, both randy31.dll: a `SimpleMesh` whose node and
+/// material carry no texture channel at all issues no `SetTexture` call at all, `RDeltaState`'s texture-stage loop `FUN_1002f275` simply
+/// never runs, so the GPU keeps whatever texture the previous draw call bound). Used as the starting "currently bound diffuse" for this
+/// mesh's own `SimpleMesh` traversal (see `Builder::last_tex` in `decode_archive_with`), and (by the caller, `playfield::Placer`) as the
+/// per-placement texture of a statel whose own archive never binds one.
+pub fn decode_statel_mesh(store: &RecordStore, rdb_type: u32, id: u32, overrides: &[(u32, u32)], inherited: Option<TextureKey>, scene: &mut Scene) -> Result<Option<usize>> {
+    decode_record(store, rdb_type, id, scene, false, overrides, inherited)
 }
 
 /// Like [`decode_mesh_into`] but with the vertices exactly as stored (node object space, the frame tree's matrices are
 /// not applied): what a `RTriMesh_t` visual built straight from the mesh data draws (the sky objects).
 pub fn decode_mesh_object_space(store: &RecordStore, id: u32, scene: &mut Scene) -> Result<Option<usize>> {
-    decode_record(store, MESH_TYPE, id, scene, true, &[])
+    decode_record(store, MESH_TYPE, id, scene, true, &[], None)
 }
 
-fn decode_record(store: &RecordStore, rdb_type: u32, id: u32, scene: &mut Scene, object_space: bool, overrides: &[(u32, u32)]) -> Result<Option<usize>> {
+fn decode_record(store: &RecordStore, rdb_type: u32, id: u32, scene: &mut Scene, object_space: bool, overrides: &[(u32, u32)], inherited: Option<TextureKey>) -> Result<Option<usize>> {
     let Some(bytes) = store.get(rdb_type, id)? else { return Ok(None) };
-    let mesh = decode_archive_with(&bytes, object_space, overrides, |key| {
+    let mesh = decode_archive_with(&bytes, object_space, overrides, inherited, |key| {
         if let std::collections::hash_map::Entry::Vacant(e) = scene.textures.entry(key) {
             if let Some(t) = load_texture(store, key).ok().flatten() {
                 e.insert(t);
@@ -248,13 +255,21 @@ struct Builder<'a, 'b> {
     /// Statel texture overrides `(SimpleMesh slot, texture id)` and the running slot counter.
     overrides: &'b [(u32, u32)],
     slot: usize,
+    /// Diffuse texture bound by the most recently drawn `SimpleMesh` (`RDeltaState`'s texture-stage apply,
+    /// randy31 `FUN_1002f275`, only issues `SetTexture` for a channel that is actually authored: a `SimpleMesh`
+    /// whose node and material carry no texture channel at all leaves the GPU's current texture bound, it does
+    /// not clear it). Seeded from `inherited` (whatever the caller's own last draw bound, e.g. the previous
+    /// statel in `playfield::Placer`), updated after every `SimpleMesh` to the texture that ends up effectively
+    /// bound (resolved, inherited, or overridden) so a run of channel-less `SimpleMesh`es all reuse the last
+    /// real texture instead of resetting to none/white.
+    last_tex: Option<TextureKey>,
 }
 
 fn decode_archive(bytes: &[u8], object_space: bool, have_texture: impl FnMut(TextureKey) -> bool) -> Result<Mesh> {
-    decode_archive_with(bytes, object_space, &[], have_texture)
+    decode_archive_with(bytes, object_space, &[], None, have_texture)
 }
 
-fn decode_archive_with(bytes: &[u8], object_space: bool, overrides: &[(u32, u32)], mut have_texture: impl FnMut(TextureKey) -> bool) -> Result<Mesh> {
+fn decode_archive_with(bytes: &[u8], object_space: bool, overrides: &[(u32, u32)], inherited: Option<TextureKey>, mut have_texture: impl FnMut(TextureKey) -> bool) -> Result<Mesh> {
     let ar = Archive::parse(bytes)?;
     let mut b = Builder {
         ar: &ar,
@@ -265,6 +280,7 @@ fn decode_archive_with(bytes: &[u8], object_space: bool, overrides: &[(u32, u32)
         object_space,
         overrides,
         slot: 0,
+        last_tex: inherited,
     };
     b.node(ar.root, &IDENTITY, 0)?;
     b.mesh.submeshes.retain(|s| !s.indices.is_empty());
@@ -317,7 +333,13 @@ impl Builder<'_, '_> {
                 tex = found;
             }
         }
-        let tex = tex.filter(|&k| (self.have_texture)(k));
+        // `FUN_1002f275` (randy31, RDeltaState's texture-stage apply) only issues `SetTexture` for a channel this
+        // delta state actually authors (and resolves): no channel at all, or one whose creator record doesn't
+        // decode, leaves the GPU's currently bound diffuse texture untouched, so this submesh draws with whatever
+        // the previous `SimpleMesh` (in this archive, or -- via `inherited` -- whatever the caller's own last draw)
+        // left bound, not blank/white.
+        let tex = tex.filter(|&k| (self.have_texture)(k)).or(self.last_tex);
+        self.last_tex = tex;
         // Alpha test wins over blend when both are on (mode 2 of @10040645 sets both; the cutout is
         // what survives without depth sorting). Blend factors ONE/ONE (or SRCALPHA/ONE) = additive.
         let blend = if state(D3DRS_ALPHATESTENABLE) == Some(1) {
@@ -390,6 +412,7 @@ impl Builder<'_, '_> {
             let tex = TextureKey { rdb_type: OVERRIDE_TEXTURES, id };
             if (self.have_texture)(tex) {
                 key.texture = Some(tex);
+                self.last_tex = key.texture;
             }
         }
         let sub = *self.groups.entry(key.id()).or_insert_with(|| {
@@ -640,11 +663,49 @@ mod tests {
 
         assert_eq!(decode_archive(&b, false, |_| true).unwrap().submeshes.len(), 1);
         let key = TextureKey { rdb_type: OVERRIDE_TEXTURES, id: 77 };
-        let m = decode_archive_with(&b, false, &[(1, 77)], |k| k == key).unwrap();
+        let m = decode_archive_with(&b, false, &[(1, 77)], None, |k| k == key).unwrap();
         assert_eq!(m.submeshes.len(), 2);
         assert_eq!((m.submeshes[0].texture, m.submeshes[1].texture), (None, Some(key)));
         // an override whose texture does not exist leaves the slot as authored
-        assert_eq!(decode_archive_with(&b, false, &[(1, 77)], |_| false).unwrap().submeshes.len(), 1);
+        assert_eq!(decode_archive_with(&b, false, &[(1, 77)], None, |_| false).unwrap().submeshes.len(), 1);
+    }
+
+    /// `RDeltaState::FUN_1002f275` (randy31) never clears texture stage 0 for a channel-less `SimpleMesh`: a bare
+    /// mesh with no material/texture channel at all draws with whatever the caller passes as `inherited` (what the
+    /// native renderer's previous draw call left bound), not a blank/white fallback.
+    #[test]
+    fn textureless_simple_mesh_inherits_the_caller_supplied_texture() {
+        const NAMES: [&str; 7] = ["obj", "data", "mesh", "vb_desc", "vertices", "trilist", "triangles"];
+        let mut b = vec![];
+        for x in [3u32, 0, 0, 1, NAMES.len() as u32] {
+            b.extend(x.to_le_bytes());
+        }
+        for n in NAMES {
+            b.extend(format!("1\0{n}\0").bytes());
+        }
+        b.extend(4u32.to_le_bytes());
+        let fl = |v: &[f32]| v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
+        let r = |v: &[i32]| v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
+        b.extend(object(&[member(0, 0x11, &r(&[0]))]));
+        b.extend(object(&[member(1, 0x11, &r(&[1]))]));
+        b.extend(object(&[member(2, 0x11, &r(&[2]))]));
+        let vb = fl(&[0., 0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0., 1., 0., 1., 0., 0., 1., 0., 1., 0., 0., 1., 1.]);
+        let mut desc = vec![];
+        for x in [16u32, 65536, 0x112, 3] {
+            desc.extend(x.to_le_bytes());
+        }
+        b.extend(object(&[member(3, 9, &desc), member(4, 9, &blob(&vb)), member(5, 0x11, &r(&[3]))]));
+        let tris: Vec<u8> = [0u16, 1, 2].iter().flat_map(|i| i.to_le_bytes()).collect();
+        b.extend(object(&[member(6, 9, &blob(&tris))]));
+        b.extend([0u8; 12]);
+
+        // no `inherited` seed: the existing, unaffected behaviour (nothing bound before this mesh's own draw).
+        assert_eq!(decode_archive(&b, false, |_| false).unwrap().submeshes[0].texture, None);
+        // seeded: this archive has no texture channel of its own anywhere, so the whole mesh draws with
+        // whatever the caller says was already bound.
+        let key = TextureKey { rdb_type: 1_010_004, id: 9001 };
+        let m = decode_archive_with(&b, false, &[], Some(key), |_| false).unwrap();
+        assert_eq!(m.submeshes[0].texture, Some(key));
     }
 
     #[test]

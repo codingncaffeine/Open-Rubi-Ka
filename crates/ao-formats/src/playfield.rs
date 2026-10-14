@@ -37,7 +37,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use ao_rdb::RecordStore;
-use ao_scene::{Instance, Scene, IDENTITY};
+use ao_scene::{Instance, Scene, TextureKey, IDENTITY};
 
 use record::Room;
 use statel::{Layout, Statel};
@@ -190,7 +190,7 @@ pub fn load_playfield_report_on_day(store: &RecordStore, client_dir: &Path, id: 
     if let Some(d) = store.get(STATELS, id)? {
         let layout = if rec.is_outdoor() { Layout::Outdoor } else { Layout::Dungeon };
         let file = statel::parse(&d, rec.count as usize, layout).with_context(|| format!("statels of playfield {id}"))?;
-        let mut placer = Placer { store, scene: &mut scene, cache: HashMap::new(), report: &mut report };
+        let mut placer = Placer { store, scene: &mut scene, cache: HashMap::new(), ctx_cache: HashMap::new(), last_diffuse: None, report: &mut report };
         // outdoor statels are under the client's zone LOD (`StatelLod`); global statels (the compacted list of mesh != 0
         // entries) are shown by the zones whose index list names them
         let tiles_x = terrain.as_ref().map_or(0, |t| t.cells_x / rec.zone_size.max(1) as usize);
@@ -219,7 +219,7 @@ pub fn load_playfield_report_on_day(store: &RecordStore, client_dir: &Path, id: 
         lod_zone_size = terrain.as_ref().map_or(0.0, |t| t.cell_size * rec.zone_size as f32);
         lod_tiles_x = if lod { tiles_x } else { 0 };
         lod_count = file.zones.len();
-        report.unique_meshes = placer.cache.values().filter(|m| m.is_some()).count();
+        report.unique_meshes = placer.cache.values().filter(|m| m.is_some()).count() + placer.ctx_cache.values().filter(|m| m.is_some()).count();
         for (i, zone) in file.zones.iter().enumerate() {
             let frame = rec.rooms.get(i).map(|r| (statel::ry(r.rot as f32 * std::f32::consts::FRAC_PI_2), r.pos));
             // outdoor lights belong to their tile-block zone and follow its distance level (`StatelLod::lights_active`)
@@ -310,7 +310,18 @@ struct Placed {
 struct Placer<'a> {
     store: &'a RecordStore,
     scene: &'a mut Scene,
+    /// Meshes that fully resolve their own diffuse texture (every submesh), independent of draw order: reused
+    /// as-is regardless of `last_diffuse`.
     cache: HashMap<MeshKey, Option<usize>>,
+    /// Meshes that leave at least one submesh with no texture channel anywhere in their own archive: the native
+    /// renderer's `SetTexture` is skipped for those (`RDeltaState::FUN_1002f275`, randy31; see `mesh.rs::Builder::last_tex`),
+    /// so their effective texture depends on whatever the *previous* statel's own last draw bound. Cached per
+    /// `(mesh key, that preceding texture)` since the same bare mesh can be placed after different neighbours.
+    ctx_cache: HashMap<(MeshKey, Option<TextureKey>), Option<usize>>,
+    /// The diffuse texture the most recently placed statel's last `SimpleMesh` left bound, in the same order
+    /// `place` is called (global list, then each zone's list, matching `load_playfield_report_on_day`): the seed
+    /// fed to the next statel that has no texture of its own anywhere.
+    last_diffuse: Option<TextureKey>,
     report: &'a mut Report,
 }
 
@@ -318,9 +329,19 @@ impl Placer<'_> {
     fn mesh(&mut self, rdb_type: u32, id: u32, attrs: &[(u32, u32)]) -> Option<usize> {
         let key = (rdb_type, id, attrs.to_vec());
         if let Some(&m) = self.cache.get(&key) {
+            if let Some(mi) = m {
+                self.last_diffuse = self.scene.meshes[mi].submeshes.last().and_then(|s| s.texture).or(self.last_diffuse);
+            }
             return m;
         }
-        let m = match crate::mesh::decode_statel_mesh(self.store, rdb_type, id, attrs, self.scene) {
+        let ctx_key = (key.clone(), self.last_diffuse);
+        if let Some(&m) = self.ctx_cache.get(&ctx_key) {
+            if let Some(mi) = m {
+                self.last_diffuse = self.scene.meshes[mi].submeshes.last().and_then(|s| s.texture).or(self.last_diffuse);
+            }
+            return m;
+        }
+        let m = match crate::mesh::decode_statel_mesh(self.store, rdb_type, id, attrs, self.last_diffuse, self.scene) {
             Ok(m) => m,
             Err(e) => {
                 self.report.first_mesh_error.get_or_insert_with(|| format!("mesh {id}: {e:#}"));
@@ -328,7 +349,17 @@ impl Placer<'_> {
                 None
             }
         };
-        self.cache.insert(key, m);
+        if let Some(mi) = m {
+            let still_bare = self.scene.meshes[mi].submeshes.iter().any(|s| s.texture.is_none() && !s.indices.is_empty());
+            self.last_diffuse = self.scene.meshes[mi].submeshes.last().and_then(|s| s.texture).or(self.last_diffuse);
+            if still_bare {
+                self.ctx_cache.insert(ctx_key, m);
+            } else {
+                self.cache.insert(key, m);
+            }
+        } else {
+            self.cache.insert(key, m);
+        }
         m
     }
 
@@ -368,7 +399,7 @@ impl Placer<'_> {
 /// never created by the client either and stay hidden (`pick` with no zones).
 fn add_lod(store: &RecordStore, scene: &mut Scene, report: &mut Report, items: Vec<Placed>, tiles_x: usize, zone_size: f32, zone_count: usize) {
     let zones = (0..zone_count).map(|i| [((i % tiles_x) as f32 + 0.5) * zone_size, -(((i / tiles_x) as f32 + 0.5) * zone_size)]).collect();
-    let mut placer = Placer { store, scene: &mut *scene, cache: HashMap::new(), report };
+    let mut placer = Placer { store, scene: &mut *scene, cache: HashMap::new(), ctx_cache: HashMap::new(), last_diffuse: None, report };
     let items = items
         .into_iter()
         .map(|it| {
