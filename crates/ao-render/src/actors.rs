@@ -231,7 +231,7 @@ impl Renderer {
             })),
             _ => None,
         };
-        let mut mat_of: HashMap<(usize, bool, [u32; 20]), usize> = HashMap::new();
+        let mut mat_of: HashMap<(usize, bool, [u32; 24]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
         let mut meshes = vec![];
         for mesh in &scene.meshes {
@@ -257,7 +257,7 @@ impl Renderer {
                 }
                 let count = indices.len() as u32 - first;
                 let view = s.texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0);
-                let mut bind = |view: usize, clamp: bool, u: [f32; 20]| {
+                let mut bind = |view: usize, clamp: bool, u: [f32; 24]| {
                     *mat_of.entry((view, clamp, u.map(f32::to_bits))).or_insert_with(|| {
                         let ub = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                             label: None,
@@ -269,8 +269,7 @@ impl Renderer {
                             layout: &self.tex_layout,
                             entries: &[
                                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[view]) },
-                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(self.material_sampler(clamp)) },
-                                wgpu::BindGroupEntry { binding: 2, resource: ub.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 1, resource: ub.as_entire_binding() },
                             ],
                         }));
                         mats.len() - 1
@@ -281,7 +280,7 @@ impl Renderer {
                 let mat = bind(view, s.texture_clamp, mat_uniform(s));
                 let pipe = material_pipe(s);
                 // the env layer redraws the same triangles right after them, in the same phase (`FUN_10056ed6`)
-                let env = s.env_texture.and_then(|k| view_of.get(&k).copied()).map(|ev| (bind(ev, false, [0.0; 20]), env_pipe(s.blend, s.two_sided)));
+                let env = s.env_texture.and_then(|k| view_of.get(&k).copied()).map(|ev| (bind(ev, false, [0.0; 24]), env_pipe(s.blend, s.two_sided)));
                 submesh_mats.push((mat, pipe, env));
                 if count == 0 {
                     continue;

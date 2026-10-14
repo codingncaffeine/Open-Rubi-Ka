@@ -23,17 +23,30 @@ struct Mat {
     scroll: vec4<f32>,   // xy = uv drift per second
     wave: vec4<f32>,     // sky: (curve_u, amp_u, curve_v, amp_v) uv offset amp * GameWaveCurve; scroll.w = 1 for a flickering sun fan
     spec: vec4<f32>,     // rgb = material specular (spec * shin_str, 0 = SPECULARENABLE off), w = power
+    flags: vec4<f32>,    // x = 1 when this material's texture addressing clamps (Submesh::texture_clamp)
 }
 @group(0) @binding(0) var<uniform> g: G;
 @group(0) @binding(1) var<storage, read> lights: array<vec4<f32>>; // pairs: (pos, range), (colour, 0)
 @group(0) @binding(2) var<storage, read> cells: array<vec2<u32>>;  // (first index, count) into `light_idx`
 @group(0) @binding(3) var<storage, read> light_idx: array<u32>;
 @group(0) @binding(4) var<storage, read> dyn_lights: array<vec4<f32>>; // per-frame moving lights, same 4-vec4 layout as `lights`
+// Both samplers live in group 0 (not per-material) so Renderer::set_anisotropy only rebuilds this one bind group,
+// not every material's: see `sample_clamped` below for the per-material repeat/clamp choice.
+@group(0) @binding(5) var samp: sampler;
+@group(0) @binding(6) var samp_clamp: sampler;
 @group(1) @binding(0) var tex: texture_2d<f32>;
-@group(1) @binding(1) var samp: sampler;
-@group(1) @binding(2) var<uniform> mat: Mat;
+@group(1) @binding(1) var<uniform> mat: Mat;
 @group(2) @binding(0) var holo0: texture_2d<f32>;
 @group(2) @binding(1) var holo1: texture_2d<f32>;
+
+// Picks the repeat or clamp-to-edge sampler per material (`Mat::flags.x`); WGSL can't `select()` between opaque
+// sampler handles, so this is a branch instead of a value expression.
+fn sample_clamped(t: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
+    if (mat.flags.x > 0.5) {
+        return textureSample(t, samp_clamp, uv);
+    }
+    return textureSample(t, samp, uv);
+}
 
 struct VIn {
     @location(0) pos: vec3<f32>,
@@ -268,7 +281,7 @@ fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
     let sprite = fade_mode == 6u;
     let faded = fade_mode >= 4u && !sprite;
     let mode = select(select(fade_mode, fade_mode - 4u, faded), 2u, sprite);
-    let t = textureSample(tex, samp, i.uv + mat.scroll.xy * g.fog.z);
+    let t = sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z);
     let alpha = t.a * i.color.a * mat.color.a * i.fade;
     if sprite && alpha <= 30.0 / 255.0 {
         discard;
@@ -304,7 +317,7 @@ fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
     let wu = u32(mat.wave.x);
     let wv = u32(mat.wave.z);
     let wobble = vec2<f32>(mat.wave.y * g.wave[wu >> 2u][wu & 3u], mat.wave.w * g.wave[wv >> 2u][wv & 3u]);
-    let c = textureSample(tex, samp, i.uv + mat.scroll.xy * g.fog.z + wobble) * i.color * mat.color;
+    let c = sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z + wobble) * i.color * mat.color;
     if mode == 1u && c.a < 0.5 {
         discard;
     }
@@ -338,8 +351,8 @@ fn fs_mesh_add(i: VOut) -> @location(0) vec4<f32> { return shade(i, 3u); }
 // matrix, with X erased and Y scrolled. COUNT3 is not D3DTTFF_PROJECTED (no divide).
 @fragment
 fn fs_holo(i: VOut) -> @location(0) vec4<f32> {
-    let t0 = textureSample(holo0, samp, vec2<f32>(0.0, i.wpos.y + fract(0.2 * i.effect_time)));
-    let t1 = textureSample(holo1, samp, i.uv + vec2<f32>(fract(0.15 * i.effect_time), 0.0));
+    let t0 = sample_clamped(holo0, vec2<f32>(0.0, i.wpos.y + fract(0.2 * i.effect_time)));
+    let t1 = sample_clamped(holo1, i.uv + vec2<f32>(fract(0.15 * i.effect_time), 0.0));
     let rgb = min(srgb_enc(t0.rgb) + srgb_enc(t1.rgb), vec3<f32>(1.0));
     let f = clamp((length(g.eye.xyz - i.wpos) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
     return vec4<f32>(mix(rgb, g.fog_g.rgb, f), t0.a * i.color.a * mat.color.a * i.fade);
@@ -367,7 +380,7 @@ fn vs_env(v: VIn) -> VOut {
 // towards the fog colour before the add (the env state blob @RCATMesh+0x224 sets no fog colour, `FUN_10055a3e`).
 @fragment
 fn fs_env(i: VOut) -> @location(0) vec4<f32> {
-    let t = textureSample(tex, samp, i.uv);
+    let t = sample_clamped(tex, i.uv);
     let f = clamp((length(g.eye.xyz - i.wpos) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
     return vec4<f32>(mix(srgb_enc(t.rgb), g.fog_g.rgb, f), 1.0);
 }
@@ -388,10 +401,10 @@ fn ground_fog(i: VOut) -> f32 {
     return clamp((length(g.eye.xyz - i.wpos) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
 }
 fn ground_palette(i: VOut) -> vec3<f32> {
-    return textureSample(holo0, samp, vec2<f32>(i.wpos.x, -i.wpos.z) * mat.wave.xz).rgb;
+    return sample_clamped(holo0, vec2<f32>(i.wpos.x, -i.wpos.z) * mat.wave.xz).rgb;
 }
 fn ground_tile(i: VOut) -> vec3<f32> {
-    let tile = textureSample(tex, samp, i.uv);
+    let tile = sample_clamped(tex, i.uv);
     if tile.a <= 128.0 / 255.0 { discard; }
     return srgb_enc(tile.rgb);
 }

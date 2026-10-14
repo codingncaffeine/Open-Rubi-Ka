@@ -362,7 +362,7 @@ struct GroundRun {
     scratch: Vec<u32>,
     materials: Vec<Option<wgpu::BindGroup>>,
     has_shadow: Vec<bool>,
-    texture_materials: Vec<(usize, TextureKey, [f32; 20])>,
+    texture_materials: Vec<(usize, TextureKey, [f32; 24])>,
 }
 
 /// Sky backdrop with its own mesh/material tables, so [`Renderer::set_sky`] can swap it while the world stays.
@@ -387,7 +387,7 @@ struct SkyGpu {
     /// offset, so a given sky submesh's uniform is stable tick to tick) reuses the existing uniform buffer and
     /// bind group instead of creating new ones. Bounded by the sky's own small, fairly static material count
     /// (sun, moon, stars, a handful of cloud/overlay layers); never pruned, same as the rest of this cache.
-    mat_of: HashMap<(Option<TextureKey>, bool, [u32; 20]), usize>,
+    mat_of: HashMap<(Option<TextureKey>, bool, [u32; 24]), usize>,
     mats: Vec<wgpu::BindGroup>,
     draws: Vec<(Draw, u32)>, // (draw, index into `xf`) in scene order
     xf: Vec<Mat4>,
@@ -423,9 +423,9 @@ struct ColorAnim {
 }
 
 /// Material uniform of a submesh (see `shader.wgsl` `Mat`).
-fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 20] {
+fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 24] {
     let [wu, au, wv, av] = s.uv_wave;
-    [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], s.sky_fog as u32 as f32, s.sun_flicker as u32 as f32, wu, au, wv, av, s.specular[0], s.specular[1], s.specular[2], s.shininess]
+    [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], s.sky_fog as u32 as f32, s.sun_flicker as u32 as f32, wu, au, wv, av, s.specular[0], s.specular[1], s.specular[2], s.shininess, s.texture_clamp as u32 as f32, 0.0, 0.0, 0.0]
 }
 
 /// Last-frame counters (after frustum culling).
@@ -482,7 +482,7 @@ pub struct Renderer {
     pipeline_layout: wgpu::PipelineLayout,
     holo_pipeline_layout: wgpu::PipelineLayout,
     sampler: wgpu::Sampler,
-    clamp_sampler: std::sync::OnceLock<wgpu::Sampler>,
+    clamp_sampler: wgpu::Sampler,
     /// Texture anisotropic filtering clamp ([`Renderer::set_anisotropy`]; audit item 2, default 1x = retail `FUN_10041ede`,
     /// `docs/screens.md` "max anisotropy 1"). The aomac Enhanced options page may raise it.
     anisotropy: u16,
@@ -519,8 +519,12 @@ pub struct Renderer {
     ground_quality: (i32, i32),
     ground_state: native_ground::NativeGround,
     ground_pipes: Vec<wgpu::RenderPipeline>,
-    /// Light storage buffer plus its pristine contents and the statel zone of each light (distance gating).
+    /// Light storage buffer plus its pristine contents and the statel zone of each light (distance gating). `cells`/`idx`
+    /// are the light-grid index buffers; all three are kept so [`Renderer::set_anisotropy`] can rebuild `globals_bg` with
+    /// the current lighting data instead of recomputing the light grid just to change a sampler.
     light_buf: wgpu::Buffer,
+    light_cells_buf: wgpu::Buffer,
+    light_idx_buf: wgpu::Buffer,
     light_base: Vec<[f32; 4]>,
     light_zones: Vec<Option<u32>>,
     /// Per-frame moving lights (worn/attached item lights such as the Light Bar), see [`Renderer::set_dynamic_lights`]:
@@ -569,13 +573,30 @@ fn default_environment(radius: f32) -> Environment {
 /// `MultisampleState` into the pipeline (no live toggle), so [`Renderer::set_msaa_samples`] calls this again at the new count;
 /// `Renderer::new` calls it once at the default (1 = MSAA off, matching retail: the MSAA-option decision found no AA option
 /// anywhere in the client's GUI/text/twk data).
-/// The world/material sampler at a given anisotropic filtering clamp (`Renderer::new` default 1 = retail; [`Renderer::set_anisotropy`]
-/// rebuilds it, same as [`Renderer::material_sampler`]'s clamp-address variant).
+/// The world/material repeat sampler at a given anisotropic filtering clamp (`Renderer::new` default 1 = retail;
+/// [`Renderer::set_anisotropy`] rebuilds it, along with [`make_clamp_sampler`]'s clamp-address variant).
 fn make_world_sampler(device: &wgpu::Device, anisotropy: u16) -> wgpu::Sampler {
     device.create_sampler_tracked(&wgpu::SamplerDescriptor {
         address_mode_u: wgpu::AddressMode::Repeat,
         address_mode_v: wgpu::AddressMode::Repeat,
         address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        anisotropy_clamp: anisotropy,
+        ..Default::default()
+    })
+}
+
+/// Clamp-to-edge counterpart of [`make_world_sampler`], same filtering/anisotropy. Both samplers live in the shared
+/// `globals_bg` bind group (group 0); `shader.wgsl`'s `sample_clamped` picks between them per material, so
+/// [`Renderer::set_anisotropy`] only has to rebuild `globals_bg`, not every material's bind group.
+fn make_clamp_sampler(device: &wgpu::Device, anisotropy: u16) -> wgpu::Sampler {
+    device.create_sampler_tracked(&wgpu::SamplerDescriptor {
+        label: Some("native D3D texture clamp"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
         mipmap_filter: wgpu::MipmapFilterMode::Linear,
@@ -771,9 +792,24 @@ impl Renderer {
         };
         let g_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT), storage_entry(1), storage_entry(2), storage_entry(3), storage_entry(4)],
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                storage_entry(1),
+                storage_entry(2),
+                storage_entry(3),
+                storage_entry(4),
+                // Both material samplers live here (not per-material): `Renderer::set_anisotropy` rebuilds only this one
+                // bind group, so every existing world/actor/sky/ground material picks up the change without a bind-group
+                // rebuild (`shader.wgsl`'s `sample_clamped` picks repeat vs clamp per material from `Mat::flags.x`).
+                wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry { binding: 6, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
         });
-        let (globals_bg, light_buf, dyn_light_buf) = globals_bind(&device, &g_layout, &globals, &LightGrid::new(&[]));
+        let sampler = make_world_sampler(&device, 1);
+        let clamp_sampler = make_clamp_sampler(&device, 1);
+        let (light_buf, light_cells_buf, light_idx_buf) = light_storage_buffers(&device, &LightGrid::new(&[]));
+        let dyn_light_buf = make_dyn_light_buffer(&device);
+        let globals_bg = globals_bind(&device, &g_layout, &globals, &light_buf, &light_cells_buf, &light_idx_buf, &dyn_light_buf, &sampler, &clamp_sampler);
         let tex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
@@ -787,16 +823,9 @@ impl Renderer {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                uniform_entry(2, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                uniform_entry(1, wgpu::ShaderStages::VERTEX_FRAGMENT),
             ],
         });
-        let sampler = make_world_sampler(&device, 1);
         let holo_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("native Holo textures"),
             entries: &[0, 1].map(|binding| wgpu::BindGroupLayoutEntry {
@@ -839,7 +868,7 @@ impl Renderer {
             pipeline_layout: layout,
             holo_pipeline_layout,
             sampler,
-            clamp_sampler: std::sync::OnceLock::new(),
+            clamp_sampler,
             anisotropy: 1,
             msaa_samples: 1,
             msaa_supported,
@@ -861,6 +890,8 @@ impl Renderer {
             ground_state: Default::default(),
             ground_pipes,
             light_buf,
+            light_cells_buf,
+            light_idx_buf,
             light_base: vec![],
             light_zones: vec![],
             dyn_light_buf,
@@ -914,31 +945,18 @@ impl Renderer {
         }
         tex.create_view_tracked(&Default::default())
     }
-    fn material_sampler(&self, clamp: bool) -> &wgpu::Sampler {
-        if !clamp { return &self.sampler; }
-        let anisotropy = self.anisotropy;
-        self.clamp_sampler.get_or_init(|| self.device.create_sampler_tracked(&wgpu::SamplerDescriptor {
-            label: Some("native D3D texture clamp"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            anisotropy_clamp: anisotropy,
-            ..Default::default()
-        }))
-    }
-
-    /// Texture anisotropic filtering clamp (audit item 2: retail runs max anisotropy 1, randy31 `FUN_10041ede`, `docs/screens.md`
-    /// "max anisotropy 1"; `Renderer::new` already defaults to it). The aomac Enhanced options page may raise it up to 16x; both the
-    /// plain and clamp-address world samplers are rebuilt (the clamp one lazily, on its next [`Renderer::material_sampler`] call).
+    /// Anisotropic filtering clamp (audit item 2: retail runs max anisotropy 1, randy31 `FUN_10041ede`, `docs/screens.md`
+    /// "max anisotropy 1"; `Renderer::new` already defaults to it). The aomac Enhanced options page may raise it up to 16x.
+    /// Rebuilds `globals_bg` (the shared bind group holding both samplers), which every already-uploaded world, actor, sky
+    /// and ground material picks up immediately (`shader.wgsl`'s `sample_clamped`) without rebuilding their own bind
+    /// groups or waiting for the next zone load.
     pub fn set_anisotropy(&mut self, level: u16) {
         let level = level.clamp(1, 16);
         if level == self.anisotropy { return; }
         self.anisotropy = level;
         self.sampler = make_world_sampler(&self.device, level);
-        self.clamp_sampler = std::sync::OnceLock::new();
+        self.clamp_sampler = make_clamp_sampler(&self.device, level);
+        self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler);
     }
 
     /// Colour/depth sample count (MSAA-option decision: not retail, `Renderer::new` already defaults to 1 = off). `requested` is
@@ -1021,7 +1039,7 @@ impl Renderer {
             Job::Mip { .. } => self.upload_built_texture(b.as_ref().expect("built in parallel above")),
         }).collect();
         // One bind group per distinct (texture, base colour, emissive, glow mask).
-        let mut mat_of: HashMap<(usize, bool, [u32; 20]), usize> = HashMap::new();
+        let mut mat_of: HashMap<(usize, bool, [u32; 24]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
         let mut material = |dev: &Renderer, view: usize, s: &ao_scene::Submesh, ground_scale: Option<[f32; 2]>| {
             let mut u = mat_uniform(s);
@@ -1037,8 +1055,7 @@ impl Renderer {
                     layout: &dev.tex_layout,
                     entries: &[
                         wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[view]) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(dev.material_sampler(s.texture_clamp)) },
-                        wgpu::BindGroupEntry { binding: 2, resource: ub.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: ub.as_entire_binding() },
                     ],
                 }));
                 mats.len() - 1
@@ -1173,8 +1190,10 @@ impl Renderer {
             .collect();
         self.set_sky(scene);
         let grid = LightGrid::new(&scene.lights);
-        (self.globals_bg, self.light_buf, self.dyn_light_buf) = globals_bind(&self.device, &self.g_layout, &self.globals, &grid);
+        (self.light_buf, self.light_cells_buf, self.light_idx_buf) = light_storage_buffers(&self.device, &grid);
+        self.dyn_light_buf = make_dyn_light_buffer(&self.device);
         self.dyn_light_count = 0;
+        self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler);
         self.light_zones = grid.zones.clone();
         self.light_base = grid.lights.clone();
         let grid = ([grid.origin.x, grid.origin.y, grid.origin.z, grid.cell], [grid.dims[0], grid.dims[1], grid.dims[2], 0]);
@@ -1219,7 +1238,6 @@ impl Renderer {
             }
         }
         self.sky_white_view.get_or_init(|| self.texture_view(&[255; 4], 1, 1, ao_scene::TextureSource::Generated));
-        self.material_sampler(true); // force-initializes `clamp_sampler` before the disjoint-borrow loop below
         let is_live = |mi: usize, mesh: &ao_scene::Mesh| {
             !mesh.vertices.is_empty() && mesh.submeshes.iter().map(|s| s.indices.len()).sum::<usize>() > 0 && scene.sky.iter().any(|s| s.mesh == mi)
         };
@@ -1265,7 +1283,6 @@ impl Renderer {
                 }
                 let key = s.texture.filter(|k| self.sky_views.contains_key(k));
                 let u = mat_uniform(s);
-                let samp = if s.texture_clamp { self.clamp_sampler.get().unwrap() } else { &self.sampler };
                 let mat = *self.sky.mat_of.entry((key, s.texture_clamp, u.map(f32::to_bits))).or_insert_with(|| {
                     let ub = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::bytes_of(&u), usage: wgpu::BufferUsages::UNIFORM });
                     self.sky.mats.push(self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
@@ -1273,8 +1290,7 @@ impl Renderer {
                         layout: &self.tex_layout,
                         entries: &[
                             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(key.map_or(self.sky_white_view.get().unwrap(), |k| &self.sky_views[&k])) },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(samp) },
-                            wgpu::BindGroupEntry { binding: 2, resource: ub.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: ub.as_entire_binding() },
                         ],
                     }));
                     self.sky.mats.len() - 1
@@ -1427,8 +1443,7 @@ impl Renderer {
                 label: Some("native ground texture family refresh"), layout: &self.tex_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(self.material_sampler(true)) },
-                    wgpu::BindGroupEntry { binding: 2, resource: uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: uniform.as_entire_binding() },
                 ],
             });
         }
@@ -1982,6 +1997,28 @@ pub(crate) fn texture_to_rgba(r: &Renderer, out: &wgpu::Texture, width: u32, hei
     Ok(pixels)
 }
 
+/// Reads back `texture` (any `Renderer::format`, RGBA or BGRA) and writes it as a PNG to `path` on a background
+/// thread: the GPU copy+map here is the fast, already-synchronous part; PNG's zlib encode is the slow CPU part
+/// (aomac's F12 screenshot), so it must not stall the render thread. Swaps R/B if the surface format is BGRA
+/// (the swapchain is typically BGRA on macOS Metal; the headless `--screenshot` CLI path is always RGBA).
+pub fn capture_frame_to_png(r: &Renderer, texture: &wgpu::Texture, width: u32, height: u32, path: std::path::PathBuf) -> Result<()> {
+    let mut pixels = texture_to_rgba(r, texture, width, height)?;
+    if matches!(r.format, wgpu::TextureFormat::Bgra8Unorm) {
+        for px in pixels.as_chunks_mut::<4>().0 { px.swap(0, 2); }
+    }
+    std::thread::Builder::new().name("screenshot-png".into()).spawn(move || {
+        let write = (|| -> Result<()> {
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(&path)?), width, height);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header()?.write_image_data(&pixels)?;
+            Ok(())
+        })();
+        if let Err(e) = write { eprintln!("screenshot: {}: {e}", path.display()); }
+    })?;
+    Ok(())
+}
+
 fn storage<T: bytemuck::Pod>(device: &wgpu::Device, data: &[T]) -> wgpu::Buffer {
     device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(data), usage: wgpu::BufferUsages::STORAGE })
 }
@@ -1998,28 +2035,44 @@ fn gate_lights(base: &[[f32; 4]], zones: &[Option<u32>], levels: &[u8]) -> Vec<[
     data
 }
 
-fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: &wgpu::Buffer, g: &LightGrid) -> (wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer) {
+/// Light-grid storage buffers ([`globals_bind`]'s binding 1-3). Kept as `Renderer` fields so a sampler-only change
+/// (`Renderer::set_anisotropy`) can rebuild `globals_bg` without recomputing the light grid.
+fn light_storage_buffers(device: &wgpu::Device, g: &LightGrid) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
     let l = device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&g.lights), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST });
     let (c, i) = (storage(device, &g.cells), storage(device, &g.idx));
-    // Zero-initialized (wgpu buffers are zero-filled on creation); `Renderer::set_dynamic_lights` rewrites the live prefix every frame.
-    let d = device.create_buffer_tracked(&wgpu::BufferDescriptor {
+    (l, c, i)
+}
+
+/// Zero-initialized (wgpu buffers are zero-filled on creation) per-frame moving-light buffer; `Renderer::set_dynamic_lights`
+/// rewrites the live prefix every frame. Recreated (losing any live dynamic lights) on `Renderer::new`/`upload`, kept as-is
+/// by a sampler-only `set_anisotropy` change.
+fn make_dyn_light_buffer(device: &wgpu::Device) -> wgpu::Buffer {
+    device.create_buffer_tracked(&wgpu::BufferDescriptor {
         label: None,
         size: (MAX_DYN_LIGHTS * 4 * 16) as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
-    });
-    let bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
+    })
+}
+
+/// Builds `globals_bg` (group 0: globals uniform, light-grid storage buffers, the per-frame dynamic-light buffer, both
+/// material samplers). Samplers live here rather than per-material so [`Renderer::set_anisotropy`] only rebuilds this one
+/// bind group.
+#[allow(clippy::too_many_arguments)]
+fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: &wgpu::Buffer, light_buf: &wgpu::Buffer, cells_buf: &wgpu::Buffer, idx_buf: &wgpu::Buffer, dyn_light_buf: &wgpu::Buffer, sampler: &wgpu::Sampler, clamp_sampler: &wgpu::Sampler) -> wgpu::BindGroup {
+    device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
         label: None,
         layout,
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: l.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: c.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: i.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: d.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: light_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: cells_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: idx_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: dyn_light_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(clamp_sampler) },
         ],
-    });
-    (bg, l, d)
+    })
 }
 
 #[cfg(test)]
@@ -2144,20 +2197,42 @@ mod sky_tests {
     }
 
     /// Audit item 2: `Renderer::new` defaults to anisotropy 1x (retail; randy31 `FUN_10041ede` sets max anisotropy 1,
-    /// `docs/screens.md` "max anisotropy 1"). The aomac Enhanced options page can raise it; changing it must rebuild both the
-    /// plain and clamp-address world samplers without panicking, and dropping back to 1x must also work.
+    /// `docs/screens.md` "max anisotropy 1"). The aomac Enhanced options page can raise it. Regression for the bug where
+    /// Enhanced-page Texture Sharpening only took effect after the next zone load: both samplers live in the shared
+    /// `globals_bg` bind group (group 0), not per-material, so `set_anisotropy` must change rendering immediately for
+    /// materials already uploaded, without touching their bind groups (`renderer.sky.mats` must not grow) or panicking
+    /// from a stale bind group referencing a dropped sampler.
     #[test]
-    fn anisotropy_defaults_to_retail_1x_and_set_anisotropy_rebuilds_samplers() {
+    fn anisotropy_defaults_to_retail_1x_and_applies_live_without_rebuilding_materials() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let mut renderer = Renderer::new(&instance, None).expect("anisotropy regression requires GPU");
         assert_eq!(renderer.anisotropy, 1, "retail default must be 1x, not the former hardcoded 16x");
-        renderer.upload(&scene([0.5, 0.0], None)); // exercises material_sampler(true), lazily creating the clamp sampler
-        renderer.set_anisotropy(16);
+        renderer.upload(&scene([0.5, 0.0], None));
+        let mats_before = renderer.sky.mats.len();
+        assert!(mats_before > 0, "the test scene must upload at least one sky material for this regression to be meaningful");
+        let render_frame = |r: &mut Renderer| {
+            let targets = Targets::new(r, 64, 64);
+            let out = r.device.create_texture_tracked(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: r.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            r.render(&out.create_view_tracked(&Default::default()), &targets, &Camera::look_at(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO));
+        };
+        render_frame(&mut renderer);
+        renderer.set_anisotropy(16); // no upload() in between: the materials above must pick this up live
         assert_eq!(renderer.anisotropy, 16);
-        renderer.upload(&scene([0.5, 0.0], None)); // re-exercises material_sampler(true) against the rebuilt clamp sampler
+        assert_eq!(renderer.sky.mats.len(), mats_before, "live anisotropy must not rebuild any material bind group");
+        render_frame(&mut renderer); // would panic if a material still referenced the dropped 1x sampler
         renderer.set_anisotropy(1);
         assert_eq!(renderer.anisotropy, 1);
-        renderer.upload(&scene([0.5, 0.0], None));
+        assert_eq!(renderer.sky.mats.len(), mats_before);
+        render_frame(&mut renderer);
     }
 
     /// MSAA-option decision: `Renderer::new` defaults to 1 sample (off, matching retail -- no AA option exists anywhere in the
