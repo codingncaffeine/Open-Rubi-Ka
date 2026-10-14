@@ -228,11 +228,13 @@ impl HudActionWin {
         self.win.as_ref().map(|w| w.view.rows().iter().map(|r| r.key).collect()).unwrap_or_default()
     }
 
-    /// Screen position of grid cell `i`'s centre (tests).
+    /// Screen position of grid cell `i`'s centre (tests): the same `cell_pos` the real click hit-test (`ListView::row_at`)
+    /// uses, so this can never drift from the actual rendered layout the way a separately hard-coded pitch did.
     #[cfg(test)]
     pub(super) fn cell_centre(&self, gui: &Gui, i: usize) -> Option<(f32, f32)> {
-        let r = gui.view_rect(self.win.as_ref()?.win, "grid")?;
-        let p = lv::ICON_32 + lv::SPACING;
-        Some((r.l + lv::BORDER + (i % COLS) as f32 * p + 16.0, r.t + lv::BORDER + (i / COLS) as f32 * p + 16.0))
+        let win = self.win.as_ref()?;
+        let r = gui.view_rect(win.win, "grid")?;
+        let (cx, cy) = win.view.cell_pos(i, lv::ICON_32);
+        Some((r.l + cx + lv::ICON_32 / 2.0, r.t + cy + lv::ICON_32 / 2.0))
     }
 }

@@ -196,7 +196,7 @@ impl ListView {
         }
     }
 
-    fn cell_pos(&self, i: usize, icon: f32) -> (f32, f32) {
+    pub(super) fn cell_pos(&self, i: usize, icon: f32) -> (f32, f32) {
         let p = icon + self.spacing;
         (BORDER + (i % self.cols) as f32 * p, BORDER + (i / self.cols) as f32 * (self.icon_height.unwrap_or(icon) + self.spacing))
     }
