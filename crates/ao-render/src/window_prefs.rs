@@ -4,7 +4,8 @@
 //! `aomac/src/play/dvalue/indep.rs`), loaded by `Preferences_t::LoadLoginPrefs` before the character list but after the account
 //! name is known. The native OS window this crate opens exists before any account is chosen (there is no login screen yet for
 //! `IndependentPrefs_t` to key a file on), so this mirrors the same idea -- an aomac-own prefs file, outside the client install
-//! (skill rule: never write inside the client dir) -- at `~/Library/Application Support/aomac/Window.cfg`: one line
+//! (skill rule: never write inside the client dir) -- next to `play/prefs.rs`'s own store (same `AOMAC_PREFS_DIR` override, so an
+//! agent's isolated prefs dir never touches the user's real `~/Library/Application Support/aomac/Window.cfg`): one line
 //! `width height [x y]` (position is written once known; a first run omits it and the OS places the window).
 
 use std::io::Write;
@@ -13,9 +14,17 @@ use std::path::PathBuf;
 /// `(width, height, position)`.
 type Saved = (u32, u32, Option<(i32, i32)>);
 
+/// `play/prefs.rs::dir()`'s own directory pick, duplicated here since `ao-render` cannot depend on the `aomac` binary crate:
+/// `AOMAC_PREFS_DIR` first (agents' isolated prefs dirs), else `~/Library/Application Support/aomac`.
+fn dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("AOMAC_PREFS_DIR") {
+        return Some(d.into());
+    }
+    Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/aomac"))
+}
+
 fn path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/aomac/Window.cfg"))
+    Some(dir()?.join("Window.cfg"))
 }
 
 /// Parses the saved `width height [x y]` line; `None` for anything malformed or non-positive.
