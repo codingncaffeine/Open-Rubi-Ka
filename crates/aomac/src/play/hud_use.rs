@@ -1,20 +1,12 @@
 //! Consumers of the HUD's use queue (`Hud::take_uses`): hotbar slots (`FUN_100d79c9`), the Attack button of the hostile target dock.
 
 use super::hud_bar::SlotUse;
+use super::hud_timerbar;
 use crate::play::Play;
 use ao_net::n3::action::{self, CampInput, Outgoing};
 
 /// Logout countdown of the camp timer bar (`LDBformat::Feed(0x1e)` in `CampStartedMessage`).
 const CAMP_SECONDS: f32 = 30.0;
-
-fn camp_timer_xml(bw: u32, bh: u32) -> String {
-    format!(
-        "<root><View view_layout=\"stacked\" name=\"camp_timer\" min_size=\"Point({bw},{bh})\" max_size=\"Point({bw},{bh})\">\
-         <PowerBar name=\"camp_bar\" bg_gfx=\"GFX_GUI_TIMERBAR_EMPTY\" full_gfx=\"GFX_GUI_TIMERBAR_FULL\" direction=\"right\"/>\
-         <View view_layout=\"vertical\" h_alignment=\"left\" v_alignment=\"top\"><TextView name=\"camp_label\" min_size=\"Point({bw},{lh})\" max_size=\"Point({bw},{lh})\" font=\"TOOLTIP\" h_alignment=\"left\" v_alignment=\"top\" layout_borders=\"Rect(0,1,0,0)\"/></View></View></root>",
-        lh = bh.saturating_sub(1)
-    )
-}
 
 impl Play {
     /// Runs the uses the HUD queued this frame.
@@ -189,14 +181,12 @@ impl Play {
     /// holding a `PowerBar_t(gfx 0x1a8 `GFX_GUI_TIMERBAR_EMPTY` / 0x1a9 `GFX_GUI_TIMERBAR_FULL`)` sized to the art and a `TextLine_t` with the
     /// name; `CampStartedMessage` fixes the time at 30.0 s, direction 1 (`FUN_1002ba93`: the bar drains) and centres it,
     /// `((display - size) / 2)` per axis. 40000 is the `RenderWindow_t` / `PowerBar_t` id argument, not a duration.
-    /// `TimerBar_c` uses font 1 (TOOLTIP) at local (0,1), not a centred NORMAL label; palette colour 0.
+    /// `TimerBar_c` uses font 1 (TOOLTIP) at local (0,1), left-aligned, solid black (`TextLine_t::SetDefaultColor(this, 0)` 0x100223ef:
+    /// a plain RGB int field, not a palette index) -- not the white, uncoloured label this port drew before (`hud_timerbar.rs`).
     fn camp_bar_open(&mut self) {
         self.camp_bar_close();
-        let (bw, bh) = self.gui.gfx_id("GFX_GUI_TIMERBAR_EMPTY").map(ao_gui::GfxId).map_or((128, 16), |g| self.gui.gfx().size(g));
-        let xml = camp_timer_xml(bw, bh);
-        match self.gui.open_window_xml("TimerBar", &xml, (0, 0), ao_gui::WindowSize::Fixed(bw, bh)) {
+        match hud_timerbar::open(&mut self.gui, "TimerBar", "Logout", 0xffffff, (0, 0)) {
             Ok(w) => {
-                self.gui.set_text(w, "camp_label", "Logout");
                 let (ow, oh) = self.gui.outer_size(w);
                 self.gui.set_window_pos(w, ((self.size.0 as i32 - ow as i32) / 2, (self.size.1 as i32 - oh as i32) / 2));
                 self.camp_bar = Some(w);
@@ -221,7 +211,7 @@ impl Play {
         *t += dt;
         let t = *t;
         if let Some(w) = self.camp_bar {
-            self.gui.set_progress(w, "camp_bar", (1.0 - t / CAMP_SECONDS).max(0.0));
+            hud_timerbar::set_progress(&mut self.gui, w, (1.0 - t / CAMP_SECONDS).max(0.0));
         }
         if t >= CAMP_SECONDS {
             self.camp = None;
@@ -294,16 +284,21 @@ impl Play {
 
 #[cfg(test)]
 mod tests {
+    use super::hud_timerbar;
+
+    /// The Logout bar's "Logout" label: `TOOLTIP` font at the bar's local (0, 1) (not centred), drawn solid black
+    /// (`TextLine_t::SetDefaultColor(this, 0)` 0x100223ef -- the colour field is a plain RGB int, 0 = black, not a palette id).
     #[test]
-    fn logout_label_uses_retail_font_and_local_origin() {
+    fn logout_label_uses_retail_font_colour_and_local_origin() {
         let dir = ao_gui::client_dir();
         if !dir.join("cd_image/gui").exists() { return; }
         let mut gui = ao_gui::Gui::new(&dir, None).unwrap();
-        let w = gui.open_window_xml("TimerBar", &super::camp_timer_xml(128, 16), (0, 0), ao_gui::WindowSize::Fixed(128, 16)).unwrap();
-        gui.set_text(w, "camp_label", "Logout");
-        let r = gui.view_rect(w, "camp_label").unwrap();
-        let bar = gui.view_rect(w, "camp_bar").unwrap();
+        let w = hud_timerbar::open(&mut gui, "TimerBar", "Logout", 0xffffff, (0, 0)).unwrap();
+        let r = gui.view_rect(w, "label").unwrap();
+        let bar = gui.view_rect(w, "bar").unwrap();
         assert_eq!((r.l - bar.l, r.t - bar.t), (0.0, 1.0));
-        assert!(super::camp_timer_xml(128, 16).contains("font=\"TOOLTIP\""));
+        gui.set_screen_size(800, 600);
+        let cmds = gui.frame(0.0).cmds;
+        assert!(cmds.iter().any(|c| matches!(c, ao_gui::DrawCmd::Glyph { tint: [0, 0, 0], .. })), "the label must draw in solid black: {cmds:?}");
     }
 }

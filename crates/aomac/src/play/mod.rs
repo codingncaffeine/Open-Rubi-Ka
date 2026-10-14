@@ -50,6 +50,7 @@ mod hud_rollup;
 mod hud_special;
 mod hud_stats;
 mod hud_target;
+mod hud_timerbar;
 mod hud_use;
 mod interact;
 mod interact_chat;

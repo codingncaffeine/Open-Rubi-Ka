@@ -144,9 +144,11 @@ impl WearTimers {
         self.pending.retain(|(_, remaining, _)| *remaining > 0.0);
     }
 
-    /// Remaining fraction (1.0 = just started, 0.0 = about to clear) of the item's timer, if any.
-    pub fn progress(&self, item: Identity) -> Option<f32> {
-        self.pending.iter().find(|(i, ..)| *i == item).map(|(_, remaining, total)| (remaining / total).clamp(0.0, 1.0))
+    /// The timer bar to show (the first still-pending entry; this port never has more than one wear/unwear in flight at once --
+    /// ponytail: a real concurrent stack would need `TimerSystemModule_t`'s free-slot list, `hud_timerbar.rs`). `(remaining / total,
+    /// total)` so the caller can gate the bar on [`super::super::hud_timerbar::MIN_SECONDS`].
+    pub fn active(&self) -> Option<(f32, f32)> {
+        self.pending.first().map(|(_, remaining, total)| ((remaining / total).clamp(0.0, 1.0), *total))
     }
 }
 
@@ -240,15 +242,15 @@ mod tests {
     fn wear_timers_count_down_and_clear() {
         let mut t = WearTimers::default();
         let item = Identity { kind: 0x66, instance: 0x12 };
-        assert_eq!(t.progress(item), None);
+        assert_eq!(t.active(), None);
         t.start(item, 2.0);
-        assert_eq!(t.progress(item), Some(1.0));
+        assert_eq!(t.active(), Some((1.0, 2.0)));
         t.tick(1.5);
-        assert_eq!(t.progress(item), Some(0.25));
+        assert_eq!(t.active(), Some((0.25, 2.0)));
         // restarting (a weapon swapped back in) resets to full
         t.start(item, 2.0);
-        assert_eq!(t.progress(item), Some(1.0));
+        assert_eq!(t.active(), Some((1.0, 2.0)));
         t.tick(2.0);
-        assert_eq!(t.progress(item), None, "elapsed timers clear themselves");
+        assert_eq!(t.active(), None, "elapsed timers clear themselves");
     }
 }
