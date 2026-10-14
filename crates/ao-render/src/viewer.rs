@@ -14,6 +14,8 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 #[path = "raw_mouse.rs"]
 mod raw_mouse;
+#[path = "window_prefs.rs"]
+mod window_prefs;
 
 /// What a [`Frontend`] can ask of the window/renderer between frames.
 pub struct Host {
@@ -423,9 +425,13 @@ fn run(scene: Scene, frontend: Option<Box<dyn Frontend>>, live: Option<LiveSky>,
 
 impl State {
     fn new(el: &ActiveEventLoop, scene: &Scene, frontend: Option<Box<dyn Frontend>>, live: Option<LiveSky>, hook: Option<FrameHook>) -> Result<Self> {
-        let window = Arc::new(el.create_window(
-            Window::default_attributes().with_title("aomac").with_inner_size(winit::dpi::LogicalSize::new(1280, 800)),
-        )?);
+        let saved = window_prefs::load();
+        let (sw, sh) = saved.map_or((1280, 800), |(w, h, _)| (w, h));
+        let mut attrs = Window::default_attributes().with_title("aomac").with_inner_size(winit::dpi::PhysicalSize::new(sw, sh));
+        if let Some((_, _, Some((x, y)))) = saved {
+            attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
+        }
+        let window = Arc::new(el.create_window(attrs)?);
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(window.clone())?;
         let mut renderer = Renderer::new(&instance, Some(&surface))?;
@@ -605,6 +611,8 @@ impl State {
             self.surface.configure(&self.renderer.device, &self.config);
             self.targets = Targets::new(&self.renderer, width, height);
             if let Some(t) = t { self.perf_times[3] += t.elapsed().as_secs_f64(); }
+            let pos = self.window.outer_position().ok().map(|p| (p.x, p.y));
+            window_prefs::save(width, height, pos);
         }
 
         let work_start = self.perf.then(Instant::now);
@@ -755,10 +763,15 @@ impl ApplicationHandler for App {
         s.sync_cursor();
         match ev {
             // Refresh pacing follows the current screen, not a "moving window" throttle.
-            WindowEvent::Moved(_) => {
+            WindowEvent::Moved(p) => {
                 s.display_period = display_period(s.window.current_monitor().and_then(|monitor| monitor.refresh_rate_millihertz()));
+                window_prefs::save(s.config.width, s.config.height, Some((p.x, p.y)));
             }
-            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CloseRequested => {
+                let pos = s.window.outer_position().ok().map(|p| (p.x, p.y));
+                window_prefs::save(s.config.width, s.config.height, pos);
+                el.exit();
+            }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 s.display_period = display_period(s.window.current_monitor().and_then(|monitor| monitor.refresh_rate_millihertz()));
                 if let Some(g) = &mut s.gui {
