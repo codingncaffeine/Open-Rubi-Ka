@@ -59,6 +59,11 @@ pub struct GuiRenderer {
     /// Bind groups actually created (new cache entries), since the layer started: a regression counter. Converges
     /// once every distinct texture (glyph atlas + each extra image) a screen uses has been seen once.
     pub(crate) bg_created: u64,
+    /// Persistent per-frame scratch (cleared, not reallocated, at the start of every `draw` call): the vertex
+    /// quads and clip/extra-image batches built from `list.cmds` never need a fresh `Vec` once the screen's
+    /// largest frame has grown these to their steady-state capacity.
+    verts: Vec<Vertex>,
+    batches: Vec<Batch>,
 }
 
 /// (scissor, extra-image slot, vertex range)
@@ -180,6 +185,8 @@ impl GuiRenderer {
             bind_groups: HashMap::new(),
             vb_created: 0,
             bg_created: 0,
+            verts: Vec::new(),
+            batches: Vec::new(),
         }
     }
 
@@ -217,8 +224,8 @@ impl GuiRenderer {
             self.extras.push((t, v));
         }
         // vertices + per-clip batches
-        let mut verts: Vec<Vertex> = Vec::new();
-        let mut batches: Vec<Batch> = Vec::new();
+        self.verts.clear();
+        self.batches.clear();
         let mut cur_extra: Option<usize> = None;
         let mut clip: Option<[i32; 4]> = None;
         let mut start = 0u32;
@@ -230,9 +237,9 @@ impl GuiRenderer {
         for c in &list.cmds {
             match *c {
                 DrawCmd::Clip(nc) => {
-                    if verts.len() as u32 > start {
-                        batches.push((clip, cur_extra, start..verts.len() as u32));
-                        start = verts.len() as u32;
+                    if self.verts.len() as u32 > start {
+                        self.batches.push((clip, cur_extra, start..self.verts.len() as u32));
+                        start = self.verts.len() as u32;
                     }
                     clip = nc;
                 }
@@ -243,64 +250,65 @@ impl GuiRenderer {
                             continue;
                         }
                         if cur_extra != Some(k) {
-                            if verts.len() as u32 > start {
-                                batches.push((clip, cur_extra, start..verts.len() as u32));
-                                start = verts.len() as u32;
+                            if self.verts.len() as u32 > start {
+                                self.batches.push((clip, cur_extra, start..self.verts.len() as u32));
+                                start = self.verts.len() as u32;
                             }
                             cur_extra = Some(k);
                         }
                         let img = &gui.extra_images()[k];
                         let uv = [src[0] / img.w as f32, src[1] / img.h as f32, (src[0] + src[2]) / img.w as f32, (src[1] + src[3]) / img.h as f32];
-                        quad(&mut verts, dst, uv, [tint[0] as f32 / 255.0, tint[1] as f32 / 255.0, tint[2] as f32 / 255.0, alpha], 3 << 16);
+                        quad(&mut self.verts, dst, uv, [tint[0] as f32 / 255.0, tint[1] as f32 / 255.0, tint[2] as f32 / 255.0, alpha], 3 << 16);
                         continue;
                     }
                     if cur_extra.is_some() {
-                        if verts.len() as u32 > start {
-                            batches.push((clip, cur_extra, start..verts.len() as u32));
-                            start = verts.len() as u32;
+                        if self.verts.len() as u32 > start {
+                            self.batches.push((clip, cur_extra, start..self.verts.len() as u32));
+                            start = self.verts.len() as u32;
                         }
                         cur_extra = None;
                     }
                     let Some(e) = gui.atlas().entry(id) else { continue };
                     let (pw, ph) = self.page_px[e.page as usize];
                     let uv = [(e.x as f32 + src[0]) / pw, (e.y as f32 + src[1]) / ph, (e.x as f32 + src[0] + src[2]) / pw, (e.y as f32 + src[1] + src[3]) / ph];
-                    quad(&mut verts, dst, uv, [tint[0] as f32 / 255.0, tint[1] as f32 / 255.0, tint[2] as f32 / 255.0, alpha], e.page);
+                    quad(&mut self.verts, dst, uv, [tint[0] as f32 / 255.0, tint[1] as f32 / 255.0, tint[2] as f32 / 255.0, alpha], e.page);
                 }
                 DrawCmd::Glyph { src, dst, tint, alpha } => {
                     if cur_extra.is_some() {
-                        if verts.len() as u32 > start {
-                            batches.push((clip, cur_extra, start..verts.len() as u32));
-                            start = verts.len() as u32;
+                        if self.verts.len() as u32 > start {
+                            self.batches.push((clip, cur_extra, start..self.verts.len() as u32));
+                            start = self.verts.len() as u32;
                         }
                         cur_extra = None;
                     }
                     let d = [dst[0] as f32, dst[1] as f32, (dst[0] + src[2] as i32) as f32, (dst[1] + src[3] as i32) as f32];
                     let uv = [src[0] as f32 / gw, src[1] as f32 / gh, (src[0] + src[2]) as f32 / gw, (src[1] + src[3]) as f32 / gh];
-                    quad(&mut verts, d, uv, [tint[0] as f32 / 255.0, tint[1] as f32 / 255.0, tint[2] as f32 / 255.0, alpha], 1 << 16);
+                    quad(&mut self.verts, d, uv, [tint[0] as f32 / 255.0, tint[1] as f32 / 255.0, tint[2] as f32 / 255.0, alpha], 1 << 16);
                 }
                 DrawCmd::Solid { dst, color, alpha } => {
                     if cur_extra.is_some() {
-                        if verts.len() as u32 > start {
-                            batches.push((clip, cur_extra, start..verts.len() as u32));
-                            start = verts.len() as u32;
+                        if self.verts.len() as u32 > start {
+                            self.batches.push((clip, cur_extra, start..self.verts.len() as u32));
+                            start = self.verts.len() as u32;
                         }
                         cur_extra = None;
                     }
-                    quad(&mut verts, dst, [0.0; 4], [color[0] as f32 / 255.0, color[1] as f32 / 255.0, color[2] as f32 / 255.0, alpha], 2 << 16);
+                    quad(&mut self.verts, dst, [0.0; 4], [color[0] as f32 / 255.0, color[1] as f32 / 255.0, color[2] as f32 / 255.0, alpha], 2 << 16);
                 }
             }
         }
-        if verts.len() as u32 > start {
-            batches.push((clip, cur_extra, start..verts.len() as u32));
+        if self.verts.len() as u32 > start {
+            self.batches.push((clip, cur_extra, start..self.verts.len() as u32));
         }
-        if verts.is_empty() {
+        if self.verts.is_empty() {
             return;
         }
         let device = &r.device;
         // Bind groups are cached by extra-image slot: the glyph/extra textures, samplers, layout and the globals
         // buffer below are all stable for the renderer's lifetime, so each distinct key only needs one bind group
         // ever, not one per `draw` call (leak follow-up: this used to rebuild every batch's bind group every frame).
-        for &(_, extra, _) in &batches {
+        for i in 0..self.batches.len() {
+            let extra = self.batches[i].1;
             if !self.bind_groups.contains_key(&extra) {
                 let (view, samp) = match extra {
                     Some(k) => (&self.extras[k].1, if gui.extra_images()[k].smooth { &self.linear } else { &self.sampler }),
@@ -324,12 +332,12 @@ impl GuiRenderer {
         // Persistent capacity-based vertex buffer (like `actors`/`set_sky`): grown in place only when the batch
         // outgrows the current capacity, written in place every call otherwise (leak follow-up: this used to
         // recreate a brand-new vertex buffer and globals uniform buffer every `draw` call).
-        let needed = (verts.len() * std::mem::size_of::<Vertex>()) as u64;
+        let needed = (self.verts.len() * std::mem::size_of::<Vertex>()) as u64;
         let (vb, created) = crate::ensure_buf(device, self.vb.take(), &mut self.vb_cap, needed, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, "gui verts");
         self.vb_created += created as u64;
-        r.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&verts));
+        r.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&self.verts));
         r.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&Globals { screen: [size.0 as f32, size.1 as f32], _pad: [0.0; 2] }));
-        let bgs: Vec<&wgpu::BindGroup> = batches.iter().map(|b| self.bind_groups.get(&b.1).expect("bind group cached above")).collect();
+        let bgs: Vec<&wgpu::BindGroup> = self.batches.iter().map(|b| self.bind_groups.get(&b.1).expect("bind group cached above")).collect();
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gui") });
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -342,7 +350,7 @@ impl GuiRenderer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_vertex_buffer(0, vb.slice(..));
-            for ((c, _, range), bg) in batches.into_iter().zip(bgs) {
+            for ((c, _, range), bg) in self.batches.drain(..).zip(bgs) {
                 pass.set_bind_group(0, bg, &[]);
                 match c {
                     Some([x0, y0, x1, y1]) => {
@@ -406,6 +414,7 @@ mod tests {
             let _ = r.device.poll(wgpu::PollType::Poll);
         }
         let (vb_warm, bg_warm) = (gr.vb_created, gr.bg_created);
+        let (verts_cap_warm, batches_cap_warm) = (gr.verts.capacity(), gr.batches.capacity());
         eprintln!("warm-up (30 frames): vb_created={vb_warm} bg_created={bg_warm}");
         for _ in 0..30 {
             let list = gui.frame(1.0 / 60.0);
@@ -414,6 +423,8 @@ mod tests {
         }
         assert_eq!(gr.vb_created, vb_warm, "steady-state busy-screen draws created {} more vertex buffers instead of reusing the capacity buffer", gr.vb_created - vb_warm);
         assert_eq!(gr.bg_created, bg_warm, "steady-state busy-screen draws created {} more bind groups instead of reusing the cache", gr.bg_created - bg_warm);
+        assert_eq!(gr.verts.capacity(), verts_cap_warm, "steady-state busy-screen draws reallocated the CPU-side vertex scratch buffer");
+        assert_eq!(gr.batches.capacity(), batches_cap_warm, "steady-state busy-screen draws reallocated the CPU-side batch scratch buffer");
     }
 
     /// Leak follow-up: `GuiRenderer::draw` creates a brand-new vertex buffer, globals uniform buffer and one bind
