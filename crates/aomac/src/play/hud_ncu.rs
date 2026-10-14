@@ -212,6 +212,12 @@ impl HudNcu {
                 win.open_menu(gui, (*x, *y));
                 return true;
             }
+            Event::WindowFrame { window } if *window == w => {
+                if win.reflow_grid(gui, lv::ICON_32) {
+                    self.built = None;
+                }
+                return true;
+            }
             Event::MenuPicked { id } if win.owns_menu(*id) => {
                 win.picked(*id);
                 self.built = None;
@@ -303,6 +309,31 @@ mod tests {
         assert!(ncu.take_outbox().is_empty(), "hostile timed template cannot send cancellation");
         assert_eq!(ncu.take_lines(), ["Can't remove hostile timed nanoprogram."]);
         assert_eq!(ncu.shown(), [25982]);
+    }
+
+    /// Dragging the NCU window's bottom-right corner wider reflows the icon grid to more columns (`MultiListView_c::RecalcCellCount`
+    /// 0x101349f6, `hud_listview.rs::reflow_grid`), instead of leaving empty space to the right of a fixed 4-column grid.
+    #[test]
+    fn widening_the_window_adds_grid_columns() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() {
+            return;
+        }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        gui.set_screen_size(2000, 1200);
+        let mut ncu = HudNcu::new(&dir, (1100, 760)).unwrap();
+        ncu.open(&mut gui);
+        let w = ncu.window().unwrap();
+        // `Hud::open`'s `wincfg.attach` makes every `Store::Dock` window (NCU included) movable/resizable; exercised directly
+        // here since this focused rig does not go through the full `Hud`.
+        gui.set_window_frame(w, true, true);
+        gui.set_window_size_limits(w, (60, 40), (2000, 1200));
+        let before = ncu.win.as_ref().unwrap().view.cols;
+        let (ox, oy, ow, oh) = gui.window_outer_frame(w).unwrap();
+        gui.set_window_outer_frame(w, (ox, oy, ow + 200, oh));
+        ncu.event(&mut gui, &Event::WindowFrame { window: w }, &Zone::new(7));
+        let after = ncu.win.as_ref().unwrap().view.cols;
+        assert!(after > before, "widening the window must add grid columns: {before} -> {after}");
     }
 
     #[test]

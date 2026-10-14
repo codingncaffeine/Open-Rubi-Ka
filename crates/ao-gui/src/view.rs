@@ -729,6 +729,7 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
                 value: 1.0,
             }));
             apply_view_attrs(&mut v, e, 0);
+            v.color = color_attr(e, "color", 0xffffff); // `RenderWindow_t::SetColor` tints the whole timer bar (e.g. the item/attack/nano colours)
             v.node = Node::Base; // PowerbarView_c::Initialize sets an HLayoutNode (no children)
             tree.add(v)
         }

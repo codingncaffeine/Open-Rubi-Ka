@@ -100,10 +100,13 @@ pub(super) fn grid_width(cols: usize, icon: f32) -> f32 {
     2.0 * BORDER + cols as f32 * icon + (cols as f32 - 1.0) * SPACING
 }
 
-/// The `ScrollView` + content skeleton of a list window: the part the window XML embeds.
+/// The `ScrollView` + content skeleton of a list window: the part the window XML embeds. Flexible beyond its initial size
+/// (`max_size="Point(16000,16000)"`, as `HudStats::open_inventory` already does for the inventory grid) so growing the window
+/// (`Store::Dock` windows are movable/resizable, docs/gui.md §6.5) actually grows the content instead of leaving empty space
+/// to the right -- the Programs / Actions / NCU icon grid reflow bug.
 pub(super) fn scroll_xml(min_h: f32, w: f32) -> String {
     format!(
-        "<ScrollView name=\"lv_scroll\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" min_size=\"Point({w},{min_h})\" max_size=\"Point({w},{min_h})\">\
+        "<ScrollView name=\"lv_scroll\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" min_size=\"Point({w},{min_h})\" max_size=\"Point(16000,16000)\">\
          <ScrollViewChild view_layout=\"vertical\" name=\"lv_scroller\"><View view_layout=\"vertical\" name=\"lv_content\"/></ScrollViewChild></ScrollView>"
     )
 }
@@ -418,6 +421,21 @@ impl ListWindow {
     pub fn place(&mut self, gui: &mut Gui, (x, y): (i32, i32)) {
         let (ow, oh) = gui.outer_size(self.win);
         gui.set_window_pos(self.win, (x.clamp(0, self.screen.0.saturating_sub(ow) as i32), y.clamp(0, self.screen.1.saturating_sub(oh) as i32)));
+    }
+
+    /// `MultiListView_c::RecalcCellCount` 0x101349f6 on `Event::WindowFrame`: the grid's column count follows the window's current
+    /// content width (as `HudStats::reflow_inventory` already does for the inventory grid). List layout keeps its fixed column
+    /// widths (only the grid reflows). Returns whether the count changed (callers must repaint / invalidate their cache then).
+    pub fn reflow_grid(&mut self, gui: &Gui, icon: f32) -> bool {
+        if self.view.mode != Mode::Grid {
+            return false;
+        }
+        let cols = grid_cols_for(gui.window_size(self.win).0 as f32, icon);
+        if cols == self.view.cols {
+            return false;
+        }
+        self.view.cols = cols;
+        true
     }
 
     pub fn close(self, gui: &mut Gui) {

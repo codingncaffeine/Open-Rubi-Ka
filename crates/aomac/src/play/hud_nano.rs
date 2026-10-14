@@ -349,6 +349,12 @@ impl HudNano {
                 win.w.open_menu(gui, (*x, *y));
                 return true;
             }
+            Event::WindowFrame { window } if *window == w => {
+                if win.w.reflow_grid(gui, lv::ICON_32) {
+                    self.built = None;
+                }
+                return true;
+            }
             Event::MenuPicked { id } if win.w.owns_menu(*id) => {
                 match *id {
                     MENU_INFO => {

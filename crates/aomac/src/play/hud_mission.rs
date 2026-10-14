@@ -306,6 +306,12 @@ impl HudMission {
                 win.open_menu(gui, (*x, *y));
                 return true;
             }
+            Event::WindowFrame { window } if *window == w => {
+                if win.reflow_grid(gui, lv::ICON_32) {
+                    self.built = None;
+                }
+                return true;
+            }
             Event::MenuPicked { id } if win.owns_menu(*id) => {
                 win.picked(*id);
                 self.built = None;

@@ -1213,7 +1213,7 @@ impl Gui {
                 let t = mul(tint, self.map_color(col));
                 self.draw_string(out, b.font, &b.text.clone(), rect.l as i32, rect.t as i32, t, alpha, false);
             }
-            Kind::PowerBar(p) => self.draw_powerbar(out, p, rect, alpha),
+            Kind::PowerBar(p) => self.draw_powerbar(out, p, rect, tint, alpha),
             Kind::Text(t) => self.draw_text_view(out, id, t, rect, tint, alpha),
             Kind::Bitmap { gfx, index } => {
                 if let Some(g) = gfx.get(*index) {
@@ -1321,7 +1321,7 @@ impl Gui {
         }
     }
 
-    fn draw_powerbar(&mut self, out: &mut Vec<DrawCmd>, p: &PowerBarData, r: Rect, alpha: f32) {
+    fn draw_powerbar(&mut self, out: &mut Vec<DrawCmd>, p: &PowerBarData, r: Rect, tint: [u8; 3], alpha: f32) {
         // PowerbarView_c::Initialize 0x1013ec3f / Recalculate 0x1013e789: the first cap (`left_gfx`: top / left end) and the second cap
         // (`right_gfx`: bottom / right end) frame the main-axis extent; the background and the bar start after the first cap.
         let horiz = p.dir == 1 || p.dir == 2;
@@ -1330,11 +1330,11 @@ impl Gui {
         let mut r = r;
         if let Some(g) = p.left {
             let (w, h) = self.gfx.size(g);
-            self.push_gfx(out, g, Rect::new(r.l, r.t, r.l + w as f32 - 1.0, r.t + h as f32 - 1.0), [255; 3], alpha);
+            self.push_gfx(out, g, Rect::new(r.l, r.t, r.l + w as f32 - 1.0, r.t + h as f32 - 1.0), tint, alpha);
         }
         if let Some(g) = p.right {
             let (w, h) = self.gfx.size(g);
-            self.push_gfx(out, g, Rect::new(r.r - w as f32 + 1.0, r.b - h as f32 + 1.0, r.r, r.b), [255; 3], alpha);
+            self.push_gfx(out, g, Rect::new(r.r - w as f32 + 1.0, r.b - h as f32 + 1.0, r.r, r.b), tint, alpha);
         }
         if horiz {
             (r.l, r.r) = (r.l + c1, r.r - c2);
@@ -1342,7 +1342,7 @@ impl Gui {
             (r.t, r.b) = (r.t + c1, r.b - c2);
         }
         if let Some(bg) = p.bg {
-            self.push_gfx(out, bg, r, [255; 3], alpha);
+            self.push_gfx(out, bg, r, tint, alpha);
         }
         let Some(full) = p.full else { return };
         let (fw, fh) = self.gfx.size(full);
@@ -1371,7 +1371,7 @@ impl Gui {
             }
         }
         let dst = dst.translate(r.l + ox, r.t + oy);
-        out.push(DrawCmd::Gfx { id: full, src: [src.l, src.t, src.width() + 1.0, src.height() + 1.0], dst: px(dst), tint: [255; 3], alpha });
+        out.push(DrawCmd::Gfx { id: full, src: [src.l, src.t, src.width() + 1.0, src.height() + 1.0], dst: px(dst), tint, alpha });
     }
 
     fn draw_text_view(&mut self, out: &mut Vec<DrawCmd>, id: ViewId, t: &TextData, r: Rect, tint: [u8; 3], alpha: f32) {
