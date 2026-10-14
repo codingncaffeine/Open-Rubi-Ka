@@ -244,6 +244,18 @@ pub struct Built {
     pub fabric: i32,
 }
 
+/// Approximate CPU-resident bytes of a built model's `Scene` (mesh vertices/indices + texture `rgba`, the
+/// dominant cost); rig and clip animation data are smaller and not counted, so this intentionally under-estimates.
+/// Used both to bound [`Dynels::models`] (`Dynels::MODEL_BYTE_BUDGET`) and by
+/// `model_cache_cap_stays_under_a_byte_budget` to measure what a real built model actually costs.
+fn built_bytes(built: &Built) -> usize {
+    let meshes: usize = built.model.meshes.iter().map(|m| {
+        m.vertices.len() * std::mem::size_of::<ao_scene::Vertex>() + m.submeshes.iter().map(|s| s.indices.len() * 4).sum::<usize>()
+    }).sum();
+    let textures: usize = built.model.textures.values().map(|t| t.rgba.len()).sum();
+    meshes + textures
+}
+
 /// A skinned pose held for good: vertices and mount transforms.
 type HeldPose = (Vec<ao_scene::Vertex>, Vec<[[f32; 4]; 4]>);
 /// A weapon to resolve: (holder, hand slot, template, message stats).
@@ -814,8 +826,12 @@ pub struct Dynels {
     want_placed: Option<u32>,
     playfield: Option<u32>,
     /// Content-hash-keyed CPU model cache, intentionally kept across zone changes (the same NPC/item look recurs
-    /// in many playfields); bounded by [`MODEL_CACHE_CAP`], evicted in [`Dynels::clear`] via `model_order`.
+    /// in many playfields); bounded by [`Dynels::MODEL_BYTE_BUDGET`] (tracked in `model_bytes`), evicted in
+    /// [`Dynels::clear`] via `model_order`.
     models: HashMap<u64, Model>,
+    /// Running sum of [`built_bytes`] over `models`' `Model::Ready` entries; what [`Dynels::evict_models`] compares
+    /// against [`Dynels::MODEL_BYTE_BUDGET`].
+    model_bytes: usize,
     /// First-seen insertion order of `models`' keys, for the FIFO eviction in [`Dynels::clear`].
     model_order: VecDeque<u64>,
     asked: HashSet<u64>,
@@ -957,6 +973,7 @@ impl Default for Dynels {
             want_placed: None,
             playfield: None,
             models: HashMap::new(),
+            model_bytes: 0,
             model_order: VecDeque::new(),
             asked: HashSet::new(),
             avatar_assets: None,
@@ -1134,20 +1151,25 @@ impl Dynels {
     /// session: measured live, ~440-540 MB added by one large outdoor playfield's distinct looks, never freed on
     /// return to a small zone (`zone-preload-proposal.md` §3). Capped here, at the one point a look stops being
     /// "the current zone's own" (a zone change): FIFO by first-seen order, skipping `keep` (this zone's own keys,
-    /// just used, most likely to be reused again right away).
+    /// just used, most likely to be reused again right away). Byte-based, not count-based: a real capture's
+    /// average built model (mesh + texture `rgba`) measured ~720 KB (`model_cache_cap_stays_under_a_byte_budget`),
+    /// so a flat count cap sized for a quiet zone (hundreds of entries) would blow well past a sane memory budget
+    /// in a zone full of large/varied looks; `model_bytes` tracks the running total exactly for that reason.
     /// ponytail: first-seen-order eviction, not true LRU (no per-access touch, cheap for the ~hundreds of keys a
-    /// session sees); raise the cap or add a byte budget if a single zone's own distinct models exceed it.
-    const MODEL_CACHE_CAP: usize = 768;
+    /// session sees).
+    const MODEL_BYTE_BUDGET: usize = 500_000_000;
     fn evict_models(&mut self, keep: &HashSet<u64>) {
         let mut scanned = 0;
-        while self.models.len() > Self::MODEL_CACHE_CAP && scanned < self.model_order.len() {
+        while self.model_bytes > Self::MODEL_BYTE_BUDGET && scanned < self.model_order.len() {
             let Some(key) = self.model_order.pop_front() else { break };
             if keep.contains(&key) {
                 self.model_order.push_back(key);
                 scanned += 1;
                 continue;
             }
-            self.models.remove(&key);
+            if let Some(Model::Ready { built, .. }) = self.models.remove(&key) {
+                self.model_bytes = self.model_bytes.saturating_sub(built_bytes(&built));
+            }
             self.asked.remove(&key);
         }
     }
@@ -2608,7 +2630,10 @@ impl Dynels {
                     }
                 }
                 Resp::Model { key, result: Ok(built) } => {
-                    self.models.insert(key, Model::Ready { built, uploaded: false });
+                    self.model_bytes += built_bytes(&built);
+                    if let Some(Model::Ready { built: old, .. }) = self.models.insert(key, Model::Ready { built, uploaded: false }) {
+                        self.model_bytes = self.model_bytes.saturating_sub(built_bytes(&old));
+                    }
                 }
                 Resp::Model { key, result: Err(e) } => {
                     eprintln!("dynels: model {key:016x}: {e}");
@@ -3158,37 +3183,94 @@ mod tests {
         assert!(matches!(world.models[&1], Model::Ready { uploaded: false, .. }));
     }
 
+    /// A synthetic built model whose [`built_bytes`] is exactly `bytes` (one texture, no mesh), for deterministic
+    /// byte-budget eviction tests without needing the real worker thread.
+    fn sized_built(bytes: usize) -> Built {
+        let texture = ao_scene::Texture { width: 1, height: 1, rgba: vec![0u8; bytes], source: Default::default() };
+        let scene = ao_scene::Scene { textures: [(ao_scene::TextureKey { rdb_type: 0, id: 0 }, texture)].into(), ..Default::default() };
+        plain(scene, true)
+    }
+
     /// Reproduces the unbounded `models` growth measured live (`zone-preload-proposal.md` §3: RSS never dropped
-    /// between crossings, climbing to >1 GB after a few zones) and checks the [`Dynels::MODEL_CACHE_CAP`] fix: the
-    /// cache stays capped across repeated A -> B -> A -> B zone changes, the current zone's own key is never the
-    /// one evicted, and an evicted key is forgotten from `asked` too so a later re-encounter rebuilds it instead
-    /// of silently staying without a model forever.
+    /// between crossings, climbing to >1 GB after a few zones) and checks the [`Dynels::MODEL_BYTE_BUDGET`] fix:
+    /// the tracked `model_bytes` stays within budget across repeated A -> B -> A -> B zone changes, the current
+    /// zone's own key is never the one evicted, an evicted key is forgotten from `asked` too so a later
+    /// re-encounter rebuilds it instead of silently staying without a model forever, and `model_bytes` always
+    /// equals the real sum over `models` (no drift between the running counter and the map it describes).
     #[test]
-    fn model_cache_stays_capped_across_repeated_zone_changes() {
+    fn model_cache_stays_within_its_byte_budget_across_repeated_zone_changes() {
         let mut world = Dynels::default();
-        let total = Dynels::MODEL_CACHE_CAP as u64 + 50;
-        for key in 1..=total {
-            world.models.insert(key, Model::Ready { built: Box::new(plain(Default::default(), true)), uploaded: false });
+        let entry_bytes = 1_000_000; // 1 MB each, synthetic
+        let count = Dynels::MODEL_BYTE_BUDGET as u64 / entry_bytes as u64 + 50; // comfortably over budget
+        for key in 1..=count {
+            let built = sized_built(entry_bytes);
+            world.model_bytes += built_bytes(&built);
+            world.models.insert(key, Model::Ready { built: Box::new(built), uploaded: false });
             world.model_order.push_back(key);
             world.asked.insert(key);
         }
-        assert_eq!(world.models.len() as u64, total, "cache is over the cap before the first eviction point");
-        let kept = total;
+        assert!(world.model_bytes > Dynels::MODEL_BYTE_BUDGET, "test setup must start over budget");
+        let kept = count;
         world.props.insert((1, 1), Prop { id: 0x4000_0001, key: kept, parent: None, name: None, pos: [0.0; 3], yaw: 0.0, scale: 1.0, submitted: false, anim: PropAnim::default(), stats: vec![] });
-        world.on_playfield(100); // A -> B: clear() runs, which now evicts down to the cap
-        assert!(world.models.len() <= Dynels::MODEL_CACHE_CAP, "capped after one zone change: {}", world.models.len());
+        world.on_playfield(100); // A -> B: clear() runs, which now evicts down to the budget
+        assert!(world.model_bytes <= Dynels::MODEL_BYTE_BUDGET, "within budget after one zone change: {} bytes", world.model_bytes);
         assert!(world.models.contains_key(&kept), "the zone's own just-used key survives eviction");
         assert!(!world.asked.contains(&1), "an evicted key is forgotten from `asked`, so it can be refetched");
-        for pf in [200, 100, 200] { // B -> A -> B: round trips must never grow the cache past the cap
-            for key in (total + 1)..=(total + 20) {
+        let real_total: usize = world.models.values().filter_map(|m| match m { Model::Ready { built, .. } => Some(built_bytes(built)), _ => None }).sum();
+        assert_eq!(world.model_bytes, real_total, "model_bytes tracks the real sum exactly");
+        for pf in [200, 100, 200] { // B -> A -> B: round trips must never grow past the budget
+            for key in (count + 1)..=(count + 20) {
                 if world.asked.insert(key) {
-                    world.models.insert(key, Model::Loading);
+                    let built = sized_built(entry_bytes);
+                    world.model_bytes += built_bytes(&built);
+                    world.models.insert(key, Model::Ready { built: Box::new(built), uploaded: false });
                     world.model_order.push_back(key);
                 }
             }
             world.on_playfield(pf);
-            assert!(world.models.len() <= Dynels::MODEL_CACHE_CAP, "pf {pf}: {}", world.models.len());
+            assert!(world.model_bytes <= Dynels::MODEL_BYTE_BUDGET, "pf {pf}: {} bytes", world.model_bytes);
         }
+    }
+
+    /// Confirms the production `model_bytes` accounting is correct against real built models, not synthetic ones:
+    /// settles a real capture's characters and placed items through the actual worker path (`Resp::Model`, the
+    /// only production insertion site) and checks `model_bytes` matches the sum of [`built_bytes`] over every
+    /// `Ready` entry, logging the measured average model size that [`Dynels::MODEL_BYTE_BUDGET`] is sized against.
+    #[test]
+    fn model_bytes_tracks_real_built_models() {
+        let Some(dir) = client() else { return };
+        let mut z = Zone::new(25988);
+        for f in frames(include_str!("../../../../docs/captures/zone_ithaca.rec")) {
+            z.on_frame(&f);
+        }
+        let keys = |z: &Zone| z.world.chars.iter().filter(|(id, _)| **id != z.world.own)
+            .map(|(_, c)| c.next.unwrap_or(c.key)).chain(z.world.props.values().map(|p| p.key)).collect::<Vec<_>>();
+        let playfield = z.world.playfield.expect("capture announces its playfield");
+        let placed: Vec<_> = placed_dynels(&RecordStore::open(&dir).unwrap(), playfield).unwrap().into_iter()
+            .filter(|d| d.template != 0).map(|d| (d.kind as i32, d.instance as i32)).collect();
+        z.world.start(dir.clone(), 25988);
+        let own = z.own().unwrap().clone();
+        let eye = scene_pos(own.pos);
+        let fwd = scene_forward(own.yaw.unwrap_or(0.0));
+        let mut host = Host::headless();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        loop {
+            z.world.update_with_collision(0.05, eye, fwd, &mut host, None, |_| None);
+            host.actor_models.clear();
+            host.actors.clear();
+            let pending = keys(&z).iter().any(|k| !matches!(z.world.models.get(k), Some(Model::Ready { .. })))
+                || z.world.want_placed.is_some() || placed.iter().any(|id| !z.world.props.contains_key(id));
+            if !pending {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "captured zone not ready after 300s");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let real_total: usize = z.world.models.values().filter_map(|m| match m { Model::Ready { built, .. } => Some(built_bytes(built)), _ => None }).sum();
+        assert_eq!(z.world.model_bytes, real_total, "model_bytes must track every Resp::Model insertion exactly");
+        let count = z.world.models.values().filter(|m| matches!(m, Model::Ready { .. })).count();
+        eprintln!("model cache: {count} models built via the real worker path, {real_total} bytes total, avg {:.0} bytes/model",
+            real_total as f64 / count.max(1) as f64);
     }
 
     #[test]
