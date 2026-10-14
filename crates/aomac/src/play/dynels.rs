@@ -22,7 +22,7 @@ use ao_render::Host;
 #[cfg(test)]
 use ao_render::Camera;
 use ao_scene::{ActorFrame, Lens};
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -804,7 +804,11 @@ pub struct Dynels {
     /// The playfield whose placed dynels (rdb 1000026) are still to be requested.
     want_placed: Option<u32>,
     playfield: Option<u32>,
+    /// Content-hash-keyed CPU model cache, intentionally kept across zone changes (the same NPC/item look recurs
+    /// in many playfields); bounded by [`MODEL_CACHE_CAP`], evicted in [`Dynels::clear`] via `model_order`.
     models: HashMap<u64, Model>,
+    /// First-seen insertion order of `models`' keys, for the FIFO eviction in [`Dynels::clear`].
+    model_order: VecDeque<u64>,
     asked: HashSet<u64>,
     scene_generation: u64,
     /// Login pref `ShowAllNames` (default on, GUI 0x10124b33).
@@ -938,6 +942,7 @@ impl Default for Dynels {
             want_placed: None,
             playfield: None,
             models: HashMap::new(),
+            model_order: VecDeque::new(),
             asked: HashSet::new(),
             scene_generation: 0,
             show_all_names: true,
@@ -1078,8 +1083,10 @@ impl Dynels {
         self.dir = Some(dir);
     }
 
-    /// Forgets every dynel (a playfield change, `Zone::reset_world`).
+    /// Forgets every dynel (a playfield change, `Zone::reset_world`). `models` survives (the GPU-ready builds are
+    /// reused across playfields for repeated looks) but is capped: see [`Dynels::evict_models`].
     pub fn clear(&mut self) {
+        let keep: HashSet<u64> = self.chars.values().map(|c| c.key).chain(self.props.values().map(|p| p.key)).collect();
         self.chars.clear();
         self.collision = None;
         self.slot_hits.clear();
@@ -1103,6 +1110,30 @@ impl Dynels {
         self.fighting.clear();
         self.wielded.clear();
         self.pending_weapons.clear();
+        self.evict_models(&keep);
+    }
+
+    /// `models` is a content-hash cache, deliberately kept across zone changes so a repeated look (the same NPC
+    /// or item template seen in another playfield) does not rebuild. Left unbounded it grows for the whole
+    /// session: measured live, ~440-540 MB added by one large outdoor playfield's distinct looks, never freed on
+    /// return to a small zone (`zone-preload-proposal.md` §3). Capped here, at the one point a look stops being
+    /// "the current zone's own" (a zone change): FIFO by first-seen order, skipping `keep` (this zone's own keys,
+    /// just used, most likely to be reused again right away).
+    /// ponytail: first-seen-order eviction, not true LRU (no per-access touch, cheap for the ~hundreds of keys a
+    /// session sees); raise the cap or add a byte budget if a single zone's own distinct models exceed it.
+    const MODEL_CACHE_CAP: usize = 768;
+    fn evict_models(&mut self, keep: &HashSet<u64>) {
+        let mut scanned = 0;
+        while self.models.len() > Self::MODEL_CACHE_CAP && scanned < self.model_order.len() {
+            let Some(key) = self.model_order.pop_front() else { break };
+            if keep.contains(&key) {
+                self.model_order.push_back(key);
+                scanned += 1;
+                continue;
+            }
+            self.models.remove(&key);
+            self.asked.remove(&key);
+        }
     }
 
     /// `AnimSet` of the weapon a character wields, slot 6 (right hand) before 8 (left): the weapon whose lists the idle / walk / run stance uses
@@ -2524,6 +2555,7 @@ impl Dynels {
         for (key, look) in std::mem::take(&mut self.pending) {
             if self.asked.insert(key) {
                 self.models.insert(key, Model::Loading);
+                self.model_order.push_back(key);
                 let _ = worker.tx.send(Req::Model { key, look, texture_quality: (key & 3) as i32 });
             }
         }
@@ -3041,6 +3073,39 @@ mod tests {
         host.set_scene(Default::default());
         world.sync_scene(&host);
         assert!(matches!(world.models[&1], Model::Ready { uploaded: false, .. }));
+    }
+
+    /// Reproduces the unbounded `models` growth measured live (`zone-preload-proposal.md` §3: RSS never dropped
+    /// between crossings, climbing to >1 GB after a few zones) and checks the [`Dynels::MODEL_CACHE_CAP`] fix: the
+    /// cache stays capped across repeated A -> B -> A -> B zone changes, the current zone's own key is never the
+    /// one evicted, and an evicted key is forgotten from `asked` too so a later re-encounter rebuilds it instead
+    /// of silently staying without a model forever.
+    #[test]
+    fn model_cache_stays_capped_across_repeated_zone_changes() {
+        let mut world = Dynels::default();
+        let total = Dynels::MODEL_CACHE_CAP as u64 + 50;
+        for key in 1..=total {
+            world.models.insert(key, Model::Ready { built: Box::new(plain(Default::default(), true)), uploaded: false });
+            world.model_order.push_back(key);
+            world.asked.insert(key);
+        }
+        assert_eq!(world.models.len() as u64, total, "cache is over the cap before the first eviction point");
+        let kept = total;
+        world.props.insert((1, 1), Prop { id: 0x4000_0001, key: kept, parent: None, name: None, pos: [0.0; 3], yaw: 0.0, scale: 1.0, submitted: false, anim: PropAnim::default(), stats: vec![] });
+        world.on_playfield(100); // A -> B: clear() runs, which now evicts down to the cap
+        assert!(world.models.len() <= Dynels::MODEL_CACHE_CAP, "capped after one zone change: {}", world.models.len());
+        assert!(world.models.contains_key(&kept), "the zone's own just-used key survives eviction");
+        assert!(!world.asked.contains(&1), "an evicted key is forgotten from `asked`, so it can be refetched");
+        for pf in [200, 100, 200] { // B -> A -> B: round trips must never grow the cache past the cap
+            for key in (total + 1)..=(total + 20) {
+                if world.asked.insert(key) {
+                    world.models.insert(key, Model::Loading);
+                    world.model_order.push_back(key);
+                }
+            }
+            world.on_playfield(pf);
+            assert!(world.models.len() <= Dynels::MODEL_CACHE_CAP, "pf {pf}: {}", world.models.len());
+        }
     }
 
     #[test]
