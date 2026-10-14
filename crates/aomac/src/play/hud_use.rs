@@ -286,17 +286,20 @@ impl Play {
 mod tests {
     use super::hud_timerbar;
 
-    /// The Logout bar's "Logout" label: `TOOLTIP` font at the bar's local (0, 1) (not centred), drawn solid black
-    /// (`TextLine_t::SetDefaultColor(this, 0)` 0x100223ef -- the colour field is a plain RGB int, 0 = black, not a palette id).
+    /// The Logout bar's "Logout" label: `TOOLTIP` font, horizontally centred across the whole bar (`TextOutput_t::Alignment`
+    /// 0x100231d8, flags bit `0x800`), 1 px down from the top (`AdjustHotspot` 0x10023247 is a no-op for that flag, so the
+    /// local y the ctor passes, 1, is never touched), drawn solid black (`TextLine_t::SetDefaultColor(this, 0)` 0x100223ef --
+    /// the colour field is a plain RGB int, 0 = black, not a palette id).
     #[test]
-    fn logout_label_uses_retail_font_colour_and_local_origin() {
+    fn logout_label_is_centred_top_aligned_and_solid_black() {
         let dir = ao_gui::client_dir();
         if !dir.join("cd_image/gui").exists() { return; }
         let mut gui = ao_gui::Gui::new(&dir, None).unwrap();
         let w = hud_timerbar::open(&mut gui, "TimerBar", "Logout", 0xffffff, (0, 0)).unwrap();
         let r = gui.view_rect(w, "label").unwrap();
         let bar = gui.view_rect(w, "bar").unwrap();
-        assert_eq!((r.l - bar.l, r.t - bar.t), (0.0, 1.0));
+        assert_eq!(r.t - bar.t, 1.0, "the label never moves off the local y = 1 the ctor passes");
+        assert!((r.l - bar.l - (bar.width() - r.width()) / 2.0).abs() < 1.0, "the label must be centred across the bar, not left-anchored: {r:?} vs {bar:?}");
         gui.set_screen_size(800, 600);
         let cmds = gui.frame(0.0).cmds;
         assert!(cmds.iter().any(|c| matches!(c, ao_gui::DrawCmd::Glyph { tint: [0, 0, 0], .. })), "the label must draw in solid black: {cmds:?}");

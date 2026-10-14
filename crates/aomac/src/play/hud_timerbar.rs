@@ -1,8 +1,15 @@
 //! `TimerBarBase_c` / `GameTimerBar_c` (GUI.dll ctor `FUN_100512ae` 0x100512ae): the progress bar `TimerSystemModule_t::CreateTimer`
 //! opens for a timed action (the `/camp` "Logout" countdown, `hud_use.rs`; the own item-action delay, `hud_stats.rs`). A `PowerBar`
-//! (`GFX_GUI_TIMERBAR_EMPTY`/`_FULL`) tinted by the timer's kind (`RenderWindow_t::SetColor`), with a `TOOLTIP`-font label at local
-//! (0, 1), left-aligned (no centring found in the ctor), solid black (`TextLine_t::SetDefaultColor(this, 0)` 0x100223ef: the colour
-//! field is a plain RGB int, not a palette index -- 0 is black, not white).
+//! (`GFX_GUI_TIMERBAR_EMPTY`/`_FULL`) tinted by the timer's kind (`RenderWindow_t::SetColor`), with a `TOOLTIP`-font label solid
+//! black (`TextLine_t::SetDefaultColor(this, 0)` 0x100223ef: the colour field is a plain RGB int, not a palette index -- 0 is
+//! black, not white).
+//!
+//! Position/alignment (raw disassembly of `FUN_100512ae`, not just its decompile, which drops two of the six `TextLine_t::TextLine_t`
+//! 0x100223ff arguments): the ctor passes `IPoint(0, 1)` and `TextOutputFlags_e` **0x800**, then immediately overwrites the label's
+//! own `TextOutput_t` rect to the *whole bar* (`IRect(0, 0, barWidth, barHeight)`, same offsets `SetDefaultColor` touches). Given
+//! that rect, `TextOutput_t::Alignment` 0x100231d8 tests the flags: `0x400` = left (`x = rect.left`), **`0x800` = centre**
+//! (`x = (rect.width - textWidth) / 2 + rect.left`), `0x1000` = right. `AdjustHotspot` 0x10023247 (vertical/hotspot shift) is a
+//! no-op for 0x800, so `y` stays the literal `1` -- centred horizontally, flush to the top (not vertically centred).
 //!
 //! `TimerSystemModule_t::StartTimerBar` 0x10051a27 (text.mdb category 10000) colours the bar by `TimerEntry_t` kind: Attack
 //! `0xaaffaa` "Timer_Attack", Special `0xaaffff` "Timer_Special", Nano `0xffaaaa` "Timer_Nano", **Item `0xaaaaff` "Timer_Item"**
@@ -26,10 +33,9 @@ fn xml(bw: u32, bh: u32, label: &str, color: u32) -> String {
     format!(
         "<root><View view_layout=\"stacked\" min_size=\"Point({bw},{bh})\" max_size=\"Point({bw},{bh})\">\
          <PowerBar name=\"bar\" bg_gfx=\"GFX_GUI_TIMERBAR_EMPTY\" full_gfx=\"GFX_GUI_TIMERBAR_FULL\" direction=\"right\" color=\"{color:#x}\"/>\
-         <View view_layout=\"vertical\" h_alignment=\"left\" v_alignment=\"top\">\
-         <TextView name=\"label\" value=\"{label}\" min_size=\"Point({bw},{lh})\" max_size=\"Point({bw},{lh})\" font=\"TOOLTIP\" h_alignment=\"left\" v_alignment=\"top\" layout_borders=\"Rect(0,1,0,0)\" color=\"0x000000\"/>\
-         </View></View></root>",
-        lh = bh.saturating_sub(1),
+         <View view_layout=\"horizontal\" h_alignment=\"center\" v_alignment=\"top\">\
+         <TextView name=\"label\" value=\"{label}\" font=\"TOOLTIP\" color=\"0x000000\" layout_borders=\"Rect(0,1,0,0)\"/>\
+         </View></View></root>"
     )
 }
 
