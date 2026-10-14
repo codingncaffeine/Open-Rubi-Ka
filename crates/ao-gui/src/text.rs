@@ -258,7 +258,7 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
     for tok in tokenize(text) {
         let wrapped = divs.iter().any(|w| *w);
         let align = *align_stack.last().unwrap();
-        let link = hrefs.last().unwrap_or(&no_link).clone();
+        let link = hrefs.last().unwrap_or(&no_link);
         let color = *color_stack.last().unwrap();
         match tok {
             Tok::Text(t) => {
@@ -273,12 +273,12 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
                                 words.push(Word { hard_break_after: true, ..new_word(String::new(), None, &no_link, 0, align, wrapped) });
                             }
                         } else {
-                            push_text(&mut words, fonts.font(font), " ", color, &link, align, wrapped);
+                            push_text(&mut words, fonts.font(font), " ", color, link, align, wrapped);
                         }
                     }
                     first = false;
                     let part = part.trim_end_matches('\r');
-                    push_text(&mut words, fonts.font(font), part, color, &link, align, wrapped);
+                    push_text(&mut words, fonts.font(font), part, color, link, align, wrapped);
                 }
             }
             Tok::Br => {
@@ -326,7 +326,7 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
                     }
                     "img" => {
                         if let Some((n, w, h)) = image_of(colors, &attrs) {
-                            words.push(Word { img: Some((n, w, h)), ..new_word(String::new(), color, &link, w, align, wrapped) });
+                            words.push(Word { img: Some((n, w, h)), ..new_word(String::new(), color, link, w, align, wrapped) });
                         }
                     }
                     _ => {}

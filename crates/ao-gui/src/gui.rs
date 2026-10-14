@@ -57,9 +57,17 @@ const TAB_PAD_R: f32 = 16.0;
 /// `GUIConfig_c` layer alpha: layer 2 (used by buttons) = 0.85.
 const BUTTON_ALPHA: f32 = 0.85;
 
+/// Innermost active scissor rect in `out`, if any (the GPU scissor a draw at this point would use).
+fn current_clip(out: &[DrawCmd]) -> Option<[i32; 4]> {
+    out.iter().rev().find_map(|c| if let DrawCmd::Clip(c) = c { Some(*c) } else { None }).flatten()
+}
+
+/// Cache key for a memoized [`text::TextLayout`]: everything `layout_text` reads besides `fonts`/`colors`.
+type LayoutKey = (FontId, String, u32, Option<i32>);
+
 /// Intersect a nested scissor and return the parent to restore after drawing.
 fn push_clip(out: &mut Vec<DrawCmd>, mut clip: [i32; 4]) -> Option<[i32; 4]> {
-    let outer = out.iter().rev().find_map(|c| if let DrawCmd::Clip(c) = c { Some(*c) } else { None }).flatten();
+    let outer = current_clip(out);
     if let Some(o) = outer {
         clip = [clip[0].max(o[0]), clip[1].max(o[1]), clip[2].min(o[2]), clip[3].min(o[3])];
     }
@@ -165,6 +173,10 @@ pub struct Gui {
     fade: fade::FadeCtl,
     /// Chat text areas with message fading on (`gui/textfade.rs`), keyed by the hidden `ScrollView`.
     text_fades: HashMap<ViewId, textfade::TextFade>,
+    /// Memoized `TextView` layouts, keyed by the owning view; recomputed only when (font, text, flags, wrap width) change.
+    text_layout_cache: HashMap<ViewId, (LayoutKey, text::TextLayout)>,
+    /// Layouts actually recomputed (cache misses) since start: a regression counter for tests.
+    pub(crate) layout_computed: u64,
     update_depth: usize,
     dirty_lists: Vec<ViewId>,
     dirty_windows: Vec<WindowId>,
@@ -237,6 +249,8 @@ impl Gui {
             tip: Default::default(),
             fade: Default::default(),
             text_fades: HashMap::new(),
+            text_layout_cache: HashMap::new(),
+            layout_computed: 0,
             update_depth: 0,
             dirty_lists: Vec::new(),
             dirty_windows: Vec::new(),
@@ -392,6 +406,7 @@ impl Gui {
         self.items.retain(|v| !gone(*v));
         self.view_tabs.retain(|v, _| !gone(*v));
         self.text_fades.retain(|v, _| !gone(*v));
+        self.text_layout_cache.retain(|v, _| !gone(*v));
         self.dirty_lists.retain(|v| !gone(*v));
         for w in self.windows.iter_mut().flatten() {
             if w.default_button.is_some_and(gone) { w.default_button = None; }
@@ -1374,14 +1389,29 @@ impl Gui {
         out.push(DrawCmd::Gfx { id: full, src: [src.l, src.t, src.width() + 1.0, src.height() + 1.0], dst: px(dst), tint, alpha });
     }
 
+    /// Memoized [`text::layout_text`]: `TextView_c::_ReWrap` only runs again once `(font, text, flags, wrap)` for `id`
+    /// changed since the last draw, instead of re-tokenizing and re-measuring the same text every frame.
+    fn layout_text_cached(&mut self, id: ViewId, font: FontId, text: &str, flags: u32, wrap: Option<i32>) -> text::TextLayout {
+        if let Some((key, layout)) = self.text_layout_cache.get(&id) {
+            if key.0 == font && key.1 == text && key.2 == flags && key.3 == wrap {
+                return layout.clone();
+            }
+        }
+        self.layout_computed += 1;
+        let layout = text::layout_text(&mut self.fonts, &self.colors, font, text, flags, wrap);
+        self.text_layout_cache.insert(id, ((font, text.to_string(), flags, wrap), layout.clone()));
+        layout
+    }
+
     fn draw_text_view(&mut self, out: &mut Vec<DrawCmd>, id: ViewId, t: &TextData, r: Rect, tint: [u8; 3], alpha: f32) {
         let editable = t.tvf & tvf::ACCEPT_TXT_INPUT != 0;
         let focused = self.focus == Some(id);
         let wrap = if t.tvf & tvf::WORD_WRAP != 0 { Some(r.width() as i32 + 1) } else { None };
-        let layout = text::layout_text(&mut self.fonts, &self.colors, t.font, &t.text, t.tvf, wrap);
+        let layout = self.layout_text_cached(id, t.font, &t.text, t.tvf, wrap);
         let fill_dy = self.fill_bottom_dy(id, t.tvf, layout.height);
         let clip = [r.l as i32, r.t as i32, r.r as i32 + 1, r.b as i32 + 1];
         let outer = if editable { push_clip(out, clip) } else { None };
+        let active_clip = current_clip(out);
         let pw = t.tvf & tvf::PASSWORD != 0;
         let chars: Vec<char> = t.text.chars().collect();
         let font_h = self.fonts.font(t.font).height;
@@ -1408,13 +1438,18 @@ impl Gui {
         for &is_shadow in passes {
             let (dx, dy) = if is_shadow { shadow.unwrap_or((0, 0)) } else { (0, 0) };
             for line in &layout.lines {
+                let y = r.t as i32 + line.y + fill_dy;
+                if let Some(c) = active_clip {
+                    if y + dy + font_h <= c[1] || y + dy >= c[3] {
+                        continue; // entirely outside the active scissor: the GPU would discard these glyphs anyway
+                    }
+                }
                 let lx = match line.align {
                     Align::Right => r.l as i32 + 1 + (r.width() as i32 - line.width),
                     Align::Center => r.l as i32 + (r.width() as i32 + 1 - line.width) / 2,
                     _ => origin_x,
                 };
                 let mut pen = lx + line.indent;
-                let y = r.t as i32 + line.y + fill_dy;
                 for run in &line.runs {
                     if let Some((name, w, h)) = &run.img {
                         // inline `<img>`: top-aligned at the pen (`_RenderLine` `SpriteInfo_t::Copy`); the text shadow is a clone of the text surface only
@@ -2676,5 +2711,67 @@ mod clip_tests {
         assert!(g.tree.resolve(new).is_none());
         g.frame(1.0);
         assert!(g.tooltip_shown().is_none());
+    }
+
+    /// Memoization follow-up: `draw_text_view` used to re-tokenize and re-measure the same `TextView` content every
+    /// frame via `text::layout_text`. `Gui::layout_text_cached` must reuse the cached `TextLayout` while
+    /// `(font, text, flags, wrap)` are unchanged and recompute only when one of them changes.
+    #[test]
+    fn text_layout_cache_is_reused_until_text_or_wrap_change() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut g = Gui::new(&dir, None).unwrap();
+        let w = g.open_window_xml("cache", r#"<root><TextView name="text" min_size="Point(100,20)" max_size="Point(100,20)"/></root>"#, (0, 0), WindowSize::Fixed(100, 20)).unwrap();
+        let id = g.find(w, "text").unwrap();
+        let before = g.layout_computed;
+        let l1 = g.layout_text_cached(id, FontId::Normal, "hello world", 0, Some(90));
+        assert_eq!(g.layout_computed, before + 1, "first call is a cache miss");
+        let l2 = g.layout_text_cached(id, FontId::Normal, "hello world", 0, Some(90));
+        assert_eq!(g.layout_computed, before + 1, "identical (text, font, flags, wrap) must hit the cache");
+        assert_eq!(l1.lines.len(), l2.lines.len());
+        g.layout_text_cached(id, FontId::Normal, "different text", 0, Some(90));
+        assert_eq!(g.layout_computed, before + 2, "a text change must invalidate the cache");
+        g.layout_text_cached(id, FontId::Normal, "different text", 0, Some(90));
+        assert_eq!(g.layout_computed, before + 2, "the new key hits the cache on the next call");
+        g.layout_text_cached(id, FontId::Normal, "different text", 0, Some(40));
+        assert_eq!(g.layout_computed, before + 3, "a wrap-width change must invalidate the cache");
+    }
+
+    /// `draw_text_view` used to emit glyph quads for every line of a `TextView`, even lines scrolled above or below
+    /// the enclosing `ScrollView`'s viewport that the GPU scissor discards anyway. Lines fully outside the active
+    /// clip must not reach the draw list at all.
+    #[test]
+    fn text_lines_scrolled_outside_the_clip_are_not_emitted() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut g = Gui::new(&dir, None).unwrap();
+        let line_h = g.font_height(FontId::Normal);
+        let lines = 20i32;
+        let text: String = (0..lines).map(|i| ((b'A' + (i % 26) as u8) as char).to_string().repeat(3)).collect::<Vec<_>>().join("<br>");
+        let viewport_h = 3 * line_h;
+        let xml = r#"<root><ScrollView name="sv"><ScrollViewChild name="svc"><TextView name="text"/></ScrollViewChild></ScrollView></root>"#;
+        let w = g.open_window_xml("scroll", xml, (0, 0), WindowSize::Fixed(120, viewport_h as u32)).unwrap();
+        g.set_text(w, "text", &text);
+        g.set_scroll_offset(w, "sv", 5.0 * line_h as f32);
+        let text_rect = g.view_rect(w, "text").unwrap();
+        let sv_rect = g.view_rect(w, "sv").unwrap();
+        let svc_rect = g.view_rect(w, "svc").unwrap();
+        let (clip_top, clip_bottom) = (sv_rect.t as i32, sv_rect.t as i32 + (svc_rect.b - svc_rect.t + 1.0) as i32);
+        let list = g.frame(0.0);
+        let ys: std::collections::HashSet<i32> = list.cmds.iter().filter_map(|c| if let DrawCmd::Glyph { dst, .. } = c { Some(dst[1]) } else { None }).collect();
+        let mut visible = 0;
+        for i in 0..lines {
+            let y = text_rect.t as i32 + i * line_h;
+            let fully_visible = y >= clip_top && y + line_h <= clip_bottom;
+            let fully_hidden = y + line_h <= clip_top || y >= clip_bottom;
+            assert!(fully_visible || fully_hidden, "line {i} straddles the clip edge; the test geometry must align to whole lines");
+            if fully_visible {
+                visible += 1;
+                assert!(ys.contains(&y), "line {i} is inside the clip but its glyphs were not drawn");
+            } else {
+                assert!(!ys.contains(&y), "line {i} is scrolled outside the clip but its glyphs were still emitted");
+            }
+        }
+        assert!(visible > 0 && visible < lines, "the test must scroll some lines off-screen while keeping others visible");
     }
 }
