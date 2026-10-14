@@ -251,11 +251,13 @@ fn fetch(v: &mut Voice, ch: usize) -> Option<(f32, f32)> {
         let Source::Stream { rx, .. } = &v.src else { unreachable!() };
         match rx.try_recv() {
             Ok(mut next) => {
-                // keep the unread tail so interpolation across chunk borders is continuous
-                let mut joined = if i < frames { v.cur[i * ch..].to_vec() } else { Vec::new() };
+                // Keep the unread tail so interpolation across chunk borders is continuous, in place: no
+                // allocation on the real-time (cpal callback) thread once `cur`'s capacity has settled to the
+                // steady-state chunk size (`drain` keeps the backing allocation, `append` only grows it the
+                // first few times a bigger chunk arrives, like the GPU `ensure_capacity`/`ensure_buf` buffers).
+                if i < frames { v.cur.drain(..i * ch); } else { v.cur.clear(); }
                 v.pos -= i as f64;
-                joined.append(&mut next);
-                v.cur = joined;
+                v.cur.append(&mut next);
             }
             Err(TryRecvError::Empty) => return Some((0.0, 0.0)),
             Err(TryRecvError::Disconnected) => {
