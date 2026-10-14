@@ -716,7 +716,7 @@ impl Play {
             match ao_formats::playfield::SkyClock::open(&dir, id) {
                 Ok(mut clock) => {
                     if let Some(clock) = &mut clock { clock.set_texture_quality(texture_quality); }
-                    drop(tx.send(Bg::Sky(id, clock)));
+                    drop(tx.send(Bg::Sky(id, Box::new(clock))));
                 }
                 Err(e) => eprintln!("live sky of playfield {id}: {e:#}"),
             }
@@ -768,7 +768,7 @@ impl Play {
                     self.show_login(host);
                     self.show_error(1, 0); // ConnectToLH failed -> ShowError(1,0)
                 }
-                Bg::Sky(id, c) if Some(id) == self.zone.playfield => self.world_sky = c,
+                Bg::Sky(id, c) if Some(id) == self.zone.playfield => self.world_sky = *c,
                 Bg::Sky(..) => {}
                 Bg::Weather(id, w) if Some(id) == self.zone.playfield => self.world_weather = Some(*w),
                 Bg::Weather(..) => {}

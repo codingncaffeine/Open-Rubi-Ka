@@ -116,7 +116,7 @@ enum Bg {
     World(u32, i32, Result<Box<Scene>, String>),
     GroundTextures(u64, Result<HashMap<ao_scene::TextureKey, ao_scene::Texture>, String>),
     /// The live sky source of playfield `id` (`None`: indoor / no tweak script), sent just before its [`Bg::World`].
-    Sky(u32, Option<ao_formats::playfield::SkyClock>),
+    Sky(u32, Box<Option<ao_formats::playfield::SkyClock>>),
     /// Per-frame effect wind, loaded independently of the audio device.
     Weather(u32, Box<ao_formats::weather::Weather>),
     Life(u32, Result<Box<(native_life_spawn::LifeWorld, native_life_render::LifeModels)>, String>),
