@@ -1212,19 +1212,30 @@ Headless acceptance hooks (`play/flow/live.rs`, added but not exercised by this 
 
 #### aomac-only additions (non-retail, "Enhanced" page)
 
-These two rows are **not** part of the retail `OptionPanel/Root.xml` inventory above: performance audit item 2 (texture
+These rows are **not** part of the retail `OptionPanel/Root.xml` inventory above: performance audit item 2 (texture
 anisotropy) and the MSAA-option decision (`docs/screens.md` "max anisotropy 1"; no AA option exists anywhere in the client's
-`cd_image/gui`/`text`/`twk` data for either control). `options.rs::enhanced_page` builds a synthetic [`Page`] (same
-`model::{Opt,Ctl,Item}` shapes the retail `Root.xml` parser produces) and appends it to the category tree as a clearly
-labelled, separate leaf ("Enhanced (aomac, not retail)"), reusing every generic page mechanism (tree entry, XML control
-generation, value sync, click/slider dispatch) unmodified. Both default to the retail value they replace in `ao-render` and
-persist through the same `DValues` → `Prefs.xml` mechanism as `DisplayCompressedTextures` (`DV Main`, account-independent,
-survives restart).
+`cd_image/gui`/`text`/`twk` data for either control), plus the windowing/camera Enhanced items 2, 6, 8 and 9. `options.rs::enhanced_page`
+builds a synthetic [`Page`] (same `model::{Opt,Ctl,Item}` shapes the retail `Root.xml` parser produces) and appends it to the
+category tree as a clearly labelled, separate leaf ("Enhanced (aomac, not retail)"), reusing every generic page mechanism (tree
+entry, XML control generation, value sync, click/slider dispatch) unmodified. Every control defaults to the retail value it
+replaces, or to off/Auto for the ones with no retail equivalent, and persists through the same `DValues` → `Prefs.xml`
+mechanism as `DisplayCompressedTextures` (`DV Main`, account-independent, survives restart).
 
 | aomac page / control | Key → store | Runtime consumer | Status |
 |---|---|---|---|
 | `Enhanced (aomac, not retail)` / `Texture Sharpening (anisotropic filtering)` | `AomacTextureSharpening` → DV Main (index 0-4) | `flow.rs::frame` maps the index to 1/2/4/8/16 → `Host.anisotropy` → `Renderer::set_anisotropy` rebuilds the world + clamp-address samplers; default index 0 = 1x, matching retail `FUN_10041ede`/`docs/screens.md` "max anisotropy 1" (audit item 2) | **AOMAC-ONLY, LIVE; not a retail control** |
-| `Enhanced (aomac, not retail)` / `Edge Smoothing (MSAA)` | `AomacEdgeSmoothing` → DV Main (index 0-3) | `flow.rs::frame` maps the index to 1/2/4/8 samples → `Host.msaa_samples` → `Renderer::set_msaa_samples` downward-clamps to what the adapter's colour+depth format features support (`clamp_msaa_samples`) and rebuilds every pipeline; default index 0 = 1 sample (off), matching retail (no AA option found anywhere in the client) | **AOMAC-ONLY, LIVE; not a retail control** |
+| `Enhanced (aomac, not retail)` / `Edge Smoothing (MSAA)` | `AomacEdgeSmoothing` → DV Main (index 0-3) | `flow.rs::frame` maps the index to 1/2/4/8 samples → `Host.msaa_samples` → `Renderer::set_msaa_samples` downward-clamps to what the adapter's colour+depth format features support (`clamp_msaa_samples`) and rebuilds every pipeline; default index 0 = 1 sample (off), matching retail (no AA option found anywhere in the client). Alpha-tested (cutout) pipelines also pick up `alpha_to_coverage_enabled` once MSAA > 1 (audit item 4: `lib.rs::build_pipelines`, `shader.wgsl`'s `shade`/`shade_sky`), smoothing foliage/fence/hair edges; off whenever MSAA is off, matching retail's hard cutout exactly | **AOMAC-ONLY, LIVE; not a retail control** |
+| `Enhanced (aomac, not retail)` / `Interface Scale` | `AomacInterfaceScale` → DV Main (index 0-3: Auto/1x/2x/3x) | Read once at `Play::new` from the account-wide root `Prefs.xml` (`Play::interface_scale`, `ao_render::Frontend::interface_scale`), so `viewer.rs::State::new` sizes the very first frame — including the login screen — correctly; live-refreshed from `hud.dvalues` every frame after and reapplied via `Host.interface_scale` (`run_gui`'s `gui_scale`). An explicit 1x/2x/3x is reduced (never below 1x) to whatever keeps the interface at least 1024x768 logical pixels; Auto is never blocked (audit item 2) | **AOMAC-ONLY, LIVE; not a retail control** |
+| `Enhanced (aomac, not retail)` / `Instant Fullscreen` (checkbox) | `AomacBorderlessFullscreen` → DV Main (bool) | `flow.rs::frame` → `Host.borderless_game`; read by `viewer.rs`'s Ctrl+Cmd+F handler (`WindowExtMacOS::set_borderless_game`) when entering fullscreen, skipping the Spaces animation and hiding the menu bar/dock. Default off (today's animated native fullscreen). Fullscreen state itself (on/off, which monitor) is remembered across restarts in `Window.cfg` regardless of this setting (audit item 6) | **AOMAC-ONLY, LIVE; not a retail control** |
+| `Enhanced (aomac, not retail)` / `Pinch to Zoom` (checkbox) | `AomacPinchZoom` → DV Main (bool) | `flow.rs::frame` → `Host.pinch_zoom`; `viewer.rs` forwards `WindowEvent::PinchGesture` as `GameInput::Pinch` only while set, `player.rs::game_input` feeds it through the same `Controls::on_wheel`/camera-zoom path as the mouse wheel (same 0.78-25 m range). Default off, opt-in (audit item 8) | **AOMAC-ONLY, LIVE; not a retail control** |
+| `Enhanced (aomac, not retail)` / `Chat Font Size` (slider) | writes the *retail* `ChatFontSize` (`MainPrefs.xml` template, tenths of a point, range 50-480) | `chat/win.rs::WinPrefs::from_dvalues` already reads `ChatFontSize` live; this is the on-screen control retail never shipped (`/setoption ChatFontSize 180` only). Window rebuild on change, like any other chat preference (audit item 9) | **AOMAC-ONLY control on a retail variable, LIVE** |
+
+Window-level restore (not an Enhanced-page control): `ao-render/window_prefs.rs`'s `Window.cfg` also remembers which display the
+window was on (by name, since display IDs are not stable across reboots) and whether it was fullscreen (audit items 6/7).
+`viewer.rs::State::new` places the window back on that monitor if it is still connected (else the primary one) and clamps the
+saved position fully onto it (`window_prefs::clamp_to_monitor`), so a display unplugged/resized/rearranged since the last run
+never opens the window off-screen. Ctrl+Cmd+F toggles fullscreen instantly (`winit::window::Fullscreen::Borderless`) in addition
+to the green button's native fullscreen.
 
 ### Action-menu click dispatch and character-local chat archives
 

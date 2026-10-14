@@ -709,15 +709,18 @@ fn ok_without_a_key_binds_input_zero() {
     assert_eq!(c.on_key(ao_render::KeyCode::Space, true), vec![]);
 }
 
-/// aomac's "Enhanced" page (not retail; `docs/gui.md` "aomac-only additions (non-retail, Enhanced page)"): both controls
-/// default to the retail-faithful value they replace in `ao-render` (audit item 2 anisotropy 1x, MSAA-option decision off),
-/// are reachable through the ordinary category tree like any other page, write through the generic radio dispatch, and
-/// persist through the same `DValues`/`Prefs.xml` mechanism as every retail control (survives a restart).
+/// aomac's "Enhanced" page (not retail; `docs/gui.md` "aomac-only additions (non-retail, Enhanced page)"): every control
+/// defaults to the retail-faithful value it replaces (or, for the window/camera additions, off/Auto), is reachable through
+/// the ordinary category tree like any other page, writes through the generic radio/checkbox/slider dispatch, and persists
+/// through the same `DValues`/`Prefs.xml` mechanism as every retail control (survives a restart).
 #[test]
 fn enhanced_page_options_default_to_retail_and_persist_across_a_restart() {
     let Some(mut r) = Rig::new() else { return };
     assert_eq!(r.d.get_i64("AomacTextureSharpening"), Some(0), "default must be off (1x), matching retail");
     assert_eq!(r.d.get_i64("AomacEdgeSmoothing"), Some(0), "default must be off, matching retail (no AA option in the client)");
+    assert_eq!(r.d.get_i64("AomacInterfaceScale"), Some(0), "default must be Auto (audit item 2)");
+    assert_eq!(r.d.get_i64("AomacBorderlessFullscreen"), Some(0), "default off: animated native fullscreen (audit item 6)");
+    assert_eq!(r.d.get_i64("AomacPinchZoom"), Some(0), "default off: opt-in (audit item 8)");
     let tmp = std::env::temp_dir().join("aomac-enhanced-options-persist");
     let _ = std::fs::remove_dir_all(&tmp);
     r.d.open_user(&tmp, "acct", 7);
@@ -730,11 +733,35 @@ fn enhanced_page_options_default_to_retail_and_persist_across_a_restart() {
     assert_eq!(r.gui.radio_value(r.win(), &g2), Some(0));
     r.click(&format!("{g2}_2")); // 4x
     assert_eq!(r.d.get_i64("AomacEdgeSmoothing"), Some(2));
+    let g3 = r.show("AomacInterfaceScale");
+    assert_eq!(r.gui.radio_value(r.win(), &g3), Some(0));
+    r.click(&format!("{g3}_2")); // 2x
+    assert_eq!(r.d.get_i64("AomacInterfaceScale"), Some(2));
+    let full = r.show("AomacBorderlessFullscreen");
+    r.click(&full);
+    assert_eq!(r.d.get_i64("AomacBorderlessFullscreen"), Some(1));
+    let pinch = r.show("AomacPinchZoom");
+    r.click(&pinch);
+    assert_eq!(r.d.get_i64("AomacPinchZoom"), Some(1));
+    // `ChatFontSize` is a *retail* DValue (`MainPrefs.xml`, tenths of a point, range 50-480); the Enhanced slider
+    // writes it through the ordinary `Ty::Variant` path, reusing its registered min/max (`Opt::range`).
+    let chat = r.show("ChatFontSize");
+    let opt = &r.opt.win.as_ref().unwrap().controls.iter().find(|c| c.opt.var == "ChatFontSize").unwrap().opt.clone();
+    assert_eq!(opt.range(&r.d), (50.0, 480.0));
+    assert_eq!(opt.value(&r.d), 140.0, "default Verdana 14pt, matching `chat/win.rs::WinPrefs::default`");
+    opt.set_value(&mut r.d, 280.0);
+    assert_eq!(r.d.get_i64("ChatFontSize"), Some(280));
+    assert_eq!(opt.value_text(280.0), "28 pt");
+    let _ = chat;
     r.d.save_user();
     let dir = ao_gui::client_dir();
     let mut again = DValues::new(&dir);
     again.open_user(&tmp, "acct", 7);
     assert_eq!(again.get_i64("AomacTextureSharpening"), Some(4));
     assert_eq!(again.get_i64("AomacEdgeSmoothing"), Some(2));
+    assert_eq!(again.get_i64("AomacInterfaceScale"), Some(2));
+    assert_eq!(again.get_i64("AomacBorderlessFullscreen"), Some(1));
+    assert_eq!(again.get_i64("AomacPinchZoom"), Some(1));
+    assert_eq!(again.get_i64("ChatFontSize"), Some(280));
     let _ = std::fs::remove_dir_all(&tmp);
 }

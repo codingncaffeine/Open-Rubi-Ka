@@ -192,6 +192,15 @@ impl DValues {
         // concrete renderer values in `options.rs::enhanced_page`/`flow.rs` (audit item 2 texture anisotropy, MSAA-option decision).
         s.add("AomacTextureSharpening", Variant::Int(0), true, CAT_MAIN, Some(Variant::Int(0)), Some(Variant::Int(4)), false);
         s.add("AomacEdgeSmoothing", Variant::Int(0), true, CAT_MAIN, Some(Variant::Int(0)), Some(Variant::Int(3)), false);
+        // Interface scale (audit item 2): 0 Auto (today's whole backing-scale rounding), 1/2/3 fixed GUI pixel scale;
+        // read at startup (`Play::new` below, `ao_render::Frontend::interface_scale`) so the login screen honours it too.
+        s.add("AomacInterfaceScale", Variant::Int(0), true, CAT_MAIN, Some(Variant::Int(0)), Some(Variant::Int(3)), false);
+        // Audit item 6: skip the Spaces fullscreen animation and hide the menu bar/dock (winit `with_borderless_game`)
+        // when Ctrl+Cmd+F or the green button enters fullscreen. Off by default (today's animated native fullscreen).
+        s.add("AomacBorderlessFullscreen", Variant::Bool(false), true, CAT_MAIN, None, None, false);
+        // Audit item 8: trackpad pinch gesture zooms the third-person camera (same 0.78-25 m range as the mouse wheel).
+        // Opt-in: not retail, and a pinch over the 3D view has no other meaning to conflict with.
+        s.add("AomacPinchZoom", Variant::Bool(false), true, CAT_MAIN, None, None, false);
         s
     }
 

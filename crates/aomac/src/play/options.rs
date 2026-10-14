@@ -249,12 +249,45 @@ fn enhanced_page() -> Page {
         scale: 1.0,
         borders: String::new(),
     };
+    let check = |var: &str, label: &str| Opt {
+        ctl: Ctl::Check,
+        var: var.to_string(),
+        ty: Ty::Variant,
+        kind: Kind::Login,
+        label: label.to_string(),
+        tooltip: None,
+        enable: String::new(),
+        bit: None,
+        fmt: String::new(),
+        scale: 1.0,
+        borders: String::new(),
+    };
+    // `ChatFontSize` is a *retail* DValue (`MainPrefs.xml` template, tenths of a point, range 50-480, read live by
+    // `chat/win.rs::WinPrefs::from_dvalues`); retail never gave it an on-screen control (only `/setoption`). The slider
+    // here is aomac-only, writing the same retail variable.
+    let chat_font = Opt {
+        ctl: Ctl::Slider,
+        var: "ChatFontSize".to_string(),
+        ty: Ty::Variant,
+        kind: Kind::Login,
+        label: "Chat Font Size".to_string(),
+        tooltip: None,
+        enable: String::new(),
+        bit: None,
+        fmt: "%.0f pt".to_string(),
+        scale: 0.1,
+        borders: String::new(),
+    };
     Page {
         label: "Enhanced (aomac, not retail)".to_string(),
         items: vec![
             Item::Text { value: "aomac-only additions: none of these exist in the original client. Every default matches retail exactly.".to_string(), borders: String::new() },
             Item::Opt(opt("AomacTextureSharpening", "Texture Sharpening (anisotropic filtering)", &[("Off (1x, retail)", 0), ("2x", 1), ("4x", 2), ("8x", 3), ("16x", 4)])),
             Item::Opt(opt("AomacEdgeSmoothing", "Edge Smoothing (MSAA)", &[("Off (retail)", 0), ("2x", 1), ("4x", 2), ("8x", 3)])),
+            Item::Opt(opt("AomacInterfaceScale", "Interface Scale", &[("Auto (retail-equivalent)", 0), ("1x", 1), ("2x", 2), ("3x", 3)])),
+            Item::Opt(check("AomacBorderlessFullscreen", "Instant Fullscreen (skip animation, hide menu bar/dock)")),
+            Item::Opt(check("AomacPinchZoom", "Pinch to Zoom (trackpad)")),
+            Item::Opt(chat_font),
         ],
     }
 }

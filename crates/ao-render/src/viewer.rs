@@ -9,8 +9,10 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{CursorGrabMode, Window, WindowId};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::monitor::MonitorHandle;
+use winit::platform::macos::WindowExtMacOS;
+use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 #[path = "raw_mouse.rs"]
 mod raw_mouse;
@@ -39,6 +41,17 @@ pub struct Host {
     /// Colour/depth MSAA sample count (aomac Enhanced option; not retail, default 1 = off). `None` leaves it as it is;
     /// downward-clamped to what the adapter supports by [`Renderer::set_msaa_samples`].
     pub msaa_samples: Option<u32>,
+    /// Interface scale (aomac Enhanced option, audit item 2): `None`/`Some(0)` = Auto (today's whole backing-scale
+    /// rounding), `Some(1..=3)` = a fixed GUI-pixel scale, reduced (never below 1x) to whatever keeps the window at
+    /// least 1024x768 logical pixels ([`gui_scale`]). Drained every frame by the viewer; the very first frame (before
+    /// the window exists) reads [`Frontend::interface_scale`] instead, so the login screen is never a frame late.
+    pub interface_scale: Option<u8>,
+    /// Skip the Spaces fullscreen animation and hide the menu bar/dock on fullscreen entry (aomac Enhanced option,
+    /// audit item 6; winit `WindowExtMacOS::set_borderless_game`). Not drained: read whenever fullscreen is toggled.
+    pub borderless_game: bool,
+    /// Trackpad pinch gesture zooms the third-person camera (aomac Enhanced option, audit item 8; opt-in, not retail).
+    /// Not drained: read whenever a `WindowEvent::PinchGesture` arrives.
+    pub pinch_zoom: bool,
     /// Live character preference controlling authored `GAME.GameShowSpaceship` instances.
     pub spaceships_shown: bool,
     pub smooth_animations: bool,
@@ -153,7 +166,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None }
+        Host { smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -195,6 +208,9 @@ pub enum GameInput {
     MouseMotion { dx: f32, dy: f32, dt: f32 },
     /// The window lost focus; release game input even while new presses are disabled.
     FocusLost,
+    /// Trackpad pinch gesture (aomac Enhanced option, audit item 8); positive = zooming in, same convention as
+    /// `winit::event::WindowEvent::PinchGesture`. Only forwarded while [`Host::pinch_zoom`] is set.
+    Pinch(f32),
 }
 
 /// The windowed GUI application: draws the original AO GUI (`ao_gui`) over the 3D scene.
@@ -204,6 +220,9 @@ pub trait Frontend {
     fn input(&mut self, ev: ao_gui::InputEvent, host: &mut Host);
     /// Raw key/mouse-look input while `host.fly` is off (default: ignored).
     fn game_input(&mut self, _ev: GameInput, _host: &mut Host) {}
+    /// Window-level scale known before any frame runs (aomac Enhanced option, audit item 2: Interface Scale); read
+    /// once by [`State::new`] so the very first window/frame (the login screen) already honours it. `0` = Auto.
+    fn interface_scale(&self) -> u8 { 0 }
     /// Per-frame logic (`dt` seconds, `size` = window in GUI pixels); returns the GUI draw list to paint.
     fn frame(&mut self, dt: f32, size: (u32, u32), host: &mut Host) -> ao_gui::DrawList;
 }
@@ -289,10 +308,26 @@ struct Gui {
     /// rounds to a fresh whole `dy`, so a scroll gesture either jumps a full zoom level per event (`hud_map.rs`'s
     /// "any nonzero dy = one zoom step") or never moves at all (`interact_ptrade.rs`'s `dy as i64` truncation).
     scroll_accum: f32,
+    /// Last `Host::interface_scale` the frontend asked for (audit item 2); `scale`/`Host::interface_scale` itself is
+    /// drained every frame, so `ScaleFactorChanged` (a separate event, after the drain) needs this to stay sticky.
+    requested_scale: u8,
 }
 
-fn gui_scale(scale_factor: f64) -> u32 {
-    (scale_factor.round() as u32).max(1)
+/// Physical pixels per GUI pixel. `requested` is [`Host::interface_scale`] (`None`/`Some(0)` = Auto, today's whole
+/// backing-scale rounding); an explicit 1x/2x/3x is reduced (never below 1x) to whatever keeps `physical` at least
+/// 1024x768 logical pixels (audit item 2: "block scales that would make the interface smaller than 1024x768 logical").
+fn gui_scale(scale_factor: f64, requested: Option<u8>, physical: (u32, u32)) -> u32 {
+    let auto = (scale_factor.round() as u32).max(1);
+    match requested {
+        None | Some(0) => auto,
+        Some(n) => {
+            let mut s = u32::from(n).max(1);
+            while s > 1 && (physical.0 / s < 1024 || physical.1 / s < 768) {
+                s -= 1;
+            }
+            s
+        }
+    }
 }
 
 /// Accumulates a trackpad's fractional `MouseScrollDelta::PixelDelta` into whole 40-pixel-per-notch steps (the same
@@ -379,6 +414,9 @@ struct State {
     speed: f32,
     looking: bool,
     focused: bool,
+    /// Raw winit keyboard modifiers (not the collapsed `ao_gui::Modifiers`): Ctrl+Cmd+F (audit item 6) needs both
+    /// physical modifiers, unlike the GUI's "Cmd counts as Ctrl" shortcuts.
+    mods: ModifiersState,
     raw_mouse: raw_mouse::RawMouse,
     cursor_hidden: bool,
     last: Instant,
@@ -460,10 +498,25 @@ fn run(scene: Scene, frontend: Option<Box<dyn Frontend>>, live: Option<LiveSky>,
 impl State {
     fn new(el: &ActiveEventLoop, scene: &Scene, frontend: Option<Box<dyn Frontend>>, live: Option<LiveSky>, hook: Option<FrameHook>) -> Result<Self> {
         let saved = window_prefs::load();
-        let (sw, sh) = saved.map_or((1280, 800), |(w, h, _)| (w, h));
+        // audit item 7: place on the saved monitor if it's still connected, else the primary one; clamp the saved
+        // position fully onto it (a display unplugged/resized/rearranged since the last run must not open off-screen).
+        let monitor = saved.as_ref().and_then(|s| s.monitor.as_deref())
+            .and_then(|name| el.available_monitors().find(|m| m.name().as_deref() == Some(name)))
+            .or_else(|| el.primary_monitor());
+        // `Saved::width/height` are logical pixels (audit item 7): resolved against *this* run's monitor scale, so a
+        // window saved on a 1x display and restored on a 2x one (or back) still looks the same physical size.
+        let target_scale = monitor.as_ref().map_or(1.0, MonitorHandle::scale_factor);
+        let (sw, sh) = saved.as_ref().map_or((1280, 800), |s| ((f64::from(s.width) * target_scale).round() as u32, (f64::from(s.height) * target_scale).round() as u32));
         let mut attrs = Window::default_attributes().with_title("aomac").with_inner_size(winit::dpi::PhysicalSize::new(sw, sh));
-        if let Some((_, _, Some((x, y)))) = saved {
-            attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
+        if let Some(pos) = saved.as_ref().and_then(|s| s.pos) {
+            let pos = monitor.as_ref().map_or(pos, |m| {
+                window_prefs::clamp_to_monitor(pos, (sw, sh), (m.position().x, m.position().y), (m.size().width, m.size().height))
+            });
+            attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(pos.0, pos.1));
+        }
+        // audit item 6: fullscreen remembered across restarts.
+        if saved.as_ref().is_some_and(|s| s.fullscreen) {
+            attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(monitor.clone())));
         }
         let window = Arc::new(el.create_window(attrs)?);
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -494,7 +547,10 @@ impl State {
         let cam = Camera::look_at(eye, at);
         let gui = frontend.map(|frontend| {
             let renderer = crate::GuiRenderer::new(&renderer, frontend.gui());
-            Gui { renderer, frontend, host: Host { camera: cam, effect_sun_direction: scene.environment.map(|env| env.sun_dir.map(|v| -v)), ..Host::headless() }, cursor: (0.0, 0.0), mods: Default::default(), scale: gui_scale(window.scale_factor()), scroll_accum: 0.0 }
+            // audit item 2: the requested scale is known before this first frame runs, so the login screen is never a frame late.
+            let requested_scale = frontend.interface_scale();
+            let scale = gui_scale(window.scale_factor(), Some(requested_scale), (config.width, config.height));
+            Gui { renderer, frontend, host: Host { camera: cam, effect_sun_direction: scene.environment.map(|env| env.sun_dir.map(|v| -v)), ..Host::headless() }, cursor: (0.0, 0.0), mods: Default::default(), scale, requested_scale, scroll_accum: 0.0 }
         });
         let now = Instant::now();
         let focused = window.has_focus();
@@ -510,6 +566,7 @@ impl State {
             speed,
             looking: false,
             focused,
+            mods: ModifiersState::empty(),
             raw_mouse: raw_mouse::RawMouse::new(),
             cursor_hidden: false,
             last: now,
@@ -529,6 +586,15 @@ impl State {
             hook,
             pending_screenshot: None,
         })
+    }
+
+    /// Saves size, position, monitor and fullscreen state for the next launch (audit items 6/7; `window_prefs::Saved`).
+    fn save_window(&self) {
+        let pos = self.window.outer_position().ok().map(|p| (p.x, p.y));
+        let monitor = self.window.current_monitor().and_then(|m| m.name());
+        let scale = self.window.scale_factor();
+        let (width, height) = ((f64::from(self.config.width) / scale).round() as u32, (f64::from(self.config.height) / scale).round() as u32);
+        window_prefs::save(&window_prefs::Saved { width, height, pos, monitor, fullscreen: self.window.fullscreen().is_some() });
     }
 
     fn fly(&self) -> bool {
@@ -563,6 +629,17 @@ impl State {
         g.host.camera = self.cam;
         if !g.host.fly && (dx != 0.0 || dy != 0.0) {
             g.frontend.game_input(GameInput::MouseMotion { dx, dy, dt }, &mut g.host);
+        }
+        // audit item 2: live-apply a scale change from the Enhanced page without a restart.
+        if let Some(requested) = g.host.interface_scale.take() {
+            g.requested_scale = requested;
+            let scale = gui_scale(self.window.scale_factor(), Some(requested), (self.config.width, self.config.height));
+            if scale != g.scale {
+                let ratio = g.scale as f32 / scale as f32;
+                g.cursor.0 *= ratio;
+                g.cursor.1 *= ratio;
+                g.scale = scale;
+            }
         }
         let size = (self.config.width / g.scale, self.config.height / g.scale);
         self.renderer.visible_actor_ids(&mut g.host.previous_visible_actors);
@@ -679,8 +756,7 @@ impl State {
             self.surface.configure(&self.renderer.device, &self.config);
             self.targets = Targets::new(&self.renderer, width, height);
             if let Some(t) = t { self.perf_times[3] += t.elapsed().as_secs_f64(); }
-            let pos = self.window.outer_position().ok().map(|p| (p.x, p.y));
-            window_prefs::save(width, height, pos);
+            self.save_window();
         }
 
         let work_start = self.perf.then(Instant::now);
@@ -798,6 +874,7 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, ev: WindowEvent) {
         let Some(s) = &mut self.state else { return };
         if let WindowEvent::Focused(focused) = &ev { s.focused = *focused; }
+        if let WindowEvent::ModifiersChanged(m) = &ev { s.mods = m.state(); }
         if let Some(g) = &mut s.gui {
             let gi = gui_input(&ev, &mut g.cursor, &mut g.mods, g.scale, &mut g.scroll_accum);
             g.host.mods = g.mods;
@@ -837,24 +914,47 @@ impl ApplicationHandler for App {
         s.sync_cursor();
         match ev {
             // Refresh pacing follows the current screen, not a "moving window" throttle.
-            WindowEvent::Moved(p) => {
+            WindowEvent::Moved(_) => {
                 s.display_period = display_period(s.window.current_monitor().and_then(|monitor| monitor.refresh_rate_millihertz()));
-                window_prefs::save(s.config.width, s.config.height, Some((p.x, p.y)));
+                s.save_window();
             }
             WindowEvent::CloseRequested => {
-                let pos = s.window.outer_position().ok().map(|p| (p.x, p.y));
-                window_prefs::save(s.config.width, s.config.height, pos);
+                s.save_window();
                 el.exit();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 s.display_period = display_period(s.window.current_monitor().and_then(|monitor| monitor.refresh_rate_millihertz()));
                 if let Some(g) = &mut s.gui {
                     // Preserve the cursor's physical position when logical GUI pixels change.
-                    let scale = gui_scale(scale_factor);
+                    let scale = gui_scale(scale_factor, Some(g.requested_scale), (s.config.width, s.config.height));
                     let ratio = g.scale as f32 / scale as f32;
                     g.cursor.0 *= ratio;
                     g.cursor.1 *= ratio;
                     g.scale = scale;
+                }
+            }
+            // Audit item 6: remembered across restarts, toggled instantly, optionally hiding the menu bar/dock.
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed && !event.repeat && s.mods.control_key() && s.mods.super_key()
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyF)) =>
+            {
+                if s.window.fullscreen().is_some() {
+                    s.window.set_fullscreen(None);
+                    s.window.set_borderless_game(false);
+                } else {
+                    let borderless_game = s.gui.as_ref().is_some_and(|g| g.host.borderless_game);
+                    s.window.set_borderless_game(borderless_game);
+                    s.window.set_fullscreen(Some(Fullscreen::Borderless(s.window.current_monitor())));
+                }
+                s.save_window();
+            }
+            // Audit item 8: trackpad pinch gesture zooms the camera, opt-in (`Host::pinch_zoom`); same gating as the
+            // other raw `GameInput` (in-world, not blocked by text input).
+            WindowEvent::PinchGesture { delta, .. } if !fly && s.gui.as_ref().is_some_and(|g| g.host.pinch_zoom) => {
+                if let Some(g) = &mut s.gui {
+                    g.host.camera = s.cam;
+                    g.frontend.game_input(GameInput::Pinch(delta as f32), &mut g.host);
+                    s.cam = g.host.camera;
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if fly || s.gui.is_none() => {
@@ -936,8 +1036,7 @@ impl ApplicationHandler for App {
     /// saves the character-viewer cache). Window position/size are saved the same way `CloseRequested` saves them.
     fn exiting(&mut self, _el: &ActiveEventLoop) {
         if let Some(s) = self.state.take() {
-            let pos = s.window.outer_position().ok().map(|p| (p.x, p.y));
-            window_prefs::save(s.config.width, s.config.height, pos);
+            s.save_window();
         } // `s` drops here: State -> Gui -> Box<dyn Frontend>, running the frontend's own Drop impl.
     }
 }
@@ -1113,12 +1212,23 @@ mod tests {
 
     #[test]
     fn gui_scale_rounds_and_keeps_at_least_one_pixel() {
-        assert_eq!(gui_scale(1.0), 1);
-        assert_eq!(gui_scale(1.49), 1);
-        assert_eq!(gui_scale(1.5), 2);
-        assert_eq!(gui_scale(2.0), 2);
-        assert_eq!(gui_scale(0.0), 1);
-        assert_eq!(gui_scale(f64::NAN), 1);
+        assert_eq!(gui_scale(1.0, None, (1920, 1080)), 1);
+        assert_eq!(gui_scale(1.49, None, (1920, 1080)), 1);
+        assert_eq!(gui_scale(1.5, None, (1920, 1080)), 2);
+        assert_eq!(gui_scale(2.0, None, (1920, 1080)), 2);
+        assert_eq!(gui_scale(0.0, None, (1920, 1080)), 1);
+        assert_eq!(gui_scale(f64::NAN, None, (1920, 1080)), 1);
+    }
+
+    /// Audit item 2: an explicit scale is used as-is when it still leaves at least 1024x768 logical pixels, but is
+    /// reduced (never below 1x) when it would not; `Auto`/`0` is untouched (today's behaviour, unblocked).
+    #[test]
+    fn gui_scale_explicit_request_is_blocked_below_1024x768_logical() {
+        assert_eq!(gui_scale(2.0, Some(0), (1200, 800)), 2, "Auto is never blocked");
+        assert_eq!(gui_scale(2.0, Some(2), (2560, 1600)), 2, "2x of a large window fits, used as requested");
+        assert_eq!(gui_scale(2.0, Some(2), (1600, 1200)), 1, "2x of 1600x1200 would be 800x600 logical: falls back to 1x");
+        assert_eq!(gui_scale(2.0, Some(3), (2560, 1600)), 2, "3x of 2560x1600 would be 853x533: falls back until it fits");
+        assert_eq!(gui_scale(2.0, Some(1), (200, 200)), 1, "a window too small for even 1x stays at 1x (best available)");
     }
 
     /// Trackpad fix: a gesture sent as many small `PixelDelta` events (each well under one 40 px notch) must still

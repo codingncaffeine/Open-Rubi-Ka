@@ -1080,6 +1080,12 @@ impl Frontend for Play {
         &self.gui
     }
 
+    /// Audit item 2 (Enhanced "Interface Scale"): read once at `Play::new` from the account-wide root `Prefs.xml`, so
+    /// the viewer can size the login screen's window correctly on its very first frame, before any HUD/DValues refresh.
+    fn interface_scale(&self) -> u8 {
+        self.interface_scale
+    }
+
     fn input(&mut self, ev: InputEvent, host: &mut Host) {
         if let Some(hud) = self.hud.as_ref() {
             if let Some(chat) = self.chat.as_mut() { chat.configure_escape(&hud.dvalues); }
@@ -1219,7 +1225,13 @@ impl Frontend for Play {
             let msaa = hud.dvalues.get_i64("AomacEdgeSmoothing").unwrap_or(0).clamp(0, 3) as usize;
             host.anisotropy = Some(ANISOTROPY[aniso]);
             host.msaa_samples = Some(MSAA[msaa]);
+            // live-apply while in game; the initial value (login screen) came from `Play::new`'s startup read.
+            self.interface_scale = hud.dvalues.get_i64("AomacInterfaceScale").unwrap_or(0).clamp(0, 3) as u8;
+            host.borderless_game = hud.dvalues.flag("AomacBorderlessFullscreen");
+            host.pinch_zoom = hud.dvalues.flag("AomacPinchZoom");
         }
+        // audit item 2: every screen, including the login screen before any HUD exists.
+        host.interface_scale = Some(self.interface_scale);
         if let Some((life, models)) = &mut self.world_life {
             life.set_enabled(self.wildlife_enabled);
             if !self.wildlife_enabled { models.clear(); }

@@ -158,6 +158,10 @@ struct Row {
 
 struct Play {
     dir: PathBuf,
+    /// Window-level Enhanced option (audit item 2): 0 Auto, 1/2/3 fixed GUI pixel scale; read once here (account-wide
+    /// root `Prefs.xml`, like `texture_resolution` below) so `ao_render::Frontend::interface_scale` can hand it to the
+    /// viewer before the OS window exists (the login screen must honour it too, not just after the HUD loads).
+    interface_scale: u8,
     /// Texture colour depth is read once by native DisplaySystem construction.
     texture_resolution: i32,
     texture_quality: i32,
@@ -320,6 +324,7 @@ impl Play {
             texture_quality: texture_values.get_i64("DisplayOtherTextureQuality").unwrap_or(3) as i32,
             texture_compressed: texture_values.flag("DisplayCompressedTextures"),
             wildlife_enabled: texture_values.flag("Wildlife"),
+            interface_scale: texture_values.get_i64("AomacInterfaceScale").unwrap_or(0).clamp(0, 3) as u8,
             ground_texture_quality: texture_values.get_i64("GroundTextureQuality").unwrap_or(2) as i32,
             ground_texture_patches: Vec::new(),
             ground_texture_serial: 0,

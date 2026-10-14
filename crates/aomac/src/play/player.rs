@@ -26,6 +26,10 @@ use std::cell::RefCell;
 
 /// Length of the jump's ceiling ray (f32 100.0 @ GC 0x10155eb0).
 const JUMP_CEILING_RAY: f32 = 100.0;
+/// Audit item 8 (aomac Enhanced, not retail: pinch-to-zoom has no retail equivalent to calibrate against). Chosen so
+/// a full pinch gesture (magnification roughly doubling, `delta` summing to about 1.0) is comparable to a few mouse
+/// wheel notches. ponytail: uncalibrated against a real trackpad; retune here if it feels too fast/slow.
+const PINCH_NOTCHES_PER_UNIT: f32 = 10.0;
 
 /// Server-coordinate view of the scene-coordinate [`Collision`] for [`Movement`].
 struct Ground<'a>(Option<&'a Collision>);
@@ -436,6 +440,10 @@ impl Player {
                 self.gui_press = [false; 2];
                 self.controls.on_focus_lost()
             }
+            // Audit item 8 (aomac Enhanced, opt-in, not retail): same wheel-notch zoom path as the mouse wheel
+            // (`Controls::on_wheel`), so it keeps the 0.78-25 m range and the `MouseWheel` pref's "zoom vs nothing"
+            // choice. ponytail: `delta` -> notches has no retail reference to calibrate against; tune by feel.
+            GameInput::Pinch(delta) => self.controls.on_wheel(delta * PINCH_NOTCHES_PER_UNIT),
         };
         self.run(cmds);
     }
