@@ -213,17 +213,26 @@ impl ActorRig {
         let used = (0..cat.submeshes.len()).filter(|&i| !(head.is_some() && cat.parts[cat.submeshes[i].material as usize].name == "head")).collect();
         let mut mounts = vec![];
         let mut head_att = None;
+        // `RVisual_t::ApplyStateChanges` (randy31 @0x1004cbe1) and the material delta-state apply inside
+        // `RViewPort_t::SetMaterial` (@0x1004b199, `FUN_10040aa0`) both issue no render-state/texture-stage call at
+        // all when a node/material has no stored `RDeltaState`; `RDeltaState`'s own texture-stage apply
+        // (`FUN_1002f275`) only calls `SetTexture` for a channel it actually resolves. A mounted head or attachment
+        // mesh with no texture channel of its own therefore draws with whatever the previous mount (or the body
+        // itself) last bound, not a blank/white fallback (`playfield::Placer::last_diffuse` is the same fix for
+        // world statels; see `mesh.rs::Builder::last_tex`).
+        let mut last_tex = model.meshes.first().and_then(|m| m.submeshes.last()).and_then(|s| s.texture);
         if let Some(h) = head {
             let att = cat.attractors.iter().position(|a| a.name.ends_with("_head")).context("model has no head attractor")?;
-            if let Some(mesh) = crate::mesh::decode_mesh_into(store, h, &mut model)? {
+            if let Some(mesh) = crate::mesh::decode_statel_mesh(store, crate::mesh::MESH_TYPE, h, &[], last_tex, &mut model)? {
                 mounts.push(Mount { attractor: att, mesh, muzzle: None });
                 head_att = Some(att);
+                last_tex = model.meshes[mesh].submeshes.last().and_then(|s| s.texture).or(last_tex);
             }
         }
         for &(place, id) in attachments {
             let prefix = format!("Attractor{:02}", place as u32 + 1);
             let Some(att) = cat.attractors.iter().position(|a| a.name.starts_with(&prefix)) else { continue };
-            if let Some(mesh) = crate::mesh::decode_mesh_into(store, id, &mut model)? {
+            if let Some(mesh) = crate::mesh::decode_statel_mesh(store, crate::mesh::MESH_TYPE, id, &[], last_tex, &mut model)? {
                 let connectors = crate::mesh::decode_mesh_connectors(store, crate::mesh::MESH_TYPE, id)?;
                 let muzzle = ["Attractor01_weaponfire", "Attractor01", "Attractor02", "Attractor01_weaponfire01", "Attractor01_weaponfire02", "Attractor01_weaponfire03", "Attractor01_weaponfire04", "Attractor01_weaponfire05", "Attractor01_weaponfire06"]
                     .iter().find_map(|name| connectors.iter().find(|(n, _)| n.as_str() == *name).map(|(_, m)| Xf {
@@ -231,6 +240,7 @@ impl ActorRig {
                         t: [m[3][0], m[3][1], m[3][2]],
                     }));
                 mounts.push(Mount { attractor: att, mesh, muzzle });
+                last_tex = model.meshes[mesh].submeshes.last().and_then(|s| s.texture).or(last_tex);
             }
         }
         // Unweighted attractor bones still have local transforms. Using their
@@ -637,6 +647,25 @@ mod tests {
         let h = rig.indicator_height();
         assert!((1.5..2.6).contains(&h), "name tag anchor {h}");
         assert!(bind_parts[1][3][1] > 1.2, "bind-pose head at the shoulders: {}", bind_parts[1][3][1]);
+    }
+
+    /// `229609` (ICC "broken platform" debris, `docs/formats.md` *ICC pf 4582 shuttleport-ruins white statels*) has
+    /// no texture channel anywhere in its archive, the same class of asset as the user-reported white back item:
+    /// mounted on an attractor (here place 5, `Attractor06_back`, same place as `Bergdoktor`'s real `summon_light`
+    /// capture, `docs/zone/dynel.md` §1.3), it must inherit the body's own last resolved texture, not draw white.
+    #[test]
+    fn textureless_attachment_inherits_the_body_last_texture() {
+        let Some(store) = store() else { return };
+        let assets = ActorAssets::new(&store).unwrap();
+        let look = PlayerLook { breed: Breed::Solitus, gender: Gender::Female, skin: Skin::Caucasian, build: 1, head: None, equipment: Equipment::default() };
+        let rig = ActorRig::player(&store, &assets, &look, &[(5, 229_609)]).unwrap();
+        assert_eq!(rig.model().meshes.len(), 2, "body, back attachment");
+        let body_tex = rig.model().meshes[0].submeshes.last().and_then(|s| s.texture).expect("naked body is always textured");
+        let back = &rig.model().meshes[1];
+        assert!(!back.submeshes.is_empty());
+        for sub in &back.submeshes {
+            assert_eq!(sub.texture, Some(body_tex), "a channel-less attachment must inherit the previous draw's texture, not render blank");
+        }
     }
 
     #[test]
