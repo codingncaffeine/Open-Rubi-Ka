@@ -47,7 +47,6 @@ struct Model {
     views: Vec<wgpu::TextureView>,
     view_of: HashMap<TextureKey, usize>,
     topology: Vec<(usize, Vec<ao_scene::Submesh>)>,
-    vertex_scratch: Vec<f32>,
 }
 
 struct ActorGpu {
@@ -152,21 +151,12 @@ impl Renderer {
                     model.topology[i] = (mesh.vertices.len(), mesh.submeshes.clone());
                     continue;
                 };
-                model.vertex_scratch.clear();
-                for vertex in &mesh.vertices {
-                    model.vertex_scratch.extend_from_slice(&[
-                        vertex.pos[0], vertex.pos[1], vertex.pos[2],
-                        vertex.normal[0], vertex.normal[1], vertex.normal[2],
-                        vertex.uv[0], vertex.uv[1],
-                        vertex.color[0], vertex.color[1], vertex.color[2], vertex.color[3],
-                    ]);
-                }
-                let vbytes = (model.vertex_scratch.len() * 4) as u64;
+                let vbytes = (mesh.vertices.len() * 48) as u64;
                 if ensure_capacity(device, &mut gpu.vb, &mut gpu.vertex_capacity, vbytes, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, "actor body vertices") {
                     *grows += 1;
                 }
                 if vbytes > 0 {
-                    queue.write_buffer(&gpu.vb, 0, bytemuck::cast_slice(&model.vertex_scratch));
+                    queue.write_buffer(&gpu.vb, 0, bytemuck::cast_slice(&mesh.vertices));
                 }
 
                 let mut indices = Vec::with_capacity(mesh.submeshes.iter().map(|s| s.indices.len()).sum());
@@ -242,12 +232,12 @@ impl Renderer {
                 meshes.push(None);
                 continue;
             }
-            let vbytes = vertex_bytes(&mesh.vertices);
-            let vertex_capacity = ((vbytes.len() * 4) as u64).next_power_of_two().max(1);
+            let vbytes = mesh.vertices.len() * 12;
+            let vertex_capacity = ((vbytes * 4) as u64).next_power_of_two().max(1);
             let vb = self.device.create_buffer_tracked(&wgpu::BufferDescriptor {
                 label: None, size: vertex_capacity, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
             });
-            self.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&vbytes));
+            self.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&mesh.vertices));
             let (mut indices, mut draws, mut submesh_mats) = (Vec::with_capacity(idx_total), vec![], Vec::with_capacity(mesh.submeshes.len()));
             let nv = mesh.vertices.len() as u32;
             for s in &mesh.submeshes {
@@ -304,8 +294,7 @@ impl Renderer {
             meshes.push(Some(ModelMesh { vb, ib, vertex_capacity, index_capacity, nverts: mesh.vertices.len(), draws, submesh_mats, sphere: (c, r) }));
         }
         let topology = scene.meshes.iter().map(|mesh| (mesh.vertices.len(), mesh.submeshes.clone())).collect();
-        let vertex_scratch = Vec::with_capacity(scene.meshes.iter().map(|mesh| mesh.vertices.len() * 12).max().unwrap_or(0));
-        self.act.models.insert(key, Model { meshes, mats, holo, views, view_of, topology, vertex_scratch });
+        self.act.models.insert(key, Model { meshes, mats, holo, views, view_of, topology });
         // actors of a replaced model rebuild their body buffer at the next pose
         for a in self.act.actors.values_mut().filter(|a| a.model == key) {
             a.vb = None;
@@ -338,16 +327,16 @@ impl Renderer {
             a.model = f.model;
             if let Some(skin) = f.skin.take().filter(|s| s.len() == body.nverts) {
                 if a.skin.as_ref().is_some_and(|previous| std::sync::Arc::ptr_eq(previous, &skin)) { continue; }
-                let bytes = bytemuck::cast_slice(&vertex_bytes(&skin)).to_vec();
+                let bytes: &[u8] = bytemuck::cast_slice(skin.as_slice());
                 match &a.vb {
-                    Some(vb) => self.queue.write_buffer(vb, 0, &bytes),
+                    Some(vb) => self.queue.write_buffer(vb, 0, bytes),
                     None => {
                         let reused = self.act.vb_pool.get_mut(&f.model).and_then(Vec::pop);
                         a.vb = Some(match reused {
-                            Some(vb) => { self.queue.write_buffer(&vb, 0, &bytes); vb }
+                            Some(vb) => { self.queue.write_buffer(&vb, 0, bytes); vb }
                             None => { self.act.vb_created += 1; self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                                 label: None,
-                                contents: &bytes,
+                                contents: bytes,
                                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                             }) }
                         });
@@ -466,50 +455,59 @@ impl Renderer {
     pub(crate) fn draw_actors(&self,enc:&mut wgpu::CommandEncoder,t:&Targets,resolve:&wgpu::TextureView,priority:i32)->usize {
         let layer=&self.act;
         let buf=layer.bufs.get(self.frame);
-        let mut calls=0;
-        let mut one=|pass:&mut wgpu::RenderPass,i:usize| {
-            let Some(buf)=buf else {return};
-            let it = &layer.items[i];
-            let model = &layer.models[&it.model];
-            let Some(mesh) = model.meshes[it.mesh].as_ref() else { return };
-            let own = (it.mesh == 0).then(|| layer.actors.get(&it.actor)?.vb.as_ref()).flatten();
-            let mut bound = false;
-            for d in &mesh.draws {
-                let effect = it.rendering_effect;
-                if effect == 1 && model.holo.is_none() { continue; }
-                if actor_priority(it.priority, it.faded, effect, blended_pipe(d.pipe)) != priority {
-                    continue;
-                }
-                if !bound {
-                    pass.set_vertex_buffer(0, own.unwrap_or(&mesh.vb).slice(..));
-                    let stride = std::mem::size_of::<ActorInstance>() as u64;
-                    pass.set_vertex_buffer(1, buf.slice(i as u64 * stride..(i as u64 + 1) * stride));
-                    pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
-                    bound = true;
-                }
-                let pipe = if it.faded && d.pipe < SKY_PIPE && d.pipe / 2 < 2 { FADE_PIPE + d.pipe } else { d.pipe };
-                let pipe = mesh_effect_pipe(pipe, effect);
-                pass.set_pipeline(&self.actor_pipes[pipe]);
-                pass.set_bind_group(1, &model.mats[d.mat], &[]);
-                if effect == 1 {
-                    pass.set_bind_group(2, model.holo.as_ref().unwrap(), &[]);
-                }
-                pass.draw_indexed(d.first_index..d.first_index + d.count, 0, 0..1);
-                calls += 1;
-            }
-        };
+        let calls=std::cell::Cell::new(0usize);
         let mut start=layer.commands.partition_point(|command|command.0<priority);
         let limit=layer.commands.partition_point(|command|command.0<=priority);
         while start<limit {
             let end=(start+1..limit).find(|&i|layer.commands[i].3).unwrap_or(limit);
             let mut pass=super::screen::world_pass(enc,t,resolve,layer.commands[start].3);
             pass.set_bind_group(0,&self.globals_bg,&[]);
+            if let Some(buf) = buf {
+                pass.set_vertex_buffer(1, buf.slice(..));
+            }
+            let (pipe_c, vb_c, mat_c) = (std::cell::Cell::new(usize::MAX), std::cell::Cell::new(0usize), std::cell::Cell::new((u64::MAX, usize::MAX)));
+            let one=|pass:&mut wgpu::RenderPass,i:usize| {
+                if buf.is_none() {return}
+                let it = &layer.items[i];
+                let model = &layer.models[&it.model];
+                let Some(mesh) = model.meshes[it.mesh].as_ref() else { return };
+                let own = (it.mesh == 0).then(|| layer.actors.get(&it.actor)?.vb.as_ref()).flatten();
+                let vb = own.unwrap_or(&mesh.vb);
+                for d in &mesh.draws {
+                    let effect = it.rendering_effect;
+                    if effect == 1 && model.holo.is_none() { continue; }
+                    if actor_priority(it.priority, it.faded, effect, blended_pipe(d.pipe)) != priority {
+                        continue;
+                    }
+                    let vb_ptr = vb as *const wgpu::Buffer as usize;
+                    if vb_c.get() != vb_ptr {
+                        pass.set_vertex_buffer(0, vb.slice(..));
+                        pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
+                        vb_c.set(vb_ptr);
+                    }
+                    let pipe = if it.faded && d.pipe < SKY_PIPE && d.pipe / 2 < 2 { FADE_PIPE + d.pipe } else { d.pipe };
+                    let pipe = mesh_effect_pipe(pipe, effect);
+                    if pipe_c.get() != pipe {
+                        pass.set_pipeline(&self.actor_pipes[pipe]);
+                        pipe_c.set(pipe);
+                    }
+                    if mat_c.get() != (it.model, d.mat) {
+                        pass.set_bind_group(1, &model.mats[d.mat], &[]);
+                        mat_c.set((it.model, d.mat));
+                    }
+                    if effect == 1 {
+                        pass.set_bind_group(2, model.holo.as_ref().unwrap(), &[]);
+                    }
+                    pass.draw_indexed(d.first_index..d.first_index + d.count, 0, i as u32..i as u32 + 1);
+                    calls.set(calls.get() + 1);
+                }
+            };
             for command in &layer.commands[start..end] {
                 if let Some(index)=command.1 {one(&mut pass,index);}
             }
             start=end;
         }
-        calls
+        calls.get()
     }
 }
 
@@ -860,7 +858,7 @@ mod tests {
     fn model_removal_keeps_unrelated_actors_and_is_idempotent() {
         let mut layer = ActorLayer::default();
         for (id, model) in [(1, 7), (2, 8), (3, 7)] {
-            layer.models.entry(model).or_insert_with(|| Model { meshes: vec![], mats: vec![], holo: None, views: vec![], view_of: HashMap::new(), topology: vec![], vertex_scratch: vec![] });
+            layer.models.entry(model).or_insert_with(|| Model { meshes: vec![], mats: vec![], holo: None, views: vec![], view_of: HashMap::new(), topology: vec![] });
             layer.actors.insert(id, ActorGpu { vb: None, seen: 1, model, skin: None });
             layer.frames.push(ActorFrame { id, model, skin: Some(std::sync::Arc::new(vec![ao_scene::Vertex::default()])), ..Default::default() });
             layer.items.push(Item { actor: id, model, mesh: 0, bucket: 0, faded: false, rendering_effect: 0, priority: None });

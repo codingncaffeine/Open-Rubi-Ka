@@ -34,7 +34,9 @@ pub struct Texture {
     pub source: TextureSource,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// `#[repr(C)]`, `Pod`/`Zeroable`: byte-identical to the GPU vertex layout, so uploads can
+/// `bytemuck::cast_slice` this directly without rebuilding a `Vec<f32>`.
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct Vertex {
     pub pos: [f32; 3],

@@ -398,7 +398,6 @@ struct CloudAnim {
     layer: ao_scene::cloud::CloudLayer,
     sim: ao_scene::cloud::Clouds,
     vertices: Vec<ao_scene::Vertex>,
-    packed: Vec<f32>,
     indices: [Vec<u32>; 2],
     grid: usize,
     time: f32,
@@ -961,7 +960,7 @@ impl Renderer {
             insts.extend(list);
             let vb = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                 label: None,
-                contents: bytemuck::cast_slice(&vertex_bytes(&mesh.vertices)),
+                contents: bytemuck::cast_slice(&mesh.vertices),
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
             let mut indices = Vec::with_capacity(idx_total);
@@ -1123,10 +1122,9 @@ impl Renderer {
                 return Vec::new();
             }
             let (old_vb, old_ib) = self.sky.meshes[mi].take().map_or((None, None), |(a, b)| (Some(a), Some(b)));
-            let vbytes = vertex_bytes(&mesh.vertices);
-            let (vb, created) = ensure_buf(&self.device, old_vb, &mut self.sky.vertex_capacity[mi], (vbytes.len() * 4) as u64, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, "sky vertices");
+            let (vb, created) = ensure_buf(&self.device, old_vb, &mut self.sky.vertex_capacity[mi], (mesh.vertices.len() * 48) as u64, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, "sky vertices");
             self.sky.buffer_creates += created as u64;
-            self.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&vbytes));
+            self.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&mesh.vertices));
             let nv = mesh.vertices.len() as u32;
             let idx_total: usize = mesh.submeshes.iter().map(|s| s.indices.len()).sum();
             let (mut indices, mut draws) = (Vec::with_capacity(idx_total), vec![]);
@@ -1207,7 +1205,6 @@ impl Renderer {
             let mut run=old_clouds.iter().position(|old|old.layer.mesh==layer.mesh && old.layer.altitude==layer.altitude)
                 .map(|i|old_clouds.swap_remove(i)).unwrap_or_else(||CloudAnim {
                     layer:layer.clone(),sim:Default::default(),vertices:scene.meshes[layer.mesh].vertices.clone(),
-                    packed:vec![0.0;scene.meshes[layer.mesh].vertices.len()*12],
                     indices:[ao_scene::cloud::Clouds::indices(2,0,30),ao_scene::cloud::Clouds::indices(10,0,30)],grid:0,time:self.time});
             run.layer=layer.clone();run.grid=0;run
         }).collect();
@@ -1364,7 +1361,7 @@ impl Renderer {
         }
         for (m, gpu) in scene.meshes.iter().zip(&self.gpu.meshes) {
             if let Some((vb, _)) = gpu {
-                self.queue.write_buffer(vb, 0, bytemuck::cast_slice(&vertex_bytes(&m.vertices)));
+                self.queue.write_buffer(vb, 0, bytemuck::cast_slice(&m.vertices));
             }
         }
     }
@@ -1497,7 +1494,7 @@ impl Renderer {
                 v.color = [lin(c, 16), lin(c, 8), lin(c, 0), (c >> 24) as f32 / 255.0];
             }
             if let Some(Some((vb, _))) = self.sky.meshes.get(a.mesh) {
-                self.queue.write_buffer(vb, 0, bytemuck::cast_slice(&vertex_bytes(&a.vertices)));
+                self.queue.write_buffer(vb, 0, bytemuck::cast_slice(&a.vertices));
             }
         }
         let grid=ao_scene::cloud::resolution(self.cloud_preferences.0,self.cloud_preferences.1,self.cloud_preferences.2);
@@ -1507,11 +1504,7 @@ impl Renderer {
             run.sim.update(&run.layer,grid,cam.pos.to_array(),dt,far,&mut run.vertices);
             if let Some(Some((vb,ib)))=self.sky.meshes.get(run.layer.mesh) {
                 if grid!=0 {
-                    for (v,p) in run.vertices.iter().zip(run.packed.as_chunks_mut::<12>().0) {
-                        p[..3].copy_from_slice(&v.pos);p[3..6].copy_from_slice(&v.normal);
-                        p[6..8].copy_from_slice(&v.uv);p[8..].copy_from_slice(&v.color);
-                    }
-                    self.queue.write_buffer(vb,0,bytemuck::cast_slice(&run.packed));
+                    self.queue.write_buffer(vb,0,bytemuck::cast_slice(&run.vertices));
                     if run.grid!=grid {
                         self.queue.write_buffer(ib,0,bytemuck::cast_slice(&run.indices[usize::from(grid==10)]));
                         let mut first=0;
@@ -1705,17 +1698,6 @@ fn instance_slots(scene: &Scene, mesh_range: &[std::ops::Range<usize>]) -> Vec<u
                 r.start + seen[i.mesh] - 1
             }
             _ => usize::MAX,
-        })
-        .collect()
-}
-
-fn vertex_bytes(v: &[ao_scene::Vertex]) -> Vec<f32> {
-    v.iter()
-        .flat_map(|v| {
-            let [x, y, z] = v.pos;
-            let [nx, ny, nz] = v.normal;
-            let [r, g, b, a] = v.color;
-            [x, y, z, nx, ny, nz, v.uv[0], v.uv[1], r, g, b, a]
         })
         .collect()
 }
