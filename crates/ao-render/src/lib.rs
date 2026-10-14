@@ -16,14 +16,15 @@ pub use native_ground::GroundPath;
 
 use anyhow::{anyhow, Context, Result};
 use ao_scene::{Blend, Environment, Scene, TextureKey};
-pub use glam::Vec3;
+pub use glam::{Vec3, Vec4};
 pub use winit::keyboard::KeyCode;
-use glam::{Mat4, Vec4};
+use glam::Mat4;
 use std::collections::HashMap;
 use std::path::Path;
 
 pub use gui::GuiRenderer;
 pub use viewer::{run_frontend, GameInput, Offscreen, run_viewer, run_viewer_hooked, run_viewer_live, FrameHook, Frontend, Host, LiveSky};
+pub use actors::{frustum_culls_sphere, POSE_MARGIN};
 
 /// Downward-clamps `requested` to the closest level present in `supported` (1 is always valid even when `supported` omits it; a pure
 /// function so it's testable without a GPU).
@@ -692,7 +693,10 @@ fn build_pipelines(
     (pipes, actor_pipes, ground_pipes)
 }
 
-fn frustum_planes(vp: &Mat4) -> [Vec4; 6] {
+/// Left/right/bottom/top/near/far planes of `vp` (view-projection), normalized, `>= 0` inside. Public so an app can
+/// build a conservative pre-skin visibility test (perf audit item 5) using the same math as the renderer's own
+/// per-mesh cull (see [`crate::frustum_culls_sphere`]).
+pub fn frustum_planes(vp: &Mat4) -> [Vec4; 6] {
     let (r0, r1, r2, r3) = (vp.row(0), vp.row(1), vp.row(2), vp.row(3));
     [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2].map(|p| p / p.truncate().length())
 }

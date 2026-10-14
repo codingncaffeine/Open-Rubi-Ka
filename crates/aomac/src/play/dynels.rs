@@ -68,6 +68,31 @@ const ACTION_UNWIELD: i32 = 0x61;
 /// NPC record key of the generic death clip and of the first unarmed attack ([`ao_formats::character::NpcAnim`]).
 const DIE_KEY: u32 = 6000;
 const ATTACK_KEY: u32 = canim::UNARMED_RSWING as u32;
+
+/// 5-plane (left/right/bottom/top/near) conservative frustum for [`Dynels::update_with_collision`]'s pre-skin cull:
+/// see the call site for why this is safely never stricter than `ao_render`'s own per-mesh sphere cull.
+fn skin_frustum_planes(cam: [f32; 3], fwd: [f32; 3]) -> [glam::Vec4; 5] {
+    let cam = glam::Vec3::from(cam);
+    let fwd = glam::Vec3::from(fwd).normalize_or_zero();
+    let fwd = if fwd == glam::Vec3::ZERO { glam::Vec3::NEG_Z } else { fwd };
+    let up = if fwd.dot(glam::Vec3::Y).abs() > 0.999 { glam::Vec3::X } else { glam::Vec3::Y };
+    let vp = glam::Mat4::perspective_rh(super::camera::FOV_HORIZONTAL, 1.0, super::camera::NEAR, 1000.0)
+        * glam::Mat4::look_to_rh(cam, fwd, up);
+    let planes = ao_render::frustum_planes(&vp);
+    [planes[0], planes[1], planes[2], planes[3], planes[4]]
+}
+
+/// Whether an actor's CPU skin ([`ao_formats::character::actor::ActorRig::pose_composed_cached`]) can be skipped this
+/// frame (perf audit item 5): conservatively frustum-culled (see [`skin_frustum_planes`]), nothing forces a fresh
+/// pose (`needs_effect_pose`), and it already has a skin to keep drawing (the first frame always skins).
+fn skip_cpu_skin(skin_planes: &[glam::Vec4; 5], pos: [f32; 3], bounding_radius: f32, scale: f32, needs_effect_pose: bool, has_skin: bool) -> bool {
+    let center = glam::Vec3::from(pos);
+    // ponytail: the real bind sphere is centred inside the body, not at the feet; doubling the radius safely
+    // over-covers that offset without plumbing the actual mesh-0 sphere centre through to this pre-GPU stage.
+    let radius = (2.0 * bounding_radius + ao_render::POSE_MARGIN) * scale;
+    has_skin && !needs_effect_pose && ao_render::frustum_culls_sphere(skin_planes, center, radius)
+}
+
 /// Weapon item stat `AnimSet` (0x161): selects the stance clips (docs/zone/combat-anim.md §3.1).
 const STAT_ANIM_SET: u32 = 353;
 /// Weapon item stat `ItemDelay` (0x126, centiseconds): the swing is sped up to land within it (`FUN_1006a239`).
@@ -2403,7 +2428,7 @@ impl Dynels {
     /// Advances the dynels and hands the visible ones to the renderer. `cam` = camera position in scene space, `fwd` = its view direction.
     /// The loaded playfield surface capability; absent geometry is not a no-hit query.
     pub fn update_with_collision(
-        &mut self, dt: f32, cam: [f32; 3], _fwd: [f32; 3], host: &mut Host,
+        &mut self, dt: f32, cam: [f32; 3], fwd: [f32; 3], host: &mut Host,
         collision: Option<&mut dyn FnMut(ao_render::Vec3) -> Option<(ao_render::Vec3, ao_render::Vec3)>>,
         own_anchor: impl FnMut(i32) -> Option<glam::Mat4>,
     ) {
@@ -2528,6 +2553,13 @@ impl Dynels {
             host.actors.push(actor);
         }
         self.advance(dt);
+        // Perf audit item 5: avoid CPU-skinning (`pose_composed_cached`) actors the renderer would cull anyway.
+        // 5 planes (no far plane: the 80 m `char_view_distance` check below already caps distance), built from a
+        // fixed 90° cone around `fwd` with aspect 1 — identical to the renderer's own horizontal half-angle
+        // (`camera::FOV_HORIZONTAL` is authored horizontal, aspect-independent) and strictly wider vertically than
+        // any real landscape window (aspect >= 1 shrinks the renderer's vertical fov below this), so this test can
+        // only be more lenient than `ao_render`'s final per-mesh sphere cull, never stricter.
+        let skin_planes = skin_frustum_planes(cam, fwd);
         for (id, c) in &mut self.chars {
             if *id == own {
                 continue;
@@ -2673,7 +2705,8 @@ impl Dynels {
             }
             let terminal = dead && clip.is_some_and(|a| c.clip_ms >= a.duration);
             let needs_effect_pose = self.effects.as_ref().is_some_and(|effects| effects.needs_source_pose((CHAR_KIND as u32, *id as u32)));
-            let skin = if c.current_skin.is_none() || (sample_pose && (!terminal || !c.terminal_pose || !c.submitted || needs_effect_pose)) {
+            let skip_culled = skip_cpu_skin(&skin_planes, p, rig.bounding_radius, c.scale, needs_effect_pose, c.current_skin.is_some());
+            let skin = if !skip_culled && (c.current_skin.is_none() || (sample_pose && (!terminal || !c.terminal_pose || !c.submitted || needs_effect_pose))) {
                 c.terminal_pose = terminal;
                 let mut cache = std::mem::take(&mut c.pose_cache);
                 let pose = rig.pose_composed_cached(c.layers(built), &mut cache);
@@ -2989,6 +3022,24 @@ mod tests {
         host.set_scene(Default::default());
         world.sync_scene(&host);
         assert!(matches!(world.models[&1], Model::Ready { uploaded: false, .. }));
+    }
+
+    #[test]
+    fn skip_cpu_skin_culls_behind_camera_but_not_in_front() {
+        // Camera at the origin looking down -Z (`Camera::forward`'s convention elsewhere in this file's tests).
+        let planes = skin_frustum_planes([0.0, 0.0, 0.0], [0.0, 0.0, -1.0]);
+        let behind = [0.0, 0.0, 10.0];
+        let in_front = [0.0, 0.0, -10.0];
+        assert!(skip_cpu_skin(&planes, behind, 1.0, 1.0, false, true), "an actor behind the camera is CPU-skin-skipped");
+        assert!(!skip_cpu_skin(&planes, in_front, 1.0, 1.0, false, true), "an actor in front of the camera still skins");
+    }
+
+    #[test]
+    fn skip_cpu_skin_never_skips_without_a_prior_skin_or_with_needs_effect_pose() {
+        let planes = skin_frustum_planes([0.0, 0.0, 0.0], [0.0, 0.0, -1.0]);
+        let behind = [0.0, 0.0, 10.0];
+        assert!(!skip_cpu_skin(&planes, behind, 1.0, 1.0, false, false), "no skin pose yet: the first frame always skins");
+        assert!(!skip_cpu_skin(&planes, behind, 1.0, 1.0, true, true), "needs_effect_pose forces a fresh skin even off-screen");
     }
 
     #[test]

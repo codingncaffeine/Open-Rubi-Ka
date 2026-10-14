@@ -8,8 +8,16 @@ use ao_scene::ActorFrame;
 /// `(mat, pipe, env (mat, pipe))`: see `ModelMesh::submesh_mats`.
 type SubmeshMat = (usize, usize, Option<(usize, usize)>);
 
-/// Extra radius around the bind-pose sphere of mesh 0: limbs reach out of it in animation.
-const POSE_MARGIN: f32 = 1.0;
+/// Extra radius around the bind-pose sphere of mesh 0: limbs reach out of it in animation. Exported so app-side
+/// pre-skin culling (e.g. aomac's dynels CPU-skin skip, perf audit item 5) can mirror this margin.
+pub const POSE_MARGIN: f32 = 1.0;
+
+/// Frustum-vs-sphere visibility test shared between the renderer's own per-mesh instancing cull below and any
+/// app-side pre-skin check: a sphere is culled when it fails any plane (`center`/`radius` in the same space as
+/// `planes`). Exported so an app-side test can use identical math to this crate's own final cull.
+pub fn frustum_culls_sphere(planes: &[Vec4], center: Vec3, radius: f32) -> bool {
+    !planes.iter().all(|p| p.dot(center.extend(1.0)) >= -radius)
+}
 
 /// Affine transform (including the existing alpha lane), then independently enabled material overrides.
 #[repr(C)]
@@ -396,7 +404,7 @@ impl Renderer {
                 let margin = if mi == 0 { POSE_MARGIN } else { 0.0 };
                 let c = m.transform_point3(mesh.sphere.0);
                 let r = (mesh.sphere.1 + margin) * scale;
-                if !f.always && !planes.iter().all(|p| p.dot(c.extend(1.0)) >= -r) {
+                if !f.always && frustum_culls_sphere(planes, c, r) {
                     continue;
                 }
                 let bucket = f.render_bucket.filter(|b| (0..=1800).contains(b))
