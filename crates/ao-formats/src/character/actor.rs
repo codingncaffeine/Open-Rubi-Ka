@@ -172,6 +172,9 @@ struct Mount {
     mesh: usize,
     /// Static weapon connector in the attachment's AO frame, resolved once at load.
     muzzle: Option<Xf>,
+    /// Embedded `RLight_t` lights of this mount's mesh (`mesh.rs::decode_mesh_lights`), in the mesh's own local scene
+    /// space (not yet placed on the bone): transformed by the mount's current pose in [`ActorRig::mount_lights`].
+    lights: Vec<ao_scene::Light>,
 }
 
 /// Native RCAT skeleton state retained between distance-decimated skin refreshes.
@@ -224,7 +227,8 @@ impl ActorRig {
         if let Some(h) = head {
             let att = cat.attractors.iter().position(|a| a.name.ends_with("_head")).context("model has no head attractor")?;
             if let Some(mesh) = crate::mesh::decode_statel_mesh(store, crate::mesh::MESH_TYPE, h, &[], last_tex, &mut model)? {
-                mounts.push(Mount { attractor: att, mesh, muzzle: None });
+                let lights = crate::mesh::decode_mesh_lights(store, crate::mesh::MESH_TYPE, h, [0.0; 3])?;
+                mounts.push(Mount { attractor: att, mesh, muzzle: None, lights });
                 head_att = Some(att);
                 last_tex = model.meshes[mesh].submeshes.last().and_then(|s| s.texture).or(last_tex);
             }
@@ -239,7 +243,8 @@ impl ActorRig {
                         r: std::array::from_fn(|r| std::array::from_fn(|c| m[c][r])),
                         t: [m[3][0], m[3][1], m[3][2]],
                     }));
-                mounts.push(Mount { attractor: att, mesh, muzzle });
+                let lights = crate::mesh::decode_mesh_lights(store, crate::mesh::MESH_TYPE, id, [0.0; 3])?;
+                mounts.push(Mount { attractor: att, mesh, muzzle, lights });
                 last_tex = model.meshes[mesh].submeshes.last().and_then(|s| s.texture).or(last_tex);
             }
         }
@@ -495,6 +500,23 @@ impl ActorRig {
         }
         cache.frames = frames;
         (verts, parts)
+    }
+
+    /// Embedded mount lights (the Light Bar's `summon_light` and similar worn items) placed by `parts` (the per-mesh
+    /// transforms [`ActorRig::pose`] returns), relative to the actor: still needs the actor's own world transform
+    /// applied by the caller (`ao_scene::Light::pos`/`spot.dir` are points/directions in this mount-relative space).
+    /// Empty for the overwhelming majority of actors (no mount carries an authored light).
+    pub fn mount_lights(&self, parts: &[[[f32; 4]; 4]]) -> Vec<ao_scene::Light> {
+        self.mounts
+            .iter()
+            .filter(|m| !m.lights.is_empty())
+            .flat_map(|m| {
+                let t = parts[m.mesh];
+                let point = move |p: [f32; 3]| -> [f32; 3] { std::array::from_fn(|j| p[0] * t[0][j] + p[1] * t[1][j] + p[2] * t[2][j] + t[3][j]) };
+                let dir = move |d: [f32; 3]| -> [f32; 3] { std::array::from_fn(|j| d[0] * t[0][j] + d[1] * t[1][j] + d[2] * t[2][j]) };
+                m.lights.iter().map(move |l| ao_scene::Light { pos: point(l.pos), spot: l.spot.map(|s| ao_scene::Spot { dir: dir(s.dir), ..s }), ..*l })
+            })
+            .collect()
     }
 
     /// Frame of the closest ancestor that has one (a bone without skin vertices in the bind pose).

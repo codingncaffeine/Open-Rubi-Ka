@@ -152,6 +152,8 @@ struct Globals {
     view: [[f32; 4]; 4],
     water_dir: [f32; 4],
     water_g: [f32; 4],
+    /// x = active dynamic light count (`Renderer::set_dynamic_lights`), yzw unused.
+    dyn_info: [i32; 4],
 }
 
 /// One submesh draw. `pipe` = `blend as usize * 2 + two_sided as usize`; sky draws use `SKY_PIPE + blend`.
@@ -213,6 +215,10 @@ fn material_pipe(s: &ao_scene::Submesh) -> usize {
 const CELL_LIGHTS: usize = 16;
 const MIN_CELL: f32 = 8.0;
 const MAX_CELLS: usize = 1 << 20;
+/// Fixed capacity of the per-frame moving-light buffer ([`Renderer::set_dynamic_lights`]): worn/attached item lights
+/// (the Light Bar and similar), rewritten every frame; D3D7's own 8-light-per-vertex cap (`vertex_lights` in the shader)
+/// already bounds how many actually contribute, so this is a generous ceiling, not a faithfulness constant.
+const MAX_DYN_LIGHTS: usize = 16;
 
 /// Static light grid: dense 3D cells, each listing up to `CELL_LIGHTS` lights whose sphere touches it.
 struct LightGrid {
@@ -285,18 +291,18 @@ impl LightGrid {
         if idx.is_empty() {
             idx.push(0);
         }
-        let gl = lights
-            .iter()
-            .flat_map(|l| {
-                // kind: 0 = linear ramp, 1 = D3D attenuation (atten x of the third vec4 is then the divisor sum)
-                let (cos_phi, cos_theta, axis) = l.spot.map_or((2.0, 0.0, [0.0; 3]), |s| ((s.phi * 0.5).cos(), (s.theta * 0.5).cos(), s.dir));
-                let a = if l.atten == [0.0; 3] { [-1.0, 0.0, 0.0] } else { l.atten }; // a0 < 0: linear
-                // colours go to the shader in D3D (gamma) space, where the fixed function lighting sums them
-                [[l.pos[0], l.pos[1], l.pos[2], l.range], [gamma(l.color[0]), gamma(l.color[1]), gamma(l.color[2]), cos_phi], [a[0], a[1], a[2], cos_theta], [axis[0], axis[1], axis[2], 0.0]]
-            })
-            .collect();
+        let gl = lights.iter().flat_map(|l| pack_light(l)).collect();
         Self { zones: lights.iter().map(|l| l.zone).collect(), lights: gl, cells, idx, origin: lo, cell, dims }
     }
+}
+
+/// Packs one light into the shader's 4-`vec4` layout: `(pos, range), (colour, cos(phi/2) | 2 = no cone), (atten0..2, cos(theta/2)), (axis, 0)`.
+/// Shared by the static [`LightGrid`] and [`Renderer::set_dynamic_lights`] (moving, per-frame lights).
+fn pack_light(l: &ao_scene::Light) -> [[f32; 4]; 4] {
+    let (cos_phi, cos_theta, axis) = l.spot.map_or((2.0, 0.0, [0.0; 3]), |s| ((s.phi * 0.5).cos(), (s.theta * 0.5).cos(), s.dir));
+    let a = if l.atten == [0.0; 3] { [-1.0, 0.0, 0.0] } else { l.atten }; // a0 < 0: linear
+    // colours go to the shader in D3D (gamma) space, where the fixed function lighting sums them
+    [[l.pos[0], l.pos[1], l.pos[2], l.range], [gamma(l.color[0]), gamma(l.color[1]), gamma(l.color[2]), cos_phi], [a[0], a[1], a[2], cos_theta], [axis[0], axis[1], axis[2], 0.0]]
 }
 
 /// Static instance data: transform plus world-space bounding sphere.
@@ -517,6 +523,11 @@ pub struct Renderer {
     light_buf: wgpu::Buffer,
     light_base: Vec<[f32; 4]>,
     light_zones: Vec<Option<u32>>,
+    /// Per-frame moving lights (worn/attached item lights such as the Light Bar), see [`Renderer::set_dynamic_lights`]:
+    /// a small fixed-capacity storage buffer rewritten every frame, separate from the static `light_buf`/grid so an
+    /// actor's own light moving every frame never rebuilds the whole scene's light grid.
+    dyn_light_buf: wgpu::Buffer,
+    dyn_light_count: i32,
     /// Traffic ships of the uploaded scene, see `Scene::movers`.
     movers: Vec<MoverRun>,
     spaceship_slots: Vec<bool>,
@@ -760,9 +771,9 @@ impl Renderer {
         };
         let g_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT), storage_entry(1), storage_entry(2), storage_entry(3)],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT), storage_entry(1), storage_entry(2), storage_entry(3), storage_entry(4)],
         });
-        let (globals_bg, light_buf) = globals_bind(&device, &g_layout, &globals, &LightGrid::new(&[]));
+        let (globals_bg, light_buf, dyn_light_buf) = globals_bind(&device, &g_layout, &globals, &LightGrid::new(&[]));
         let tex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
@@ -852,6 +863,8 @@ impl Renderer {
             light_buf,
             light_base: vec![],
             light_zones: vec![],
+            dyn_light_buf,
+            dyn_light_count: 0,
             frame: 0,
             vis: vec![],
             vis_src: vec![],
@@ -1160,7 +1173,8 @@ impl Renderer {
             .collect();
         self.set_sky(scene);
         let grid = LightGrid::new(&scene.lights);
-        (self.globals_bg, self.light_buf) = globals_bind(&self.device, &self.g_layout, &self.globals, &grid);
+        (self.globals_bg, self.light_buf, self.dyn_light_buf) = globals_bind(&self.device, &self.g_layout, &self.globals, &grid);
+        self.dyn_light_count = 0;
         self.light_zones = grid.zones.clone();
         self.light_base = grid.lights.clone();
         let grid = ([grid.origin.x, grid.origin.y, grid.origin.z, grid.cell], [grid.dims[0], grid.dims[1], grid.dims[2], 0]);
@@ -1518,6 +1532,20 @@ impl Renderer {
         self.gpu.radius
     }
 
+    /// Per-frame moving point/spot lights (worn/attached item lights, e.g. the Light Bar's embedded `RLight_t`,
+    /// `mesh.rs::decode_mesh_lights`, tracked to its attractor bone every frame): affects terrain, statics and actors
+    /// through the same `vertex_lights` D3D7 formula as the static light grid, capped at [`MAX_DYN_LIGHTS`] (far above
+    /// the handful of simultaneously worn light items expected live). Call once per frame before [`Renderer::render`];
+    /// an empty slice turns dynamic lighting off again (e.g. the item unequipped or its wearer out of view).
+    pub fn set_dynamic_lights(&mut self, lights: &[ao_scene::Light]) {
+        let n = lights.len().min(MAX_DYN_LIGHTS);
+        self.dyn_light_count = n as i32;
+        if n > 0 {
+            let packed: Vec<[f32; 4]> = lights[..n].iter().flat_map(pack_light).collect();
+            self.queue.write_buffer(&self.dyn_light_buf, 0, bytemuck::cast_slice(&packed));
+        }
+    }
+
     pub fn set_screen_effects(&mut self,layers:Vec<ScreenLayer>,fog_disabled:bool) {
         self.screen.layers=layers;
         self.screen.fog_disabled=fog_disabled;
@@ -1570,6 +1598,7 @@ impl Renderer {
             view: Mat4::look_to_rh(cam.pos, cam.forward(), cam.up()).to_cols_array_2d(),
             water_dir: v4(Vec3::from_array(water_dir).normalize_or_zero().to_array(), 0.0),
             water_g: g4(water_color, env.sun_specular),
+            dyn_info: [self.dyn_light_count, 0, 0, 0],
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
 
@@ -1969,9 +1998,16 @@ fn gate_lights(base: &[[f32; 4]], zones: &[Option<u32>], levels: &[u8]) -> Vec<[
     data
 }
 
-fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: &wgpu::Buffer, g: &LightGrid) -> (wgpu::BindGroup, wgpu::Buffer) {
+fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: &wgpu::Buffer, g: &LightGrid) -> (wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer) {
     let l = device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&g.lights), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST });
     let (c, i) = (storage(device, &g.cells), storage(device, &g.idx));
+    // Zero-initialized (wgpu buffers are zero-filled on creation); `Renderer::set_dynamic_lights` rewrites the live prefix every frame.
+    let d = device.create_buffer_tracked(&wgpu::BufferDescriptor {
+        label: None,
+        size: (MAX_DYN_LIGHTS * 4 * 16) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
         label: None,
         layout,
@@ -1980,9 +2016,10 @@ fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: 
             wgpu::BindGroupEntry { binding: 1, resource: l.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: c.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: i.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: d.as_entire_binding() },
         ],
     });
-    (bg, l)
+    (bg, l, d)
 }
 
 #[cfg(test)]

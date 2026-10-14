@@ -15,6 +15,7 @@ struct G {
     view: mat4x4<f32>,     // world -> camera space (env map texgen)
     water_dir: vec4<f32>,
     water_g: vec4<f32>,    // authored WaterLightCurrent, not doubled GroundLightCurrent
+    dyn_info: vec4<i32>,   // x = active dynamic (per-frame moving) light count in `dyn_lights`
 }
 struct Mat {
     color: vec4<f32>,
@@ -27,6 +28,7 @@ struct Mat {
 @group(0) @binding(1) var<storage, read> lights: array<vec4<f32>>; // pairs: (pos, range), (colour, 0)
 @group(0) @binding(2) var<storage, read> cells: array<vec2<u32>>;  // (first index, count) into `light_idx`
 @group(0) @binding(3) var<storage, read> light_idx: array<u32>;
+@group(0) @binding(4) var<storage, read> dyn_lights: array<vec4<f32>>; // per-frame moving lights, same 4-vec4 layout as `lights`
 @group(1) @binding(0) var tex: texture_2d<f32>;
 @group(1) @binding(1) var samp: sampler;
 @group(1) @binding(2) var<uniform> mat: Mat;
@@ -167,40 +169,71 @@ struct Lit {
 fn vertex_lights(p: vec3<f32>, n: vec3<f32>, power: f32) -> array<vec3<f32>, 2> {
     var diff = vec3<f32>(0.0);
     var spec = vec3<f32>(0.0);
-    let c = vec3<i32>(floor((p - g.grid.xyz) / g.grid.w));
-    if any(c < vec3<i32>(0)) || any(c >= g.dims.xyz) {
-        return array<vec3<f32>, 2>(diff, spec);
-    }
-    let e = cells[u32((c.z * g.dims.y + c.y) * g.dims.x + c.x)];
     let v = normalize(g.eye.xyz - p);
+    let c = vec3<i32>(floor((p - g.grid.xyz) / g.grid.w));
     // D3D7 fixed function: at most 8 active lights; the cell list is sorted strongest first.
     // Lights switched off by the statel distance LOD (range 0) do not count against the 8.
     var used = 0u;
-    for (var k = 0u; k < e.y && used < 8u; k = k + 1u) {
-        let li = light_idx[e.x + k] * 4u;
-        let a = lights[li];
+    if !(any(c < vec3<i32>(0)) || any(c >= g.dims.xyz)) {
+        let e = cells[u32((c.z * g.dims.y + c.y) * g.dims.x + c.x)];
+        for (var k = 0u; k < e.y && used < 8u; k = k + 1u) {
+            let li = light_idx[e.x + k] * 4u;
+            let a = lights[li];
+            if a.w <= 0.0 {
+                continue;
+            }
+            used = used + 1u;
+            let col = lights[li + 1u];
+            let att = lights[li + 2u];
+            let d = a.xyz - p;
+            let dist = length(d);
+            if dist <= a.w {
+                let l = d / max(dist, 1e-3);
+                var i = select(1.0 - dist / a.w, 1.0 / (att.x + dist * (att.y + dist * att.z)), att.x >= 0.0);
+                if col.w < 1.5 {
+                    // spot: rho = cos(angle between -L and the axis); 1 inside theta/2, 0 outside phi/2, linear between
+                    let rho = dot(-l, lights[li + 3u].xyz);
+                    i = i * clamp((rho - col.w) / max(att.w - col.w, 1e-4), 0.0, 1.0);
+                }
+                let nl = dot(n, l);
+                if nl > 0.0 {
+                    diff += col.rgb * (i * nl);
+                    if power > 0.0 {
+                        spec += col.rgb * (i * pow(max(dot(n, normalize(l + v)), 0.0), power));
+                    }
+                }
+            }
+        }
+    }
+    // Per-frame moving lights (worn/attached item lights such as the Light Bar, `Renderer::set_dynamic_lights`): a
+    // small flat list, not range-gridded (few are ever active live), the same D3D7 formula, sharing the 8-light
+    // budget above -- and evaluated even where the point falls outside the static grid (indoor/edge cases).
+    let dyn_count = u32(g.dyn_info.x);
+    for (var k = 0u; k < dyn_count && used < 8u; k = k + 1u) {
+        let li = k * 4u;
+        let a = dyn_lights[li];
         if a.w <= 0.0 {
             continue;
         }
-        used = used + 1u;
-        let col = lights[li + 1u];
-        let att = lights[li + 2u];
         let d = a.xyz - p;
         let dist = length(d);
-        if dist <= a.w {
-            let l = d / max(dist, 1e-3);
-            var i = select(1.0 - dist / a.w, 1.0 / (att.x + dist * (att.y + dist * att.z)), att.x >= 0.0);
-            if col.w < 1.5 {
-                // spot: rho = cos(angle between -L and the axis); 1 inside theta/2, 0 outside phi/2, linear between
-                let rho = dot(-l, lights[li + 3u].xyz);
-                i = i * clamp((rho - col.w) / max(att.w - col.w, 1e-4), 0.0, 1.0);
-            }
-            let nl = dot(n, l);
-            if nl > 0.0 {
-                diff += col.rgb * (i * nl);
-                if power > 0.0 {
-                    spec += col.rgb * (i * pow(max(dot(n, normalize(l + v)), 0.0), power));
-                }
+        if dist > a.w {
+            continue;
+        }
+        used = used + 1u;
+        let col = dyn_lights[li + 1u];
+        let att = dyn_lights[li + 2u];
+        let l = d / max(dist, 1e-3);
+        var i = select(1.0 - dist / a.w, 1.0 / (att.x + dist * (att.y + dist * att.z)), att.x >= 0.0);
+        if col.w < 1.5 {
+            let rho = dot(-l, dyn_lights[li + 3u].xyz);
+            i = i * clamp((rho - col.w) / max(att.w - col.w, 1e-4), 0.0, 1.0);
+        }
+        let nl = dot(n, l);
+        if nl > 0.0 {
+            diff += col.rgb * (i * nl);
+            if power > 0.0 {
+                spec += col.rgb * (i * pow(max(dot(n, normalize(l + v)), 0.0), power));
             }
         }
     }

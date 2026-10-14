@@ -65,6 +65,11 @@ pub struct Host {
     pub actor_model_removals: Vec<u64>,
     /// The actors to draw this frame ([`ao_scene::ActorFrame`]); push every frame, the viewer drains it. Actors that are not pushed are forgotten.
     pub actors: Vec<ao_scene::ActorFrame>,
+    /// Per-frame moving lights (worn/attached item lights, e.g. a Light Bar's embedded `RLight_t`, tracked to its
+    /// attractor bone): push every frame ([`Renderer::set_dynamic_lights`]), the viewer applies and replaces them
+    /// alongside `actors`. Not pushed = no dynamic lights this frame (an empty push, not a missing one, since the
+    /// previous frame's lights must not linger once their source actor leaves view/range).
+    pub dynamic_lights: Vec<ao_scene::Light>,
     /// Forget all actor models and actors before applying `actor_models` (a new zone).
     pub clear_actors: bool,
     /// Replace the live sky ([`LiveSky`]; `Some(None)` = static sky) of the windowed viewer before the next frame; drained by the viewer.
@@ -135,6 +140,7 @@ impl Host {
             r.update_actor_model(key, &scene);
         }
         r.set_actors(std::mem::take(&mut self.actors));
+        r.set_dynamic_lights(&std::mem::take(&mut self.dynamic_lights));
         for (key,texture) in self.screen_textures.drain(..) {r.upload_screen_texture(key,&texture);}
         let fog=self.native_fog.as_ref().map(|state|state.get());
         if let Some(fog)=fog {r.set_fog_density_scale(fog.weight);}
@@ -144,7 +150,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None }
+        Host { smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -168,6 +174,7 @@ impl Host {
         self.actor_model_updates.clear();
         self.actor_model_removals.clear();
         self.actors.clear();
+        self.dynamic_lights.clear();
         self.screen_layers.clear();
         self.screen_textures.clear();
         self.viewport_depth_clears.clear();

@@ -4671,31 +4671,41 @@ mod variant_tests {
         assert_eq!(z.world.take_sounds(), [GameSound { id: sid("SM_Sandy_Game_Feet_Man_Swim"), pos: pp, material: 5, size: 1 }]);
     }
 
-    /// The Beach Leet's authored attack notes fire once per independent holder node.
+    /// The Beach Leet's authored attack notes come from exactly one holder node per swing, not a duplicate/stacked
+    /// one: some attack clip variants are authored multi-hit combos whose own note id legitimately fires more than
+    /// once in a single (non-looping) play (confirmed live: clip 1034's note 38 fires at 4 distinct authored times,
+    /// `note_fired` bits 0 and 1 both set), so repeated note values are not themselves evidence of a bug.
     #[test]
     fn a_holder_swing_clip_reports_its_notes() {
         let Some((mut z, _, leet)) = fight_zone() else { return };
-        // The attack clip variant is picked from `Dynels::rng`, seeded from wall-clock time in production (matches the
-        // client's `srand(time)`): pin it so this test's chosen variant, and therefore its note timing within the fixed
-        // 80-frame window, is deterministic instead of occasionally picking a variant whose clip naturally loops twice.
-        z.world.rng = CrtRand::new(1);
         let mut host = Host::headless();
         let (eye, fwd) = (scene_pos(z.own().unwrap().pos), [0.0, 0.0, -1.0]);
+        // `fight_zone` replays real captured combat traffic, which can leave the leet already mid-swing by the time
+        // the async model finishes loading and this function returns: clear any leftover action so `play_swing`
+        // below always begins a genuinely fresh holder node (not reusing one with in-flight `ms`/`note_fired`).
+        z.world.chars.get_mut(&leet).unwrap().actions.clear();
         z.world.take_notes();
         z.world.play_swing(leet, None, canim::list::ATTACK);
         let mut notes = vec![];
-        for _ in 0..80 {
+        // Observe this holder node's lifetime (`Char::actions`, emptied by `ActionAnim::advance` returning false on
+        // completion), not a fixed frame count: whichever attack clip variant `Dynels::rng` happens to pick
+        // (wall-clock seeded in production, like the client's `srand(time)`) plays to its own natural end.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
             z.world.update_with_collision(0.05, eye, fwd, &mut host, None, |_| None);
             host.actors.clear();
             notes.extend(z.world.take_notes());
+            let count = z.world.chars[&leet].actions.iter().filter(|a| a.key == Some(canim::list::ATTACK)).count();
+            assert!(count <= 1, "at most one attack holder node for this key at a time: {count}");
+            if count == 0 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "leet attack holder node never finished");
         }
         // idle/walk clips legitimately repeat their locomotion notes (`0xf` idle) every loop now that the base clip fires
         // notes too (`footstep_and_land_notes_...`); this test is about the attacking leet's own attack notes only.
         notes.retain(|n| n.0 == leet && n.1.id != 0xf);
         eprintln!("leet attack clip notes: {notes:?}");
-        let mut uniq = notes.clone();
-        uniq.dedup();
-        assert_eq!(notes.len(), uniq.len(), "every note fires once");
         assert!(!notes.is_empty() && notes.iter().all(|n| n.0 == leet));
     }
 
