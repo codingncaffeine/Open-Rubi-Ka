@@ -1653,7 +1653,10 @@ impl Renderer {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: t.msaa.as_ref().unwrap_or(resolve),
-                    resolve_target: t.msaa.as_ref().map(|_| resolve),
+                    // Resolved once, in a single trailing pass after every draw this frame (below): mid-frame resolves
+                    // are pure wasted bandwidth, since nothing reads `resolve` before `self.screen.draw` at the very
+                    // end (audit item 1, S-effort stopgap: skip empty passes, resolve only in the last pass).
+                    resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(framebuffer_clear(env.sky_color)),
@@ -1738,34 +1741,59 @@ impl Renderer {
             }
             drop(pass);
             calls.set(calls.get() + self.draw_actors(&mut enc,t,resolve,3));
-            let mut pass=screen::world_pass(&mut enc,t,resolve,false);
-            pass.set_bind_group(0,&self.globals_bg,&[]);
-            // the actor pass rebinds pipeline, buffers and material: forget the cached state
-            pipe.set(usize::MAX);
-            mesh.set((false, usize::MAX));
-            mat.set((false, usize::MAX));
-            if let Some(inst) = inst_buf {
-                pass.set_vertex_buffer(1, inst.slice(..));
-                for d in &self.gpu.liquid {
-                    let r = self.vis_range[d.mesh].clone();
-                    if !r.is_empty() {
-                        draw(&mut pass, d, r, false);
+            // The liquid and blended passes previously opened even with nothing to draw: skip them entirely then
+            // (audit item 1, S-effort stopgap).
+            if !self.gpu.liquid.is_empty() {
+                let mut pass=screen::world_pass(&mut enc,t,resolve,false);
+                pass.set_bind_group(0,&self.globals_bg,&[]);
+                // the actor pass rebinds pipeline, buffers and material: forget the cached state
+                pipe.set(usize::MAX);
+                mesh.set((false, usize::MAX));
+                mat.set((false, usize::MAX));
+                if let Some(inst) = inst_buf {
+                    pass.set_vertex_buffer(1, inst.slice(..));
+                    for d in &self.gpu.liquid {
+                        let r = self.vis_range[d.mesh].clone();
+                        if !r.is_empty() {
+                            draw(&mut pass, d, r, false);
+                        }
                     }
                 }
+                drop(pass);
             }
-            drop(pass);
             calls.set(calls.get()+self.draw_actors(&mut enc,t,resolve,4));
-            pass=screen::world_pass(&mut enc,t,resolve,false);
-            pass.set_bind_group(0,&self.globals_bg,&[]);
-            pipe.set(usize::MAX);mesh.set((false,usize::MAX));mat.set((false,usize::MAX));
-            if let Some(inst)=inst_buf {
-                pass.set_vertex_buffer(1,inst.slice(..));
-                for &(_, di, vi) in &self.sorted {
-                    draw(&mut pass, &self.gpu.blended[di as usize], vi..vi + 1, false);
+            if !self.sorted.is_empty() {
+                let mut pass=screen::world_pass(&mut enc,t,resolve,false);
+                pass.set_bind_group(0,&self.globals_bg,&[]);
+                pipe.set(usize::MAX);mesh.set((false,usize::MAX));mat.set((false,usize::MAX));
+                if let Some(inst)=inst_buf {
+                    pass.set_vertex_buffer(1,inst.slice(..));
+                    for &(_, di, vi) in &self.sorted {
+                        draw(&mut pass, &self.gpu.blended[di as usize], vi..vi + 1, false);
+                    }
                 }
+                drop(pass);
             }
-            drop(pass);
             for priority in [5,6,10,7] {calls.set(calls.get()+self.draw_actors(&mut enc,t,resolve,priority));}
+            if let Some(msaa) = &t.msaa {
+                // The one real resolve of the frame (audit item 1, S-effort stopgap): every earlier pass above wrote
+                // `resolve_target: None`, so this zero-draw pass is the only point this frame's draws are resolved
+                // into `resolve`, right before `self.screen.draw` reads it. `StoreOp::Discard`: nothing reads `msaa`
+                // again before the next frame clears it.
+                enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("msaa resolve"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: msaa,
+                        resolve_target: Some(resolve),
+                        depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Discard },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
         }
         self.screen.draw(&mut enc,resolve);
         self.stats = FrameStats { instances: self.vis.len(), draw_calls: calls.get() };
