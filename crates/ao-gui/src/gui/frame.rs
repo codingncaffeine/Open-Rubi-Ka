@@ -613,6 +613,29 @@ mod tests {
         assert!(!gui.interacting());
     }
 
+    /// Measured per-event cost (bug 1, "slight lag when moving GUI elements"): a window drag is `MouseMove` events
+    /// through the real `Gui::input` -> `frame_mouse_move` -> (for a pure move, no resize) `set_window_outer_frame`,
+    /// no `relayout_window`. Budget generous for CI noise; the real number is logged for the before/after report.
+    #[test]
+    fn window_drag_mouse_move_cost_stays_microseconds_not_milliseconds() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let w = gui.open_window_xml("drag", "<root><CanvasView name=\"bar\"/></root>", (100, 100), WindowSize::Fixed(200, 150)).unwrap();
+        gui.set_window_dock_frame(w, Some("Drag"));
+        gui.input(crate::InputEvent::MouseDown { x: 150.0, y: 107.0, button: crate::MouseButton::Left });
+        assert!(gui.interacting());
+        let n = 2000;
+        let start = std::time::Instant::now();
+        for i in 0..n {
+            gui.input(crate::InputEvent::MouseMove { x: 150.0 + (i % 400) as f32, y: 107.0 + (i % 50) as f32 });
+        }
+        let per_event = start.elapsed() / n;
+        eprintln!("window drag MouseMove: {:.1} us/event ({} events)", per_event.as_secs_f64() * 1e6, n);
+        gui.input(crate::InputEvent::MouseUp { x: 150.0, y: 107.0, button: crate::MouseButton::Left });
+        assert!(per_event.as_micros() < 500, "drag MouseMove got {per_event:?}/event, expected sub-millisecond (no relayout on a pure move)");
+    }
+
     #[test]
     fn inactive_tabs_run_at_double_layer_alpha_clamped_at_the_vertex() {
         assert_eq!(tab_alpha(true, 1.0), 0.85);

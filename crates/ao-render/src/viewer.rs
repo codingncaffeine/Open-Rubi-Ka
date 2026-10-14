@@ -437,7 +437,10 @@ impl State {
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: if std::env::var_os("AOMAC_NOVSYNC").is_some() { wgpu::PresentMode::AutoNoVsync } else { wgpu::PresentMode::AutoVsync },
-            desired_maximum_frame_latency: 2,
+            // Minimum wgpu/Metal allows (`CAMetalLayer.maximumDrawableCount` = this + 1 = 2, Apple's floor):
+            // fewer buffered drawables means less input-to-photon latency, at the cost of occasionally blocking
+            // `get_current_texture` a little longer for the compositor to free a drawable.
+            desired_maximum_frame_latency: 1,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
         };
