@@ -267,7 +267,8 @@ enum Light {
     Unlit,
     /// Directional light from the sun, colour `SpaceLight<n>Current`.
     Moon([f32; 3]),
-    /// `CloudLightCurrent`, no direction term.
+    /// `CloudLightCurrent`, direction `CloudLightDirection` (`Tweak_Rubi-Ka_SunLight.txt`: `GAME.Sun1Rotation`, the same
+    /// value as `SpaceLight*Direction`).
     Cloud([f32; 3]),
 }
 
@@ -302,12 +303,17 @@ impl Builder<'_> {
 
     /// `FOGENABLE`: the linear fog of the playfield, evaluated per vertex at the distance the object's authored radius has at
     /// the view distance (like the atmosphere strip). Opaque and blended layers get a fog coloured overlay (`FOGCOLOR`,
-    /// default the world fog colour); additive ones fade out (their fog colour is black). Without an explicit state the
-    /// scenery sorted at or after `BackgroundSort.Horizon` is fogged, everything before it is not [GUESS: the client's default
-    /// fog state is not stored in the scripts; the horizon map must not show as a brown band behind a fogged terrain].
+    /// default the world fog colour); additive ones fade out (their fog colour is black). Without an explicit state,
+    /// ground scenery sorted at or after `BackgroundSort.Horizon` is fogged, everything before it is not [GUESS: the
+    /// client's default fog state is not stored in the scripts; the horizon map must not show as a brown band behind a
+    /// fogged terrain]; `SunlightType e_SunLight_CloudLayer*` objects (the horizon cloud bank, atmospheric, not ground
+    /// terrain) are excluded from that default: `HorizonClouds` sets no `FOGENABLE` of its own, and the guess otherwise
+    /// adds a near-opaque (vertex `amount` ~0.99 at this mesh's authored radius) fog-coloured overlay that flattens its
+    /// textured cloud detail into a solid colour (the grey sheet half of the daytime ICC pf 4582 report).
     fn fogged(&self, o: &Obj, mut mesh: Mesh) -> Mesh {
         let horizon = self.sorts.get("Horizon").copied().unwrap_or(u32::MAX);
-        if !o.flag("FOGENABLE").unwrap_or_else(|| self.sort(o) >= horizon) {
+        let cloud_layer = o.field("SunlightType").map(str::trim).is_some_and(|t| t.starts_with("e_SunLight_CloudLayer"));
+        if !o.flag("FOGENABLE").unwrap_or(!cloud_layer && self.sort(o) >= horizon) {
             return mesh;
         }
         let amount = |v: &Vertex| {
@@ -379,11 +385,10 @@ impl Builder<'_> {
             v.normal = scene(q.rotate(scene(v.normal)));
             let c = match light {
                 Light::Unlit => [1.0; 3],
-                Light::Moon(l) => {
+                Light::Moon(l) | Light::Cloud(l) => {
                     let d = (0..3).map(|k| v.normal[k] * to_sun[k]).sum::<f32>().max(0.0);
                     l.map(|c| c * d)
                 }
-                Light::Cloud(l) => l,
             };
             // cloud layers thin out towards the horizon (haze) instead of ending in the straight line where the fogged horizon
             // dish starts [GUESS: the client's own cloud/fog blend was not found]
@@ -766,5 +771,53 @@ Object VortexHorizon
         assert_eq!(rim.states.get("DESTBLEND").map(String::as_str), Some("e_D3DBLEND_ONE"));
         assert_eq!(object_blend(clouds, Blend::Opaque), Blend::AlphaBlend);
         assert_eq!(object_blend(rim, Blend::Opaque), Blend::SourceColorOne);
+    }
+
+    /// Daytime ICC pf 4582 report: a flat light-grey sheet with a dark-blue jagged edge replaced the real sky gradient.
+    /// Two independent bugs compounded: (1) `fogged()`'s ground-scenery default guess (`sort >= Horizon`) also caught
+    /// `HorizonClouds` (no `FOGENABLE` of its own, `SunlightType e_SunLight_CloudLayer0`), adding a near-opaque
+    /// fog-coloured overlay submesh that flattened its textured cloud detail into one solid colour; (2) `Light::Cloud`
+    /// used a flat `CloudLightCurrent` tint with no direction term, so `HorizonCloudsRim`'s self-modulated glow blend
+    /// (`src² + dst`) saturated uniformly under the bright daytime tint instead of varying with the surface normal, as
+    /// `CloudLightDirection` (`Tweak_Rubi-Ka_SunLight.txt`: `GAME.Sun1Rotation`, the same value as the Moon lights'
+    /// `SpaceLight*Direction`) implies it should.
+    #[test]
+    fn real_horizon_clouds_skip_the_ground_fog_guess_and_shade_directionally_at_noon() {
+        let Some(t) = real_tweaks(4582) else { return };
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        let (Ok(store), objs) = (ao_rdb::RecordStore::open(&dir), t.objects()) else { return };
+        let Ok(names) = NameTable::load(&store) else { return };
+        let sky = super::super::Sky::new(&t, 3240.0).expect("noon sky"); // noon: the brightest CloudLightCurrent of the day
+        let sorts = objs.iter().find(|o| o.name == "BackgroundSort").map_or_else(HashMap::new, |o| {
+            o.fields.iter().filter_map(|(k, v)| Some((k.clone(), script::eval(v, &|_| None)? as u32))).collect()
+        });
+        let ctx = Ctx {
+            day_time: sky.day_time,
+            sun1: super::super::sun_rotation(sky.sun_ao),
+            sun2: super::super::sun_rotation(sky.sun2_ao),
+            cloud_intensity: sky.weather.thick_clouds_intensity(),
+            hq_offset: hq_offset(&objs),
+            delta_time: 0.0,
+            wind: [0.0; 2],
+            night: sky.night,
+            counters: counters(&objs),
+            waves: [0.0; 16],
+        };
+        let mut scene = Scene::default();
+        let fog = Fog { color: [0.3, 0.45, 0.7], start: 0.5, end: 600.0 };
+        let mut b = Builder { fog, store: &store, names, ctx, objs: &objs, sky: &sky, scene: &mut scene, sorts };
+
+        let clouds = objs.iter().find(|o| o.name == "HorizonClouds").expect("HorizonClouds");
+        let mesh = b.mesh_object(clouds).expect("HorizonClouds mesh");
+        let n_submeshes = mesh.submeshes.len();
+        let fogged = b.fogged(clouds, mesh);
+        assert_eq!(fogged.submeshes.len(), n_submeshes, "CloudLayer sky objects must not be swept into the ground-fog default guess");
+
+        let rim = objs.iter().find(|o| o.name == "HorizonCloudsRim").expect("HorizonCloudsRim");
+        let rim_mesh = b.mesh_object(rim).expect("HorizonCloudsRim mesh");
+        let reds: Vec<f32> = rim_mesh.vertices.iter().map(|v| v.color[0]).collect();
+        let (min_r, max_r) = reds.iter().fold((f32::MAX, f32::MIN), |(mn, mx), &r| (mn.min(r), mx.max(r)));
+        assert!(max_r - min_r > 0.05, "CloudLayer lighting must vary with the surface normal like CloudLightDirection implies, not be a flat tint ({min_r}..{max_r})");
     }
 }
