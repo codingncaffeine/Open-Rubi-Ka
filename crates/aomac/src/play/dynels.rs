@@ -4624,6 +4624,10 @@ mod variant_tests {
     #[test]
     fn a_holder_swing_clip_reports_its_notes() {
         let Some((mut z, _, leet)) = fight_zone() else { return };
+        // The attack clip variant is picked from `Dynels::rng`, seeded from wall-clock time in production (matches the
+        // client's `srand(time)`): pin it so this test's chosen variant, and therefore its note timing within the fixed
+        // 80-frame window, is deterministic instead of occasionally picking a variant whose clip naturally loops twice.
+        z.world.rng = CrtRand::new(1);
         let mut host = Host::headless();
         let (eye, fwd) = (scene_pos(z.own().unwrap().pos), [0.0, 0.0, -1.0]);
         z.world.take_notes();
