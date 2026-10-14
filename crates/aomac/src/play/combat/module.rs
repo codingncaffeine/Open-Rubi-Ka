@@ -243,6 +243,12 @@ impl Module {
         self.dying.is_some()
     }
 
+    /// `combat::state::Combat::add_test_char` for tests in sibling modules (`combat` is private here).
+    #[cfg(test)]
+    pub fn test_add_char(&mut self, id: i32, name: &str, npc: bool, health: i32) {
+        self.combat.add_test_char(id, name, npc, health);
+    }
+
     /// Animation id of the own death: `CharacterAction` 99's `identity_b.instance` (stat 0x183), [`DEFAULT_DEATH_ANIM`] when the server sent none.
     pub fn death_anim(&self) -> u16 {
         self.dying.as_ref().map_or(DEFAULT_DEATH_ANIM, |d| d.anim)

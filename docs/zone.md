@@ -86,6 +86,7 @@ Movement of other dynels, animation roles and name tags: [zone/motion.md](zone/m
 | combat glue (module, keys, numbers, music feed, own avatar) | `play/combat/{module,glue}.rs`: commands → frames, `CombatEvent` → dynel/avatar clips, floating numbers, `Audio::set_combat_char`; live fight | [zone/combat.md](zone/combat.md) |
 | combat input / outgoing | `combat::{attack, stop_fight, sec_spec_attack}` encoders (flag byte 0), `can_attack`, `AttackGate` (`+0x79` guard), `default_attack`; keys/clicks → N3Msg chain | docs/zone/combat-net.md |
 | combat state / log / numbers | fight controller per dynel (`Combat::on_frame` → `CombatEvent`), health bookkeeping, the client's feedback formatter (`FUN_10012bd5`) with the real `text.mdb` strings, HUD / world floating numbers (colour, life, rise) | [zone/combat-log.md](zone/combat-log.md) (`play/combat/{state,log,stat_names}.rs`) |
+| combat Attack/Reload HUD bars | `TimerBarBase_c` kind 1/5 per weapon hand (`play/combat/arms.rs::item_round_seconds`, `play/dynels.rs` state machine, `play/hud_stats.rs` windows) | [zone/combat-timers.md](zone/combat-timers.md) |
 | time of day | `GameTimeIIR_t.time` (67170.0) → sky clock (`GameDayTime` wraps at 6480 s; 67170 mod 6480 = 2370) | docs/zone/world.md §4 |
 | playfield changes | `PlayfieldAnarchyF` again (+ `ZoneRedirection` 0x3C when the zone server changes) | docs/zone/world.md §1, protocol.md §5 |
 

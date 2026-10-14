@@ -166,7 +166,11 @@ pub(super) struct HudStats {
     /// `FUN_10047fde`/`FUN_1003d7ce` [GC]: the client-local wear/unwear busy timer ([`item_dnd::wear_delay`]).
     wear_timers: item_dnd::WearTimers,
     /// `TimerSystemModule_t::CreateTimer` item-action bar (`hud_timerbar.rs`) while [`Self::wear_timers`] counts down a long enough delay.
-    item_timer: Option<WindowId>,
+    item_timer: Option<(WindowId, i32)>,
+    /// Open Attack timer bars, keyed by weapon hand slot: `(window, free-position slot index)`.
+    attack_timers: std::collections::HashMap<i32, (WindowId, i32)>,
+    /// Open Reload timer bar.
+    reload_timer: Option<(WindowId, i32)>,
 }
 
 /// Value of the first `<Bool name=NAME value=..>` below `e`.
@@ -233,6 +237,8 @@ impl HudStats {
             item_button: ao_gui::MouseButton::Left,
             wear_timers: Default::default(),
             item_timer: None,
+            attack_timers: Default::default(),
+            reload_timer: None,
         })
     }
 
@@ -970,6 +976,8 @@ impl HudStats {
         self.advance_item_hold(gui, zone, _dt);
         self.wear_timers.tick(_dt);
         self.update_item_timer(gui);
+        self.update_attack_timers(gui, zone);
+        self.update_reload_timer(gui, zone);
         self.refresh_stats(zone);
         self.update_skills(gui, zone);
         self.update_wear(gui, zone);
@@ -980,29 +988,102 @@ impl HudStats {
         }
     }
 
+    /// Lowest free-position slot (`hud_timerbar::pos_slot`) not already held by an open Item/Attack/Reload timer bar
+    /// (`TimerSystemModule_t::FindNextFreePos`'s linear scan over the shared stack).
+    fn free_timer_slot(&self) -> i32 {
+        let mut used: Vec<i32> = self.attack_timers.values().map(|&(_, s)| s).collect();
+        used.extend(self.item_timer.map(|(_, s)| s));
+        used.extend(self.reload_timer.map(|(_, s)| s));
+        (0..).find(|n| !used.contains(n)).unwrap_or(0)
+    }
+
     /// `TimerSystemModule_t::StartTimerBar` type 4 ("Item", tint `hud_timerbar::COLOR_ITEM`): shown while [`item_dnd::WearTimers`]
     /// counts down a wear/unwear delay of at least [`hud_timerbar::MIN_SECONDS`]; closes itself once the delay clears (the real
     /// equip/unequip itself only ever happens on the server's own `ContainerAddItemIIR_t`, never gated by this cosmetic bar).
     fn update_item_timer(&mut self, gui: &mut Gui) {
         match self.wear_timers.active() {
             Some((progress, total)) if total >= hud_timerbar::MIN_SECONDS => {
-                let w = match self.item_timer {
-                    Some(w) => w,
-                    None => match hud_timerbar::open(gui, "ItemTimerBar", hud_timerbar::LABEL_ITEM, hud_timerbar::COLOR_ITEM, hud_timerbar::POS_SLOT0) {
-                        Ok(w) => {
-                            self.item_timer = Some(w);
-                            w
+                let (w, _) = match self.item_timer {
+                    Some(ws) => ws,
+                    None => {
+                        let slot = self.free_timer_slot();
+                        match hud_timerbar::open(gui, "ItemTimerBar", hud_timerbar::LABEL_ITEM, hud_timerbar::COLOR_ITEM, hud_timerbar::pos_slot(slot)) {
+                            Ok(w) => {
+                                self.item_timer = Some((w, slot));
+                                (w, slot)
+                            }
+                            Err(e) => {
+                                eprintln!("hud: item timer bar: {e:#}");
+                                return;
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("hud: item timer bar: {e:#}");
-                            return;
-                        }
-                    },
+                    }
                 };
                 hud_timerbar::set_progress(gui, w, progress);
             }
             _ => {
-                if let Some(w) = self.item_timer.take() {
+                if let Some((w, _)) = self.item_timer.take() {
+                    gui.close_window(w);
+                }
+            }
+        }
+    }
+
+    /// `TimerSystemModule_t::StartTimerBar` type 1 ("Attack"): one bar per open [`super::dynels::Dynels::attack_bar_progress`]
+    /// entry, closed when its weapon hand stops fighting or is unwielded. docs/zone/combat-timers.md.
+    fn update_attack_timers(&mut self, gui: &mut Gui, zone: &Zone) {
+        let bars = zone.world.attack_bar_progress(zone.char_id as i32, &zone.stats);
+        let gone: Vec<i32> = self.attack_timers.keys().filter(|slot| !bars.iter().any(|&(s, ..)| s == **slot)).copied().collect();
+        for slot in gone {
+            if let Some((w, _)) = self.attack_timers.remove(&slot) {
+                gui.close_window(w);
+            }
+        }
+        for (slot, progress, _total) in bars {
+            let w = match self.attack_timers.get(&slot).copied() {
+                Some((w, _)) => w,
+                None => {
+                    let timer_slot = self.free_timer_slot();
+                    match hud_timerbar::open(gui, "AttackTimerBar", hud_timerbar::LABEL_ATTACK, hud_timerbar::COLOR_ATTACK, hud_timerbar::pos_slot(timer_slot)) {
+                        Ok(w) => {
+                            self.attack_timers.insert(slot, (w, timer_slot));
+                            w
+                        }
+                        Err(e) => {
+                            eprintln!("hud: attack timer bar: {e:#}");
+                            continue;
+                        }
+                    }
+                }
+            };
+            hud_timerbar::set_progress(gui, w, progress);
+        }
+    }
+
+    /// `TimerSystemModule_t::StartTimerBar` type 5 ("Reload"): [`super::dynels::Dynels::reload_bar_progress`].
+    fn update_reload_timer(&mut self, gui: &mut Gui, zone: &Zone) {
+        match zone.world.reload_bar_progress() {
+            Some((progress, _total)) => {
+                let w = match self.reload_timer {
+                    Some((w, _)) => w,
+                    None => {
+                        let slot = self.free_timer_slot();
+                        match hud_timerbar::open(gui, "ReloadTimerBar", hud_timerbar::LABEL_RELOAD, hud_timerbar::COLOR_RELOAD, hud_timerbar::pos_slot(slot)) {
+                            Ok(w) => {
+                                self.reload_timer = Some((w, slot));
+                                w
+                            }
+                            Err(e) => {
+                                eprintln!("hud: reload timer bar: {e:#}");
+                                return;
+                            }
+                        }
+                    }
+                };
+                hud_timerbar::set_progress(gui, w, progress);
+            }
+            None => {
+                if let Some((w, _)) = self.reload_timer.take() {
                     gui.close_window(w);
                 }
             }
@@ -1726,12 +1807,12 @@ mod tests {
         assert_eq!(payload, [inv::move_item_to_inventory(me, belt, 7)]);
         let (started, total) = s.hud.wear_timers.active().expect("the 70 s EquipDelay bar just started");
         assert!(started > 0.99 && total == 70.0, "{started} {total}");
-        let bar = s.hud.item_timer.expect("a long enough equip delay opens the Item timer bar");
+        let bar = s.hud.item_timer.expect("a long enough equip delay opens the Item timer bar").0;
         assert_eq!(s.gui.text(bar, "label"), "Item", "text.mdb 10000 Timer_Item, not an icon overlay");
         o.frame(&mut s, 35.0);
         let (half, _) = s.hud.wear_timers.active().expect("still counting down halfway through");
         assert!((half - 0.5).abs() < 0.01, "{half}");
-        assert_eq!(s.hud.item_timer, Some(bar), "the same bar keeps counting down");
+        assert_eq!(s.hud.item_timer.map(|(w, _)| w), Some(bar), "the same bar keeps counting down");
         // the server's own answer moves the item regardless of the local cosmetic timer
         s.zone.apply_inventory(&inv::InventoryMsg::ContainerAdd { item: belt, container: mine, slot: 7 });
         o.frame(&mut s, 0.016);
@@ -1739,6 +1820,40 @@ mod tests {
         o.frame(&mut s, 35.0);
         assert_eq!(s.hud.wear_timers.active(), None, "the timer clears itself once the 70 s elapse");
         assert_eq!(s.hud.item_timer, None, "the bar closes itself along with the timer");
+    }
+
+    /// Two Attack bars (dual hands) stacked under the Item bar, and a separate Reload bar, each at the retail free-slot
+    /// position (`hud_timerbar::pos_slot`, `FindNextFreePos`). `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac --
+    /// combat_timer_bars_stack_and_show_mid_fight` -> `combat-timer-bars.png`. docs/zone/combat-timers.md.
+    #[test]
+    fn combat_timer_bars_stack_and_show_mid_fight() {
+        let Some((mut s, mut o)) = shot() else { return };
+        let own = s.zone.char_id as i32;
+        s.zone.world.arms.wield(own, 500, 6, None, &[(0x126, 500), (0xd2, 500), (440, 100), (0x1a4, -1)]);
+        s.zone.world.arms.wield(own, 501, 8, None, &[(0x126, 400), (0xd2, 400), (440, 100), (0x1a4, 2)]);
+        s.zone.stats.insert(100, 600);
+        s.zone.stats.insert(51, 0);
+        s.zone.world.update_attack_bars(own, true, 0.0);
+        assert_eq!(s.zone.world.attack_bar_progress(own, &s.zone.stats).len(), 2, "both hands open a bar");
+        s.zone.world.start_reload_bar(own, &s.zone.stats);
+        assert!(s.zone.world.reload_bar_progress().is_some());
+        o.frame(&mut s, 0.016);
+        assert_eq!(s.hud.attack_timers.len(), 2);
+        assert!(s.hud.reload_timer.is_some());
+        let mut slots: Vec<i32> = s.hud.attack_timers.values().map(|&(_, slot)| slot).collect();
+        slots.push(s.hud.reload_timer.unwrap().1);
+        slots.sort_unstable();
+        assert_eq!(slots, [0, 1, 2], "FindNextFreePos: lowest free slot each, no overlap with each other");
+        for &(w, _) in s.hud.attack_timers.values() {
+            assert_eq!(s.gui.text(w, "label"), "Attack");
+        }
+        assert_eq!(s.gui.text(s.hud.reload_timer.unwrap().0, "label"), "Reload");
+        png(&mut s, &mut o, "combat-timer-bars");
+        // the fight stopping closes both Attack bars but leaves the still-counting Reload bar alone
+        s.zone.world.update_attack_bars(own, false, 0.0);
+        o.frame(&mut s, 0.016);
+        assert!(s.hud.attack_timers.is_empty());
+        assert!(s.hud.reload_timer.is_some());
     }
 
     /// The real `Hud`: the menu toggles open the windows, the frame close button (and `Close`) clears the menu state again; the NewChar template's

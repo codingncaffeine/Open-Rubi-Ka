@@ -791,6 +791,15 @@ pub struct Dynels {
     wielded: Vec<i32>,
     /// Weapon-slot tables of the characters: stat `DamageType` of the item behind an `AttackInfo` slot (the hit lines of the chat log).
     pub arms: super::combat::arms::Armory,
+    /// `(slot, elapsed since the last swing or fight start)` of the own character's wielded hands while fighting: backs the
+    /// HUD `TimerSystemModule_t::StartTimerBar` kind-1 "Attack" bars (`Dynels::update_attack_bars`, `hud_stats::update_attack_timers`).
+    attack_bars: HashMap<i32, f32>,
+    /// `(elapsed, total)` of the predicted Reload bar (kind 5 "Reload"), started by `Dynels::start_reload_bar` when the
+    /// player sends the Reload special action. [GUESS] duration: no distinct `ReloadTime` item stat exists in this
+    /// client's rdb/stat tables (searched `stat_names.txt`; Gamecode `FUN_1006949a`/`FUN_10029e66` only send/gate the
+    /// request, they carry no duration) -- reuses [`super::combat::arms::item_round_seconds`] of the ranged hand, the only
+    /// evidenced weapon timing this port has. docs/zone/combat-timers.md.
+    reload_bar: Option<(f32, f32)>,
     /// (swing clip, `ItemDelay`) of the last [`Dynels::pick_swing`] of a character: the clip plays sped up by [`canim::swing_speed_scale`].
     swing_delay: HashMap<i32, (u32, i32)>,
     /// (clip, playback rate) of the last [`Dynels::react_to_hit`] of a character.
@@ -937,6 +946,8 @@ impl Default for Dynels {
             fighting: HashSet::new(),
             wielded: vec![],
             arms: Default::default(),
+            attack_bars: HashMap::new(),
+            reload_bar: None,
             swing_delay: HashMap::new(),
             once_rate: HashMap::new(),
             weapons: HashMap::new(),
@@ -1448,6 +1459,62 @@ impl Dynels {
     pub fn hit_seen(&mut self, attacker: i32, ctx: super::combat::notes::HitCtx) {
         self.slot_hits.insert((attacker, ctx.slot), (ctx.damage, ctx.flags));
         self.swings.insert(attacker, (ctx.victim, ctx.slot));
+    }
+
+    /// Starts/clears the own Attack bars and advances every open one (once per tick, `combat/glue.rs`). `fighting` =
+    /// `combat::module::Module::attacking()`; a slot whose hand is no longer wielded drops its bar, a newly wielded one
+    /// starts fresh at zero.
+    pub fn update_attack_bars(&mut self, own: i32, fighting: bool, dt: f32) {
+        if fighting {
+            let slots = self.arms.attack_slots(own);
+            self.attack_bars.retain(|slot, _| slots.contains(slot));
+            for slot in slots {
+                self.attack_bars.entry(slot).or_insert(0.0);
+            }
+            for v in self.attack_bars.values_mut() {
+                *v += dt;
+            }
+        } else if !self.attack_bars.is_empty() {
+            self.attack_bars.clear();
+        }
+        if let Some((elapsed, total)) = self.reload_bar.as_mut() {
+            *elapsed += dt;
+            if *elapsed >= *total {
+                self.reload_bar = None;
+            }
+        }
+    }
+
+    /// Restarts the Attack bar of `slot` at a swing of the own character (`CombatEvent::Hit`/`Miss` whose attacker is
+    /// `own`, `combat/glue.rs`). A no-op if that hand's bar is not open (the swing belongs to a special-attack key, not a
+    /// tracked hand slot).
+    pub fn restart_attack_bar(&mut self, slot: i32) {
+        if let Some(v) = self.attack_bars.get_mut(&slot) {
+            *v = 0.0;
+        }
+    }
+
+    /// `(slot, progress 0..1, total seconds)` of every open Attack bar, for the HUD's TimerBarBase windows.
+    pub fn attack_bar_progress(&self, own: i32, stats: &HashMap<u32, i32>) -> Vec<(i32, f32, f32)> {
+        self.attack_bars.iter().filter_map(|(&slot, &elapsed)| {
+            let item = self.arms.slot_item(own, slot)?;
+            let total = super::combat::arms::item_round_seconds(item, stats);
+            Some((slot, (elapsed / total).min(1.0), total))
+        }).collect()
+    }
+
+    /// Starts the Reload bar (`hud_use.rs` Reload special action 0x6e): duration from the first wielded hand carrying
+    /// ammo (`item.ammo != -1`). A no-op without a ranged hand (the action is only offered for one, `hud_special.rs`
+    /// `sync_equipment`).
+    pub fn start_reload_bar(&mut self, own: i32, stats: &HashMap<u32, i32>) {
+        if let Some(item) = self.arms.attack_slots(own).iter().filter_map(|&s| self.arms.slot_item(own, s)).find(|i| i.ammo != -1) {
+            self.reload_bar = Some((0.0, super::combat::arms::item_round_seconds(item, stats)));
+        }
+    }
+
+    /// `(progress 0..1, total seconds)` of the open Reload bar, if any.
+    pub fn reload_bar_progress(&self) -> Option<(f32, f32)> {
+        self.reload_bar.map(|(elapsed, total)| ((elapsed / total).min(1.0), total))
     }
 
     /// `FUN_1006a9c5` selects a special clip but retains the slot's previous flags and damage.
@@ -3770,6 +3837,51 @@ mod tests {
         let normal = crate::play::combat::state::CombatEvent::Hit { attacker: who, victim: 77, damage: 10, slot: 6, flags: 4 };
         crate::play::combat::glue::combat_animations(&mut z.world, None, -1, &[normal], |_| false);
         assert_eq!(z.world.chars[&who].actions.len(), 1, "normal attack is suppressed by the fallback special's resolved key");
+    }
+
+    /// `update_attack_bars`/`restart_attack_bar`/`attack_bar_progress`/`start_reload_bar`: no client rdb needed, the
+    /// message-stat path of `combat::arms::Armory` already carries AttackDelay/RechargeDelay/InitiativeSkill/AmmoType.
+    #[test]
+    fn attack_and_reload_bars_track_hands_swings_and_fight_state() {
+        let mut d = Dynels::default();
+        let own = 1;
+        d.arms.wield(own, 500, 6, None, &[(0x126, 500), (0xd2, 500), (440, 100), (0x1a4, 2)]);
+        let mut stats = HashMap::new();
+        stats.insert(100, 1200);
+        stats.insert(51, 0);
+        // no bar while not fighting
+        d.update_attack_bars(own, false, 1.0);
+        assert!(d.attack_bar_progress(own, &stats).is_empty());
+        // fighting opens the right-hand bar at zero progress, then it fills
+        d.update_attack_bars(own, true, 0.0);
+        let bars = d.attack_bar_progress(own, &stats);
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].0, 6);
+        assert_eq!(bars[0].1, 0.0);
+        let total = bars[0].2;
+        assert!(total > 0.0);
+        d.update_attack_bars(own, true, total * 0.5);
+        let half = d.attack_bar_progress(own, &stats)[0].1;
+        assert!((half - 0.5).abs() < 0.01, "{half}");
+        // a swing of the own character's right hand restarts the bar
+        d.restart_attack_bar(6);
+        assert_eq!(d.attack_bar_progress(own, &stats)[0].1, 0.0);
+        // a swing of an untracked slot (no such hand open) is a no-op
+        d.restart_attack_bar(8);
+        assert!(d.attack_bar_progress(own, &stats).iter().all(|&(s, ..)| s != 8));
+        // leaving the fight clears the bar
+        d.update_attack_bars(own, false, 1.0);
+        assert!(d.attack_bar_progress(own, &stats).is_empty());
+        // Reload: the ranged hand (AmmoType present) starts a bar and it clears once elapsed reaches its total
+        assert!(d.reload_bar_progress().is_none());
+        d.start_reload_bar(own, &stats);
+        let (p0, reload_total) = d.reload_bar_progress().expect("a ranged hand is wielded");
+        assert_eq!(p0, 0.0);
+        d.update_attack_bars(own, false, reload_total * 0.5);
+        let (half, _) = d.reload_bar_progress().unwrap();
+        assert!((half - 0.5).abs() < 0.01, "{half}");
+        d.update_attack_bars(own, false, reload_total);
+        assert!(d.reload_bar_progress().is_none(), "the reload bar closes once its duration elapses");
     }
 }
 

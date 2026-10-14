@@ -169,6 +169,7 @@ impl Play {
         let Some(m) = self.fight.as_mut() else { return };
         m.update(dt, &self.zone, self.audio.as_ref());
         let own = self.zone.char_id as i32;
+        self.zone.world.update_attack_bars(own, m.attacking(), dt);
         // Every health consumer (target, team, nametag and NPC info) reads the zone stores.
         let events = m.take_events();
         for e in &events {
@@ -197,6 +198,9 @@ impl Play {
         for e in &events {
             if let Some((attacker, ctx)) = hit_of(e) {
                 self.zone.world.hit_seen(attacker, ctx);
+                if attacker == own {
+                    self.zone.world.restart_attack_bar(ctx.slot);
+                }
             }
             if let CombatEvent::SpecialAttack { who, target, slot, .. } = e {
                 self.zone.world.special_hit_seen(*who, target.instance, *slot);
@@ -777,5 +781,57 @@ mod health_tests {
         assert!(matches!(death.first(), Some(CombatEvent::Health { health: 5, .. })));
         assert_eq!(zone.dynels[&2].health, 0);
         assert!(death.iter().any(|e| matches!(e, CombatEvent::Died { dynel: 2, cause: 4 })));
+    }
+
+
+    /// End-to-end wiring (`combat/glue.rs`'s own `update_attack_bars`/`restart_attack_bar` calls, `hud_stats.rs`'s window
+    /// mirror) over the real fight capture: `Module` drives the own character's hits/misses, `Zone::on_frame` feeds the
+    /// real `Dynels::arms` from the same wire (own 0x82e8's bare-hands martial-arts item), and the Attack bar for slot 0
+    /// opens with a real initiative-scaled duration, fills, and restarts on every own swing. docs/zone/combat-timers.md.
+    #[test]
+    fn captured_fight_drives_the_attack_bar() {
+        let dir = match ao_gui::client_dir() { d if d.join("cd_image/rdb.db").exists() => d, _ => return };
+        let own = 0x82e8;
+        let mut m = Module::with_texts(Box::new(Fixed::new()), own);
+        let mut zone = crate::play::zone::Zone::new(own);
+        zone.world.arms = crate::play::combat::arms::Armory::open(&dir);
+        // `zone_fight_ithaca.rec` carries no `SpecialAttackWeaponIIR_t` for the own character (only the leet's N3 traffic
+        // was captured): seed the bare-hands martial-arts item the same way `arms::tests::captured_wear_and_unwear_of_
+        // the_rifle` seeds it for the sibling rifle capture (item 43712, `BARE_HANDS_KEY` = 100 in `combat::arms`).
+        zone.world.arms.list(own as i32, false, &[(43712, 100)]);
+        m.test_add_char(0xfd6a9, "Beach Leet", true, 12);
+        let (mut own_swings, mut restarts, mut snapshot) = (0, 0, None);
+        for l in include_str!("../../../../../docs/captures/zone_fight_ithaca.rec").lines() {
+            let mut p = l.split(' ');
+            let (_, dir_, hex) = (p.next().unwrap(), p.next().unwrap(), p.next().unwrap());
+            let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+            let f = ao_net::frame::Frame::decode_with(&b, false).unwrap().unwrap().0;
+            if dir_ == ">" {
+                continue;
+            }
+            m.on_frame(&f);
+            zone.on_frame(&f);
+            zone.world.update_attack_bars(own as i32, m.attacking(), 0.1);
+            for e in m.take_events() {
+                if let Some((attacker, ctx)) = hit_of(&e) {
+                    if attacker == own as i32 {
+                        own_swings += 1;
+                        zone.world.restart_attack_bar(ctx.slot);
+                        restarts += 1;
+                    }
+                }
+            }
+            if let Some(bar) = zone.world.attack_bar_progress(own as i32, &zone.stats).into_iter().next() {
+                snapshot.get_or_insert(bar);
+            }
+        }
+        assert!(own_swings >= 3 && restarts == own_swings, "{own_swings} {restarts}");
+        let (slot, progress, total) = snapshot.expect("the fight capture must open the own character's Attack bar at least once");
+        assert_eq!(slot, 0, "Aomacvolk fights bare-handed (no WeaponItemFullUpdate in this capture)");
+        assert!(total > 0.1 && total < 20.0, "a sane initiative-scaled round time: {total}s");
+        assert!((0.0..=1.0).contains(&progress));
+        // StopFight at the end of the capture must clear the bar (`update_attack_bars(fighting=false, ..)`).
+        zone.world.update_attack_bars(own as i32, false, 0.0);
+        assert!(zone.world.attack_bar_progress(own as i32, &zone.stats).is_empty());
     }
 }

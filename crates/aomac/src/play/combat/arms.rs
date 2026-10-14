@@ -49,10 +49,45 @@ pub struct Item {
     pub effect_type: i32,
     pub impact_effect_type: i32,
     pub ammo: i32,
+    /// Stat `AttackDelay` (0x126 = 294).
     pub delay: i32,
+    /// Stat `RechargeDelay` (0xd2 = 210): the item-info DPS cell's other half of the round time
+    /// (`chat::item_info_combat::delay`, `recharge = true`).
+    pub recharge: i32,
+    /// Stat `InitiativeSkill` (440): which of the character's skills scales `delay`/`recharge` (`round_seconds`).
+    pub initiative_skill: i32,
+    /// Stat `AttackDelayCap` (523), present on some weapons.
+    pub attack_cap: Option<i32>,
+    /// Stat `RechargeDelayCap` (524).
+    pub recharge_cap: Option<i32>,
     /// Effective `AttackRange` (287); ctor defaults are 20 wielded / 2 dummy.
     pub attack_range: i32,
     pub wielded: bool,
+}
+
+/// GC 1006772b/10067849: hundredths, current raw initiative and AggDef, the post-1200 initiative slope, individual item
+/// caps, then the one-second floor. Shared by the item-info DPS cell (`chat::item_info_combat::delay`) and the Attack /
+/// Reload HUD timer bars (`item_round_seconds`, `hud_stats::update_attack_timers`).
+pub fn round_delay(raw: i32, cap: Option<i32>, initiative: i32, agg_def: i32, recharge: bool) -> f32 {
+    let initiative = if initiative <= 1200 { initiative as f32 * 0.5 } else { (initiative - 1200) as f32 / 6.0 + 600.0 };
+    let mut time = (raw as f32 + 75.0) - initiative * if recharge { 2.0 } else { 1.0 } / 3.0 - agg_def as f32;
+    if let Some(cap) = cap {
+        time = time.max(cap as f32);
+    }
+    time.max(100.0)
+}
+
+/// Total round time (seconds) of `item`: `round_delay(AttackDelay) + round_delay(RechargeDelay)`, both initiative-scaled
+/// against the own character's current raw stats (`stats`, `Zone::stats`). `recharge_init` follows stat 118 unless
+/// `initiative_skill` already lies in 0..=1200 (`chat::item_info_combat::fields`, `FUN_10067849`).
+pub fn item_round_seconds(item: &Item, stats: &HashMap<u32, i32>) -> f32 {
+    use ao_formats::stats::INVALID;
+    let agg_def = stats.get(&51).copied().unwrap_or(INVALID);
+    let init = item.initiative_skill;
+    let attack_init = stats.get(&(init as u32)).copied().unwrap_or(INVALID);
+    let recharge_init = stats.get(&(if (0..=1200).contains(&init) { init } else { 118 } as u32)).copied().unwrap_or(INVALID);
+    (round_delay(item.delay, item.attack_cap, attack_init, agg_def, false)
+        + round_delay(item.recharge, item.recharge_cap, recharge_init, agg_def, true)) * 0.01
 }
 
 #[derive(Default)]
@@ -137,7 +172,8 @@ impl Armory {
         let record = template.zip(self.store.as_ref()).and_then(|(t, s)| s.get(ao_formats::dynel_visual::ITEM_TEMPLATE_TYPE, t).ok().flatten());
         let animations = record.as_ref().map(|r| ao_formats::dynel_visual::animation_map(r)).unwrap_or_default();
         let effects = record.as_ref().and_then(|r| super::super::chat::item_template_spells(r, 10).ok()).map(|s| super::effects::bindings(&s)).unwrap_or_default();
-        Item { item_class: get(&stats, 0x37).unwrap_or(0), dtype: get(&stats, STAT_DAMAGE_TYPE).unwrap_or(DEFAULT_DAMAGE_TYPE), ammo: get(&stats, STAT_AMMO_TYPE).unwrap_or(-1), delay: get(&stats, 0x126).unwrap_or(200), attack_range: get(&stats, 0x11f).unwrap_or(if wielded { 20 } else { 2 }), effect_type: get(&stats, 413).unwrap_or(0), impact_effect_type: get(&stats, 414).unwrap_or(49999), sounds: tpl.map(|t| t.sounds).unwrap_or_default(), animations, effects, wielded }
+        let invalid = ao_formats::stats::INVALID;
+        Item { item_class: get(&stats, 0x37).unwrap_or(0), dtype: get(&stats, STAT_DAMAGE_TYPE).unwrap_or(DEFAULT_DAMAGE_TYPE), ammo: get(&stats, STAT_AMMO_TYPE).unwrap_or(-1), delay: get(&stats, 0x126).unwrap_or(200), recharge: get(&stats, 0xd2).unwrap_or(200), initiative_skill: get(&stats, 440).unwrap_or(invalid), attack_cap: get(&stats, 523).filter(|&v| v != invalid), recharge_cap: get(&stats, 524).filter(|&v| v != invalid), attack_range: get(&stats, 0x11f).unwrap_or(if wielded { 20 } else { 2 }), effect_type: get(&stats, 413).unwrap_or(0), impact_effect_type: get(&stats, 414).unwrap_or(49999), sounds: tpl.map(|t| t.sounds).unwrap_or_default(), animations, effects, wielded }
     }
 
     /// `holder` wields weapon dynel `item` in body `slot` (`WeaponItemFullUpdateIIR_t`).
@@ -238,11 +274,16 @@ impl Armory {
         self.by.get(&holder)?.slots.get(&slot)
     }
 
-    /// GC 0x10068969: hands 8/6, or bare hands 0 only when neither is occupied.
+    /// GC 0x10068969: hands 8/6, or bare hands 0 only when neither is occupied -- every wielded hand, for `in_attack_range`
+    /// and the per-hand Attack timer bar (`item_round_seconds`, `hud_stats::update_attack_timers`).
+    pub fn attack_slots(&self, holder: i32) -> Vec<i32> {
+        let hands: Vec<i32> = [8, 6].into_iter().filter(|&s| self.slot_item(holder, s).is_some()).collect();
+        if hands.is_empty() { vec![0] } else { hands }
+    }
+
     /// GC 0x1009a68e: percentage bonus, truncate to integer, upper limit 40.
     pub fn in_attack_range(&self, holder: i32, distance: f32, bonus: i32) -> bool {
-        let slots = if self.slot_item(holder, 8).is_some() || self.slot_item(holder, 6).is_some() { &[8, 6][..] } else { &[0][..] };
-        slots.iter().filter_map(|&slot| self.slot_item(holder, slot)).any(|item| {
+        self.attack_slots(holder).iter().filter_map(|&slot| self.slot_item(holder, slot)).any(|item| {
             let range = (item.attack_range as f64 + item.attack_range as f64 * bonus as f64 * 0.01) as i32;
             range.min(40) as f32 > distance
         })
@@ -541,5 +582,46 @@ mod tests {
         assert_eq!(a.damage_type(own, 6, 0), None, "slot 0x41 is the bag, not a hand");
         a.on_message(&weapon_updates[2], false);
         assert_eq!(a.damage_type(own, 6, 0), Some(PROJECTILE));
+    }
+
+    /// GC 0x10068969: bare hands while unarmed, both hands once either is wielded, the other hand added once it is too.
+    #[test]
+    fn attack_slots_follow_wielded_hands() {
+        let mut a = player();
+        assert_eq!(a.attack_slots(1), vec![0]);
+        a.wield(1, 500, 6, None, &[(STAT_DAMAGE_TYPE, PROJECTILE)]);
+        assert_eq!(a.attack_slots(1), vec![6]);
+        a.wield(1, 501, 8, None, &[(STAT_DAMAGE_TYPE, ENERGY)]);
+        assert_eq!(a.attack_slots(1), vec![8, 6]);
+        a.unwield(500);
+        assert_eq!(a.attack_slots(1), vec![8]);
+    }
+
+    /// `round_delay` reproduces `chat::item_info_combat::delay`'s fixture exactly (same formula, different input shape).
+    #[test]
+    fn round_delay_matches_the_item_info_dps_cell() {
+        assert_eq!(round_delay(500, None, 1200, 100, false), 275.0);
+        assert!((round_delay(500, None, 1800, 100, false) - (475.0 - 700.0 / 3.0)).abs() < 0.0001);
+        assert_eq!(round_delay(500, None, 1200, 100, true), 100.0);
+        assert_eq!(round_delay(500, Some(250), 1200, 100, true), 250.0);
+    }
+
+    #[test]
+    fn item_round_seconds_sums_attack_and_recharge_in_hundredths() {
+        let mut a = player();
+        // AttackDelay 294 = 500, RechargeDelay 210 = 500, no caps, no InitiativeSkill (440 absent -> INVALID, both
+        // lookups miss): the raw formula with `initiative = INVALID` behaves like an absurdly high initiative value,
+        // so pin the item with an explicit InitiativeSkill the test stats table actually carries.
+        a.wield(1, 500, 6, None, &[(0x126, 500), (0xd2, 500), (440, 100)]);
+        let mut stats = HashMap::new();
+        stats.insert(100, 1200);
+        stats.insert(51, 0);
+        let item = a.slot_item(1, 6).unwrap();
+        assert_eq!(item.initiative_skill, 100);
+        let seconds = item_round_seconds(item, &stats);
+        // round_delay(500, None, 1200, 0, false) = 575 - 400 = 175 (= (500+75) - 1200*0.5/3*1 - 0); recharge uses
+        // the same 1200 stat value (0..=1200) -> round_delay(500, None, 1200, 0, true) = 575 - 800/3 = 308.3333
+        let expected = (round_delay(500, None, 1200, 0, false) + round_delay(500, None, 1200, 0, true)) * 0.01;
+        assert!((seconds - expected).abs() < 0.0001);
     }
 }
