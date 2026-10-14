@@ -1243,6 +1243,10 @@ impl Frontend for Play {
             // regardless (`Font::glyph_scaled`). Off (1) reproduces retail exactly.
             let smooth_text = hud.dvalues.flag("AomacSmoothText");
             self.gui.set_text_scale(if smooth_text { host.window_scale.clamp(1, 8) as u8 } else { 1 });
+            // Audit item 11, not retail, opt-in: relights every pixel with the same D3D7 light-accumulation formula
+            // the vertex shader already uses (`shader.wgsl`'s `shade`/`light_vertex_sun`). Off (default) reproduces
+            // retail's per-vertex lighting exactly.
+            host.per_pixel_lighting = hud.dvalues.flag("AomacPerPixelLighting");
         }
         // audit item 2: every screen, including the login screen before any HUD exists.
         host.interface_scale = Some(self.interface_scale);

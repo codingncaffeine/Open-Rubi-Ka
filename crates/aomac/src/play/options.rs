@@ -305,6 +305,7 @@ fn enhanced_page() -> Page {
             Item::Opt(check("AomacWidescreenFOV", "Widescreen FOV (keep the 4:3 vertical angle)")),
             Item::Opt(slider("AomacSceneryDistance", "Extended Scenery Distance (terrain/statels only, 1.0x = retail)", "%.2fx")),
             Item::Opt(check("AomacSmoothText", "Anti-aliased Text (Retina, TrueType fonts only)")),
+            Item::Opt(check("AomacPerPixelLighting", "Per-Pixel Lighting (sharper falloff/highlights, same light budget)")),
         ],
     }
 }

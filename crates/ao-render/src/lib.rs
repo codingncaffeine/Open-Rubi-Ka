@@ -152,7 +152,8 @@ struct Globals {
     view: [[f32; 4]; 4],
     water_dir: [f32; 4],
     water_g: [f32; 4],
-    /// x = active dynamic light count (`Renderer::set_dynamic_lights`), yzw unused.
+    /// x = active dynamic light count (`Renderer::set_dynamic_lights`), y = aomac Enhanced "Per-Pixel Lighting" toggle
+    /// (audit item 11, not retail; `Renderer::set_per_pixel_lighting`, 0/1), zw unused.
     dyn_info: [i32; 4],
 }
 
@@ -532,6 +533,10 @@ pub struct Renderer {
     /// actor's own light moving every frame never rebuilds the whole scene's light grid.
     dyn_light_buf: wgpu::Buffer,
     dyn_light_count: i32,
+    /// aomac Enhanced "Per-Pixel Lighting" (audit item 11, opt-in, not retail; default off = retail per-vertex exactly):
+    /// written into `Globals::dyn_info.y`, read by `shader.wgsl`'s `shade` to call the shared `light_vertex_sun` again
+    /// per pixel instead of using the vertex-interpolated `light`/`spec`.
+    per_pixel_lighting: bool,
     /// Traffic ships of the uploaded scene, see `Scene::movers`.
     movers: Vec<MoverRun>,
     spaceship_slots: Vec<bool>,
@@ -654,15 +659,17 @@ fn build_pipelines(
                     dst_factor: if effect == 12 { wgpu::BlendFactor::OneMinusSrcAlpha } else { wgpu::BlendFactor::SrcAlpha },
                     operation: wgpu::BlendOperation::Add,
                 };
-                ("fs_blend", Some(wgpu::BlendState { color: component, alpha: component }), true)
+                // `fs_liquid` (audit item 11): plain `fs_blend` lighting but not eligible for the per-pixel relight,
+                // since `vs_liquid` fed the vertex formula the authored water direction/colour, not `g.sun_dir`/`g.sun_g`.
+                ("fs_liquid", Some(wgpu::BlendState { color: component, alpha: component }), true)
             },
             _ => (fs, state, depth_write),
         };
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(fs),
-            // Ground effects 8-11 sample `ground_palette` (holo0) at bind group 2; liquids (12/13) reuse the plain
-            // `fs_blend` shader, which never samples group 2, so they must stay on the 2-group layout (no draw path
-            // for `self.gpu.liquid` binds a group 2 - `DisplaySystem_t::Render`'s liquid list carries no palette texture).
+            // Ground effects 8-11 sample `ground_palette` (holo0) at bind group 2; liquids (12/13) use `fs_liquid`,
+            // which never samples group 2, so they must stay on the 2-group layout (no draw path for `self.gpu.liquid`
+            // binds a group 2 - `DisplaySystem_t::Render`'s liquid list carries no palette texture).
             layout: Some(if effect == 1 || (8..=11).contains(&effect) { holo_pipeline_layout } else { layout }),
             vertex: wgpu::VertexState {
                 module: shader,
@@ -787,9 +794,11 @@ impl Renderer {
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         };
+        // `shade`'s audit item 11 per-pixel relight (opt-in) calls the same `vertex_lights`/`dyn_lights` read the
+        // vertex shader already does, so these must be visible to the fragment stage too, not just the vertex one.
         let storage_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
-            visibility: wgpu::ShaderStages::VERTEX,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         };
@@ -899,6 +908,7 @@ impl Renderer {
             light_zones: vec![],
             dyn_light_buf,
             dyn_light_count: 0,
+            per_pixel_lighting: false,
             frame: 0,
             vis: vec![],
             vis_src: vec![],
@@ -1573,6 +1583,11 @@ impl Renderer {
         }
     }
 
+    /// aomac Enhanced "Per-Pixel Lighting" (audit item 11, opt-in; default off = retail per-vertex exactly).
+    pub fn set_per_pixel_lighting(&mut self, on: bool) {
+        self.per_pixel_lighting = on;
+    }
+
     pub fn set_screen_effects(&mut self,layers:Vec<ScreenLayer>,fog_disabled:bool) {
         self.screen.layers=layers;
         self.screen.fog_disabled=fog_disabled;
@@ -1625,7 +1640,7 @@ impl Renderer {
             view: Mat4::look_to_rh(cam.pos, cam.forward(), cam.up()).to_cols_array_2d(),
             water_dir: v4(Vec3::from_array(water_dir).normalize_or_zero().to_array(), 0.0),
             water_g: g4(water_color, env.sun_specular),
-            dyn_info: [self.dyn_light_count, 0, 0, 0],
+            dyn_info: [self.dyn_light_count, self.per_pixel_lighting as i32, 0, 0],
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
 
@@ -2624,6 +2639,67 @@ mod sky_tests {
         // 0.07 * 255 = 18, not the per-pixel 255
         assert!((14..24).contains(&centre(&far)), "centre {}", centre(&far));
     }
+    /// Same scene/camera as [`pixels`] but with [`Renderer::set_per_pixel_lighting`] forced, to compare the opt-in
+    /// per-pixel path (audit item 11) against the retail-default per-vertex one.
+    fn pixels_with(scene: &Scene, per_pixel: bool, name: &str) -> Option<Vec<u8>> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).ok()?;
+        r.upload(scene);
+        r.set_per_pixel_lighting(per_pixel);
+        let (width, height) = (64, 64);
+        let targets = Targets::new(&r, width, height);
+        let out = r.device.create_texture_tracked(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: r.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        r.render(&out.create_view_tracked(&Default::default()), &targets, &Camera::look_at([0.0, 0.0, 0.0].into(), [0.0, 0.0, -1.0].into()));
+        let path = std::env::temp_dir().join(format!("ao-render-{}-{name}.png", std::process::id()));
+        texture_to_png(&r, &out, width, height, &path).ok()?;
+        let bytes = std::fs::read(&path).ok();
+        let _ = std::fs::remove_file(&path);
+        bytes
+    }
+
+    /// Audit item 11, opt-in, default off: `Renderer::set_per_pixel_lighting(false)` must render byte-identical to
+    /// never calling it at all (the retail-faithful default every existing non-per-pixel test above relies on).
+    #[test]
+    fn per_pixel_lighting_off_is_byte_identical_to_the_retail_default() {
+        let quad = lit_quad(20.0, [0.0, 0.0, -8.0], 1.0, 0.0);
+        let (Some(default_render), Some(explicit_off)) = (pixels(&quad, 0.0, "pp_default"), pixels_with(&quad, false, "pp_explicit_off")) else { return };
+        assert_eq!(default_render, explicit_off, "per-pixel lighting off must be byte-identical to the retail per-vertex default");
+    }
+
+    /// Same big quad/light as `diffuse_light_is_evaluated_per_vertex_and_interpolated` (per-vertex centre ~18): with
+    /// per-pixel lighting on, the centre sits right under the light (N.L ~= 1) and must come out near-saturated,
+    /// while still never exceeding the shared D3D7 1.0 clamp both paths share (`light_vertex_sun`'s `min(.., 1.0)`).
+    #[test]
+    fn per_pixel_lighting_relights_the_quad_without_exceeding_the_shared_clamp() {
+        let quad = lit_quad(20.0, [0.0, 0.0, -8.0], 1.0, 0.0);
+        let Some(pixel) = pixels_with(&quad, true, "pp_on") else { return };
+        assert!(centre(&pixel) > 200, "per-pixel centre must be near-full brightness directly under the light, got {}", centre(&pixel));
+        // `light_vertex_sun`'s `min(.., vec3(1.0))` clamp is shared by both paths (not re-checked here: the encoded
+        // u8 channel is structurally capped at 255 either way), so this can never read brighter than the shared cap.
+    }
+
+    /// Baked-lighting dungeons (`Submesh::prelit`, item 11 plan 2b): the vertex colour *is* the baked light, skipping
+    /// `vertex_lights` entirely in `vs`, so the per-pixel toggle must have no effect on them.
+    #[test]
+    fn per_pixel_lighting_does_not_touch_prelit_baked_dungeons() {
+        let mut s = lit_quad(2.0, [0.0, 0.0, -8.0], 1.0, 0.0);
+        s.meshes[0].submeshes[0].prelit = true;
+        for v in &mut s.meshes[0].vertices {
+            v.color = [0.5, 0.4, 0.3, 1.0];
+        }
+        let (Some(off), Some(on)) = (pixels_with(&s, false, "pp_prelit_off"), pixels_with(&s, true, "pp_prelit_on")) else { return };
+        assert_eq!(off, on, "prelit baked-lighting surfaces must be unaffected by the per-pixel lighting toggle");
+    }
+
 
     /// `SPECULARENABLE` materials add `specular * (N.H)^power` after the texture stage, also on a black diffuse material.
     #[test]
