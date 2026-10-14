@@ -34,6 +34,11 @@ pub struct Host {
     pub fog_density_scale: Option<f32>,
     /// Startup color-depth quality and future-upload native compression preference.
     pub texture_policy: Option<(i32, bool)>,
+    /// Texture anisotropic filtering clamp (aomac Enhanced option, audit item 2; retail default 1x). `None` leaves it as it is.
+    pub anisotropy: Option<u16>,
+    /// Colour/depth MSAA sample count (aomac Enhanced option; not retail, default 1 = off). `None` leaves it as it is;
+    /// downward-clamped to what the adapter supports by [`Renderer::set_msaa_samples`].
+    pub msaa_samples: Option<u32>,
     /// Live character preference controlling authored `GAME.GameShowSpaceship` instances.
     pub spaceships_shown: bool,
     pub smooth_animations: bool,
@@ -139,7 +144,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None }
+        Host { smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -543,6 +548,12 @@ impl State {
         if let Some((quality, compressed)) = g.host.texture_policy.take() {
             self.renderer.set_texture_policy(quality, compressed);
         }
+        if let Some(level) = g.host.anisotropy.take() {
+            self.renderer.set_anisotropy(level);
+        }
+        if let Some(samples) = g.host.msaa_samples.take() {
+            self.renderer.set_msaa_samples(samples);
+        }
         if let Some(scene) = g.host.scene.take() {
             self.renderer.upload(&scene);
             self.speed = (self.renderer.radius() * 0.15).max(5.0);
@@ -626,6 +637,9 @@ impl State {
         }
         self.raw_mouse.set_active(self.looking && self.focused && !self.fly());
         let (gui_out, quit) = self.run_gui(dt);
+        if self.targets.sample_count != self.renderer.msaa_samples() {
+            self.targets = Targets::new(&self.renderer, self.config.width, self.config.height);
+        }
         if let Some(want) = self.gui.as_ref().filter(|_| !self.fly()).map(|g| g.host.look) {
             if want != self.looking {
                 self.set_look(want);
@@ -887,8 +901,17 @@ impl Offscreen {
         if let Some(sun) = LiveRun::advance(&mut self.live, &mut self.r, dt) { self.host.effect_sun_direction = Some(sun); }
         self.r.visible_actor_ids(&mut self.host.previous_visible_actors);
         let list = fe.frame(dt, self.size, &mut self.host);
+        if self.targets.sample_count != self.r.msaa_samples() {
+            self.targets = Targets::new(&self.r, self.size.0, self.size.1);
+        }
         if let Some((quality, compressed)) = self.host.texture_policy.take() {
             self.r.set_texture_policy(quality, compressed);
+        }
+        if let Some(level) = self.host.anisotropy.take() {
+            self.r.set_anisotropy(level);
+        }
+        if let Some(samples) = self.host.msaa_samples.take() {
+            self.r.set_msaa_samples(samples);
         }
         if let Some(scene) = self.host.scene.take() {
             self.r.upload(&scene);

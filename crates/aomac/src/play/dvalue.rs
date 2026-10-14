@@ -187,6 +187,11 @@ impl DValues {
         for n in ["got_ip", "got_perk", "got_tech"] {
             s.add(n, Variant::Bool(false), false, CAT_VARIABLES, None, None, false);
         }
+        // aomac-only "Enhanced" options page (not retail: no `Root.xml` control, no `MainPrefs.xml` template entry). Persisted
+        // like any other `DV Main` control (account-independent, survives restart in the root `Prefs.xml`); indices map to
+        // concrete renderer values in `options.rs::enhanced_page`/`flow.rs` (audit item 2 texture anisotropy, MSAA-option decision).
+        s.add("AomacTextureSharpening", Variant::Int(0), true, CAT_MAIN, Some(Variant::Int(0)), Some(Variant::Int(4)), false);
+        s.add("AomacEdgeSmoothing", Variant::Int(0), true, CAT_MAIN, Some(Variant::Int(0)), Some(Variant::Int(3)), false);
         s
     }
 

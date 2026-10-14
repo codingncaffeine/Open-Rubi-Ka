@@ -103,7 +103,9 @@ fn upload(device:&wgpu::Device,queue:&wgpu::Queue,image:&ao_scene::Texture,polic
 }
 
 pub(super) fn world_pass<'a>(enc:&'a mut wgpu::CommandEncoder,t:&'a Targets,resolve:&'a wgpu::TextureView,clear_depth:bool)->wgpu::RenderPass<'a> {
-    enc.begin_render_pass(&wgpu::RenderPassDescriptor {label:Some("ordered native viewport"),color_attachments:&[Some(wgpu::RenderPassColorAttachment {view:&t.msaa,resolve_target:Some(resolve),depth_slice:None,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {view:&t.depth,depth_ops:Some(wgpu::Operations {load:if clear_depth {wgpu::LoadOp::Clear(1.0)}else {wgpu::LoadOp::Load},store:wgpu::StoreOp::Store}),stencil_ops:None}),timestamp_writes:None,occlusion_query_set:None,multiview_mask:None})
+    let view=t.msaa.as_ref().unwrap_or(resolve);
+    let resolve_target=t.msaa.as_ref().map(|_|resolve);
+    enc.begin_render_pass(&wgpu::RenderPassDescriptor {label:Some("ordered native viewport"),color_attachments:&[Some(wgpu::RenderPassColorAttachment {view,resolve_target,depth_slice:None,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {view:&t.depth,depth_ops:Some(wgpu::Operations {load:if clear_depth {wgpu::LoadOp::Clear(1.0)}else {wgpu::LoadOp::Load},store:wgpu::StoreOp::Store}),stencil_ops:None}),timestamp_writes:None,occlusion_query_set:None,multiview_mask:None})
 }
 
 #[cfg(test)]

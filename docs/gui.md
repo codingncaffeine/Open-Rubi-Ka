@@ -1210,6 +1210,22 @@ Headless acceptance hooks (`play/flow/live.rs`, added but not exercised by this 
 | Fixed keys `#CameraKeys3rd` / `#SaveFixedCamera` | `KEY_COMMAND_CAMERA_SET_PREFERRED_POS` → IP Login int | `Controls::set_keys` / fixed camera dispatch; GUI 0x100be84b/0x1012488b | **LIVE** |
 | Fixed keys `#CameraKeys3rd` / `#ResetFixedCamera` | `KEY_COMMAND_CAMERA_RESET` → IP Login int | `Controls::set_keys` / fixed camera dispatch; GUI 0x100be84b/0x1012488b | **LIVE** |
 
+#### aomac-only additions (non-retail, "Enhanced" page)
+
+These two rows are **not** part of the retail `OptionPanel/Root.xml` inventory above: performance audit item 2 (texture
+anisotropy) and the MSAA-option decision (`docs/screens.md` "max anisotropy 1"; no AA option exists anywhere in the client's
+`cd_image/gui`/`text`/`twk` data for either control). `options.rs::enhanced_page` builds a synthetic [`Page`] (same
+`model::{Opt,Ctl,Item}` shapes the retail `Root.xml` parser produces) and appends it to the category tree as a clearly
+labelled, separate leaf ("Enhanced (aomac, not retail)"), reusing every generic page mechanism (tree entry, XML control
+generation, value sync, click/slider dispatch) unmodified. Both default to the retail value they replace in `ao-render` and
+persist through the same `DValues` → `Prefs.xml` mechanism as `DisplayCompressedTextures` (`DV Main`, account-independent,
+survives restart).
+
+| aomac page / control | Key → store | Runtime consumer | Status |
+|---|---|---|---|
+| `Enhanced (aomac, not retail)` / `Texture Sharpening (anisotropic filtering)` | `AomacTextureSharpening` → DV Main (index 0-4) | `flow.rs::frame` maps the index to 1/2/4/8/16 → `Host.anisotropy` → `Renderer::set_anisotropy` rebuilds the world + clamp-address samplers; default index 0 = 1x, matching retail `FUN_10041ede`/`docs/screens.md` "max anisotropy 1" (audit item 2) | **AOMAC-ONLY, LIVE; not a retail control** |
+| `Enhanced (aomac, not retail)` / `Edge Smoothing (MSAA)` | `AomacEdgeSmoothing` → DV Main (index 0-3) | `flow.rs::frame` maps the index to 1/2/4/8 samples → `Host.msaa_samples` → `Renderer::set_msaa_samples` downward-clamps to what the adapter's colour+depth format features support (`clamp_msaa_samples`) and rebuilds every pipeline; default index 0 = 1 sample (off), matching retail (no AA option found anywhere in the client) | **AOMAC-ONLY, LIVE; not a retail control** |
+
 ### Action-menu click dispatch and character-local chat archives
 
 The GUI identity of an action-menu entry is distinct from its optional DValue name. The unnamed

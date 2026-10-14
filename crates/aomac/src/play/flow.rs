@@ -1184,6 +1184,13 @@ impl Frontend for Play {
             self.texture_compressed = hud.dvalues.flag("DisplayCompressedTextures");
             self.ground_texture_quality = hud.dvalues.get_i64("GroundTextureQuality").unwrap_or(2) as i32;
             self.wildlife_enabled = hud.dvalues.flag("Wildlife");
+            // aomac Enhanced options page (not retail): `options.rs::enhanced_page` radio indices -> concrete renderer values.
+            const ANISOTROPY: [u16; 5] = [1, 2, 4, 8, 16];
+            const MSAA: [u32; 4] = [1, 2, 4, 8];
+            let aniso = hud.dvalues.get_i64("AomacTextureSharpening").unwrap_or(0).clamp(0, 4) as usize;
+            let msaa = hud.dvalues.get_i64("AomacEdgeSmoothing").unwrap_or(0).clamp(0, 3) as usize;
+            host.anisotropy = Some(ANISOTROPY[aniso]);
+            host.msaa_samples = Some(MSAA[msaa]);
         }
         if let Some((life, models)) = &mut self.world_life {
             life.set_enabled(self.wildlife_enabled);

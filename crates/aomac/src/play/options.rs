@@ -15,11 +15,11 @@ mod probe;
 
 pub(super) use live::{audio_prefs, login_audio_prefs};
 
-use super::dvalue::{DValues, Variant};
+use super::dvalue::{DValues, Kind, Variant};
 use ao_formats::screens::{TextDb, CAT_GUI};
 use ao_gui::view::ListItem;
 use ao_gui::{xml, Event, Gui, InputEvent, MouseButton, WindowId, WindowSize};
-use model::{Ctl, Item, Opt, Page};
+use model::{Ctl, Item, Opt, Page, Ty};
 use std::path::Path;
 
 /// `Window(Rect(200,200,600,400), ..)` of `FUN_100c3c44` (floats `_DAT_101a959c` / `_DAT_101b3db8` / `_DAT_101b1840`), used when the config has no `WindowFrame`.
@@ -229,6 +229,36 @@ fn page_xml(page: &Page, idx: usize, n: &mut usize) -> String {
     s + "</View></ScrollViewChild></ScrollView>"
 }
 
+/// aomac's own "Enhanced" rendering options: **not retail** (no `Root.xml` control, no RE evidence for either toggle anywhere in
+/// `cd_image/gui` or `text`; `docs/gui.md` "aomac-only additions (non-retail, Enhanced page)"). Both default to the
+/// retail-faithful value they replace in `ao-render`: anisotropy 1x (audit item 2, `docs/screens.md` "max anisotropy 1",
+/// randy31 `FUN_10041ede`) and MSAA off (the MSAA-option decision: no AA option exists anywhere in the client's GUI/text/twk
+/// data). Persisted through the same `DValues`/`Prefs.xml` mechanism as every retail control (`DValues::new` registers the two
+/// variables as `DV Main`, account-independent, surviving restart exactly like `DisplayCompressedTextures`).
+fn enhanced_page() -> Page {
+    let opt = |var: &str, label: &str, radios: &[(&str, i32)]| Opt {
+        ctl: Ctl::Radio(radios.iter().map(|&(l, v)| (l.to_string(), v)).collect()),
+        var: var.to_string(),
+        ty: Ty::Variant,
+        kind: Kind::Login, // unused by Ty::Variant (`Opt::{value,range,set_value}` only read `kind` for Ty::Int/Float)
+        label: label.to_string(),
+        tooltip: None,
+        enable: String::new(),
+        bit: None,
+        fmt: String::new(),
+        scale: 1.0,
+        borders: String::new(),
+    };
+    Page {
+        label: "Enhanced (aomac, not retail)".to_string(),
+        items: vec![
+            Item::Text { value: "aomac-only additions: none of these exist in the original client. Every default matches retail exactly.".to_string(), borders: String::new() },
+            Item::Opt(opt("AomacTextureSharpening", "Texture Sharpening (anisotropic filtering)", &[("Off (1x, retail)", 0), ("2x", 1), ("4x", 2), ("8x", 3), ("16x", 4)])),
+            Item::Opt(opt("AomacEdgeSmoothing", "Edge Smoothing (MSAA)", &[("Off (retail)", 0), ("2x", 1), ("4x", 2), ("8x", 3)])),
+        ],
+    }
+}
+
 impl HudOptions {
     pub(super) fn handles(kind: super::hud::WindowKind) -> bool {
         kind == super::hud::WindowKind::Options
@@ -243,7 +273,8 @@ impl HudOptions {
         });
         let texts = TextDb::load(dir)?;
         let keypages = keypage::KeyPages::new(dir, &texts, screen);
-        Ok(Self { pages: model::parse(&root), texts, template, screen, win: None, closed: false, actions: vec![], live: live::Live::default(), dir: dir.to_path_buf(), esc: vec![], keypages })
+        let pages = { let mut p = model::parse(&root); p.push(enhanced_page()); p };
+        Ok(Self { pages, texts, template, screen, win: None, closed: false, actions: vec![], live: live::Live::default(), dir: dir.to_path_buf(), esc: vec![], keypages })
     }
 
     pub(super) fn set_screen(&mut self, screen: (u32, u32)) {

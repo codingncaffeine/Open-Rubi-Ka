@@ -25,7 +25,11 @@ use std::path::Path;
 pub use gui::GuiRenderer;
 pub use viewer::{run_frontend, GameInput, Offscreen, run_viewer, run_viewer_hooked, run_viewer_live, FrameHook, Frontend, Host, LiveSky};
 
-const MSAA: u32 = 4;
+/// Downward-clamps `requested` to the closest level present in `supported` (1 is always valid even when `supported` omits it; a pure
+/// function so it's testable without a GPU).
+fn clamp_msaa_samples(requested: u32, supported: &[u32]) -> u32 {
+    supported.iter().copied().filter(|&c| c <= requested).max().unwrap_or(1)
+}
 const INST_RING: usize = 3;
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const SKY_SRGB: [f32; 3] = [0.53, 0.72, 0.92];
@@ -426,26 +430,32 @@ pub struct FrameStats {
 
 /// Colour + depth attachments sized to the output.
 pub struct Targets {
-    msaa: wgpu::TextureView,
+    /// `None` when MSAA is disabled (`Renderer::msaa_samples` == 1, the retail default): the colour pass writes straight into the
+    /// resolve view instead of a separate multisampled target (audit item 2 / MSAA-option decision: no unnecessary resolve target).
+    msaa: Option<wgpu::TextureView>,
     depth: wgpu::TextureView,
     pub size: (u32, u32),
+    /// The sample count these attachments were built for; callers that keep a `Targets` across frames (`State`, `Offscreen`) must
+    /// rebuild it when this no longer matches `Renderer::msaa_samples()`.
+    pub sample_count: u32,
 }
 
 impl Targets {
     pub fn new(r: &Renderer, w: u32, h: u32) -> Self {
+        let samples = r.msaa_samples();
         let mk = |format, label| {
             r.device.create_texture_tracked(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                 mip_level_count: 1,
-                sample_count: MSAA,
+                sample_count: samples,
                 dimension: wgpu::TextureDimension::D2,
                 format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 view_formats: &[],
             }).create_view_tracked(&Default::default())
         };
-        Self { msaa: mk(r.format, "msaa"), depth: mk(DEPTH, "depth"), size: (w, h) }
+        Self { msaa: (samples > 1).then(|| mk(r.format, "msaa")), depth: mk(DEPTH, "depth"), size: (w, h), sample_count: samples }
     }
 }
 
@@ -461,8 +471,18 @@ pub struct Renderer {
     g_layout: wgpu::BindGroupLayout,
     tex_layout: wgpu::BindGroupLayout,
     holo_layout: wgpu::BindGroupLayout,
+    shader: wgpu::ShaderModule,
+    pipeline_layout: wgpu::PipelineLayout,
+    holo_pipeline_layout: wgpu::PipelineLayout,
     sampler: wgpu::Sampler,
     clamp_sampler: std::sync::OnceLock<wgpu::Sampler>,
+    /// Texture anisotropic filtering clamp ([`Renderer::set_anisotropy`]; audit item 2, default 1x = retail `FUN_10041ede`,
+    /// `docs/screens.md` "max anisotropy 1"). The aomac Enhanced options page may raise it.
+    anisotropy: u16,
+    /// Colour/depth sample count ([`Renderer::set_msaa_samples`]; MSAA-option decision: not retail, default 1 = off).
+    msaa_samples: u32,
+    /// Sample counts the adapter actually supports for both the surface colour format and [`DEPTH`] (always includes 1).
+    msaa_supported: Vec<u32>,
     texture_policy: native_texture::Policy,
     pipes: Vec<wgpu::RenderPipeline>, // indexed by Draw::pipe
     actor_pipes: Vec<wgpu::RenderPipeline>, // same indices, actor-only instance layout
@@ -533,6 +553,145 @@ fn default_environment(radius: f32) -> Environment {
 }
 
 /// Left, right, bottom, top, near, far planes (normalised, normals point inside).
+/// Builds every opaque/blend/sky/env/ground/liquid pipeline variant at a given colour+depth sample count. wgpu bakes
+/// `MultisampleState` into the pipeline (no live toggle), so [`Renderer::set_msaa_samples`] calls this again at the new count;
+/// `Renderer::new` calls it once at the default (1 = MSAA off, matching retail: the MSAA-option decision found no AA option
+/// anywhere in the client's GUI/text/twk data).
+/// The world/material sampler at a given anisotropic filtering clamp (`Renderer::new` default 1 = retail; [`Renderer::set_anisotropy`]
+/// rebuilds it, same as [`Renderer::material_sampler`]'s clamp-address variant).
+fn make_world_sampler(device: &wgpu::Device, anisotropy: u16) -> wgpu::Sampler {
+    device.create_sampler_tracked(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        anisotropy_clamp: anisotropy,
+        ..Default::default()
+    })
+}
+
+fn build_pipelines(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+    layout: &wgpu::PipelineLayout,
+    holo_pipeline_layout: &wgpu::PipelineLayout,
+    msaa: u32,
+) -> (Vec<wgpu::RenderPipeline>, Vec<wgpu::RenderPipeline>, Vec<wgpu::RenderPipeline>) {
+    let f4 = |o| wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: o, shader_location: 4 + (o / 16) as u32 };
+    let inst_attrs = [f4(0), f4(16), f4(32), f4(48)];
+    let actor_attrs = [f4(0), f4(16), f4(32), f4(48), f4(64), f4(80), f4(96), f4(112)];
+    let vert_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
+    let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
+    let one_one = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
+    let mk = |blend: Blend, two_sided: bool, sky: bool, env: bool, fade: bool, sprite: bool, actor: bool, effect: u32| {
+        let (fs, state, depth_write) = match blend {
+            _ if env => ("fs_env", Some(wgpu::BlendState { color: one_one, alpha: one_one }), false),
+            _ if sprite => ("fs_sprite", Some(wgpu::BlendState::ALPHA_BLENDING), true),
+            Blend::Opaque if fade => ("fs_fade_opaque", Some(wgpu::BlendState::ALPHA_BLENDING), true),
+            Blend::AlphaTest if fade => ("fs_fade_test", Some(wgpu::BlendState::ALPHA_BLENDING), true),
+            Blend::Opaque => ("fs_opaque", None, true),
+            Blend::AlphaTest => ("fs_test", None, true),
+            Blend::AlphaBlend => ("fs_blend", Some(wgpu::BlendState::ALPHA_BLENDING), false),
+            Blend::Additive => ("fs_add", Some(wgpu::BlendState { color: add, alpha: wgpu::BlendComponent::OVER }), false),
+            Blend::ZeroSourceColor | Blend::DestinationColorSourceColor | Blend::PremultipliedAlpha | Blend::SourceColorOne => ("fs_blend", Some(native_blend_state(blend)), false),
+        };
+        let fs = if sky {
+            match blend {
+                Blend::Opaque => "fs_sky_opaque",
+                Blend::AlphaTest => "fs_sky_test",
+                Blend::Additive => "fs_sky_add",
+                _ => "fs_sky_blend",
+            }
+        } else { fs };
+        let depth_write = depth_write && !sky;
+        let (fs, state, depth_write) = match effect {
+            1 => ("fs_holo", Some(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::Src, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent::OVER }), false),
+            2 => (fs, state, true),
+            4..=6 => ("fs_mesh_add", Some(wgpu::BlendState { color: add, alpha: add }), false),
+            8 => ("fs_ground_fused", None, true),
+            9 => ("fs_ground_base", None, true),
+            10 => ("fs_ground_shadow", Some(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::Src, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent::REPLACE }), false),
+            11 => ("fs_ground_simple", None, true),
+            12 | 13 => {
+                let component = wgpu::BlendComponent {
+                    src_factor: if effect == 12 { wgpu::BlendFactor::SrcAlpha } else { wgpu::BlendFactor::OneMinusSrcAlpha },
+                    dst_factor: if effect == 12 { wgpu::BlendFactor::OneMinusSrcAlpha } else { wgpu::BlendFactor::SrcAlpha },
+                    operation: wgpu::BlendOperation::Add,
+                };
+                ("fs_blend", Some(wgpu::BlendState { color: component, alpha: component }), true)
+            },
+            _ => (fs, state, depth_write),
+        };
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(fs),
+            // Ground effects 8-11 sample `ground_palette` (holo0) at bind group 2; liquids (12/13) reuse the plain
+            // `fs_blend` shader, which never samples group 2, so they must stay on the 2-group layout (no draw path
+            // for `self.gpu.liquid` binds a group 2 - `DisplaySystem_t::Render`'s liquid list carries no palette texture).
+            layout: Some(if effect == 1 || (8..=11).contains(&effect) { holo_pipeline_layout } else { layout }),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some(if (8..=11).contains(&effect) { "vs_ground" } else if matches!(effect, 12 | 13) { "vs_liquid" } else if actor && matches!(effect, 1 | 2 | 4..=6) { "vs_actor" } else if sky { "vs_sky" } else if env { "vs_env" } else if actor { "vs_actor" } else { "vs" }),
+                compilation_options: Default::default(),
+                buffers: &[
+                    wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vert_attrs },
+                    wgpu::VertexBufferLayout {
+                        array_stride: if actor { std::mem::size_of::<actors::ActorInstance>() as u64 } else { 64 },
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: if actor { &actor_attrs } else { &inst_attrs },
+                    },
+                ],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some(fs),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format, blend: state, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: (!two_sided && !sky && !matches!(effect, 1 | 4..=6)).then_some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH,
+                depth_write_enabled: Some(depth_write),
+                // the env pass redraws the very triangles of the base pass: D3D's default ZFUNC LESSEQUAL
+                depth_compare: Some(if sky { wgpu::CompareFunction::Always } else if env || matches!(effect, 10 | 12 | 13) { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Less }),
+                stencil: Default::default(),
+                // Blended overlays are often coplanar with the opaque surface below them.
+                bias: if effect == 7 { wgpu::DepthBiasState { constant: -1, slope_scale: 0.0, clamp: 0.0 } } else if effect != 0 || depth_write || env { Default::default() } else { wgpu::DepthBiasState { constant: -2, slope_scale: -2.0, clamp: 0.0 } },
+            }),
+            multisample: wgpu::MultisampleState { count: msaa, mask: !0, alpha_to_coverage_enabled: false },
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let pipe_specs = [Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive]
+        .into_iter()
+        .flat_map(|b| [false, true].map(|two| (b, two, false, false)))
+        .chain([Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive].map(|b| (b, true, true, false)))
+        .chain([false, true, false, true].map(|two| (Blend::Opaque, two, false, true)))
+        .map(|(b, two, sky, env)| (b, two, sky, env, false))
+        .chain([Blend::Opaque, Blend::AlphaTest].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, true))))
+        .map(|(b, two, sky, env, fade)| (b, two, sky, env, fade, false))
+        .chain([false, true].map(|two| (Blend::AlphaBlend, two, false, false, false, true)))
+        .chain([Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha, Blend::SourceColorOne].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, false, false))))
+        // sky draws key their pipe off `SKY_PIPE + blend as usize`, only valid for the four contiguous base blends;
+        // `SourceColorOne` is not contiguous with them (it sits after the other native blends), so it gets a lone
+        // dedicated sky slot at the very end of the table (`SKY_GLOW_PIPE`) instead.
+        .chain(std::iter::once((Blend::SourceColorOne, true, true, false, false, false)));
+    let pipes = pipe_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false, 0))
+        .chain((12..=13).map(|effect| mk(Blend::AlphaBlend, true, false, false, false, false, false, effect))).collect();
+    let actor_pipes = (0..=7).flat_map(|effect| pipe_specs.clone().map(move |spec| (effect, spec)))
+        .map(|(effect, (b, two, sky, env, fade, sprite))| mk(b, two, sky, env, fade, sprite, true, effect)).collect();
+    let ground_pipes = (8..=11).map(|effect| mk(Blend::Opaque, false, false, false, false, false, false, effect)).collect();
+
+    (pipes, actor_pipes, ground_pipes)
+}
+
 fn frustum_planes(vp: &Mat4) -> [Vec4; 6] {
     let (r0, r1, r2, r3) = (vp.row(0), vp.row(1), vp.row(2), vp.row(3));
     [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2].map(|p| p / p.truncate().length())
@@ -564,6 +723,13 @@ impl Renderer {
                 *caps.formats.iter().find(|f| !f.is_srgb()).expect("surface requires a gamma-space UNORM format")
             }
             None => wgpu::TextureFormat::Rgba8Unorm,
+        };
+        // Both the colour target (`format`) and [`DEPTH`] must support a sample count for `Targets` to create matching
+        // attachments at it; `set_msaa_samples` clamps requests to this intersection (always includes 1).
+        let msaa_supported: Vec<u32> = {
+            let color = adapter.get_texture_format_features(format).flags.supported_sample_counts();
+            let depth = adapter.get_texture_format_features(DEPTH).flags.supported_sample_counts();
+            color.into_iter().filter(|c| depth.contains(c)).collect()
         };
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -615,16 +781,7 @@ impl Renderer {
                 uniform_entry(2, wgpu::ShaderStages::VERTEX_FRAGMENT),
             ],
         });
-        let sampler = device.create_sampler_tracked(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            anisotropy_clamp: 16,
-            ..Default::default()
-        });
+        let sampler = make_world_sampler(&device, 1);
         let holo_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("native Holo textures"),
             entries: &[0, 1].map(|binding| wgpu::BindGroupLayoutEntry {
@@ -641,114 +798,7 @@ impl Renderer {
             bind_group_layouts: &[Some(&g_layout), Some(&tex_layout)],
             immediate_size: 0,
         });
-        let f4 = |o| wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: o, shader_location: 4 + (o / 16) as u32 };
-        let inst_attrs = [f4(0), f4(16), f4(32), f4(48)];
-        let actor_attrs = [f4(0), f4(16), f4(32), f4(48), f4(64), f4(80), f4(96), f4(112)];
-        let vert_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
-        let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
-        let one_one = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
-        let mk = |blend: Blend, two_sided: bool, sky: bool, env: bool, fade: bool, sprite: bool, actor: bool, effect: u32| {
-            let (fs, state, depth_write) = match blend {
-                _ if env => ("fs_env", Some(wgpu::BlendState { color: one_one, alpha: one_one }), false),
-                _ if sprite => ("fs_sprite", Some(wgpu::BlendState::ALPHA_BLENDING), true),
-                Blend::Opaque if fade => ("fs_fade_opaque", Some(wgpu::BlendState::ALPHA_BLENDING), true),
-                Blend::AlphaTest if fade => ("fs_fade_test", Some(wgpu::BlendState::ALPHA_BLENDING), true),
-                Blend::Opaque => ("fs_opaque", None, true),
-                Blend::AlphaTest => ("fs_test", None, true),
-                Blend::AlphaBlend => ("fs_blend", Some(wgpu::BlendState::ALPHA_BLENDING), false),
-                Blend::Additive => ("fs_add", Some(wgpu::BlendState { color: add, alpha: wgpu::BlendComponent::OVER }), false),
-                Blend::ZeroSourceColor | Blend::DestinationColorSourceColor | Blend::PremultipliedAlpha | Blend::SourceColorOne => ("fs_blend", Some(native_blend_state(blend)), false),
-            };
-            let fs = if sky {
-                match blend {
-                    Blend::Opaque => "fs_sky_opaque",
-                    Blend::AlphaTest => "fs_sky_test",
-                    Blend::Additive => "fs_sky_add",
-                    _ => "fs_sky_blend",
-                }
-            } else { fs };
-            let depth_write = depth_write && !sky;
-            let (fs, state, depth_write) = match effect {
-                1 => ("fs_holo", Some(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::Src, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent::OVER }), false),
-                2 => (fs, state, true),
-                4..=6 => ("fs_mesh_add", Some(wgpu::BlendState { color: add, alpha: add }), false),
-                8 => ("fs_ground_fused", None, true),
-                9 => ("fs_ground_base", None, true),
-                10 => ("fs_ground_shadow", Some(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::Src, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent::REPLACE }), false),
-                11 => ("fs_ground_simple", None, true),
-                12 | 13 => {
-                    let component = wgpu::BlendComponent {
-                        src_factor: if effect == 12 { wgpu::BlendFactor::SrcAlpha } else { wgpu::BlendFactor::OneMinusSrcAlpha },
-                        dst_factor: if effect == 12 { wgpu::BlendFactor::OneMinusSrcAlpha } else { wgpu::BlendFactor::SrcAlpha },
-                        operation: wgpu::BlendOperation::Add,
-                    };
-                    ("fs_blend", Some(wgpu::BlendState { color: component, alpha: component }), true)
-                },
-                _ => (fs, state, depth_write),
-            };
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(fs),
-                // Ground effects 8-11 sample `ground_palette` (holo0) at bind group 2; liquids (12/13) reuse the plain
-                // `fs_blend` shader, which never samples group 2, so they must stay on the 2-group layout (no draw path
-                // for `self.gpu.liquid` binds a group 2 - `DisplaySystem_t::Render`'s liquid list carries no palette texture).
-                layout: Some(if effect == 1 || (8..=11).contains(&effect) { &holo_pipeline_layout } else { &layout }),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some(if (8..=11).contains(&effect) { "vs_ground" } else if matches!(effect, 12 | 13) { "vs_liquid" } else if actor && matches!(effect, 1 | 2 | 4..=6) { "vs_actor" } else if sky { "vs_sky" } else if env { "vs_env" } else if actor { "vs_actor" } else { "vs" }),
-                    compilation_options: Default::default(),
-                    buffers: &[
-                        wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vert_attrs },
-                        wgpu::VertexBufferLayout {
-                            array_stride: if actor { std::mem::size_of::<actors::ActorInstance>() as u64 } else { 64 },
-                            step_mode: wgpu::VertexStepMode::Instance,
-                            attributes: if actor { &actor_attrs } else { &inst_attrs },
-                        },
-                    ],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState { format, blend: state, write_mask: wgpu::ColorWrites::ALL })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: (!two_sided && !sky && !matches!(effect, 1 | 4..=6)).then_some(wgpu::Face::Back),
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH,
-                    depth_write_enabled: Some(depth_write),
-                    // the env pass redraws the very triangles of the base pass: D3D's default ZFUNC LESSEQUAL
-                    depth_compare: Some(if sky { wgpu::CompareFunction::Always } else if env || matches!(effect, 10 | 12 | 13) { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Less }),
-                    stencil: Default::default(),
-                    // Blended overlays are often coplanar with the opaque surface below them.
-                    bias: if effect == 7 { wgpu::DepthBiasState { constant: -1, slope_scale: 0.0, clamp: 0.0 } } else if effect != 0 || depth_write || env { Default::default() } else { wgpu::DepthBiasState { constant: -2, slope_scale: -2.0, clamp: 0.0 } },
-                }),
-                multisample: wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false },
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let pipe_specs = [Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive]
-            .into_iter()
-            .flat_map(|b| [false, true].map(|two| (b, two, false, false)))
-            .chain([Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive].map(|b| (b, true, true, false)))
-            .chain([false, true, false, true].map(|two| (Blend::Opaque, two, false, true)))
-            .map(|(b, two, sky, env)| (b, two, sky, env, false))
-            .chain([Blend::Opaque, Blend::AlphaTest].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, true))))
-            .map(|(b, two, sky, env, fade)| (b, two, sky, env, fade, false))
-            .chain([false, true].map(|two| (Blend::AlphaBlend, two, false, false, false, true)))
-            .chain([Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha, Blend::SourceColorOne].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, false, false))))
-            // sky draws key their pipe off `SKY_PIPE + blend as usize`, only valid for the four contiguous base blends;
-            // `SourceColorOne` is not contiguous with them (it sits after the other native blends), so it gets a lone
-            // dedicated sky slot at the very end of the table (`SKY_GLOW_PIPE`) instead.
-            .chain(std::iter::once((Blend::SourceColorOne, true, true, false, false, false)));
-        let pipes = pipe_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false, 0))
-            .chain((12..=13).map(|effect| mk(Blend::AlphaBlend, true, false, false, false, false, false, effect))).collect();
-        let actor_pipes = (0..=7).flat_map(|effect| pipe_specs.clone().map(move |spec| (effect, spec)))
-            .map(|(effect, (b, two, sky, env, fade, sprite))| mk(b, two, sky, env, fade, sprite, true, effect)).collect();
-        let ground_pipes = (8..=11).map(|effect| mk(Blend::Opaque, false, false, false, false, false, false, effect)).collect();
+        let (pipes, actor_pipes, ground_pipes) = build_pipelines(&device, &shader, format, &layout, &holo_pipeline_layout, 1);
         let mut r = Self {
             device,
             queue,
@@ -770,8 +820,14 @@ impl Renderer {
             g_layout,
             tex_layout,
             holo_layout,
+            shader,
+            pipeline_layout: layout,
+            holo_pipeline_layout,
             sampler,
             clamp_sampler: std::sync::OnceLock::new(),
+            anisotropy: 1,
+            msaa_samples: 1,
+            msaa_supported,
             texture_policy: Default::default(),
             pipes,
             actor_pipes,
@@ -856,6 +912,7 @@ impl Renderer {
     }
     fn material_sampler(&self, clamp: bool) -> &wgpu::Sampler {
         if !clamp { return &self.sampler; }
+        let anisotropy = self.anisotropy;
         self.clamp_sampler.get_or_init(|| self.device.create_sampler_tracked(&wgpu::SamplerDescriptor {
             label: Some("native D3D texture clamp"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -864,9 +921,40 @@ impl Renderer {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            anisotropy_clamp: 16,
+            anisotropy_clamp: anisotropy,
             ..Default::default()
         }))
+    }
+
+    /// Texture anisotropic filtering clamp (audit item 2: retail runs max anisotropy 1, randy31 `FUN_10041ede`, `docs/screens.md`
+    /// "max anisotropy 1"; `Renderer::new` already defaults to it). The aomac Enhanced options page may raise it up to 16x; both the
+    /// plain and clamp-address world samplers are rebuilt (the clamp one lazily, on its next [`Renderer::material_sampler`] call).
+    pub fn set_anisotropy(&mut self, level: u16) {
+        let level = level.clamp(1, 16);
+        if level == self.anisotropy { return; }
+        self.anisotropy = level;
+        self.sampler = make_world_sampler(&self.device, level);
+        self.clamp_sampler = std::sync::OnceLock::new();
+    }
+
+    /// Colour/depth sample count (MSAA-option decision: not retail, `Renderer::new` already defaults to 1 = off). `requested` is
+    /// downward-clamped to a level the adapter's colour+depth format features actually support ([`clamp_msaa_samples`]); every
+    /// pipeline is then rebuilt at the new [`wgpu::MultisampleState`] (wgpu bakes the sample count into the pipeline, there is no
+    /// live toggle). Callers that keep a [`Targets`] across frames must rebuild it when [`Renderer::msaa_samples`] changes
+    /// (`Targets::sample_count`). Audit item 1 (single pass, memoryless targets) is a separate follow-up: this only makes the
+    /// existing multi-pass path support sample counts other than the former hardcoded 4, including disabling MSAA.
+    pub fn set_msaa_samples(&mut self, requested: u32) {
+        let level = clamp_msaa_samples(requested.max(1), &self.msaa_supported);
+        if level == self.msaa_samples { return; }
+        self.msaa_samples = level;
+        let (pipes, actor_pipes, ground_pipes) = build_pipelines(&self.device, &self.shader, self.format, &self.pipeline_layout, &self.holo_pipeline_layout, level);
+        self.pipes = pipes;
+        self.actor_pipes = actor_pipes;
+        self.ground_pipes = ground_pipes;
+    }
+
+    pub fn msaa_samples(&self) -> u32 {
+        self.msaa_samples
     }
 
     // The native P8 shadow palette is filtered in framebuffer space. It is
@@ -1564,8 +1652,8 @@ impl Renderer {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &t.msaa,
-                    resolve_target: Some(resolve),
+                    view: t.msaa.as_ref().unwrap_or(resolve),
+                    resolve_target: t.msaa.as_ref().map(|_| resolve),
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(framebuffer_clear(env.sky_color)),
@@ -1849,6 +1937,18 @@ fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: 
 
 #[cfg(test)]
 mod sky_tests {
+    /// Pure, GPU-free regression for the MSAA-option decision's downward clamp: unsupported levels fall back to the next lower
+    /// one the adapter format features actually report, and a missing/empty list never panics (1 = off is always valid).
+    #[test]
+    fn clamp_msaa_samples_downward_clamps_to_nearest_supported() {
+        assert_eq!(super::clamp_msaa_samples(1, &[1, 2, 4]), 1);
+        assert_eq!(super::clamp_msaa_samples(4, &[1, 2, 4]), 4);
+        assert_eq!(super::clamp_msaa_samples(8, &[1, 2, 4]), 4, "no 8x support: fall back to the nearest lower level, not panic");
+        assert_eq!(super::clamp_msaa_samples(2, &[1, 4]), 1, "no exact match: the nearest level below the request, not above");
+        assert_eq!(super::clamp_msaa_samples(4, &[]), 1, "missing format-feature data never panics: 1 (off) is always valid");
+        assert_eq!(super::clamp_msaa_samples(16, &[1, 2, 4, 8, 16]), 16);
+    }
+
     #[test]
     fn look_to_up_reproduces_forward_and_up() {
         for (f, u) in [(Vec3::new(0.3, -0.2, -1.0), Vec3::new(0.5, 1.0, 0.1)), (Vec3::new(-1.0, 0.1, 0.4), Vec3::new(0.0, -1.0, 0.0))] {
@@ -1954,6 +2054,55 @@ mod sky_tests {
         }
         assert_eq!(renderer.sky_rebuilds(), rebuilds, "steady-state live sky ticks triggered further full rebuilds");
         assert_eq!(renderer.sky_buffer_creates(), creates, "steady-state live sky ticks created {} more GPU buffers instead of reusing them", renderer.sky_buffer_creates() - creates);
+    }
+
+    /// Audit item 2: `Renderer::new` defaults to anisotropy 1x (retail; randy31 `FUN_10041ede` sets max anisotropy 1,
+    /// `docs/screens.md` "max anisotropy 1"). The aomac Enhanced options page can raise it; changing it must rebuild both the
+    /// plain and clamp-address world samplers without panicking, and dropping back to 1x must also work.
+    #[test]
+    fn anisotropy_defaults_to_retail_1x_and_set_anisotropy_rebuilds_samplers() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("anisotropy regression requires GPU");
+        assert_eq!(renderer.anisotropy, 1, "retail default must be 1x, not the former hardcoded 16x");
+        renderer.upload(&scene([0.5, 0.0], None)); // exercises material_sampler(true), lazily creating the clamp sampler
+        renderer.set_anisotropy(16);
+        assert_eq!(renderer.anisotropy, 16);
+        renderer.upload(&scene([0.5, 0.0], None)); // re-exercises material_sampler(true) against the rebuilt clamp sampler
+        renderer.set_anisotropy(1);
+        assert_eq!(renderer.anisotropy, 1);
+        renderer.upload(&scene([0.5, 0.0], None));
+    }
+
+    /// MSAA-option decision: `Renderer::new` defaults to 1 sample (off, matching retail -- no AA option exists anywhere in the
+    /// client's GUI/text/twk data). `set_msaa_samples` rebuilds every pipeline at the new `MultisampleState` and the renderer
+    /// must still draw a full frame both with MSAA off (the `Targets::msaa == None` fast path, no resolve target) and with it on.
+    #[test]
+    fn msaa_samples_defaults_off_and_set_msaa_samples_rebuilds_pipelines() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("MSAA regression requires GPU");
+        assert_eq!(renderer.msaa_samples(), 1, "retail default must be 1 sample (off), matching the MSAA-option decision");
+        renderer.upload(&scene([0.5, 0.0], None));
+        let render_frame = |r: &mut Renderer, w: u32, h: u32| {
+            let targets = Targets::new(r, w, h);
+            let out = r.device.create_texture_tracked(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: r.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            r.render(&out.create_view_tracked(&Default::default()), &targets, &Camera::look_at(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO));
+        };
+        render_frame(&mut renderer, 64, 64); // MSAA off: Targets::msaa is None, no resolve target
+        renderer.set_msaa_samples(4);
+        assert!(renderer.msaa_samples() > 1, "the adapter must support at least 2x/4x MSAA for this regression to be meaningful");
+        render_frame(&mut renderer, 64, 64); // the caller rebuilt Targets at the new sample count
+        renderer.set_msaa_samples(1);
+        assert_eq!(renderer.msaa_samples(), 1);
+        render_frame(&mut renderer, 64, 64);
     }
 
     /// Red channel of the centre pixel of a PNG.

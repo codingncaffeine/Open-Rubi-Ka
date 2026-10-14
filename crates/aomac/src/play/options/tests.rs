@@ -708,3 +708,33 @@ fn ok_without_a_key_binds_input_zero() {
     c.set_keys(&r.bindings(), &keys::FixedKeys::default());
     assert_eq!(c.on_key(ao_render::KeyCode::Space, true), vec![]);
 }
+
+/// aomac's "Enhanced" page (not retail; `docs/gui.md` "aomac-only additions (non-retail, Enhanced page)"): both controls
+/// default to the retail-faithful value they replace in `ao-render` (audit item 2 anisotropy 1x, MSAA-option decision off),
+/// are reachable through the ordinary category tree like any other page, write through the generic radio dispatch, and
+/// persist through the same `DValues`/`Prefs.xml` mechanism as every retail control (survives a restart).
+#[test]
+fn enhanced_page_options_default_to_retail_and_persist_across_a_restart() {
+    let Some(mut r) = Rig::new() else { return };
+    assert_eq!(r.d.get_i64("AomacTextureSharpening"), Some(0), "default must be off (1x), matching retail");
+    assert_eq!(r.d.get_i64("AomacEdgeSmoothing"), Some(0), "default must be off, matching retail (no AA option in the client)");
+    let tmp = std::env::temp_dir().join("aomac-enhanced-options-persist");
+    let _ = std::fs::remove_dir_all(&tmp);
+    r.d.open_user(&tmp, "acct", 7);
+    let g = r.show("AomacTextureSharpening");
+    assert_eq!(r.gui.radio_value(r.win(), &g), Some(0));
+    r.click(&format!("{g}_4")); // 16x
+    assert_eq!(r.d.get_i64("AomacTextureSharpening"), Some(4));
+    assert_eq!(r.gui.radio_value(r.win(), &g), Some(4));
+    let g2 = r.show("AomacEdgeSmoothing");
+    assert_eq!(r.gui.radio_value(r.win(), &g2), Some(0));
+    r.click(&format!("{g2}_2")); // 4x
+    assert_eq!(r.d.get_i64("AomacEdgeSmoothing"), Some(2));
+    r.d.save_user();
+    let dir = ao_gui::client_dir();
+    let mut again = DValues::new(&dir);
+    again.open_user(&tmp, "acct", 7);
+    assert_eq!(again.get_i64("AomacTextureSharpening"), Some(4));
+    assert_eq!(again.get_i64("AomacEdgeSmoothing"), Some(2));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
