@@ -215,6 +215,13 @@ struct Play {
     awaiting_alive: bool,
     /// `Report::dungeon` of the current playfield (`N3Msg_IsDungeon`).
     dungeon: bool,
+    /// `AOMAC_ZONE_TIMING=1`: log zone-change latency stages to stderr (recv/world_ready/first_frame/char_in_play_sent/server_alive/dynels_visible),
+    /// each as milliseconds since the stage-starting message. A measurement instrument only; off by default.
+    zone_timing: bool,
+    /// Start of the current `zone_timing` cycle, time-boxed (see `Play::zt_begin`): a new `recv_*` more than 3 s after this one starts a fresh cycle.
+    zone_timer: Option<std::time::Instant>,
+    /// One-shot guard for the `dynels_visible` stage within the current `zone_timing` cycle.
+    zone_timing_dynels_seen: bool,
     /// District music / ambience of the loading playfield (`Bg::Info`), switched in when the world appears.
     world_audio: Option<(u32, Box<ao_audio::PlayfieldAudio>)>,
     /// State of the current zone connection (`ZoneHandoff` .. disconnect).
@@ -353,6 +360,9 @@ impl Play {
             teleporting: false,
             awaiting_alive: false,
             dungeon: false,
+            zone_timing: std::env::var_os("AOMAC_ZONE_TIMING").is_some(),
+            zone_timer: None,
+            zone_timing_dynels_seen: false,
             world_audio: None,
             zone: zone::Zone::default(),
             world_frames: 0,

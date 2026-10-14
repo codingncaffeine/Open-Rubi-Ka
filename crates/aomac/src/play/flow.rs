@@ -633,6 +633,25 @@ impl Play {
         !self.awaiting_alive
     }
 
+    /// `AOMAC_ZONE_TIMING`: starts a fresh zone-change cycle timer (unless the current one began under 3 s ago — the coalescing window for
+    /// a `ZoneRedirect` followed by its `Playfield`) and logs `label` at t=0 (or the elapsed time since the redirect). Which stage fires
+    /// last (`CharInPlay`'s server echo vs. the dynels already drawn) is not fixed, so the cycle is time-boxed rather than closed by an event.
+    fn zt_begin(&mut self, label: &str) {
+        if !self.zone_timing { return; }
+        if self.zone_timer.is_none_or(|t0| t0.elapsed() > std::time::Duration::from_secs(3)) {
+            self.zone_timer = Some(std::time::Instant::now());
+            self.zone_timing_dynels_seen = false;
+        }
+        self.zt(label);
+    }
+
+    /// `AOMAC_ZONE_TIMING`: logs `label` with milliseconds elapsed since the current zone-change cycle began.
+    fn zt(&self, label: &str) {
+        if let (true, Some(t0)) = (self.zone_timing, self.zone_timer) {
+            eprintln!("zone_timing {label} t={}ms", t0.elapsed().as_millis());
+        }
+    }
+
     /// `TeleportEndedMessage`: `EnteringPF` ("Entering '%s'") with the playfield name (`N3Msg_GetPFName`), or `EnteringNewArea` when the
     /// playfield has no name or `N3Msg_IsDungeon` (`Report::dungeon`), as a red System line. The name comes from `pfnrmap.dat` like the
     /// character list's (`FUN_1003676c`, the lookup `GetPFName` tries first, then the playfield's own name).
@@ -682,11 +701,14 @@ impl Play {
         let (texture_quality, ground_texture_quality) = (self.texture_quality, self.ground_texture_quality);
         // the zone clock and game day (`GameTimeIIR_t`) when the burst reached the playfield message; later `GameTime`s resync the live sky
         let (day_time, day) = (self.zone.day_time(), self.zone.game_day as u32);
+        let (zt_on, zt0) = (self.zone_timing, self.zone_timer);
+        let zt = move |label: &str| if let (true, Some(t0)) = (zt_on, zt0) { eprintln!("zone_timing {label} t={}ms", t0.elapsed().as_millis()); };
         std::thread::spawn(move || {
             let mut r = RecordStore::open(&dir).and_then(|store| {
                 store.set_other_texture_quality(texture_quality);
                 store.set_ground_texture_quality(ground_texture_quality);
                 let (scene, report) = ao_formats::playfield::load_playfield_report_on_day(&store, &dir, id, day_time, day)?;
+                zt("pf_terrain_statics_loaded");
                 let weather = ao_formats::playfield::open_weather(&store, id)?;
                 let _ = tx.send(Bg::Weather(id, Box::new(weather)));
                 let life = (|| -> anyhow::Result<_> {
@@ -701,6 +723,7 @@ impl Play {
                     }
                     Ok((world, models))
                 })().map(Box::new).map_err(|error| format!("{error:#}"));
+                zt("pf_life_loaded");
                 let _ = tx.send(Bg::Life(id, life));
                 // `PlayfieldInit` [GC 0x10016e2c] -> `SandyInterfaceModule_t::ActivateGameZone`: district music, ambience and statel emitters
                 let audio = want_audio.then(|| ao_audio::PlayfieldAudio::load(&store, id, &report.sounds).map_err(|e| eprintln!("playfield audio {id}: {e:#}")).ok()).flatten();
@@ -720,6 +743,7 @@ impl Play {
                 }
                 Err(e) => eprintln!("live sky of playfield {id}: {e:#}"),
             }
+            zt("pf_thread_done");
             let _ = tx.send(Bg::World(id, ground_texture_quality, r));
         });
     }
@@ -794,6 +818,7 @@ impl Play {
                 Bg::World(id, _, _) if Some(id) != self.zone.playfield => {}
                 Bg::World(id, quality, Ok(scene)) => {
                     eprintln!("playfield {id} loaded");
+                    self.zt("world_data_ready");
                     self.ground_texture_installed_quality = quality;
                     self.world_scene = Some(scene);
                     self.world_ready = true;
@@ -900,6 +925,7 @@ impl Play {
                         zone::ZoneEvent::Playfield(id) => {
                             eprintln!("zone: playfield {id}");
                             if self.screen == Screen::InWorld {
+                                self.zt_begin(&format!("recv_playfield id={id}"));
                                 self.begin_zone_change(host);
                             }
                             self.start_world_load(id);
@@ -907,11 +933,12 @@ impl Play {
                         // `n3TeleportIIR_t` (own, destination playfield): `StartTeleport` -> `TeleportStarted`, before the new playfield arrives
                         zone::ZoneEvent::Teleport => {
                             if self.screen == Screen::InWorld {
+                                self.zt_begin("recv_teleport");
                                 self.begin_zone_change(host);
                             }
                         }
                         // the server's echo of our `CharInPlay`: `AliveMessage`
-                        zone::ZoneEvent::Alive => self.alive(),
+                        zone::ZoneEvent::Alive => { self.zt("server_alive"); self.alive(); }
                         // `GameTime_t::Update`: the clock jumps to the server's; the loading world already used the older one
                         zone::ZoneEvent::Time => host.sky_clock = Some(self.zone.day_time()),
                         zone::ZoneEvent::None => {}
@@ -921,6 +948,7 @@ impl Play {
                     // the session thread has reconnected (system message 0x3C); the new server's burst follows
                     eprintln!("zone redirection to {zone_ip}:{zone_port}");
                     if self.screen == Screen::InWorld {
+                        self.zt_begin("recv_redirect");
                         self.begin_zone_change(host);
                     }
                 }
@@ -1279,6 +1307,7 @@ impl Frontend for Play {
                         a.set_playfield(pf_audio);
                     }
                     self.screen = Screen::InWorld;
+                    self.zt("first_frame");
                     // `TeleportEndedMessage` [GUI 0x100292ce]: the flag clears and the countdown to `CharInPlay` starts again; the HUD and
                     // chat windows of the old world are still there (docs/zone/world.md §10.2)
                     let teleported = std::mem::take(&mut self.teleporting);
@@ -1344,8 +1373,16 @@ impl Frontend for Play {
                     let id = self.zone.char_id;
                     s.send_zone(ao_net::n3::outgoing::n3_frame(0, id, ao_net::n3::outgoing::char_in_play(id as i32)));
                     eprintln!("zone: CharInPlay sent ({} frames, {} dynels known)", self.zone.frames, self.zone.dynels.len());
+                    self.zt("char_in_play_sent");
                 }
             }
+        }
+        // `screen == InWorld` is already true throughout a mid-game teleport (no loading screen, docs/zone/world.md §10.2); gate on
+        // `world_ready` (set once the destination's geometry/`Bg::World` arrived) so this does not fire on the pre-teleport dynel list.
+        // One-shot per cycle (the condition stays true for many frames); the cycle itself is time-boxed by `zt_begin`, not closed here.
+        if self.world_ready && self.zone_timer.is_some() && !self.zone_timing_dynels_seen && !self.zone.dynels.is_empty() {
+            self.zone_timing_dynels_seen = true;
+            self.zt(&format!("dynels_visible n={}", self.zone.dynels.len()));
         }
         if self.screen == Screen::InWorld {
             // Complete camp before world updates can emit more sounds into the login lifecycle.
