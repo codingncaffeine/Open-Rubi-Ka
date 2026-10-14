@@ -1219,9 +1219,19 @@ impl Movement {
             };
         }
         if local {
-            // dynel->vtbl[0x74] = n3Dynel_t::VehicleForwardUpdate(zero, rot, dx, dy): the yaw part.
+            // dynel->vtbl[0x74] = n3Dynel_t::VehicleForwardUpdate(zero, rot, dx, dy): the yaw part. While moving this calls
+            // `Vehicle_t::SetRelPosRot` (docs/zone/movement.md §3: "client+0xFC := 1"), not just `SetRelRot`: the rotation
+            // carries the velocity with it, the same as a keyboard turn while moving (`step`'s `in_turn` branch below
+            // rotates `vel`, the body then follows it through `OrientationMode 0`). Without this, `vel` keeps pointing at
+            // the pre-turn heading and every following physics tick's OrientationMode-0 sync (`step`, "the body faces the
+            // velocity") snaps `yaw` back towards it, fighting the mouse by up to the full turn every tick ("turning
+            // against a wall") whenever the character is moving under its own velocity (running/walking/swimming/flying).
             self.yaw = wrap(self.yaw + f1);
             self.look_dirty = true;
+            if self.vel != [0.0, 0.0] {
+                let (s, c) = f1.sin_cos();
+                self.vel = [self.vel[0] * c + self.vel[1] * s, -self.vel[0] * s + self.vel[1] * c];
+            }
         } else {
             self.emit(action, f1, f2);
         }
@@ -2345,6 +2355,36 @@ mod tests {
         m.take_outgoing();
         m.mouse_turn(0.1, 0.0, 0.1);
         assert!(run(&mut m, &w, 1.0).is_empty(), "0.1 rad < 0.17");
+    }
+
+    /// Bug report: "while standing [mouse-look] works, but while running it feels like turning against a wall."
+    /// Root cause: the local mouse-look branch of `movement_changed` only wrote `self.yaw`; `self.vel` kept pointing at
+    /// the pre-turn heading, so the very next `step()` tick's OrientationMode-0 sync ("the body faces the velocity",
+    /// unconditional whenever `vel != [0,0]`) snapped `yaw` straight back towards the old travel direction, undoing
+    /// almost the whole turn every physics tick. A real right-drag interleaves small `mouse_turn` deltas with physics
+    /// ticks exactly like this (the same per-frame aggregate order as `ao_render::viewer::run_gui`/`Player::frame`).
+    #[test]
+    fn mouse_look_turns_the_heading_while_running_not_just_when_standing() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([0.0; 3], 0.0, 0); // facing +Z (yaw 0), default RunSpeed -> 5 m/s
+        m.action(id::FORWARD_START, 0.0);
+        run(&mut m, &w, 1.0); // reach running speed, still heading +Z
+        assert!(m.speed() > 4.0, "should be running: {}", m.speed());
+        m.mouse_turn(0.0, 0.0, 1.0); // RMB down: native start event, dx dropped
+        // a 1 rad right-drag spread over 20 motion events, each followed by a physics tick (the real event order)
+        for i in 0..20 {
+            m.mouse_turn(0.05, 0.0, 1.0 + i as f32 * 0.016);
+            run(&mut m, &w, 1.0 / 60.0);
+        }
+        assert!((m.yaw() - 1.0).abs() < 0.05, "yaw must track the mouse while running just as it does standing, got {}", m.yaw());
+        assert!(m.speed() > 4.0, "still running after the turn: {}", m.speed());
+        // the travel direction must follow the new heading too, not the pre-turn one
+        let p1 = m.pos();
+        run(&mut m, &w, 0.5);
+        let p2 = m.pos();
+        let d = [p2[0] - p1[0], p2[2] - p1[2]];
+        let heading = d[0].atan2(d[1]);
+        assert!(wrap(heading - m.yaw()).abs() < 0.1, "displacement {d:?} (heading {heading}) should follow yaw {}", m.yaw());
     }
 
     #[test]
