@@ -104,6 +104,13 @@ impl Renderer {
             if run.indices.is_empty() { continue; }
             let edge = &mut self.liquid_edge[usize::from(run.source.style == 2)];
             if run.source.style != 4 { next_edge_phase(edge, run.source.style); }
+            // Visibility is from the *previous* frame's frustum cull (this frame's isn't computed yet when
+            // `update_liquids` runs, before `render`'s cull pass): close enough to skip the per-vertex UV pass
+            // (the actual per-frame cost here, `layer_uv`'s wave/trig math times every vertex times up to 2
+            // passes) for liquids that stayed off-screen. Always regenerate on a cell change regardless, so the
+            // GPU buffer and `run.bytes`/`run.gpu_indices` never fall out of sync with each other.
+            let visible = self.vis_range.get(run.source.mesh).is_none_or(|r| !r.is_empty());
+            if !changed && !visible { continue; }
             run.bytes.clear();
             let passes = if run.source.style == 4 { 1 } else { 2 };
             for pass in 0..passes {
@@ -210,5 +217,50 @@ mod tests {
         renderer.update_liquids(Vec3::from_array(camera));
         assert_eq!(renderer.gpu.liquid[0].count, fine);
         assert_eq!(renderer.gpu.liquid[1].first_index, fine);
+    }
+
+    #[test]
+    fn native_liquid_skips_uv_regen_off_screen_but_keeps_advancing_edge_phase() {
+        use ao_scene::{liquid::SourceTriangle, Instance, Mesh, Scene, Submesh, IDENTITY};
+        let source = Surface::new(0, 0, vec![SourceTriangle { kind: 0, vertices: [
+            Vertex { pos: [200.0, 5.0, -200.0], ..Default::default() },
+            Vertex { pos: [260.0, 5.0, -200.0], ..Default::default() },
+            Vertex { pos: [200.0, 5.0, -260.0], ..Default::default() },
+        ] }]).unwrap();
+        let camera = source.initial_camera().unwrap();
+        let (mut vertices, indices) = {
+            let mut vertices = vec![];
+            let mut indices = vec![];
+            let mut colors = vec![];
+            source.geometry(camera, false, &mut vertices, &mut indices, &mut colors);
+            (vertices, indices)
+        };
+        vertices.extend_from_within(..);
+        let mut submesh = Submesh::new(indices, None);
+        submesh.liquid = true;
+        let mut scene = Scene::default();
+        scene.meshes.push(Mesh { vertices, submeshes: vec![submesh] });
+        scene.instances.push(Instance { mesh: 0, transform: IDENTITY });
+        scene.liquids.push(source);
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).unwrap();
+        renderer.upload(&scene);
+        // First frame: no prior cull result (`vis_range` empty), so treated as visible -- establishes the buffer
+        // and a first set of UVs.
+        renderer.update_liquids(Vec3::from_array(camera));
+        let bytes_before = renderer.liquids[0].bytes.clone();
+        let edge_before = renderer.liquid_edge[0];
+        assert!(!bytes_before.is_empty());
+        // Mark every mesh invisible, like a frustum cull that found nothing on screen last frame, then call
+        // again with the same camera cell (so geometry/indices don't change) but a different clock time.
+        renderer.vis_range = vec![0..0; renderer.gpu.mesh_range.len()];
+        renderer.seek(1.0);
+        renderer.update_liquids(Vec3::from_array(camera));
+        assert_eq!(renderer.liquids[0].bytes, bytes_before, "UVs must not regenerate for an off-screen liquid");
+        assert!(renderer.liquid_edge[0] > edge_before, "the edge/draw-count animation phase must keep advancing while off-screen");
+        // Coming back on screen regenerates with the new clock time.
+        renderer.vis_range = vec![0..1; renderer.gpu.mesh_range.len()];
+        renderer.update_liquids(Vec3::from_array(camera));
+        assert_ne!(renderer.liquids[0].bytes, bytes_before, "UVs must regenerate once the liquid is visible again");
     }
 }
