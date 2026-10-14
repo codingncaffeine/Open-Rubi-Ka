@@ -5,7 +5,7 @@ struct G {
     sun_color: vec4<f32>,
     ambient: vec4<f32>,
     fog_color: vec4<f32>,
-    fog: vec4<f32>,        // x = start, y = end, z = time (s)
+    fog: vec4<f32>,        // x = start, y = end, z = time (s), w = alpha-to-coverage active (aomac Enhanced, audit item 4; MSAA > 1)
     grid: vec4<f32>,       // xyz = light grid origin, w = cell size
     dims: vec4<i32>,       // light grid cells (x, y, z)
     wave: array<vec4<f32>, 4>, // GameWaveCurve0..15 (`ao_scene::wave_curves`)
@@ -283,10 +283,14 @@ fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
     let mode = select(select(fade_mode, fade_mode - 4u, faded), 2u, sprite);
     let t = sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z);
     let alpha = t.a * i.color.a * mat.color.a * i.fade;
+    // Audit item 4 (aomac Enhanced, opt-in via MSAA > 1): the pipeline's `alpha_to_coverage_enabled` (`lib.rs::build_pipelines`)
+    // turns the real alpha this fragment outputs into per-sample coverage instead of a hard cutoff, softening foliage/fence/hair
+    // edges. At MSAA = 1 (the retail-faithful default) `a2c` is always false and behaviour is exactly the former hard cutout.
+    let a2c = g.fog.w > 0.5;
     if sprite && alpha <= 30.0 / 255.0 {
         discard;
     }
-    if mode == 1u && alpha < 0.5 {
+    if mode == 1u && !a2c && alpha < 0.5 {
         discard;
     }
     let to_eye = g.eye.xyz - i.wpos;
@@ -305,7 +309,7 @@ fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
     // opaque/test: fog towards fog colour, alpha 1; blend: same with alpha; additive: fade out instead of tinting.
     let add = mode == 3u;
     let rgb = select(mix(lit, g.fog_g.rgb, f), lit, add);
-    var a = select(select(1.0, alpha, mode == 2u), alpha * (1.0 - f), add);
+    var a = select(select(1.0, alpha, mode == 2u || (mode == 1u && a2c)), alpha * (1.0 - f), add);
     if faded {
         a = select(i.fade, alpha, mode == 1u);
     }
@@ -318,7 +322,8 @@ fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
     let wv = u32(mat.wave.z);
     let wobble = vec2<f32>(mat.wave.y * g.wave[wu >> 2u][wu & 3u], mat.wave.w * g.wave[wv >> 2u][wv & 3u]);
     let c = sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z + wobble) * i.color * mat.color;
-    if mode == 1u && c.a < 0.5 {
+    let a2c = g.fog.w > 0.5; // audit item 4, see `shade`
+    if mode == 1u && !a2c && c.a < 0.5 {
         discard;
     }
     var rgb = c.rgb * (vec3<f32>(1.0) + mat.emissive.rgb);
@@ -327,7 +332,7 @@ fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
         rgb = mix(rgb, g.fog_color.rgb, clamp((i.n.x - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0));
     }
     // Preserve the sky's existing shading; only move the former target encoding before gamma-space blending.
-    return vec4<f32>(srgb_enc(rgb), select(1.0, c.a, mode >= 2u));
+    return vec4<f32>(srgb_enc(rgb), select(1.0, c.a, mode >= 2u || (mode == 1u && a2c)));
 }
 
 @fragment

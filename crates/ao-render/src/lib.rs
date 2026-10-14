@@ -697,7 +697,10 @@ fn build_pipelines(
                 // Blended overlays are often coplanar with the opaque surface below them.
                 bias: if effect == 7 { wgpu::DepthBiasState { constant: -1, slope_scale: 0.0, clamp: 0.0 } } else if effect != 0 || depth_write || env { Default::default() } else { wgpu::DepthBiasState { constant: -2, slope_scale: -2.0, clamp: 0.0 } },
             }),
-            multisample: wgpu::MultisampleState { count: msaa, mask: !0, alpha_to_coverage_enabled: false },
+            // Audit item 4 (aomac Enhanced, opt-in): only the hard-cutout alpha-test shaders (`shade`/`shade_sky`'s
+            // `mode == 1u`, no blend state of their own) benefit; blended/additive pipelines already have real alpha
+            // blending. Off at MSAA 1 (retail-faithful default): there is nothing for per-sample coverage to smooth.
+            multisample: wgpu::MultisampleState { count: msaa, mask: !0, alpha_to_coverage_enabled: msaa > 1 && matches!(fs, "fs_test" | "fs_sky_test") },
             multiview_mask: None,
             cache: None,
         })
@@ -1603,7 +1606,7 @@ impl Renderer {
             sun_color: v4(env.sun_color, 0.0),
             ambient: v4(env.ambient, 0.0),
             fog_color: v4(env.fog_color, 1.0),
-            fog: [env.fog_start, env.fog_end, self.time, 0.0],
+            fog: [env.fog_start, env.fog_end, self.time, if self.msaa_samples > 1 { 1.0 } else { 0.0 }],
             grid: self.gpu.grid.0,
             dims: self.gpu.grid.1,
             wave: std::array::from_fn(|i| std::array::from_fn(|j| w[i * 4 + j])),
