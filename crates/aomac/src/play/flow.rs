@@ -1067,7 +1067,7 @@ impl Frontend for Play {
         if let (Screen::InWorld, Some(p)) = (self.screen, self.player.as_mut()) {
             if let InputEvent::MouseDown { x, y, .. } | InputEvent::MouseUp { x, y, .. } | InputEvent::Wheel { x, y, .. } = ev {
                 if open || matches!(ev, InputEvent::MouseUp { .. }) {
-                    p.mouse(&ev, self.gui.wants_mouse(x, y));
+                    p.mouse(&ev, self.gui.wants_mouse(x, y), host);
                 }
             }
         }

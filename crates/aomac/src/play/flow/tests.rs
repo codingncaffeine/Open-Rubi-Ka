@@ -536,6 +536,7 @@ fn focus_loss_resets_input_even_while_game_input_is_closed() {
     r.p.player.as_mut().unwrap().mouse(
         &ao_gui::InputEvent::MouseDown { x: 640.0, y: 400.0, button: ao_gui::MouseButton::Right },
         false,
+        &mut r.host,
     );
     r.p.game_input(ao_render::GameInput::MouseMotion { dx: 10.0, dy: 0.0, dt: 0.016 }, &mut r.host);
     frames(&mut r, 1);
@@ -631,6 +632,39 @@ fn first_person_and_mouse_look_from_the_input_events() {
     }
     let turned = (r.p.zone.own().unwrap().yaw.unwrap_or(0.0) - yaw0 + std::f32::consts::PI).rem_euclid(2.0 * std::f32::consts::PI) - std::f32::consts::PI;
     assert!(turned.abs() > 0.5 && turned.abs() < 1.5, "turned {turned} rad");
+}
+
+/// Real-window event ordering regression: `ao_render::viewer`'s `window_event` dispatches the RMB-down
+/// `WindowEvent::MouseInput` straight to `Frontend::input`, and a `DeviceEvent::MouseMotion` can arrive
+/// before the next `RedrawRequested`/`frame()` call -- the viewer only forwards raw deltas while
+/// `host.look` is set (it gates `RawMouse::set_active`/cursor capture on it). `host.look` must therefore
+/// flip inside `Frontend::input` itself, not wait for the next `frame()`: before the fix `Player::mouse`
+/// left `host.look` stale until `Player::frame` ran, so a motion delta delivered between the button-down
+/// event and the first subsequent frame was silently dropped by the viewer's `!s.looking` guard.
+#[test]
+fn mouse_look_captures_before_the_next_frame_not_after() {
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    r.enter();
+    for _ in 0..30 {
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+    }
+    let yaw0 = r.p.zone.own().unwrap().yaw.unwrap_or(0.0);
+    let (x, y, button) = (640.0, 400.0, ao_gui::MouseButton::Right);
+    // No `r.p.frame()` call here: this is the exact order a real window delivers
+    // WindowEvent::MouseInput(Right, pressed) followed by DeviceEvent::MouseMotion before any redraw.
+    r.p.input(ao_gui::InputEvent::MouseDown { x, y, button }, &mut r.host);
+    assert!(r.host.look, "RMB down must capture the cursor within the same input event, not the next frame()");
+    for _ in 0..4 {
+        r.p.game_input(ao_render::GameInput::MouseMotion { dx: 25.0, dy: 0.0, dt: 0.016 }, &mut r.host);
+    }
+    r.p.input(ao_gui::InputEvent::MouseUp { x, y, button }, &mut r.host);
+    for _ in 0..60 {
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+    }
+    let turned = (r.p.zone.own().unwrap().yaw.unwrap_or(0.0) - yaw0 + std::f32::consts::PI).rem_euclid(2.0 * std::f32::consts::PI) - std::f32::consts::PI;
+    assert!(turned.abs() > 0.5 && turned.abs() < 1.5, "turned {turned} rad without an intervening frame() before the first motion");
 }
 
 /// The client-initiated teleport try in the flow (docs/zone/world.md §10.2): `StartTryingTeleport` = `TeleportStarted` while the playfield keeps

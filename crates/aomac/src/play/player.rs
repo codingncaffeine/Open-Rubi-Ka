@@ -430,8 +430,10 @@ impl Player {
         self.run(cmds);
     }
 
-    /// Mouse buttons and the wheel (`Frontend::input`); `over_gui` = the cursor is over a GUI window.
-    pub fn mouse(&mut self, ev: &InputEvent, over_gui: bool) {
+    /// Mouse buttons and the wheel (`Frontend::input`); `over_gui` = the cursor is over a GUI window. Updates
+    /// `host.look` in the same event the button transitions `mouse_capture` (not deferred to the next `frame()`):
+    /// a press/drag/release that arrives between frames must not lose motion to a stale cursor-capture state.
+    pub fn mouse(&mut self, ev: &InputEvent, over_gui: bool, host: &mut Host) {
         let btn = |b: MouseButton| match b {
             MouseButton::Left => Some(0),
             MouseButton::Right => Some(1),
@@ -457,6 +459,7 @@ impl Player {
             _ => return,
         };
         self.run(cmds);
+        host.look = self.controls.mouse_capture();
     }
 
     /// One frame: advance the movement, return the `CharDCMove` frames to send, place avatar + camera.
