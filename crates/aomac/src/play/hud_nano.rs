@@ -197,7 +197,11 @@ impl HudNano {
         let rows_h = 2.0 * lv::BORDER + ROWS as f32 * lv::ICON_32 + (ROWS as f32 - 1.0) * lv::SPACING;
         let client = (cw as u32, (selector_h + rows_h) as u32);
         let all = self.columns();
-        let view = ListView::new(Mode::Grid, all.clone(), lv::grid_cols_for(cw, lv::ICON_32), ROWS, (1, false));
+        let cols = lv::grid_cols_for(cw, lv::ICON_32);
+        let mut view = ListView::new(Mode::Grid, all.clone(), cols, ROWS, (1, false));
+        // `MultiListView_c::RecalcCellCount` 0x101349f6: fill the fixed RollupArea page width, not a blank strip from a plain
+        // 10 px gap (`hud_listview.rs::fill_spacing`, same bug/fix as the Actions page).
+        view.spacing = lv::fill_spacing(cw, cols, lv::ICON_32);
         let texts = MenuTexts { list_mode: self.text("ListMode"), auto_arrange: self.text("AutoArrange") };
         let title = self.text("Programs");
         let w = ListWindow::open(gui, Spec { name: "NanoView", title: &title, pos: (0, 0), client, top_xml: &selector, top_h: selector_h, texts, menu_base: MENU_BASE, screen: self.screen }, view, all, Some((rollup, KEY)))?;

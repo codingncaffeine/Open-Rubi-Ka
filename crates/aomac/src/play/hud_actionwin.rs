@@ -81,7 +81,12 @@ impl HudActionWin {
         if self.win.is_some() {
             return;
         }
-        let view = ListView::new(Mode::Grid, vec![], COLS, CELLS / COLS, (0, false));
+        let mut view = ListView::new(Mode::Grid, vec![], COLS, CELLS / COLS, (0, false));
+        // `MultiListView_c::RecalcCellCount` 0x101349f6 stretches the inter-icon gap to fill the view even at a fixed size
+        // (the RollupArea page width never changes): the plain 10 px default gap left a 39 px blank strip at the 167 px view's
+        // right edge (3 columns only need 128 px); the Programs/Actions "doesn't reflow with window width" bug is this, not
+        // only the resizable NCU/Mission/Programs free windows (`hud_listview.rs::fill_spacing`).
+        view.spacing = lv::fill_spacing(VIEW as f32, COLS, lv::ICON_32);
         let spec = Spec { name: "SpecialActionView", title: "Actions", pos: (0, 0), client: (VIEW, VIEW), top_xml: "", top_h: 0.0, texts: MenuTexts::default(), menu_base: 0x6800, screen: self.screen };
         match ListWindow::open(gui, spec, view, vec![], Some((rollup, KEY))) {
             Ok(w) => {

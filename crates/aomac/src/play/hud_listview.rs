@@ -61,6 +61,7 @@ struct PaintedLayout {
     cols: usize,
     min_rows: usize,
     icon: f32,
+    spacing: f32,
 }
 
 pub(super) struct ListView {
@@ -90,14 +91,29 @@ pub(super) struct ListView {
     item_tip: Option<(i32, bool, String)>,
 }
 
-/// Columns of a grid that fits `client_w` px: `n` icons and `n - 1` spacings between the borders (`RecalcCellCount`).
+/// Columns of a grid that fits `client_w` px: `n` icons and `n - 1` spacings between the borders (`RecalcCellCount`
+/// 0x101349f6's first pass, dividing by the default icon+spacing pitch).
 pub(super) fn grid_cols_for(client_w: f32, icon: f32) -> usize {
     (((client_w - 2.0 * BORDER + SPACING) / (icon + SPACING)).floor() as usize).max(1)
 }
 
-/// Client width of a grid of `cols` columns.
+/// Client width of a grid of `cols` columns at the default (unstretched) spacing.
 pub(super) fn grid_width(cols: usize, icon: f32) -> f32 {
     2.0 * BORDER + cols as f32 * icon + (cols as f32 - 1.0) * SPACING
+}
+
+/// `RecalcCellCount` 0x101349f6's second pass: once the column count is fixed, the gap between icons is stretched
+/// (`floor((width - borders - cols * icon) / (cols - 1))`) to exactly fill `client_w` -- the grid never leaves a blank
+/// strip down the right edge the way a fixed 10 px gap does whenever `client_w` isn't an exact multiple of the pitch
+/// (the Programs / Actions / NCU grid reflow bug, which is not only about window resize: a page whose width never
+/// changes, like the Actions RollupArea page, has the same leftover-slack bug at its one fixed size). A single column
+/// has nothing to stretch between, so it keeps the plain default.
+pub(super) fn fill_spacing(client_w: f32, cols: usize, icon: f32) -> f32 {
+    if cols < 2 {
+        return SPACING;
+    }
+    let slack = (client_w - grid_width(cols, icon)).max(0.0);
+    SPACING + slack / (cols as f32 - 1.0)
 }
 
 /// The `ScrollView` + content skeleton of a list window: the part the window XML embeds. Flexible beyond its initial size
@@ -194,7 +210,7 @@ impl ListView {
     pub fn paint(&mut self, gui: &mut Gui, w: WindowId, icon: f32) {
         let rebuild = !self.painted.as_ref().is_some_and(|p| {
             p.mode == self.mode && p.keys.iter().copied().eq(self.rows.iter().map(|r| r.key))
-                && p.columns == self.columns && p.cols == self.cols && p.min_rows == self.min_rows && p.icon == icon
+                && p.columns == self.columns && p.cols == self.cols && p.min_rows == self.min_rows && p.icon == icon && p.spacing == self.spacing
         });
         if !rebuild && !self.dirty && self.painted_selection == self.selected {
             return;
@@ -213,7 +229,7 @@ impl ListView {
             gui.relayout_window(w);
         }
         if rebuild {
-            self.painted = Some(PaintedLayout { mode: self.mode, keys: self.order.clone(), columns: self.columns.clone(), cols: self.cols, min_rows: self.min_rows, icon });
+            self.painted = Some(PaintedLayout { mode: self.mode, keys: self.order.clone(), columns: self.columns.clone(), cols: self.cols, min_rows: self.min_rows, icon, spacing: self.spacing });
         }
         self.painted_selection = self.selected;
         self.dirty = false;
@@ -423,18 +439,22 @@ impl ListWindow {
         gui.set_window_pos(self.win, (x.clamp(0, self.screen.0.saturating_sub(ow) as i32), y.clamp(0, self.screen.1.saturating_sub(oh) as i32)));
     }
 
-    /// `MultiListView_c::RecalcCellCount` 0x101349f6 on `Event::WindowFrame`: the grid's column count follows the window's current
-    /// content width (as `HudStats::reflow_inventory` already does for the inventory grid). List layout keeps its fixed column
-    /// widths (only the grid reflows). Returns whether the count changed (callers must repaint / invalidate their cache then).
+    /// `MultiListView_c::RecalcCellCount` 0x101349f6 on `Event::WindowFrame`: the grid's column count *and* its gap both follow
+    /// the window's current content width (as `HudStats::reflow_inventory` already does for the inventory grid's column count).
+    /// List layout keeps its fixed column widths (only the grid reflows). Returns whether either changed (callers must repaint
+    /// / invalidate their cache then).
     pub fn reflow_grid(&mut self, gui: &Gui, icon: f32) -> bool {
         if self.view.mode != Mode::Grid {
             return false;
         }
-        let cols = grid_cols_for(gui.window_size(self.win).0 as f32, icon);
-        if cols == self.view.cols {
+        let client_w = gui.window_size(self.win).0 as f32;
+        let cols = grid_cols_for(client_w, icon);
+        let spacing = fill_spacing(client_w, cols, icon);
+        if cols == self.view.cols && spacing == self.view.spacing {
             return false;
         }
         self.view.cols = cols;
+        self.view.spacing = spacing;
         true
     }
 
@@ -513,6 +533,21 @@ pub(super) fn hms(cs: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `RecalcCellCount` 0x101349f6's second pass: a 167 px view (the Actions `SpecialActionView_c` size, `_DAT_101bd710`) with
+    /// 3 columns of 32 px icons must stretch its gap to fill the view exactly, not leave the Programs/Actions "blank strip to
+    /// the right" bug behind a fixed 10 px gap.
+    #[test]
+    fn fill_spacing_stretches_the_gap_to_consume_the_whole_width() {
+        let (view_w, cols, icon) = (167.0, 3, ICON_32);
+        let spacing = fill_spacing(view_w, cols, icon);
+        assert!(spacing > SPACING, "167 px has slack beyond the plain {SPACING} px default gap: got {spacing}");
+        assert_eq!(2.0 * BORDER + cols as f32 * icon + (cols as f32 - 1.0) * spacing, view_w, "the filled grid must span the whole view, not leave a trailing gap");
+        // below 2 columns there is nothing to stretch between
+        assert_eq!(fill_spacing(167.0, 1, icon), SPACING);
+        // an exact fit (no slack) keeps the plain default
+        assert_eq!(fill_spacing(grid_width(4, icon), 4, icon), SPACING);
+    }
 
     #[test]
     fn list_header_reserves_height_before_first_row_and_icon() {

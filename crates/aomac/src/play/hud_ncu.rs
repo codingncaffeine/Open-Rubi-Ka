@@ -123,7 +123,10 @@ impl HudNcu {
         let client = (ow.saturating_sub(10).max(60), oh.saturating_sub(31).max(40));
         let all = self.columns();
         let cols = lv::grid_cols_for(client.0 as f32, lv::ICON_32);
-        let view = ListView::new(Mode::Grid, all.clone(), cols, 3, (12, false));
+        let mut view = ListView::new(Mode::Grid, all.clone(), cols, 3, (12, false));
+        // `MultiListView_c::RecalcCellCount` 0x101349f6: fill the initial window width, not a blank strip from a plain 10 px
+        // gap (`hud_listview.rs::fill_spacing`); `Event::WindowFrame` keeps it filled as the window resizes.
+        view.spacing = lv::fill_spacing(client.0 as f32, cols, lv::ICON_32);
         let texts = MenuTexts { list_mode: self.text("ListMode"), auto_arrange: self.text("AutoArrange") };
         match ListWindow::open(gui, Spec { name: "NCUView", title: "NCU", pos: (x, y), client, top_xml: "", top_h: 0.0, texts, menu_base: MENU_BASE, screen: self.screen }, view, all, None) {
             Ok(w) => {
