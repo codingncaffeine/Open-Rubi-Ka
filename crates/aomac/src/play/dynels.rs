@@ -2727,6 +2727,15 @@ impl Dynels {
             let k = c.scale;
             let transform = [[cs * k, 0.0, -s * k, 0.0], [0.0, k, 0.0, 0.0], [s * k, 0.0, cs * k, 0.0], [p[0], p[1], p[2], 1.0]];
             let actor = ActorFrame { id: *id as u32, model: c.key, transform, parts: c.parts.clone(), part_attractors: rig.part_attractors(), skin, always: false, alpha: 1.0, ..Default::default() };
+            // Worn/attached item lights (the Light Bar's embedded `RLight_t` and similar, `mesh.rs::decode_mesh_lights`):
+            // actor-relative from `ActorRig::mount_lights`, placed in the world by this dynel's own transform, the same
+            // way `ActorFrame::transform` places its mesh vertices (`vertex_lights` in the shader then lights terrain,
+            // statics and other actors from them, not just this dynel's own body).
+            for l in rig.mount_lights(&c.parts) {
+                let point = |p: [f32; 3]| -> [f32; 3] { std::array::from_fn(|j| p[0] * transform[0][j] + p[1] * transform[1][j] + p[2] * transform[2][j] + transform[3][j]) };
+                let dir = |d: [f32; 3]| -> [f32; 3] { std::array::from_fn(|j| d[0] * transform[0][j] + d[1] * transform[1][j] + d[2] * transform[2][j]) };
+                host.dynamic_lights.push(ao_scene::Light { pos: point(l.pos), spot: l.spot.map(|s| ao_scene::Spot { dir: dir(s.dir), ..s }), ..l });
+            }
             if let Some(effects) = &mut self.effects {
                 let identity = (CHAR_KIND as u32, *id as u32);
                 if effects.needs_source_mesh(identity) { effects.prepare_source_mesh(identity, &built.model, &actor); }
@@ -3909,6 +3918,57 @@ mod variant_tests {
         }
     }
 
+    /// Opt-in visual evidence (`AOMAC_SHOT_DIR`): Bergdoktor's real `summon_light` lighting a dark ground plane at his
+    /// feet, with and without the dynamic light wired through `Host::dynamic_lights`.
+    #[test]
+    fn captured_light_bar_lights_the_ground_at_night() {
+        let Some(out) = std::env::var_os("AOMAC_SHOT_DIR").map(PathBuf::from) else { return };
+        let Some(dir) = client() else { return };
+        struct Shot { gui: Gui, scene: Option<ao_scene::Scene>, lights: Vec<ao_scene::Light> }
+        impl ao_render::Frontend for Shot {
+            fn gui(&self) -> &Gui { &self.gui }
+            fn input(&mut self, _: ao_gui::InputEvent, _: &mut Host) {}
+            fn frame(&mut self, dt: f32, _: (u32, u32), host: &mut Host) -> ao_gui::DrawList {
+                host.camera = Camera::look_at(ao_render::Vec3::new(1.8, 1.3, 2.2), ao_render::Vec3::new(0.0, -0.3, 0.3));
+                if let Some(scene) = self.scene.take() { host.set_scene(scene); }
+                host.dynamic_lights = self.lights.clone();
+                self.gui.frame(dt)
+            }
+        }
+        let store = RecordStore::open(&dir).unwrap();
+        let mut assets = ActorAssets::new(&store).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let u = frames(include_str!("../../../../docs/captures/zone_ithaca.rec")).iter().filter_map(|f| ao_net::n3::decode(f).ok())
+            .find_map(|m| match m.body {
+                N3::Dynel(Dynel::SimpleCharFullUpdate(u)) if u.name == "Bergdoktor" => Some(u),
+                _ => None,
+            }).expect("captured remote player");
+        let built = build_char(&store, &mut assets, &CharLook::from_update(&u)).unwrap();
+        let rig = built.rig.unwrap();
+        let (vertices, transforms) = rig.pose(None);
+        let lights = rig.mount_lights(&transforms); // actor-relative = world, the actor sits at the scene origin here
+        assert!(!lights.is_empty(), "Bergdoktor's summon_light must decode");
+        let mut scene = built.model;
+        scene.meshes[0].vertices = vertices;
+        scene.instances = transforms.into_iter().enumerate().map(|(mesh, transform)| ao_scene::Instance { mesh, transform }).collect();
+        scene.environment = Some(ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 400.0, fog_end: 800.0, ambient: [0.01; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 0.0 });
+        // A plain, untextured 10x10 m ground quad under Bergdoktor's feet: without a dynamic light, `base_color` white
+        // and near-zero ambient leave it almost black; the Light Bar's glow should visibly lift the patch around him.
+        let gi = scene.meshes.len();
+        let quad = [(-5.0, -5.0), (5.0, -5.0), (5.0, 5.0), (-5.0, 5.0)];
+        let vb: Vec<ao_scene::Vertex> = quad.iter().map(|&(x, z)| ao_scene::Vertex { pos: [x, 0.0, z], normal: [0.0, 1.0, 0.0], uv: [0.0, 0.0], color: ao_scene::WHITE }).collect();
+        let sub = ao_scene::Submesh::new(vec![0, 1, 2, 0, 2, 3], None);
+        scene.meshes.push(ao_scene::Mesh { vertices: vb, submeshes: vec![sub] });
+        scene.instances.push(ao_scene::Instance { mesh: gi, transform: ao_scene::IDENTITY });
+        let mut shot = Shot { gui: Gui::new(&dir, None).unwrap(), scene: Some(scene), lights: vec![] };
+        let mut renderer = ao_render::Offscreen::new(&shot, (640, 480)).unwrap();
+        for (name, on) in [("off", false), ("on", true)] {
+            shot.lights = if on { lights.clone() } else { vec![] };
+            let list = renderer.frame(&mut shot, 0.016);
+            renderer.png(&shot, &list, &out.join(format!("light-bar-{name}.png"))).unwrap();
+        }
+    }
+
     #[test]
     fn full_update_head_survives_missing_attractor_but_appearance_clears_it() {
         let mut u = frames(include_str!("../../../../docs/captures/zone_enter_ithaca.rec"))
@@ -4788,5 +4848,51 @@ mod variant_tests {
         assert!(last.2 <= first.2 + 4, "effect anchors must plateau, not grow per replay: {first:?} -> {last:?}");
         assert!(last.3 <= first.3 + 2, "source_runtime must plateau, not grow per replay: {first:?} -> {last:?}");
         assert!(last.4 <= first.4 + 2, "buff_models must plateau, not grow per replay: {first:?} -> {last:?}");
+    }
+
+    /// Bergdoktor's real `summon_light` attachment (mesh 26163, `Attractor06_back`, `docs/captures/zone_ithaca.rec`,
+    /// `docs/zone/dynel.md` §1.3 -- the user-reported "Light Bar" UTILS item) must reach the renderer as a moving
+    /// point light once his model is built, tracking his position every frame, and disappear once he leaves view.
+    #[test]
+    fn worn_light_bar_reaches_the_renderer_as_a_tracked_point_light() {
+        let Some(dir) = client() else { return };
+        let own = 25988;
+        let mut z = Zone::new(own as u32);
+        z.world.start(dir, own);
+        z.world.char_view_distance = 100_000.0; // the authored light's own range (6.13 m) still bounds who it lights, see `vertex_lights`
+        let rec = frames(include_str!("../../../../docs/captures/zone_ithaca.rec"));
+        let mut host = Host::headless();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let berg_key = loop {
+            for f in &rec {
+                z.on_frame(f);
+                let (eye, fwd) = z.own().map_or(([0.0; 3], [0.0, 0.0, -1.0]), |o| (scene_pos(o.pos), [0.0, 0.0, -1.0]));
+                z.world.update_with_collision(0.016, eye, fwd, &mut host, None, |_| None);
+                host.actors.clear();
+                host.dynamic_lights.clear();
+            }
+            if let Some(c) = z.world.chars.values().find(|c| c.name == "Bergdoktor") {
+                if model_state(&z.world, c.key) == "ready" {
+                    break c.key;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "Bergdoktor's model not ready after 60s");
+        };
+        // One more tick with Bergdoktor's model ready: his embedded light must be present, near his own position,
+        // matching the authored `RLight_t` (range/colour) within the mount's own accumulated transform error.
+        let (eye, fwd) = z.own().map_or(([0.0; 3], [0.0, 0.0, -1.0]), |o| (scene_pos(o.pos), [0.0, 0.0, -1.0]));
+        z.world.update_with_collision(0.016, eye, fwd, &mut host, None, |_| None);
+        let berg_pos = scene_pos(z.world.chars.values().find(|c| c.name == "Bergdoktor").unwrap().pose.pos);
+        let lights = host.dynamic_lights.clone();
+        let near = lights.iter().find(|l| (0..3).map(|i| (l.pos[i] - berg_pos[i]).powi(2)).sum::<f32>().sqrt() < 2.5);
+        let l = near.unwrap_or_else(|| panic!("no dynamic light near Bergdoktor {berg_pos:?}: {lights:?}"));
+        assert!((l.range - 6.13).abs() < 0.1, "authored summon_light range: {}", l.range);
+        assert!((l.color[0] - 1.0).abs() < 0.05 && (l.color[1] - 0.836).abs() < 0.05 && (l.color[2] - 0.394).abs() < 0.05, "authored summon_light colour: {:?}", l.color);
+        // Dropping his dynel (n3ToClientQuit) must drop his light with it, not leave it lit forever.
+        z.world.chars.remove(&z.world.chars.iter().find(|(_, c)| c.key == berg_key).map(|(id, _)| *id).unwrap());
+        host.dynamic_lights.clear();
+        let (eye, fwd) = z.own().map_or(([0.0; 3], [0.0, 0.0, -1.0]), |o| (scene_pos(o.pos), [0.0, 0.0, -1.0]));
+        z.world.update_with_collision(0.016, eye, fwd, &mut host, None, |_| None);
+        assert!(host.dynamic_lights.iter().all(|l| (0..3).map(|i| (l.pos[i] - berg_pos[i]).powi(2)).sum::<f32>().sqrt() >= 2.5), "light must not linger after the dynel is gone");
     }
 }
