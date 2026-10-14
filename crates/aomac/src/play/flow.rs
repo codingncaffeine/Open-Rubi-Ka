@@ -1229,6 +1229,11 @@ impl Frontend for Play {
             self.interface_scale = hud.dvalues.get_i64("AomacInterfaceScale").unwrap_or(0).clamp(0, 3) as u8;
             host.borderless_game = hud.dvalues.flag("AomacBorderlessFullscreen");
             host.pinch_zoom = hud.dvalues.flag("AomacPinchZoom");
+            // Audit item 13, not retail, opt-in: rasterize TrueType glyphs at the real window backing scale with
+            // real coverage antialiasing instead of retail's hinted 1-bit bitmap; bitmap fonts are unaffected
+            // regardless (`Font::glyph_scaled`). Off (1) reproduces retail exactly.
+            let smooth_text = hud.dvalues.flag("AomacSmoothText");
+            self.gui.set_text_scale(if smooth_text { host.window_scale.clamp(1, 8) as u8 } else { 1 });
         }
         // audit item 2: every screen, including the login screen before any HUD exists.
         host.interface_scale = Some(self.interface_scale);
@@ -1239,7 +1244,8 @@ impl Frontend for Play {
         self.refresh_ground_quality();
         // Ground invalidates current materials; ordinary callbacks affect resource uploads.
         // Colour depth remains startup-only.
-        host.texture_policy = Some((self.texture_resolution, self.texture_compressed));
+        let better_mips = self.hud.as_ref().is_some_and(|h| h.dvalues.flag("AomacBetterMipFiltering"));
+        host.texture_policy = Some((self.texture_resolution, self.texture_compressed, better_mips));
         self.zone.world.set_texture_quality(self.texture_quality);
         if let Some(player) = self.player.as_mut() {
             player.set_texture_quality(self.texture_quality);
@@ -1413,10 +1419,15 @@ impl Frontend for Play {
             // `ViewDistance` / `DisplayCharViewDistance` (docs/chat/dvalue.md): far plane + fog + statel LOD, characters' draw distance
             if let Some(h) = self.hud.as_mut() {
                 h.sync_keys();
+                // aomac Enhanced "Widescreen FOV" (audit item 16, not retail, default off, PRK-signed-off): widens the
+                // real lens and, so the perf pre-skin cull never gets stricter than it, `Dynels::fov_horizontal` too.
+                let widescreen_fov = h.dvalues.flag("AomacWidescreenFOV");
                 if let Some(p) = self.player.as_mut() {
                     let (b, f) = h.key_tables();
                     p.set_keys(b, f);
                     p.set_view_distance(h.dvalues.view_distance());
+                    p.set_widescreen_fov(widescreen_fov);
+                    p.set_scenery_distance_mult(h.dvalues.get_f32("AomacSceneryDistance").unwrap_or(1.0));
                     if let Some(mode) = h.take_menu_camera() {
                         p.select_camera_mode(mode);
                     }
@@ -1425,6 +1436,7 @@ impl Frontend for Play {
                     p.set_fade(super::avatar::Fade::from_prefs(&h.dvalues.prefs));
                 }
                 self.zone.world.char_view_distance = h.dvalues.char_view_distance();
+                self.zone.world.fov_horizontal = super::camera::horizontal_fov(widescreen_fov, size.0 as f32 / size.1.max(1) as f32);
                 self.zone.world.set_name_prefs(&h.dvalues);
                 self.zone.triangle_targeting = h.dvalues.get_i64("BoundingBoxTargeting").unwrap_or(1) == 0;
                 host.spaceships_shown = h.dvalues.prefs.get_int("IsSpaceShipsShown", super::dvalue::Kind::Char).unwrap_or(1) != 0;

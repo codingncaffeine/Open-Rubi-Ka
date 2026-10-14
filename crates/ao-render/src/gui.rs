@@ -273,7 +273,7 @@ impl GuiRenderer {
                     let uv = [(e.x as f32 + src[0]) / pw, (e.y as f32 + src[1]) / ph, (e.x as f32 + src[0] + src[2]) / pw, (e.y as f32 + src[1] + src[3]) / ph];
                     quad(&mut self.verts, dst, uv, [tint[0] as f32 / 255.0, tint[1] as f32 / 255.0, tint[2] as f32 / 255.0, alpha], e.page);
                 }
-                DrawCmd::Glyph { src, dst, tint, alpha } => {
+                DrawCmd::Glyph { src, dst, scale, tint, alpha } => {
                     if cur_extra.is_some() {
                         if self.verts.len() as u32 > start {
                             self.batches.push((clip, cur_extra, start..self.verts.len() as u32));
@@ -281,7 +281,15 @@ impl GuiRenderer {
                         }
                         cur_extra = None;
                     }
-                    let d = [dst[0] as f32, dst[1] as f32, (dst[0] + src[2] as i32) as f32, (dst[1] + src[3] as i32) as f32];
+                    // aomac Enhanced "Anti-aliased Text" (audit item 13, not retail): `scale` > 1 means the atlas
+                    // bitmap (`src` w/h) was rasterized that many times bigger for AA; dividing the destination
+                    // box back down to the logical glyph size keeps layout identical while this per-command
+                    // `scale` upscale (combined with the interface's own physical backing-scale upscale of the
+                    // whole GUI) ends up sampling the atlas near 1:1 at the physical pixel grid. `scale` 1 (every
+                    // bitmap font, and the option off) is exactly the old 1:1 behaviour.
+                    let sc = u32::from(scale.max(1)) as f32;
+                    let (bw, bh) = (src[2] as f32 / sc, src[3] as f32 / sc);
+                    let d = [dst[0] as f32, dst[1] as f32, dst[0] as f32 + bw, dst[1] as f32 + bh];
                     let uv = [src[0] as f32 / gw, src[1] as f32 / gh, (src[0] + src[2]) as f32 / gw, (src[1] + src[3]) as f32 / gh];
                     quad(&mut self.verts, d, uv, [tint[0] as f32 / 255.0, tint[1] as f32 / 255.0, tint[2] as f32 / 255.0, alpha], 1 << 16);
                 }

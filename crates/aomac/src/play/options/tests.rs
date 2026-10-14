@@ -721,6 +721,10 @@ fn enhanced_page_options_default_to_retail_and_persist_across_a_restart() {
     assert_eq!(r.d.get_i64("AomacInterfaceScale"), Some(0), "default must be Auto (audit item 2)");
     assert_eq!(r.d.get_i64("AomacBorderlessFullscreen"), Some(0), "default off: animated native fullscreen (audit item 6)");
     assert_eq!(r.d.get_i64("AomacPinchZoom"), Some(0), "default off: opt-in (audit item 8)");
+    assert_eq!(r.d.get("AomacBetterMipFiltering"), Some(&super::super::dvalue::Variant::Bool(false)), "default must be off, matching retail's plain box filter");
+    assert_eq!(r.d.get("AomacWidescreenFOV"), Some(&super::super::dvalue::Variant::Bool(false)), "default must be off, matching retail's fixed 90 degree FOV");
+    assert_eq!(r.d.get("AomacSceneryDistance"), Some(&super::super::dvalue::Variant::Float(1.0)), "default must be 1.0x, matching retail's ViewDistance far plane");
+    assert_eq!(r.d.get("AomacSmoothText"), Some(&super::super::dvalue::Variant::Bool(false)), "default must be off, matching retail's hinted 1-bit bitmap");
     let tmp = std::env::temp_dir().join("aomac-enhanced-options-persist");
     let _ = std::fs::remove_dir_all(&tmp);
     r.d.open_user(&tmp, "acct", 7);
@@ -753,6 +757,26 @@ fn enhanced_page_options_default_to_retail_and_persist_across_a_restart() {
     assert_eq!(r.d.get_i64("ChatFontSize"), Some(280));
     assert_eq!(opt.value_text(280.0), "28 pt");
     let _ = chat;
+    let c3 = r.show("AomacBetterMipFiltering");
+    assert!(!r.gui.checked(r.win(), &c3));
+    r.click(&c3);
+    assert_eq!(r.d.get("AomacBetterMipFiltering"), Some(&super::super::dvalue::Variant::Bool(true)));
+    let c4 = r.show("AomacWidescreenFOV");
+    assert!(!r.gui.checked(r.win(), &c4));
+    r.click(&c4);
+    assert_eq!(r.d.get("AomacWidescreenFOV"), Some(&super::super::dvalue::Variant::Bool(true)));
+    let s5 = r.show("AomacSceneryDistance");
+    let id = r.win();
+    let rect = r.gui.view_rect(id, &s5).unwrap();
+    let width = r.gui.canvas_size(id, &s5).0 as f32;
+    r.send(InputEvent::MouseDown { x: rect.l + 3.0, y: rect.t + 4.0, button: MouseButton::Left });
+    r.send(InputEvent::MouseMove { x: rect.l + width * 2.0, y: rect.t + 4.0 }); // drag to the far right: clamped to the 2.0x max
+    r.send(InputEvent::MouseUp { x: 0.0, y: 0.0, button: MouseButton::Left });
+    assert_eq!(r.d.get("AomacSceneryDistance"), Some(&super::super::dvalue::Variant::Float(2.0)));
+    let c6 = r.show("AomacSmoothText");
+    assert!(!r.gui.checked(r.win(), &c6));
+    r.click(&c6);
+    assert_eq!(r.d.get("AomacSmoothText"), Some(&super::super::dvalue::Variant::Bool(true)));
     r.d.save_user();
     let dir = ao_gui::client_dir();
     let mut again = DValues::new(&dir);
@@ -763,5 +787,9 @@ fn enhanced_page_options_default_to_retail_and_persist_across_a_restart() {
     assert_eq!(again.get_i64("AomacBorderlessFullscreen"), Some(1));
     assert_eq!(again.get_i64("AomacPinchZoom"), Some(1));
     assert_eq!(again.get_i64("ChatFontSize"), Some(280));
+    assert_eq!(again.get("AomacBetterMipFiltering"), Some(&super::super::dvalue::Variant::Bool(true)));
+    assert_eq!(again.get("AomacWidescreenFOV"), Some(&super::super::dvalue::Variant::Bool(true)));
+    assert_eq!(again.get("AomacSceneryDistance"), Some(&super::super::dvalue::Variant::Float(2.0)));
+    assert_eq!(again.get("AomacSmoothText"), Some(&super::super::dvalue::Variant::Bool(true)));
     let _ = std::fs::remove_dir_all(&tmp);
 }

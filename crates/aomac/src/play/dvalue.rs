@@ -201,6 +201,20 @@ impl DValues {
         // Audit item 8: trackpad pinch gesture zooms the third-person camera (same 0.78-25 m range as the mouse wheel).
         // Opt-in: not retail, and a pinch over the 3D view has no other meaning to conflict with.
         s.add("AomacPinchZoom", Variant::Bool(false), true, CAT_MAIN, None, None, false);
+        // Audit item 12: gamma-correct downsample + coverage-preserving alpha mips (`native_texture::build_texture_mips`).
+        // Default off: retail's plain sRGB-byte box filter (randy31 `FUN_100193e4`).
+        s.add("AomacBetterMipFiltering", Variant::Bool(false), true, CAT_MAIN, None, None, false);
+        // Audit item 16, PRK-signed-off (`agent://EnhanceReview`): keeps the 4:3 vertical angle (`camera::lens`); default
+        // off: retail's fixed 90 degree horizontal FOV (`camera::FOV_HORIZONTAL`, N3 `n3Camera_t` ctor).
+        s.add("AomacWidescreenFOV", Variant::Bool(false), true, CAT_MAIN, None, None, false);
+        // Audit item 15: multiplies the player camera's far plane (terrain/statel LOD + fog end move with it, see
+        // `camera::far_plane`/`Renderer::set_lens`); never touches `char_view_distance` (dynels.rs) or the 30 m name-tag
+        // radius (ao-net `nametag.rs`), which use their own separate distance checks. Default 1.0x = retail `ViewDistance`.
+        s.add("AomacSceneryDistance", Variant::Float(1.0), true, CAT_MAIN, Some(Variant::Float(1.0)), Some(Variant::Float(2.0)), false);
+        // Audit item 13: rasterizes TrueType glyphs at the window's backing scale with real coverage antialiasing
+        // (`ao_gui::font::TtFont::glyph`'s `scale` parameter / `Flatten::fill_aa`) instead of retail's hinted 1-bit
+        // bitmap; bitmap fonts (tooltips, shell, chat, name tags) are always pixel art regardless. Default off.
+        s.add("AomacSmoothText", Variant::Bool(false), true, CAT_MAIN, None, None, false);
         s
     }
 

@@ -128,6 +128,9 @@ struct Popup {
     combo: ViewId,
     hover: Option<usize>,
 }
+/// Atlas region (x, y, w, h) plus the effective rasterization scale ([`Font::glyph_scaled`]) of a cached glyph;
+/// `None` when the glyph has no visible coverage (space, etc).
+type GlyphSrc = Option<([u16; 4], u8)>;
 
 pub struct Gui {
     gfx: GfxSet,
@@ -139,7 +142,13 @@ pub struct Gui {
     tree: Tree,
     windows: Vec<Option<Window>>,
     glyphs: GlyphAtlas,
-    glyph_map: HashMap<(FontId, char), Option<[u16; 4]>>,
+    /// aomac Enhanced "Anti-aliased Text" cache (not retail, audit item 13): keyed by `text_scale` too, since a
+    /// changed backing scale needs its glyphs re-rasterized ([`Font::glyph_scaled`]) and re-atlased.
+    glyph_map: HashMap<(FontId, char, u8), GlyphSrc>,
+    /// Backing-scale multiplier TrueType glyphs are rasterized at for anti-aliasing (aomac Enhanced option, not
+    /// retail, audit item 13); 1 = retail's hinted 1-bit bitmap, matching every default. Set by the frontend
+    /// through [`Gui::set_text_scale`] from the window's current physical-pixels-per-GUI-pixel ratio.
+    text_scale: u8,
     localize: Localize,
     mouse: Point,
     hover: Option<ViewId>,
@@ -226,6 +235,7 @@ impl Gui {
             windows: Vec::new(),
             glyphs: GlyphAtlas::new(),
             glyph_map: HashMap::new(),
+            text_scale: 1,
             localize: localize.unwrap_or_else(|| Box::new(|_| None)),
             mouse: Point::default(),
             hover: None,
@@ -267,6 +277,13 @@ impl Gui {
     /// Glyph coverage atlas; re-upload when `version` changed.
     pub fn glyph_atlas(&self) -> &GlyphAtlas {
         &self.glyphs
+    }
+    /// aomac Enhanced "Anti-aliased Text" (not retail, audit item 13, opt-in): `scale` is the window's current
+    /// physical-pixels-per-GUI-pixel ratio TrueType glyphs will be rasterized at ([`Font::glyph_scaled`]); the
+    /// frontend calls this once per frame from the Enhanced option and the live backing scale. 1 = retail's
+    /// hinted 1-bit bitmap (the default, matching every unset option); bitmap fonts are never affected.
+    pub fn set_text_scale(&mut self, scale: u8) {
+        self.text_scale = scale.max(1);
     }
     pub fn fonts(&mut self) -> &mut FontSystem {
         &mut self.fonts
@@ -797,7 +814,7 @@ impl Gui {
         if !self.fonts.set_chat(family, style, size) {
             return false;
         }
-        self.glyph_map.retain(|(f, _), _| *f != FontId::Chat);
+        self.glyph_map.retain(|(f, _, _), _| *f != FontId::Chat);
         for w in 0..self.windows.len() {
             self.relayout_window(w);
         }
@@ -1162,18 +1179,22 @@ impl Gui {
         }
     }
 
-    fn glyph_src(&mut self, font: FontId, ch: char) -> Option<[u16; 4]> {
-        if let Some(c) = self.glyph_map.get(&(font, ch)) {
+    /// Returns the atlas region and the effective rasterization scale ([`Font::glyph_scaled`]) a renderer needs to
+    /// divide the atlas region back down by to get the logical destination box (aomac Enhanced "Anti-aliased
+    /// Text", audit item 13; `self.text_scale` 1 is always 1 here too, byte-identical to the pre-item-13 cache).
+    fn glyph_src(&mut self, font: FontId, ch: char) -> Option<([u16; 4], u8)> {
+        if let Some(c) = self.glyph_map.get(&(font, ch, self.text_scale)) {
             return *c;
         }
-        let g = self.fonts.font(font).glyph(ch).clone();
+        let (g, scale) = self.fonts.font(font).glyph_scaled(ch, self.text_scale);
+        let g = g.clone();
         let src = if g.width > 0 && g.height > 0 && g.bits.iter().any(|b| *b != 0) {
             let cov: Vec<u8> = g.bits.iter().map(|b| if *b > 1 { *b } else if *b == 1 { 255 } else { 0 }).collect();
-            self.glyphs.alloc(g.width as u32, g.height as u32, &cov).map(|(x, y)| [x as u16, y as u16, g.width as u16, g.height as u16])
+            self.glyphs.alloc(g.width as u32, g.height as u32, &cov).map(|(x, y)| ([x as u16, y as u16, g.width as u16, g.height as u16], scale))
         } else {
             None
         };
-        self.glyph_map.insert((font, ch), src);
+        self.glyph_map.insert((font, ch, self.text_scale), src);
         src
     }
 
@@ -1183,8 +1204,8 @@ impl Gui {
         let mut pen = x;
         for ch in s.chars() {
             let ch = if password { '*' } else { ch };
-            if let Some(src) = self.glyph_src(font, ch) {
-                out.push(DrawCmd::Glyph { src, dst: [pen, y], tint, alpha });
+            if let Some((src, scale)) = self.glyph_src(font, ch) {
+                out.push(DrawCmd::Glyph { src, dst: [pen, y], scale, tint, alpha });
             }
             pen += self.fonts.font(font).advance(ch);
         }

@@ -16,6 +16,11 @@ use std::f32::consts::{FRAC_PI_2, PI};
 /// The world camera is created with `SetViewPlaneWindow(π/2, aspect)` (`n3Camera_t` ctor, N3 @0x10021a76 / `FUN_1002107a`
 /// @0x1002107a, constant `_DAT_1003ccf8`): 90° *horizontal*.
 pub const FOV_HORIZONTAL: f32 = FRAC_PI_2;
+/// aomac Enhanced option "Widescreen FOV" (not retail, default off, audit item 16; PRK-signed-off, `agent://EnhanceReview`
+/// "widescreen FOV"): keeps the *vertical* half of the retail 4:3 lens (`vertical_fov(FOV_HORIZONTAL, 4.0/3.0)`, 73.7398°)
+/// instead of the retail horizontal angle, so a wider window gets more horizontal view (100° at 16:10, 106° at 16:9, 121°
+/// at 21:9) without showing anything above/below what a 4:3 window already could.
+pub const FOV_VERTICAL_WIDE: f32 = 1.287_002_2;
 /// Near clip plane: the third `VisualCamera_t` constructor argument of `n3EngineClient_t::CreateCamera` (N3 @0x10007842, `_DAT_1003ce50`).
 pub const NEAR: f32 = 0.2;
 /// `ViewDistance` default (`SetDefaultLoginPrefs` GUI @0x10124b33).
@@ -27,9 +32,18 @@ pub fn far_plane(view_distance: f32) -> f32 {
 }
 
 /// The lens of the player camera over the playfield's `base` (far plane: the client's [`far_plane`] of the default view
-/// distance, which is the fog distance the playfield lens already carries).
-pub fn lens(base: Lens) -> Lens {
-    Lens { fov: FOV_HORIZONTAL, horizontal: true, near: NEAR, ..base }
+/// distance, which is the fog distance the playfield lens already carries). `widescreen` is the aomac Enhanced option
+/// above; retail is always `false` (fixed 90° horizontal).
+pub fn lens(base: Lens, widescreen: bool) -> Lens {
+    if widescreen { Lens { fov: FOV_VERTICAL_WIDE, horizontal: false, near: NEAR, ..base } } else { Lens { fov: FOV_HORIZONTAL, horizontal: true, near: NEAR, ..base } }
+}
+
+/// Horizontal field of view actually rendered at `aspect` (width / height): retail's fixed 90° (aspect-independent), or,
+/// with the widescreen option on, the horizontal angle the vertical-locked [`FOV_VERTICAL_WIDE`] lens shows at `aspect`
+/// (inverse of [`Lens::vertical_fov`]). Used by [`super::dynels::Dynels::fov_horizontal`] so its animation-cull pre-check
+/// widens along with the real lens instead of assuming the retail fixed 90° (audit item 16 prerequisite).
+pub fn horizontal_fov(widescreen: bool, aspect: f32) -> f32 {
+    if widescreen { 2.0 * ((FOV_VERTICAL_WIDE * 0.5).tan() * aspect).atan() } else { FOV_HORIZONTAL }
 }
 
 /// N3 1001ff2f (LocalityListener at camera+0xa4) adds camera+1d4 to the
@@ -1101,11 +1115,21 @@ mod tests {
     }
 
     #[test]
+    fn far_plane_scales_with_the_aomac_scenery_distance_multiplier_but_shares_the_same_base() {
+        // audit item 15: `Player::frame` multiplies `far_plane(view_distance)` by `scenery_distance_mult`
+        // (clamped 1.0-2.0 in `Player::set_scenery_distance_mult`), the same far plane `Renderer::set_lens`
+        // already uses to move the fog end and statel LOD view length.
+        let base = far_plane(VIEW_DISTANCE);
+        assert_eq!(base * 1.0, base, "1.0x must be identical to retail");
+        assert_eq!(base * 2.0, 1600.0, "2.0x doubles the far plane, fog end and statel LOD view length together");
+    }
+
+    #[test]
     fn near_far_and_lens() {
         assert_eq!(NEAR, 0.2);
         assert_eq!(far_plane(VIEW_DISTANCE), 800.0);
         assert_eq!(far_plane(0.0), NEAR + 50.0);
-        let l = lens(Lens { fov: 1.0, horizontal: false, near: 0.5, far: Some(900.0) });
+        let l = lens(Lens { fov: 1.0, horizontal: false, near: 0.5, far: Some(900.0) }, false);
         assert_eq!((l.fov, l.horizontal, l.near, l.far), (FOV_HORIZONTAL, true, 0.2, Some(900.0)));
     }
 
@@ -1383,8 +1407,20 @@ mod tests {
 
     #[test]
     fn fov_is_ninety_degrees_horizontal() {
-        let l = lens(Lens::default());
+        let l = lens(Lens::default(), false);
         assert!(near(l.vertical_fov(1.0), FRAC_PI_2));
         assert!(near(l.vertical_fov(16.0 / 9.0).to_degrees(), 58.716));
+    }
+
+    #[test]
+    fn widescreen_fov_keeps_the_4_3_vertical_angle_and_widens_horizontally() {
+        let retail = lens(Lens::default(), false);
+        let wide = lens(Lens::default(), true);
+        // Same vertical angle at 4:3 (the aspect the retail horizontal FOV was authored for)...
+        assert!(near(retail.vertical_fov(4.0 / 3.0), wide.vertical_fov(4.0 / 3.0)));
+        // ...but at 16:9 the widescreen lens shows much more horizontally than retail's shrinking vertical fov would.
+        let h_fov = |l: Lens, aspect: f32| 2.0 * (l.vertical_fov(aspect) * 0.5).tan().atan2(1.0 / aspect) * 0.0 + 2.0 * ((l.vertical_fov(aspect) * 0.5).tan() * aspect).atan();
+        assert!((h_fov(wide, 16.0 / 9.0).to_degrees() - 106.0).abs() < 0.5, "got {}", h_fov(wide, 16.0 / 9.0).to_degrees());
+        assert!((h_fov(retail, 16.0 / 9.0).to_degrees() - 90.0).abs() < 1e-3);
     }
 }

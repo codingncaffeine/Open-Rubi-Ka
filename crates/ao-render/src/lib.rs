@@ -911,14 +911,16 @@ impl Renderer {
         Ok(r)
     }
 
-    /// Native quality is latched at startup; compression callbacks affect future loads.
-    pub fn set_texture_policy(&mut self, quality: i32, compressed: bool) {
-        self.texture_policy = native_texture::Policy { quality, compressed };
+    /// Native quality is latched at startup; compression callbacks affect future loads. `better` is the aomac
+    /// Enhanced "Better Mip Filtering" option (not retail, default off, audit item 12).
+    pub fn set_texture_policy(&mut self, quality: i32, compressed: bool, better: bool) {
+        self.texture_policy = native_texture::Policy { quality, compressed, better };
     }
 
     fn texture_view(&self, rgba: &[u8], w: u32, h: u32, source: ao_scene::TextureSource) -> wgpu::TextureView {
         let bc_supported = self.device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
-        let built = native_texture::build_texture_mips(self.texture_policy, source, bc_supported, rgba, w, h);
+        // Sky/ground single-texture uploads are never alpha-tested foliage: coverage preservation does not apply.
+        let built = native_texture::build_texture_mips(self.texture_policy, source, bc_supported, rgba, w, h, false);
         self.upload_built_texture(&built)
     }
 
@@ -1004,17 +1006,24 @@ impl Renderer {
         self.ground_state.recreate();
         let bc_supported = self.device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
         let policy = self.texture_policy;
+        // aomac Enhanced "Better Mip Filtering" coverage preservation only applies to textures actually used by a
+        // `Blend::AlphaTest` submesh (foliage, fences, hair cards); every other texture keeps the plain box filter.
+        let alpha_tested: std::collections::HashSet<TextureKey> = scene.meshes.iter()
+            .flat_map(|m| &m.submeshes)
+            .filter(|s| s.blend == ao_scene::Blend::AlphaTest)
+            .filter_map(|s| s.texture)
+            .collect();
         enum Job<'a> {
             Ground(&'a ao_scene::Texture),
-            Mip { rgba: &'a [u8], w: u32, h: u32, source: ao_scene::TextureSource },
+            Mip { rgba: &'a [u8], w: u32, h: u32, source: ao_scene::TextureSource, alpha_test: bool },
         }
         const DEFAULT_WHITE: [u8; 4] = [255; 4];
-        let mut jobs: Vec<Job> = vec![Job::Mip { rgba: &DEFAULT_WHITE, w: 1, h: 1, source: ao_scene::TextureSource::Generated }];
+        let mut jobs: Vec<Job> = vec![Job::Mip { rgba: &DEFAULT_WHITE, w: 1, h: 1, source: ao_scene::TextureSource::Generated, alpha_test: false }];
         let mut view_of: HashMap<TextureKey, usize> = HashMap::new();
         for (k, t) in &scene.textures {
             if t.width > 0 && t.height > 0 && t.rgba.len() == (t.width * t.height * 4) as usize {
                 view_of.insert(*k, jobs.len());
-                jobs.push(if k.rdb_type == 1_000_007 { Job::Ground(t) } else { Job::Mip { rgba: &t.rgba, w: t.width, h: t.height, source: t.source } });
+                jobs.push(if k.rdb_type == 1_000_007 { Job::Ground(t) } else { Job::Mip { rgba: &t.rgba, w: t.width, h: t.height, source: t.source, alpha_test: alpha_tested.contains(k) } });
             }
         }
         // CPU-side box-filter mip chain + BC/packed encoding runs across threads (audit item 10, the
@@ -1030,8 +1039,8 @@ impl Renderer {
             for (job_chunk, built_chunk) in jobs.chunks(chunk).zip(built.chunks_mut(chunk)) {
                 scope.spawn(move || {
                     for (job, slot) in job_chunk.iter().zip(built_chunk.iter_mut()) {
-                        if let Job::Mip { rgba, w, h, source } = job {
-                            *slot = Some(native_texture::build_texture_mips(policy, *source, bc_supported, rgba, *w, *h));
+                        if let Job::Mip { rgba, w, h, source, alpha_test } = job {
+                            *slot = Some(native_texture::build_texture_mips(policy, *source, bc_supported, rgba, *w, *h, *alpha_test));
                         }
                     }
                 });

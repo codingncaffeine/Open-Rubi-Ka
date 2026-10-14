@@ -11,8 +11,14 @@ pub enum DrawCmd {
     /// Skin image (`src` = x, y, w, h in image pixels) stretched to `dst` (x0, y0, x1, y1 exclusive),
     /// modulated by `tint` (RGB) and `alpha`.
     Gfx { id: GfxId, src: [f32; 4], dst: [f32; 4], tint: [u8; 3], alpha: f32 },
-    /// Glyph coverage from the glyph atlas (`src` = x, y, w, h in atlas pixels), drawn 1:1 at `dst`.
-    Glyph { src: [u16; 4], dst: [i32; 2], tint: [u8; 3], alpha: f32 },
+    /// Glyph coverage from the glyph atlas (`src` = x, y, w, h in atlas pixels): drawn at `dst` sized
+    /// `src.w / scale, src.h / scale` (physical atlas source, logical destination). `scale` 1 (retail, every
+    /// bitmap font) draws 1:1, as before; `scale` > 1 is the aomac Enhanced "Anti-aliased Text" option (not
+    /// retail, audit item 13): the atlas bitmap was rasterized `scale`x bigger with real coverage
+    /// antialiasing, so dividing its size back down to the unscaled, retail-hinted logical glyph box (and
+    /// letting the interface's own physical backing-scale upscale fill that box back in) keeps every text
+    /// layout identical while drawing a smooth, Retina-resolution glyph instead of a blocky nearest-neighbour one.
+    Glyph { src: [u16; 4], dst: [i32; 2], scale: u8, tint: [u8; 3], alpha: f32 },
     /// Solid rectangle (x0, y0, x1, y1 exclusive).
     Solid { dst: [f32; 4], color: [u8; 3], alpha: f32 },
     /// Scissor rectangle (x0, y0, x1, y1 exclusive); `None` clears it.

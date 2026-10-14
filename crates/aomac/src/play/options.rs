@@ -278,6 +278,19 @@ fn enhanced_page() -> Page {
         scale: 0.1,
         borders: String::new(),
     };
+    let slider = |var: &str, label: &str, fmt: &str| Opt {
+        ctl: Ctl::Slider,
+        var: var.to_string(),
+        ty: Ty::Variant,
+        kind: Kind::Login,
+        label: label.to_string(),
+        tooltip: None,
+        enable: String::new(),
+        bit: None,
+        fmt: fmt.to_string(),
+        scale: 1.0,
+        borders: String::new(),
+    };
     Page {
         label: "Enhanced (aomac, not retail)".to_string(),
         items: vec![
@@ -288,6 +301,10 @@ fn enhanced_page() -> Page {
             Item::Opt(check("AomacBorderlessFullscreen", "Instant Fullscreen (skip animation, hide menu bar/dock)")),
             Item::Opt(check("AomacPinchZoom", "Pinch to Zoom (trackpad)")),
             Item::Opt(chat_font),
+            Item::Opt(check("AomacBetterMipFiltering", "Better Mip Filtering (gamma-correct, coverage-preserving foliage)")),
+            Item::Opt(check("AomacWidescreenFOV", "Widescreen FOV (keep the 4:3 vertical angle)")),
+            Item::Opt(slider("AomacSceneryDistance", "Extended Scenery Distance (terrain/statels only, 1.0x = retail)", "%.2fx")),
+            Item::Opt(check("AomacSmoothText", "Anti-aliased Text (Retina, TrueType fonts only)")),
         ],
     }
 }

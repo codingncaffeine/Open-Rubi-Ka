@@ -98,6 +98,9 @@ enum Kind {
 pub struct Font {
     kind: Kind,
     cache: HashMap<char, Glyph>,
+    /// aomac Enhanced "Anti-aliased Text" cache (not retail, audit item 13): keyed by the backing scale a
+    /// glyph was rasterized at, since a bigger window scale needs a bigger, re-rasterized atlas bitmap.
+    aa_cache: HashMap<(char, u8), Glyph>,
     /// Line height in pixels (`FontInfo+0xff0`).
     pub height: i32,
     /// Advance of the space character (`FontInfo+0xff4`).
@@ -109,11 +112,30 @@ impl Font {
         if !self.cache.contains_key(&ch) {
             let g = match &self.kind {
                 Kind::Bitmap(b) => b.glyph(ch),
-                Kind::Tt(t) => t.glyph(ch),
+                Kind::Tt(t) => t.glyph(ch, 1),
             };
             self.cache.insert(ch, g);
         }
         &self.cache[&ch]
+    }
+    /// aomac Enhanced "Anti-aliased Text" (not retail, audit item 13, opt-in): the glyph rasterized `scale`x
+    /// bigger with real coverage antialiasing instead of 1-bit hinting ([`TtFont::glyph`]'s `scale` parameter).
+    /// Bitmap fonts (tooltips, shell, chat, name tags) always stay pixel art at scale 1 regardless of the
+    /// option, since only `Kind::Tt` honours `scale` > 1. Returns the *effective* scale used, so the caller
+    /// can size the destination box back down from the bigger atlas bitmap (physical source, logical
+    /// destination) -- the retail-hinted advance (`Font::advance`) never depends on `scale`, so text layout
+    /// is unchanged.
+    pub fn glyph_scaled(&mut self, ch: char, scale: u8) -> (&Glyph, u8) {
+        let scale = match &self.kind { Kind::Bitmap(_) => 1, Kind::Tt(_) => scale.max(1) };
+        if scale <= 1 {
+            return (self.glyph(ch), 1);
+        }
+        if !self.aa_cache.contains_key(&(ch, scale)) {
+            let Kind::Tt(t) = &self.kind else { unreachable!("scale > 1 is forced to 1 for Kind::Bitmap above") };
+            let g = t.glyph(ch, scale);
+            self.aa_cache.insert((ch, scale), g);
+        }
+        (&self.aa_cache[&(ch, scale)], scale)
     }
     pub fn advance(&mut self, ch: char) -> i32 {
         self.glyph(ch).advance
@@ -141,11 +163,11 @@ impl FontSystem {
             let path = client_cd.join("textures/fonts").join(fnt);
             let gid = gfx.id(tex).ok_or_else(|| anyhow!("{tex} missing"))?;
             let bf = BitmapFont::load(&path, gfx, gid)?;
-            fonts.insert(id, Font { height: bf.height, space: bf.advance(' '), kind: Kind::Bitmap(bf), cache: HashMap::new() });
+            fonts.insert(id, Font { height: bf.height, space: bf.advance(' '), kind: Kind::Bitmap(bf), cache: HashMap::new(), aa_cache: HashMap::new() });
         }
         let tt = |name: &str, h: i32, bold: bool, italic: bool| -> Result<Font> {
             let f = TtFont::new(&dir, name, h, bold, italic)?;
-            let mut font = Font { height: f.cell_height, space: 0, kind: Kind::Tt(f), cache: HashMap::new() };
+            let mut font = Font { height: f.cell_height, space: 0, kind: Kind::Tt(f), cache: HashMap::new(), aa_cache: HashMap::new() };
             font.space = font.advance(' ');
             Ok(font)
         };
@@ -181,7 +203,7 @@ impl FontSystem {
         };
         let lf = (size / 10).clamp(5, 48);
         let Ok(f) = TtFont::new(&self.dir, family, lf, bold, italic) else { return false };
-        let mut font = Font { height: f.cell_height, space: 0, kind: Kind::Tt(f), cache: HashMap::new() };
+        let mut font = Font { height: f.cell_height, space: 0, kind: Kind::Tt(f), cache: HashMap::new(), aa_cache: HashMap::new() };
         font.space = font.advance(' ');
         self.fonts.insert(FontId::Chat, font);
         true
@@ -294,7 +316,14 @@ impl TtFont {
         Ok(Self { data, ppem: ppem as f32, hint, ascent, descent, cell_height: ascent + descent, hdmx })
     }
 
-    fn glyph(&self, ch: char) -> Glyph {
+    /// `scale` 1 reproduces the retail 1-bit hinted bitmap exactly (same `self.hint` instance, same `Flatten::fill`,
+    /// byte-identical to the pre-item-13 implementation). `scale` > 1 is the aomac Enhanced "Anti-aliased Text"
+    /// option (not retail, audit item 13, opt-in): a *bigger* bitmap (physical atlas source) rasterized with real
+    /// coverage antialiasing ([`Flatten::fill_aa`]) at a fresh hinting instance for `ppem * scale`, same interpreter
+    /// engine as retail, just more detail. `advance`/`cell_height`/`ascent` stay the retail-hinted LOGICAL values
+    /// (never multiplied by `scale`): callers divide the bigger bitmap's width/height back down by `scale` to get
+    /// the logical destination box, so text layout is unaffected either way.
+    fn glyph(&self, ch: char, scale: u8) -> Glyph {
         let font = FontRef::new(&self.data).expect("validated in new");
         let ch = if ch == '\t' { ' ' } else { ch };
         let gid = font.charmap().map(ch).unwrap_or_default();
@@ -307,15 +336,32 @@ impl TtFont {
             font.glyph_metrics(Size::new(self.ppem), LocationRef::default()).advance_width(gid).unwrap_or(0.0).round() as i32
         });
         let outlines = font.outline_glyphs();
-        let mut pen = Flatten::default();
-        if let Some(g) = outlines.get(gid) {
-            let _ = g.draw(DrawSettings::hinted(&self.hint, false), &mut pen);
+        if scale <= 1 {
+            let mut pen = Flatten::default();
+            if let Some(g) = outlines.get(gid) {
+                let _ = g.draw(DrawSettings::hinted(&self.hint, false), &mut pen);
+            }
+            let h = self.cell_height;
+            let w = (adv.max(0) as usize).max(pen.max_x().ceil().max(0.0) as usize) + 1;
+            let mut bits = vec![0u8; w * h as usize];
+            pen.fill(w, h as usize, self.ascent as f32, &mut bits);
+            return Glyph { advance: adv, width: w as i32, height: h, bits };
         }
-        let h = self.cell_height;
-        let w = (adv.max(0) as usize).max(pen.max_x().ceil().max(0.0) as usize) + 1;
-        let mut bits = vec![0u8; w * h as usize];
-        pen.fill(w, h as usize, self.ascent as f32, &mut bits);
-        Glyph { advance: adv, width: w as i32, height: h, bits }
+        // Fixed box-filtered supersample factor for the AA coverage fill: fine enough that diagonal/curved
+        // strokes look smooth, cheap enough to run per-glyph at load time (glyphs are cached after the first draw).
+        const AA_SUPERSAMPLE: usize = 4;
+        let scale_f = f32::from(scale);
+        let hint = HintingInstance::new(&outlines, Size::new(self.ppem * scale_f), LocationRef::default(), HintingOptions { engine: Engine::Interpreter, target: Target::Mono }).ok();
+        let mut pen = Flatten::default();
+        if let (Some(g), Some(hint)) = (outlines.get(gid), &hint) {
+            let _ = g.draw(DrawSettings::hinted(hint, false), &mut pen);
+        }
+        let h_phys = self.cell_height as usize * scale as usize;
+        let ascent_phys = self.ascent as f32 * scale_f;
+        let w_phys = ((adv.max(0) as f32 * scale_f) as usize).max(pen.max_x().ceil().max(0.0) as usize) + scale as usize;
+        let mut bits = vec![0u8; w_phys * h_phys];
+        pen.fill_aa(w_phys, h_phys, ascent_phys, AA_SUPERSAMPLE, &mut bits);
+        Glyph { advance: adv, width: w_phys as i32, height: h_phys as i32, bits }
     }
 }
 
@@ -368,6 +414,54 @@ impl Flatten {
                         out[row * w + px as usize] = 1;
                     }
                 }
+            }
+        }
+    }
+
+    /// Coverage antialiasing of the same non-zero-winding scanline fill as [`Flatten::fill`], used only by the
+    /// aomac Enhanced "Anti-aliased Text" option (not retail, audit item 13): `ss` x `ss` box-filtered
+    /// supersampling (`ss` sub-rows per pixel row, `ss` sub-columns per pixel column) producing real 0..255
+    /// coverage instead of `fill`'s hard 0/1.
+    fn fill_aa(&self, w: usize, h: usize, baseline: f32, ss: usize, out: &mut [u8]) {
+        let ss = ss.max(1);
+        let hits_per_px = (ss * ss) as u32;
+        let mut counts = vec![0u32; w];
+        for row in 0..h {
+            counts.fill(0);
+            for sy in 0..ss {
+                let y = baseline - (row as f32 + (sy as f32 + 0.5) / ss as f32);
+                let mut xs: Vec<(f32, i32)> = Vec::new();
+                for s in &self.segs {
+                    let (x0, y0, x1, y1) = (s[0], s[1], s[2], s[3]);
+                    if y0 == y1 {
+                        continue;
+                    }
+                    let (lo, hi, dir) = if y0 < y1 { (y0, y1, 1) } else { (y1, y0, -1) };
+                    if y >= lo && y < hi {
+                        let t = (y - y0) / (y1 - y0);
+                        xs.push((x0 + t * (x1 - x0), dir));
+                    }
+                }
+                xs.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let mut wind = 0;
+                let mut enter = 0.0;
+                for (x, d) in xs {
+                    let was = wind;
+                    wind += d;
+                    if was == 0 && wind != 0 {
+                        enter = x;
+                    } else if was != 0 && wind == 0 {
+                        let a = ((enter * ss as f32) - 0.5).ceil() as i64;
+                        let b = ((x * ss as f32) - 0.5).ceil() as i64; // exclusive
+                        let (a, b) = if b <= a && x > enter { let m = (((enter + x) * 0.5) * ss as f32).floor() as i64; (m, m + 1) } else { (a, b) };
+                        for subx in a.max(0)..b.min((w * ss) as i64) {
+                            counts[subx as usize / ss] += 1;
+                        }
+                    }
+                }
+            }
+            for x in 0..w {
+                out[row * w + x] = ((counts[x] * 255 + hits_per_px / 2) / hits_per_px) as u8;
             }
         }
     }
@@ -432,10 +526,28 @@ mod tests {
         // Windows: Verdana at lfHeight 13 is the classic 8pt (11 ppem) face, tmHeight 13.
         assert_eq!(f.ppem as i32, 11);
         assert_eq!(f.cell_height, 13);
-        let g = f.glyph('L');
+        let g = f.glyph('L', 1);
         println!("{}\nadv {}", dump(&g), g.advance);
         assert!(g.bits.iter().any(|b| *b != 0));
-        let l = f.glyph('l');
+        let l = f.glyph('l', 1);
         println!("{}", dump(&l));
+    }
+
+    #[test]
+    fn anti_aliased_text_scales_the_bitmap_not_the_advance() {
+        // audit item 13: `scale` 1 must be exactly today's retail hinted 1-bit bitmap; `scale` > 1 (the aomac
+        // Enhanced "Anti-aliased Text" option) must rasterize a bigger bitmap with real (non-binary) coverage,
+        // while the retail-hinted advance/cell height -- what drives text layout -- never changes with scale.
+        let Some(dir) = find_verdana_dir() else { return };
+        let f = TtFont::new(&dir, "Verdana", 13, false, false).unwrap();
+        let retail = f.glyph('A', 1);
+        assert!(retail.bits.iter().all(|&b| b == 0 || b == 1), "scale 1 must stay the retail 1-bit bitmap");
+        for scale in [2u8, 3] {
+            let aa = f.glyph('A', scale);
+            assert_eq!(aa.advance, retail.advance, "scale must never change the retail-hinted advance (layout)");
+            assert_eq!(aa.height, retail.height * i32::from(scale), "the AA bitmap must be `scale`x the logical cell height");
+            assert!(aa.width >= retail.width * i32::from(scale) - i32::from(scale), "the AA bitmap must be about `scale`x the logical width");
+            assert!(aa.bits.iter().any(|&b| b > 1 && b < 255), "a real coverage mask must have in-between (antialiased) values, not just 0/255");
+        }
     }
 }

@@ -73,6 +73,13 @@ pub(super) struct Player {
     lens_set: bool,
     /// `ViewDistance` pref (0..1, docs/chat/dvalue.md): the lens' far plane is [`camera::far_plane`] of it.
     view_distance: f32,
+    /// aomac Enhanced "Widescreen FOV" option (not retail, audit item 16): keeps the 4:3 vertical angle instead
+    /// of the retail fixed 90° horizontal angle ([`camera::lens`]).
+    widescreen_fov: bool,
+    /// aomac Enhanced "Extended Scenery Distance" (not retail, audit item 15, 1.0-2.0x): multiplies the far plane
+    /// that `camera::far_plane` already derives from `view_distance`, so terrain/statel draw distance, fog end and
+    /// statel LOD extend together (`Renderer::set_lens`) while `char_view_distance`/name-tag radius are untouched.
+    scenery_distance_mult: f32,
     /// `FadeCharacter*` prefs and the cached factor of `VisualCATMesh_t::RefreshAlpha` ([`avatar::Fade`]).
     fade: avatar::Fade,
     fader: avatar::Fader,
@@ -162,6 +169,8 @@ impl Player {
                 model_sent: false,
                 lens_set: false,
                 view_distance: camera::VIEW_DISTANCE,
+                widescreen_fov: false,
+                scenery_distance_mult: 1.0,
                 fade: avatar::Fade::default(),
                 fader: avatar::Fader::default(),
                 gui_press: [false; 2],
@@ -227,6 +236,23 @@ impl Player {
     pub fn set_view_distance(&mut self, vd: f32) {
         if vd != self.view_distance {
             self.view_distance = vd;
+            self.lens_set = false;
+        }
+    }
+
+    /// aomac Enhanced "Widescreen FOV" changed: the next frame sends the lens again.
+    pub fn set_widescreen_fov(&mut self, on: bool) {
+        if on != self.widescreen_fov {
+            self.widescreen_fov = on;
+            self.lens_set = false;
+        }
+    }
+
+    /// aomac Enhanced "Extended Scenery Distance" changed: the next frame sends the lens again.
+    pub fn set_scenery_distance_mult(&mut self, mult: f32) {
+        let mult = mult.clamp(1.0, 2.0);
+        if mult != self.scenery_distance_mult {
+            self.scenery_distance_mult = mult;
             self.lens_set = false;
         }
     }
@@ -599,9 +625,11 @@ impl Player {
         let ground = |p: [f32; 3]| col.and_then(|c| c.ground(p));
         host.camera = self.camera.update_with(scene_pos(pos), yaw, dt, &Sight { clear: &clear, door_closed: &closed, ground: &ground });
         if !self.lens_set {
-            // FOV 90 degrees horizontal, near 0.2 (`VisualCamera_t`, docs/zone/camera.md); far = `ViewDistance` * 1000 m (`FUN_1001fc91`)
-            let mut lens = camera::lens(host.lens.unwrap_or(zone.world.lens));
-            lens.far = Some(camera::far_plane(self.view_distance));
+            // FOV 90 degrees horizontal, near 0.2 (`VisualCamera_t`, docs/zone/camera.md); far = `ViewDistance` * 1000 m
+            // (`FUN_1001fc91`) * the aomac Enhanced "Extended Scenery Distance" multiplier (audit item 15, not retail,
+            // 1.0x default); widescreen_fov is the aomac Enhanced FOV option (audit item 16, not retail).
+            let mut lens = camera::lens(host.lens.unwrap_or(zone.world.lens), self.widescreen_fov);
+            lens.far = Some(camera::far_plane(self.view_distance) * self.scenery_distance_mult);
             host.lens = Some(lens);
             self.lens_set = true;
         }

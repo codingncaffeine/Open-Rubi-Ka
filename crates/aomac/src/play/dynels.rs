@@ -70,13 +70,16 @@ const DIE_KEY: u32 = 6000;
 const ATTACK_KEY: u32 = canim::UNARMED_RSWING as u32;
 
 /// 5-plane (left/right/bottom/top/near) conservative frustum for [`Dynels::update_with_collision`]'s pre-skin cull:
-/// see the call site for why this is safely never stricter than `ao_render`'s own per-mesh sphere cull.
-fn skin_frustum_planes(cam: [f32; 3], fwd: [f32; 3]) -> [glam::Vec4; 5] {
+/// see the call site for why this is safely never stricter than `ao_render`'s own per-mesh sphere cull. `fov_horizontal`
+/// is the real camera's current horizontal FOV ([`Dynels::fov_horizontal`]): retail's fixed 90°, or wider with the aomac
+/// Enhanced "Widescreen FOV" option on (audit item 16 prerequisite) so this cheap square-aspect cone keeps covering at
+/// least as much horizontally as the renderer's own wider-than-90° lens.
+fn skin_frustum_planes(cam: [f32; 3], fwd: [f32; 3], fov_horizontal: f32) -> [glam::Vec4; 5] {
     let cam = glam::Vec3::from(cam);
     let fwd = glam::Vec3::from(fwd).normalize_or_zero();
     let fwd = if fwd == glam::Vec3::ZERO { glam::Vec3::NEG_Z } else { fwd };
     let up = if fwd.dot(glam::Vec3::Y).abs() > 0.999 { glam::Vec3::X } else { glam::Vec3::Y };
-    let vp = glam::Mat4::perspective_rh(super::camera::FOV_HORIZONTAL, 1.0, super::camera::NEAR, 1000.0)
+    let vp = glam::Mat4::perspective_rh(fov_horizontal, 1.0, super::camera::NEAR, 1000.0)
         * glam::Mat4::look_to_rh(cam, fwd, up);
     let planes = ao_render::frustum_planes(&vp);
     [planes[0], planes[1], planes[2], planes[3], planes[4]]
@@ -811,6 +814,11 @@ pub struct Dynels {
     /// `DisplayCharViewDistance` in metres (default 80, `FUN_1001f964` N3 0x1001f964; docs/chat/dvalue.md): characters farther from the
     /// viewer are not drawn (`n3VisualDynel_t::Run`, N3 0x100196bd: squared distance to the controlled dynel on ground playfields).
     pub char_view_distance: f32,
+    /// Real horizontal field of view the active camera renders this frame ([`super::camera::horizontal_fov`]), set by
+    /// `flow.rs` each frame: widens [`skip_cpu_skin`]'s conservative pre-skin cull cone along with the aomac Enhanced
+    /// "Widescreen FOV" option (audit item 16 prerequisite) so it never culls something the renderer would still draw.
+    /// Retail (and the default) is the fixed 90° [`super::camera::FOV_HORIZONTAL`].
+    pub fov_horizontal: f32,
     /// Lens of the playfield scene (projection of the name tags).
     pub lens: Lens,
     /// The tag sprites held by the renderer and the 2 s nametag listing (`play/tags.rs`).
@@ -935,6 +943,7 @@ impl Default for Dynels {
             show_all_names: true,
             show_org_names: true,
             char_view_distance: 80.0,
+            fov_horizontal: super::camera::FOV_HORIZONTAL,
             lens: Lens::default(),
             tags: TagLayer::default(),
             listing: Listing::default(),
@@ -2555,11 +2564,12 @@ impl Dynels {
         self.advance(dt);
         // Perf audit item 5: avoid CPU-skinning (`pose_composed_cached`) actors the renderer would cull anyway.
         // 5 planes (no far plane: the 80 m `char_view_distance` check below already caps distance), built from a
-        // fixed 90° cone around `fwd` with aspect 1 — identical to the renderer's own horizontal half-angle
-        // (`camera::FOV_HORIZONTAL` is authored horizontal, aspect-independent) and strictly wider vertically than
-        // any real landscape window (aspect >= 1 shrinks the renderer's vertical fov below this), so this test can
-        // only be more lenient than `ao_render`'s final per-mesh sphere cull, never stricter.
-        let skin_planes = skin_frustum_planes(cam, fwd);
+        // `self.fov_horizontal` cone around `fwd` with aspect 1 — identical to the renderer's own horizontal
+        // half-angle at retail's fixed 90° (aspect-independent), or widened along with the aomac Enhanced
+        // "Widescreen FOV" option (audit item 16), and strictly wider vertically than any real landscape window
+        // (aspect >= 1 shrinks the renderer's vertical fov below this), so this test can only be more lenient
+        // than `ao_render`'s final per-mesh sphere cull, never stricter.
+        let skin_planes = skin_frustum_planes(cam, fwd, self.fov_horizontal);
         for (id, c) in &mut self.chars {
             if *id == own {
                 continue;
@@ -3036,7 +3046,7 @@ mod tests {
     #[test]
     fn skip_cpu_skin_culls_behind_camera_but_not_in_front() {
         // Camera at the origin looking down -Z (`Camera::forward`'s convention elsewhere in this file's tests).
-        let planes = skin_frustum_planes([0.0, 0.0, 0.0], [0.0, 0.0, -1.0]);
+        let planes = skin_frustum_planes([0.0, 0.0, 0.0], [0.0, 0.0, -1.0], super::super::camera::FOV_HORIZONTAL);
         let behind = [0.0, 0.0, 10.0];
         let in_front = [0.0, 0.0, -10.0];
         assert!(skip_cpu_skin(&planes, behind, 1.0, 1.0, false, true), "an actor behind the camera is CPU-skin-skipped");
@@ -3045,10 +3055,26 @@ mod tests {
 
     #[test]
     fn skip_cpu_skin_never_skips_without_a_prior_skin_or_with_needs_effect_pose() {
-        let planes = skin_frustum_planes([0.0, 0.0, 0.0], [0.0, 0.0, -1.0]);
+        let planes = skin_frustum_planes([0.0, 0.0, 0.0], [0.0, 0.0, -1.0], super::super::camera::FOV_HORIZONTAL);
         let behind = [0.0, 0.0, 10.0];
         assert!(!skip_cpu_skin(&planes, behind, 1.0, 1.0, false, false), "no skin pose yet: the first frame always skins");
         assert!(!skip_cpu_skin(&planes, behind, 1.0, 1.0, true, true), "needs_effect_pose forces a fresh skin even off-screen");
+    }
+
+    #[test]
+    fn widescreen_fov_widens_the_skin_cull_cone_so_edge_characters_still_animate() {
+        // Audit item 16 prerequisite: a character 55 degrees off-centre is outside retail's fixed-90-degree cull cone
+        // (half-angle 45 degrees) but inside the real frustum once the Enhanced widescreen option widens the lens
+        // past 90 degrees horizontal (e.g. 120.6 degrees at a 21:9 aspect) -- it must not stop animating.
+        // Far enough out that `skip_cpu_skin`'s fixed `POSE_MARGIN` cull-radius inflation (`ao_render::POSE_MARGIN`,
+        // additive, independent of distance) is negligible next to how far past/short of the frustum edge this
+        // point sits.
+        let angle = 55f32.to_radians();
+        let pos = [angle.sin() * 1000.0, 0.0, -angle.cos() * 1000.0];
+        let retail = skin_frustum_planes([0.0, 0.0, 0.0], [0.0, 0.0, -1.0], super::super::camera::FOV_HORIZONTAL);
+        assert!(skip_cpu_skin(&retail, pos, 0.1, 1.0, false, true), "55 degrees off-centre must be outside retail's fixed 90 degree cull cone");
+        let wide = skin_frustum_planes([0.0, 0.0, 0.0], [0.0, 0.0, -1.0], super::super::camera::horizontal_fov(true, 21.0 / 9.0));
+        assert!(!skip_cpu_skin(&wide, pos, 0.1, 1.0, false, true), "widescreen FOV must widen the cull cone so edge characters keep animating");
     }
 
     #[test]

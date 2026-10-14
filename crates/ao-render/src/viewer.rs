@@ -34,8 +34,8 @@ pub struct Host {
     pub lens: Option<ao_scene::Lens>,
     /// Fog density multiplier of the `FogMode` pref ([`ao_scene::fog_mode_density_scale`]); `None` leaves it as it is; drained by the viewer.
     pub fog_density_scale: Option<f32>,
-    /// Startup color-depth quality and future-upload native compression preference.
-    pub texture_policy: Option<(i32, bool)>,
+    /// Startup color-depth quality, native compression preference, and aomac Enhanced "Better Mip Filtering" (not retail).
+    pub texture_policy: Option<(i32, bool, bool)>,
     /// Texture anisotropic filtering clamp (aomac Enhanced option, audit item 2; retail default 1x). `None` leaves it as it is.
     pub anisotropy: Option<u16>,
     /// Colour/depth MSAA sample count (aomac Enhanced option; not retail, default 1 = off). `None` leaves it as it is;
@@ -123,6 +123,11 @@ pub struct Host {
     /// Frontend request: write the current frame (world + GUI) as a PNG to this path once, off the render thread
     /// (aomac's F12 screenshot); `None` = no request. Drained by the viewer/`Offscreen`.
     pub screenshot: Option<std::path::PathBuf>,
+    /// Informational, filled by the viewer before every `Frontend::frame` call (opposite direction from most
+    /// `Host` fields): physical pixels per GUI pixel of the real window, 1 in `Offscreen` unless a test sets it.
+    /// Lets the aomac Enhanced "Anti-aliased Text" option (not retail, audit item 13) rasterize TrueType glyphs
+    /// at the real backing scale through `ao_gui::Gui::set_text_scale`.
+    pub window_scale: u32,
 }
 
 fn present_mode(wait: bool) -> wgpu::PresentMode {
@@ -166,7 +171,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None }
+        Host { smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -643,6 +648,7 @@ impl State {
         }
         let size = (self.config.width / g.scale, self.config.height / g.scale);
         self.renderer.visible_actor_ids(&mut g.host.previous_visible_actors);
+        g.host.window_scale = g.scale;
         let list = g.frontend.frame(dt, size, &mut g.host);
         if let Some(wait) = g.host.wait_for_vert_sync.take() {
             let mode = present_mode(wait && std::env::var_os("AOMAC_NOVSYNC").is_none());
@@ -652,8 +658,8 @@ impl State {
             }
         }
         self.cam = g.host.camera;
-        if let Some((quality, compressed)) = g.host.texture_policy.take() {
-            self.renderer.set_texture_policy(quality, compressed);
+        if let Some((quality, compressed, better_mips)) = g.host.texture_policy.take() {
+            self.renderer.set_texture_policy(quality, compressed, better_mips);
         }
         if let Some(level) = g.host.anisotropy.take() {
             self.renderer.set_anisotropy(level);
@@ -1075,8 +1081,8 @@ impl Offscreen {
         if self.targets.sample_count != self.r.msaa_samples() {
             self.targets = Targets::new(&self.r, self.size.0, self.size.1);
         }
-        if let Some((quality, compressed)) = self.host.texture_policy.take() {
-            self.r.set_texture_policy(quality, compressed);
+        if let Some((quality, compressed, better_mips)) = self.host.texture_policy.take() {
+            self.r.set_texture_policy(quality, compressed, better_mips);
         }
         if let Some(level) = self.host.anisotropy.take() {
             self.r.set_anisotropy(level);
