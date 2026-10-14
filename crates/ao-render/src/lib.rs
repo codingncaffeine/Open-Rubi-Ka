@@ -866,47 +866,34 @@ impl Renderer {
     }
 
     fn texture_view(&self, rgba: &[u8], w: u32, h: u32, source: ao_scene::TextureSource) -> wgpu::TextureView {
-        let encoding = self.texture_policy.encoding(source, self.device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC), w, h);
-        let mips = 32 - w.max(h).leading_zeros();
+        let bc_supported = self.device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
+        let built = native_texture::build_texture_mips(self.texture_policy, source, bc_supported, rgba, w, h);
+        self.upload_built_texture(&built)
+    }
+
+    /// Issues the actual GPU texture creation + `queue.write_texture` calls for a CPU-built mip chain
+    /// (see [`native_texture::build_texture_mips`]). Kept separate so a batch of textures can be built
+    /// in parallel on worker threads while every wgpu call still happens serially on the caller's thread.
+    fn upload_built_texture(&self, built: &native_texture::BuiltTexture) -> wgpu::TextureView {
+        let block = built.encoding.block_edge();
+        let block_bytes = built.encoding.block_bytes();
         let tex = self.device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: None,
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            mip_level_count: mips,
+            size: wgpu::Extent3d { width: built.w, height: built.h, depth_or_array_layers: 1 },
+            mip_level_count: built.mips,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: encoding.format(),
+            format: built.encoding.format(),
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        // CPU box-filter mip chain (sRGB-space average; fine for diffuse art).
-        let (mut cw, mut ch, mut data) = (w, h, rgba.to_vec());
-        let mut encoded = Vec::new();
-        for level in 0..mips {
-            let block = encoding.block_edge();
-            let bytes = if encoding == native_texture::Encoding::Rgba8 { data.as_slice() }
-            else { encoding.encode(&data, cw, ch, &mut encoded); encoded.as_slice() };
+        for (level, lvl) in built.levels.iter().enumerate() {
             self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: level, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                bytes,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(cw.div_ceil(block) * encoding.block_bytes()), rows_per_image: Some(ch.div_ceil(block)) },
-                wgpu::Extent3d { width: cw.div_ceil(block) * block, height: ch.div_ceil(block) * block, depth_or_array_layers: 1 },
+                wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: level as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                &lvl.bytes,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(lvl.cw.div_ceil(block) * block_bytes), rows_per_image: Some(lvl.ch.div_ceil(block)) },
+                wgpu::Extent3d { width: lvl.cw.div_ceil(block) * block, height: lvl.ch.div_ceil(block) * block, depth_or_array_layers: 1 },
             );
-            if level + 1 == mips { break; }
-            let (nw, nh) = ((cw / 2).max(1), (ch / 2).max(1));
-            let mut next = vec![0u8; (nw * nh * 4) as usize];
-            for y in 0..nh {
-                for x in 0..nw {
-                    for c in 0..4 {
-                        let mut s = 0u32;
-                        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                            let (sx, sy) = ((2 * x + dx).min(cw - 1), (2 * y + dy).min(ch - 1));
-                            s += data[((sy * cw + sx) * 4 + c) as usize] as u32;
-                        }
-                        next[((y * nw + x) * 4 + c) as usize] = ((s + 2) / 4) as u8;
-                    }
-                }
-            }
-            (cw, ch, data) = (nw, nh, next);
         }
         tex.create_view_tracked(&Default::default())
     }
@@ -977,14 +964,45 @@ impl Renderer {
         self.water_light = scene.water_light;
         self.sky.clouds.clear();
         self.ground_state.recreate();
-        let mut views = vec![self.texture_view(&[255; 4], 1, 1, ao_scene::TextureSource::Generated)];
+        let bc_supported = self.device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
+        let policy = self.texture_policy;
+        enum Job<'a> {
+            Ground(&'a ao_scene::Texture),
+            Mip { rgba: &'a [u8], w: u32, h: u32, source: ao_scene::TextureSource },
+        }
+        const DEFAULT_WHITE: [u8; 4] = [255; 4];
+        let mut jobs: Vec<Job> = vec![Job::Mip { rgba: &DEFAULT_WHITE, w: 1, h: 1, source: ao_scene::TextureSource::Generated }];
         let mut view_of: HashMap<TextureKey, usize> = HashMap::new();
         for (k, t) in &scene.textures {
             if t.width > 0 && t.height > 0 && t.rgba.len() == (t.width * t.height * 4) as usize {
-                view_of.insert(*k, views.len());
-                views.push(if k.rdb_type == 1_000_007 { self.ground_palette_view(t) } else { self.texture_view(&t.rgba, t.width, t.height, t.source) });
+                view_of.insert(*k, jobs.len());
+                jobs.push(if k.rdb_type == 1_000_007 { Job::Ground(t) } else { Job::Mip { rgba: &t.rgba, w: t.width, h: t.height, source: t.source } });
             }
         }
+        // CPU-side box-filter mip chain + BC/packed encoding runs across threads (audit item 10, the
+        // expensive part with BC compression on); GPU texture creation and `queue.write_texture` stay
+        // serial on the calling thread below, since wgpu's Queue isn't safe to interleave across
+        // threads. Each texture's encoded bytes depend only on its own pixels, never on thread
+        // scheduling, so output is byte-identical to the old fully-serial path.
+        let mut built: Vec<Option<native_texture::BuiltTexture>> = Vec::with_capacity(jobs.len());
+        built.resize_with(jobs.len(), || None);
+        let threads = std::thread::available_parallelism().map(std::num::NonZero::get).unwrap_or(1).min(jobs.len().max(1));
+        let chunk = jobs.len().div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            for (job_chunk, built_chunk) in jobs.chunks(chunk).zip(built.chunks_mut(chunk)) {
+                scope.spawn(move || {
+                    for (job, slot) in job_chunk.iter().zip(built_chunk.iter_mut()) {
+                        if let Job::Mip { rgba, w, h, source } = job {
+                            *slot = Some(native_texture::build_texture_mips(policy, *source, bc_supported, rgba, *w, *h));
+                        }
+                    }
+                });
+            }
+        });
+        let views: Vec<wgpu::TextureView> = jobs.iter().zip(built.iter()).map(|(job, b)| match job {
+            Job::Ground(t) => self.ground_palette_view(t),
+            Job::Mip { .. } => self.upload_built_texture(b.as_ref().expect("built in parallel above")),
+        }).collect();
         // One bind group per distinct (texture, base colour, emissive, glow mask).
         let mut mat_of: HashMap<(usize, bool, [u32; 20]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
