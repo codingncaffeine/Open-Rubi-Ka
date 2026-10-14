@@ -97,6 +97,8 @@ pub(super) struct Player {
     fight: Option<FightLevels>,
     /// `n3Playfield_t::GetZoneInstance` of the playfield: the own dynel's zone instance feeds `Movement::zone_instance`.
     zones: Option<Rc<ZoneLocator>>,
+    /// F12 screenshot (retail, `player.rs::run`'s `Cmd::Screenshot`): consumed by the flow via [`Player::take_screenshot`].
+    screenshot_requested: bool,
 }
 
 /// The state of the door at scene position `pos` into its room link (nothing for a door that links no rooms, `0xffff` = leads nowhere).
@@ -171,6 +173,7 @@ impl Player {
                 fighting: false,
                 fight,
                 zones,
+                screenshot_requested: false,
             })
         })();
         built.map_err(|e| eprintln!("player: {e:#}")).ok()
@@ -391,6 +394,12 @@ impl Player {
         std::mem::take(&mut self.game)
     }
 
+    /// F12 screenshot, since the last call (retail GUI.dll `FlowControlModule_t::SlotScreenshot`; the flow has the
+    /// renderer access this layer doesn't).
+    pub fn take_screenshot(&mut self) -> bool {
+        std::mem::take(&mut self.screenshot_requested)
+    }
+
     fn run(&mut self, cmds: Vec<Cmd>) {
         for c in cmds {
             match c {
@@ -405,11 +414,12 @@ impl Player {
                         self.movement.end_mouse_look(self.clock);
                     }
                 }
-                // selection clicks are the HUD's (`Hud::input`); item pick-up / screenshot have no consumer yet
+                // selection clicks are the HUD's (`Hud::input`); item pick-up has no consumer yet
                 // attack / sit / special attacks belong to the combat layer (`combat::Module`, run by the flow)
                 Cmd::Attack | Cmd::SwitchTarget | Cmd::Sit | Cmd::Special(_) => self.game.push(c),
                 Cmd::Click(b) => self.clicks.push(b),
-                Cmd::PickupItem | Cmd::Screenshot => {}
+                Cmd::Screenshot => self.screenshot_requested = true,
+                Cmd::PickupItem => {}
             }
         }
     }

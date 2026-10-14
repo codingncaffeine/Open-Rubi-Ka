@@ -1229,8 +1229,13 @@ impl Frontend for Play {
         // Colour depth remains startup-only.
         host.texture_policy = Some((self.texture_resolution, self.texture_compressed));
         self.zone.world.set_texture_quality(self.texture_quality);
-        if let Some(player) = self.player.as_ref() {
+        if let Some(player) = self.player.as_mut() {
             player.set_texture_quality(self.texture_quality);
+            if player.take_screenshot() {
+                // Retail F12 (`GUI.dll` `FlowControlModule_t::SlotScreenshot`): silent, no chat feedback (RE confirmed
+                // no feedback string exists); `next_screenshot_path` matches the retail folder/naming.
+                if let Some(path) = super::prefs::next_screenshot_path() { host.screenshot = Some(path); }
+            }
         }
         if let Some(hud) = self.hud.as_ref() {
             if let Some(chat) = self.chat.as_mut() { chat.configure_escape(&hud.dvalues); }

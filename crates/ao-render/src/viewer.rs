@@ -107,6 +107,9 @@ pub struct Host {
     /// Shared native VisualFog state, also mutated by effect constructors/destructors.
     pub native_fog: Option<super::SharedNativeFog>,
     native_fog_preference: Option<i32>,
+    /// Frontend request: write the current frame (world + GUI) as a PNG to this path once, off the render thread
+    /// (aomac's F12 screenshot); `None` = no request. Drained by the viewer/`Offscreen`.
+    pub screenshot: Option<std::path::PathBuf>,
 }
 
 fn present_mode(wait: bool) -> wgpu::PresentMode {
@@ -150,7 +153,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None }
+        Host { smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -281,14 +284,31 @@ struct Gui {
     mods: ao_gui::Modifiers,
     /// Physical pixels per GUI pixel.
     scale: u32,
+    /// Fractional trackpad `PixelDelta` scroll not yet accumulated into a whole 40 px notch (`gui_input`'s
+    /// `MouseWheel` case); a mouse wheel's `LineDelta` never touches this. Without it, each small trackpad event
+    /// rounds to a fresh whole `dy`, so a scroll gesture either jumps a full zoom level per event (`hud_map.rs`'s
+    /// "any nonzero dy = one zoom step") or never moves at all (`interact_ptrade.rs`'s `dy as i64` truncation).
+    scroll_accum: f32,
 }
 
 fn gui_scale(scale_factor: f64) -> u32 {
     (scale_factor.round() as u32).max(1)
 }
 
+/// Accumulates a trackpad's fractional `MouseScrollDelta::PixelDelta` into whole 40-pixel-per-notch steps (the same
+/// unit `LineDelta`/`Wheel::dy` already use), carrying the leftover fraction to the next event instead of rounding
+/// it away. Without this, a scroll gesture sent as many small pixel events either jumps a whole notch per event
+/// (any consumer that treats nonzero `dy` as one step, e.g. `hud_map.rs`'s map zoom) or never moves at all (a
+/// consumer that truncates `dy` to an integer, e.g. `interact_ptrade.rs`'s trade-list scroll).
+fn accumulate_scroll(accum: &mut f32, pixel_y: f32) -> Option<f32> {
+    *accum += pixel_y / 40.0;
+    let dy = accum.trunc();
+    *accum -= dy;
+    (dy != 0.0).then_some(dy)
+}
+
 /// winit -> GUI input. Cursor positions are physical pixels / `scale`; Cmd counts as Ctrl (macOS shortcuts).
-fn gui_input(ev: &WindowEvent, cursor: &mut (f32, f32), mods: &mut ao_gui::Modifiers, scale: u32) -> Option<ao_gui::InputEvent> {
+fn gui_input(ev: &WindowEvent, cursor: &mut (f32, f32), mods: &mut ao_gui::Modifiers, scale: u32, scroll_accum: &mut f32) -> Option<ao_gui::InputEvent> {
     use ao_gui::{InputEvent as I, Key as K};
     use winit::keyboard::{Key, NamedKey};
     let s = scale as f32;
@@ -307,13 +327,13 @@ fn gui_input(ev: &WindowEvent, cursor: &mut (f32, f32), mods: &mut ao_gui::Modif
             let (x, y) = *cursor;
             Some(if *state == ElementState::Pressed { I::MouseDown { x, y, button } } else { I::MouseUp { x, y, button } })
         }
-        WindowEvent::MouseWheel { delta, .. } => {
-            let dy = match delta {
-                MouseScrollDelta::LineDelta(_, y) => *y,
-                MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
-            };
-            Some(I::Wheel { x: cursor.0, y: cursor.1, dy })
-        }
+        WindowEvent::MouseWheel { delta, .. } => match delta {
+            MouseScrollDelta::LineDelta(_, y) => Some(I::Wheel { x: cursor.0, y: cursor.1, dy: *y }),
+            // Trackpads send many small fractional pixel steps per gesture; a whole-level consumer (`hud_map.rs`'s
+            // map zoom, any nonzero dy = one level) or a truncating one (`interact_ptrade.rs`'s `dy as i64`) both
+            // need accumulation across events into whole 40 px notches, not a fresh round-per-event.
+            MouseScrollDelta::PixelDelta(p) => accumulate_scroll(scroll_accum, p.y as f32).map(|dy| I::Wheel { x: cursor.0, y: cursor.1, dy }),
+        },
         WindowEvent::ModifiersChanged(m) => {
             let st = m.state();
             *mods = ao_gui::Modifiers { shift: st.shift_key(), ctrl: st.control_key() || st.super_key(), alt: st.alt_key() };
@@ -378,6 +398,8 @@ struct State {
     clock: f32,
     live: Option<LiveRun>,
     hook: Option<FrameHook>,
+    /// `Host::screenshot`, drained from `run_gui` and captured after this frame renders (`frame`'s F12 handling).
+    pending_screenshot: Option<std::path::PathBuf>,
 }
 
 /// Called once per frame with the camera position and the frame time (audio listener).
@@ -472,7 +494,7 @@ impl State {
         let cam = Camera::look_at(eye, at);
         let gui = frontend.map(|frontend| {
             let renderer = crate::GuiRenderer::new(&renderer, frontend.gui());
-            Gui { renderer, frontend, host: Host { camera: cam, effect_sun_direction: scene.environment.map(|env| env.sun_dir.map(|v| -v)), ..Host::headless() }, cursor: (0.0, 0.0), mods: Default::default(), scale: gui_scale(window.scale_factor()) }
+            Gui { renderer, frontend, host: Host { camera: cam, effect_sun_direction: scene.environment.map(|env| env.sun_dir.map(|v| -v)), ..Host::headless() }, cursor: (0.0, 0.0), mods: Default::default(), scale: gui_scale(window.scale_factor()), scroll_accum: 0.0 }
         });
         let now = Instant::now();
         let focused = window.has_focus();
@@ -505,6 +527,7 @@ impl State {
             clock: 0.0,
             live: live.map(LiveRun::new),
             hook,
+            pending_screenshot: None,
         })
     }
 
@@ -583,6 +606,7 @@ impl State {
         }
         self.renderer.set_ground_rendering(g.host.ground_rendering);
         if let Some(textures) = g.host.ground_textures.take() { self.renderer.refresh_ground_textures(&textures); }
+        self.pending_screenshot = g.host.screenshot.take();
         g.host.apply_actors(&mut self.renderer);
         (Some(list), g.host.quit)
     }
@@ -590,6 +614,32 @@ impl State {
     fn paint_gui(&mut self, list: ao_gui::DrawList, view: &wgpu::TextureView) {
         let Some(g) = &mut self.gui else { return };
         g.renderer.draw(&self.renderer, view, (self.config.width, self.config.height), g.scale, g.frontend.gui(), &list);
+    }
+
+    /// F12 screenshot (`Host::screenshot`): re-renders the just-drawn frame (world + GUI) into a one-off
+    /// `RENDER_ATTACHMENT | COPY_SRC` texture (render-to-texture readback, not `COPY_SRC` on the swapchain itself --
+    /// macOS `CAMetalLayer` drawables don't reliably support it) and saves it as a PNG off the render thread. Only
+    /// runs on the rare frame a screenshot is requested, so it costs nothing otherwise.
+    fn capture_screenshot(&mut self, path: std::path::PathBuf, gui_list: Option<ao_gui::DrawList>) {
+        let (width, height) = (self.config.width, self.config.height);
+        let tex = self.renderer.device.create_texture_tracked(&wgpu::TextureDescriptor {
+            label: Some("F12 screenshot"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.renderer.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view_tracked(&Default::default());
+        self.renderer.render(&view, &self.targets, &self.cam);
+        if let (Some(list), Some(g)) = (gui_list, &mut self.gui) {
+            g.renderer.draw(&self.renderer, &crate::GuiRenderer::view(&tex), (width, height), g.scale, g.frontend.gui(), &list);
+        }
+        if let Err(e) = crate::capture_frame_to_png(&self.renderer, &tex, width, height, path.clone()) {
+            eprintln!("screenshot: {}: {e}", path.display());
+        }
     }
 
     fn finish_perf_frame(&mut self, start: Instant) {
@@ -679,6 +729,9 @@ impl State {
         let t0 = self.perf.then(Instant::now);
         let submission = self.renderer.render(&view, &self.targets, &self.cam);
         if let Some(t) = t0 { self.cpu += t.elapsed().as_secs_f32(); }
+        if let Some(path) = self.pending_screenshot.take() {
+            self.capture_screenshot(path, gui_out.clone());
+        }
         if let Some(list) = gui_out {
             let t = self.perf.then(Instant::now);
             let gview = crate::GuiRenderer::view(&frame.texture);
@@ -746,7 +799,7 @@ impl ApplicationHandler for App {
         let Some(s) = &mut self.state else { return };
         if let WindowEvent::Focused(focused) = &ev { s.focused = *focused; }
         if let Some(g) = &mut s.gui {
-            let gi = gui_input(&ev, &mut g.cursor, &mut g.mods, g.scale);
+            let gi = gui_input(&ev, &mut g.cursor, &mut g.mods, g.scale, &mut g.scroll_accum);
             g.host.mods = g.mods;
             if let Some(ie) = gi {
                 // a key that types a character also presses that key first: hotkeys (docs/gui.md 12.1) read the key, text fields the text.
@@ -875,6 +928,18 @@ impl ApplicationHandler for App {
             }
         }
     }
+
+    /// winit calls this when the event loop is about to stop, including on macOS when the system "Quit" menu item
+    /// (Cmd+Q, part of winit's default app menu) terminates the app: that path never sends `WindowEvent::CloseRequested`,
+    /// so without this handler `App` (and the `State`/`Gui`/boxed `Frontend` it owns) was simply leaked by the process
+    /// exit instead of dropped, skipping every `Drop` impl a frontend relies on for shutdown (aomac's `Play::drop`
+    /// saves the character-viewer cache). Window position/size are saved the same way `CloseRequested` saves them.
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        if let Some(s) = self.state.take() {
+            let pos = s.window.outer_position().ok().map(|p| (p.x, p.y));
+            window_prefs::save(s.config.width, s.config.height, pos);
+        } // `s` drops here: State -> Gui -> Box<dyn Frontend>, running the frontend's own Drop impl.
+    }
 }
 
 /// A [`Frontend`] driven without a window: the same per-frame sequence as the windowed app (`frame`, scene upload, lens,
@@ -942,6 +1007,9 @@ impl Offscreen {
         self.r.set_ground_rendering(self.host.ground_rendering);
         if let Some(textures) = self.host.ground_textures.take() { self.r.refresh_ground_textures(&textures); }
         self.host.apply_actors(&mut self.r);
+        if let Some(path) = self.host.screenshot.take() {
+            if let Err(e) = self.png(fe, &list, &path) { eprintln!("screenshot: {}: {e}", path.display()); }
+        }
         // No swapchain/present here to drive wgpu's own resource reclaim; queue.write_buffer/write_texture calls
         // (sky ticks, actor skin updates, GUI) stage pending writes that wgpu only flushes/frees on the next
         // queue.submit, so an explicit empty submit every tick (matching the real windowed loop's per-frame
@@ -1051,6 +1119,27 @@ mod tests {
         assert_eq!(gui_scale(2.0), 2);
         assert_eq!(gui_scale(0.0), 1);
         assert_eq!(gui_scale(f64::NAN), 1);
+    }
+
+    /// Trackpad fix: a gesture sent as many small `PixelDelta` events (each well under one 40 px notch) must still
+    /// add up to the same whole-notch `dy` sequence a discrete mouse wheel's `LineDelta` would send, not round each
+    /// event to zero (trade-list scroll) or treat each nonzero event as a full notch (map zoom overshoot).
+    #[test]
+    fn fractional_trackpad_pixels_accumulate_into_whole_notches() {
+        let mut accum = 0.0f32;
+        // 8 events of 5 px each (a realistic trackpad step) = one 40 px notch; only the last reaches a whole notch.
+        let mut dys = vec![];
+        for _ in 0..8 {
+            dys.push(accumulate_scroll(&mut accum, 5.0));
+        }
+        assert_eq!(dys, vec![None, None, None, None, None, None, None, Some(1.0)], "8x 5px must add up to exactly one notch on the final event, not before");
+        assert_eq!(accum, 0.0, "a whole notch must not leave a stray fractional remainder");
+        // The opposite direction accumulates the same way, and leftover fractions carry across calls.
+        assert_eq!(accumulate_scroll(&mut accum, -20.0), None);
+        assert_eq!(accumulate_scroll(&mut accum, -20.0), Some(-1.0));
+        // A single large flick (> 40 px) still yields one whole-notch step per call, not a fractional one.
+        assert_eq!(accumulate_scroll(&mut accum, 100.0), Some(2.0));
+        assert!((accum - 0.5).abs() < 1e-6, "the 20px remainder above the 2 whole notches must carry over");
     }
 
     #[test]

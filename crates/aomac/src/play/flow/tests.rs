@@ -799,3 +799,32 @@ fn sex_names_follow_the_get_sex_str_table() {
     assert_eq!([0, 1, 2, 3].map(sex_name), ["NONE", "Uni", "Male", "Female"]);
     assert_eq!(format!("{} {}", breed_name(4), sex_name(1)), "Atrox Uni");
 }
+
+/// `App::exiting()` (`ao-render`'s `viewer.rs`, winit `ApplicationHandler`) relies on dropping the frontend to run
+/// `Play::drop` when Cmd+Q (or anything else that skips `show_login`/`leave_world`) terminates the app instead of
+/// going through `WindowEvent::CloseRequested`. A plain scope-exit `drop` must save the character-viewer cache
+/// exactly like an explicit `save_viewer_cache()` call would -- regression for the no-`exiting()` bug where that
+/// drop never used to run at all, so the cache was lost on every Cmd+Q.
+#[test]
+fn dropping_play_without_explicit_shutdown_still_saves_the_viewer_cache() {
+    let Some(mut r) = rig() else { return };
+    let u = include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec").lines().filter_map(|line| {
+        let mut p = line.split(' ');
+        let (_, direction, hex) = (p.next()?, p.next()?, p.next()?);
+        if direction != "<" { return None; }
+        let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
+        let (frame, _) = ao_net::frame::Frame::decode_with(&bytes, false).ok()??;
+        match ao_net::n3::decode(&frame).ok()?.body {
+            ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::SimpleCharFullUpdate(u)) if u.name == "Aomacvolk" => Some(*u),
+            _ => None,
+        }
+    }).next().expect("captured own update");
+    const CHAR_ID: u32 = 0x5a11ee; // distinct from every other test sharing this process's scratch prefs dir
+    r.p.zone.char_id = CHAR_ID;
+    r.p.zone.own_update = Some(Box::new(u.clone()));
+    drop(r.p); // no explicit save_viewer_cache()/show_login() call: only `Drop` can save it
+    let scratch = std::env::temp_dir().join(format!("aomac-play-test-{}", std::process::id()));
+    let cache = ao_formats::character::ViewerCache::load(&scratch);
+    let saved = cache.0.get(&(CHAR_ID as i32)).expect("Play::drop must have saved the viewer cache entry");
+    assert_eq!(saved.head_mesh() as i32, u.head_mesh.unwrap_or(saved.head_mesh() as i32), "the saved entry must reflect the live update's appearance");
+}

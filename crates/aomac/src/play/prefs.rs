@@ -47,6 +47,40 @@ pub fn set_test_dir(d: impl Into<PathBuf>) {
     TEST_DIR.with(|t| *t.borrow_mut() = Some(d));
 }
 
+/// Retail F12 screenshot folder and naming (RE: GUI.dll `FlowControlModule_t::SlotScreenshot` makes an unconditional
+/// virtual call into `DisplaySystem.dll`'s backbuffer-capture routine with no explicit path, which falls back to
+/// `BinaryIO.dll` `AnarchyPath_t::GetScreenshotsPath` = `%LOCALAPPDATA%\Funcom\Anarchy Online\Screenshots\`, creating
+/// it if missing, then names the file `"%sscrn%04i.png"` against a process-lifetime counter that keeps incrementing
+/// past any name already on disk, so it never overwrites). No chat feedback line exists anywhere in retail's
+/// GUI/Gamecode/Interfaces/DisplaySystem modules for this command -- confirmed by `DumpRefs` across all four, the
+/// only hits are the `#CameraScreenshot` command name and the `SlotScreenshot` symbol itself -- so aomac stays
+/// silent too. aomac equivalent of the retail folder: the prefs app-support dir's `Screenshots` subfolder (not the
+/// client install dir, which aomac never writes to).
+#[cfg(not(test))]
+static SCREENSHOT_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(test)]
+thread_local! { static SCREENSHOT_COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(not(test))]
+fn next_screenshot_index() -> u32 { SCREENSHOT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }
+#[cfg(test)]
+fn next_screenshot_index() -> u32 { SCREENSHOT_COUNTER.with(|c| { let n = c.get(); c.set(n + 1); n }) }
+
+/// Test-only: isolates the screenshot counter per thread like [`set_test_dir`] isolates the prefs dir.
+#[cfg(test)]
+pub fn reset_screenshot_counter() { SCREENSHOT_COUNTER.with(|c| c.set(0)); }
+
+pub fn next_screenshot_path() -> Option<PathBuf> {
+    let folder = dir()?.join("Screenshots");
+    std::fs::create_dir_all(&folder).ok()?;
+    loop {
+        let path = folder.join(format!("scrn{:04}.png", next_screenshot_index()));
+        if !path.exists() {
+            return Some(path);
+        }
+    }
+}
+
 fn path() -> Option<PathBuf> {
     Some(dir()?.join("prefs.txt"))
 }
@@ -128,6 +162,25 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// Naming/folder regression: a fresh folder gets created, names count up `scrn0000.png`, `scrn0001.png`, ...
+    /// (retail's `"%sscrn%04i.png"`), and a name already on disk (from a previous run, matching retail's
+    /// `stat64i32` check) is skipped rather than overwritten.
+    #[test]
+    fn screenshot_path_creates_the_folder_and_counts_up_skipping_existing_files() {
+        let scratch = std::env::temp_dir().join(format!("aomac-screenshot-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        set_test_dir(&scratch);
+        reset_screenshot_counter();
+        let first = next_screenshot_path().unwrap();
+        assert_eq!(first, scratch.join("Screenshots/scrn0000.png"));
+        assert!(scratch.join("Screenshots").is_dir(), "the Screenshots folder must be created, not assumed to exist");
+        std::fs::write(&first, b"existing capture").unwrap(); // simulate the previous screenshot already on disk
+        std::fs::write(scratch.join("Screenshots/scrn0001.png"), b"existing capture").unwrap();
+        let next = next_screenshot_path().unwrap();
+        assert_eq!(next, scratch.join("Screenshots/scrn0002.png"), "must skip past files already on disk, never overwrite");
+        std::fs::remove_dir_all(&scratch).unwrap();
     }
 }
 
