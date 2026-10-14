@@ -384,9 +384,12 @@ pub struct Avatar {
 }
 
 impl Avatar {
-    /// Builds the rig from the own dynel's update. `id` is the dynel instance id (`ActorFrame::id`).
-    pub fn new(store: &RecordStore, client_dir: &Path, id: u32, u: &SimpleCharFullUpdate) -> Result<Self> {
-        let assets = ActorAssets::new(store)?;
+    /// Builds the rig from the own dynel's update. `id` is the dynel instance id (`ActorFrame::id`). `assets` is
+    /// reused across zone changes by the caller ([`super::player::Player`]): its `rest`/`clips`/`anims` caches are
+    /// a pure function of the client's own data, independent of the avatar's current look, so a fresh `ActorAssets`
+    /// only needs building once per session, not once per `Player::new` (measured live: resolving the own model's
+    /// rest pose dominated the ~120-140 ms per-zone-change stall, `zone-preload-proposal.md` §2.1).
+    pub fn new(store: &RecordStore, client_dir: &Path, id: u32, u: &SimpleCharFullUpdate, assets: ActorAssets) -> Result<Self> {
         let (breed, gender) = wire_breed_sex(u.breed as i32, u.sex as i32)?;
         let heads = head_table(store, breed, gender, 2)?;
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
@@ -395,6 +398,12 @@ impl Avatar {
         a.set_pose(store, AvatarPose::default())?;
         a.set_transform([u.pos[0], u.pos[1], -u.pos[2]], u.yaw().map_or(0.0, |y| -y));
         Ok(a)
+    }
+
+    /// Reclaims the warmed `ActorAssets` ([`Avatar::new`]) so the caller can hand it back to the next zone's
+    /// avatar build instead of discarding it with the rest of the dropped [`super::player::Player`].
+    pub(super) fn into_assets(self) -> ActorAssets {
+        self.assets
     }
 
     /// The model for `Host::actor_models` (key [`MODEL_KEY`]).
@@ -747,7 +756,7 @@ pub(super) mod tests {
     fn smooth_animation_toggle_changes_native_refresh_not_clip_time() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
-        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
         let radius = avatar.rig.bounding_radius;
         let camera = avatar.transform.w_axis.truncate() + Vec3::X * radius * 50.0;
         let first = avatar.frame().skin.unwrap();
@@ -769,7 +778,7 @@ pub(super) mod tests {
     fn own_body_pick_uses_posed_triangles_and_world_transform() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
-        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
         avatar.set_transform([3.0, 2.0, -4.0], 0.7);
         let actor = avatar.frame();
         let vertices = actor.skin.as_ref().unwrap();
@@ -811,7 +820,7 @@ pub(super) mod tests {
     fn own_swing_history_preserves_slots_through_replacement_and_death() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
-        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
         let clip = |time| Arc::new(CatAnim { source_id: 0, root: String::new(),
             events: vec![(time, "attack".into())], version: 0, duration: 1000.0,
             signature: 0, param: 0.0, tracks: vec![] });
@@ -837,7 +846,7 @@ pub(super) mod tests {
     fn own_social_actions_use_retail_clip_candidates() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
-        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
         for (id, name) in [(6, "backflip"), (0x12, "eat"), (0x29, "puke")] {
             let expected = super::super::combat::anim::resolve_clip(&avatar.assets.names, avatar.anim_set, id, false).expect("retail social clip");
             assert_eq!(expected.1, id, "{name} should not need a fallback");
@@ -850,7 +859,7 @@ pub(super) mod tests {
     fn own_upper_action_preserves_locomotion_and_composes_effect_anchors() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
-        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
         let walk = AvatarPose { role: Role::Walk, speed: 1.5, ref_speed: 1.5 };
         avatar.set_pose(&store, walk.clone()).unwrap();
         avatar.update(0.2);
@@ -900,7 +909,7 @@ pub(super) mod tests {
     fn base_clip_reports_its_own_step_and_land_notes() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
-        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
         avatar.set_pose(&store, AvatarPose { role: Role::Walk, speed: 1.5, ref_speed: 1.5 }).unwrap();
         let mut steps = 0;
         for _ in 0..200 {
@@ -922,7 +931,7 @@ pub(super) mod tests {
     fn step_notes_are_silent_while_airborne() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
-        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
         avatar.set_pose(&store, AvatarPose { role: Role::Walk, speed: 1.5, ref_speed: 1.5 }).unwrap();
         avatar.set_airborne(true);
         let mut steps = 0;
@@ -940,7 +949,7 @@ pub(super) mod tests {
     fn own_role_change_crossfades_body_pose_instead_of_popping() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
-        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
         let idle_clip = avatar.clip.clone().expect("retail idle clip resolves");
         avatar.set_pose(&store, AvatarPose { role: Role::Run, speed: 5.0, ref_speed: 5.0 }).unwrap();
         assert!(avatar.prev_clip.is_some(), "the outgoing idle clip must survive the role change to fade out");
@@ -1002,7 +1011,7 @@ pub(super) mod tests {
         let mut u = own_update();
         u.cloth.push(ao_net::n3::dynel::ClothData { raw: 1, texture: 154207, page: 0, extra: None });
         u.flags |= ao_net::n3::dynel::flag::SET_DYNEL_800;
-        let mut avatar = Avatar::new(&store, &dir, 7, &u).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &u, ActorAssets::new(&store).unwrap()).unwrap();
         let mut zone = super::super::zone::Zone::new(0x82e8);
         zone.own_update = Some(Box::new(u));
         let rec = include_str!("../../../../docs/captures/zone_wear_rifle_borealis.rec");
@@ -1175,7 +1184,7 @@ pub(super) mod tests {
     fn head_position_agrees_with_head_height() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
-        let mut a = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let mut a = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
         a.set_transform([10.0, 20.0, 30.0], 0.0);
         let p = a.head_position();
         assert!((p.y - 20.0 - a.head_height().unwrap()).abs() < 1e-4, "{p:?}");
@@ -1189,7 +1198,7 @@ pub(super) mod tests {
         let (Some(dir), Some(out)) = (client(), std::env::var_os("AVATAR_FADE_SHOT")) else { return };
         let store = RecordStore::open(&dir).unwrap();
         let u = own_update();
-        let mut a = Avatar::new(&store, &dir, 7, &u).unwrap();
+        let mut a = Avatar::new(&store, &dir, 7, &u, ActorAssets::new(&store).unwrap()).unwrap();
         let pos = super::super::zone::scene_pos(u.pos);
         let yaw = super::super::zone::scene_yaw(u.yaw().unwrap_or(0.0));
         a.set_transform(pos, yaw);
@@ -1214,7 +1223,7 @@ pub(super) mod tests {
     fn head_attractor_height_is_the_camera_look_target() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
-        let mut a = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let mut a = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
         let idle = a.head_height().expect("players have a head attractor");
         eprintln!("head attractor height (idle) {idle:.3} m, body {:.3} m", a.height());
         assert!(idle > 1.4 && idle < 1.8 && idle < a.height(), "{idle}");
@@ -1239,7 +1248,7 @@ pub(super) mod tests {
     fn own_idle_clip_keeps_advancing_and_wraps_over_several_seconds() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
-        let mut a = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let mut a = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
         assert_eq!(a.rate, 1.0, "zero speed falls back to the authored playback rate, not a stall");
         let duration = a.clip.as_ref().expect("retail idle clip resolves").duration;
         assert!(duration > 1000.0, "retail idle-stand is a multi-second authored clip, not a single pose");
@@ -1263,7 +1272,7 @@ pub(super) mod tests {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
         let u = own_update();
-        let mut a = Avatar::new(&store, &dir, 7, &u).unwrap();
+        let mut a = Avatar::new(&store, &dir, 7, &u, ActorAssets::new(&store).unwrap()).unwrap();
         let idle = a.frame();
         a.set_pose(&store, AvatarPose { role: Role::Run, speed: 5.0, ref_speed: 5.0 }).unwrap();
         a.update(0.2);
@@ -1322,7 +1331,7 @@ pub(super) mod tests {
     fn nano_cast_loop_restarts_and_release_finishes() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
-        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
         let start = AvatarPose::still(Role::Clip("spell-sus".into()));
         avatar.set_cast_loop(true);
         avatar.set_pose(&store, start.clone()).unwrap();
@@ -1348,7 +1357,7 @@ pub(super) mod tests {
     fn worn_weapon_mounts_its_mesh_and_switches_the_stance() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
-        let mut a = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let mut a = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
         let head = a.look.head.unwrap();
         let appearance = |list: &[(u8, u32)]| ao_net::n3::world::AppearanceUpdate { cloth: Vec::new(), attractors: list.iter().map(|&(a, b)| ao_net::n3::world::Attractor { a, b: b as i32, c: 0, d: 0 }).collect(), visual_flags: 31, extra: 0 };
         let plain = (a.model().meshes.len(), a.frame().parts.len());

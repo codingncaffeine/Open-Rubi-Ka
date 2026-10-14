@@ -810,6 +810,10 @@ pub struct Dynels {
     /// First-seen insertion order of `models`' keys, for the FIFO eviction in [`Dynels::clear`].
     model_order: VecDeque<u64>,
     asked: HashSet<u64>,
+    /// The own avatar's [`ActorAssets`], parked here (`Dynels::stash_avatar_assets`) between zone changes so its
+    /// `rest`/`clips`/`anims` caches survive the per-zone `Player` rebuild instead of resolving the model's rest
+    /// pose from scratch every time (`player::Player::new`, `zone-preload-proposal.md` §2.1).
+    avatar_assets: Option<ActorAssets>,
     scene_generation: u64,
     /// Login pref `ShowAllNames` (default on, GUI 0x10124b33).
     pub show_all_names: bool,
@@ -944,6 +948,7 @@ impl Default for Dynels {
             models: HashMap::new(),
             model_order: VecDeque::new(),
             asked: HashSet::new(),
+            avatar_assets: None,
             scene_generation: 0,
             show_all_names: true,
             show_org_names: true,
@@ -1140,6 +1145,17 @@ impl Dynels {
     /// (AnimHolder idle update `FUN_1003cad0`, docs/zone/combat-anim.md §4). `None`: nothing wielded or the item is not resolved yet.
     pub fn wielded_set(&self, id: i32) -> Option<i32> {
         self.wield.get(&id)?.iter().flatten().next().map(|w| w.set)
+    }
+
+    /// Takes the warmed own-avatar `ActorAssets` for [`player::Player::new`] to reuse, if one survived the last
+    /// zone change (`None` on the very first build of a session).
+    pub fn take_avatar_assets(&mut self) -> Option<ActorAssets> {
+        self.avatar_assets.take()
+    }
+
+    /// Parks the outgoing `Player`'s `ActorAssets` for the next zone's avatar build ([`Dynels::take_avatar_assets`]).
+    pub fn stash_avatar_assets(&mut self, assets: ActorAssets) {
+        self.avatar_assets = Some(assets);
     }
 
     /// `id`'s fight controller changed state (`FUN_10069c68` start / `FUN_10068b7f` stop, `CombatEvent::FightStarted` / `FightStopped`): a
@@ -3832,7 +3848,8 @@ mod variant_tests {
             zone.on_frame(&frame);
         }
         zone.world.wield.entry(own).or_default()[0] = Some(Wield { set: 3, delay: 200 });
-        let mut player = Player::new(&dir, &zone, zone.playfield.unwrap_or(800)).expect("capture has own character");
+        let playfield = zone.playfield.unwrap_or(800);
+        let mut player = Player::new(&dir, &mut zone, playfield).expect("capture has own character");
         for (special, expected) in [(148, 1024), (150, 1023)] {
             let target = ao_net::msg::Identity { kind: CHAR_KIND, instance: 7 };
             let events = [

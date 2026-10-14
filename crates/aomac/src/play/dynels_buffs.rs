@@ -139,7 +139,7 @@ mod tests {
             _=>None,
         }).expect("captured own avatar");
         let store=ao_rdb::RecordStore::open(&dir).unwrap();
-        let mut avatar=crate::play::avatar::Avatar::new(&store,&dir,33588,&update).unwrap();
+        let mut avatar=crate::play::avatar::Avatar::new(&store,&dir,33588,&update,ao_formats::character::actor::ActorAssets::new(&store).unwrap()).unwrap();
         avatar.set_transform(origin.to_array(),0.0);
         let anchor=|id|avatar.effect_anchor(id).map(|m|glam::Mat4::from_cols_array_2d(&m));
         let spine=anchor(1004).expect("authored Spine3 connector").w_axis.truncate();

@@ -576,7 +576,7 @@ impl Play {
             return;
         }
         self.save_viewer_cache();
-        self.player = None;
+        self.drop_player();
         host.fly = false;
         self.zone.reset_world();
         self.fight_reset();
@@ -588,6 +588,15 @@ impl Play {
         self.ground_texture_serial = self.ground_texture_serial.wrapping_add(1);
         host.ground_textures = None;
         self.fade = Fade::Hold;
+    }
+
+    /// Drops the current `Player`, parking its warmed `ActorAssets` in `self.zone.world` first
+    /// ([`player::Player::into_avatar_assets`]) so the next zone's/re-placement's `Player::new` reuses them
+    /// instead of resolving the own model's rest pose from scratch again.
+    fn drop_player(&mut self) {
+        if let Some(player) = self.player.take() {
+            self.zone.world.stash_avatar_assets(player.into_avatar_assets());
+        }
     }
 
     /// `FlowControlModule_t::TeleportStartedMessage` (GUI event 5), also posted by `TeleportTrier_t::StartTryingTeleport` of the client-initiated
@@ -1371,7 +1380,9 @@ impl Frontend for Play {
                     if !teleported {
                         self.gui.clear_focus(); // the login window's password field kept the keyboard focus
                     }
-                    self.player = player::Player::new(&self.dir, &self.zone, self.zone.playfield.unwrap_or(0));
+                    self.drop_player();
+                    let playfield = self.zone.playfield.unwrap_or(0);
+                    self.player = player::Player::new(&self.dir, &mut self.zone, playfield);
                     host.fly = teleported && self.player.is_none();
                     self.fade = if teleported { Fade::Hold } else { Fade::Out(0.0) };
                 }
@@ -1414,7 +1425,9 @@ impl Frontend for Play {
         if self.screen == Screen::InWorld {
             if self.player.as_ref().is_some_and(|p| p.serial() != self.zone.own_serial) {
                 // the server placed the own character again (teleport within the playfield)
-                self.player = player::Player::new(&self.dir, &self.zone, self.zone.playfield.unwrap_or(0));
+                self.drop_player();
+                let playfield = self.zone.playfield.unwrap_or(0);
+                self.player = player::Player::new(&self.dir, &mut self.zone, playfield);
             }
             // `ViewDistance` / `DisplayCharViewDistance` (docs/chat/dvalue.md): far plane + fog + statel LOD, characters' draw distance
             if let Some(h) = self.hud.as_mut() {

@@ -12,6 +12,7 @@ use super::zone::{scene_pos, scene_yaw, OwnEvent, Zone, IN_PLAY_STAT};
 use super::combat::actions::Pose;
 use super::combat::anim::anim_name;
 use ao_formats::character::Role;
+use ao_formats::character::actor::ActorAssets;
 use ao_formats::playfield::{camera_views, zone_locator, ZoneLocator};
 use ao_formats::playfield::collision::{Aligned, Body, Collision, SurfaceState, FOOT_CLEARANCE};
 use ao_gui::{InputEvent, MouseButton};
@@ -125,13 +126,21 @@ impl Player {
         self.store.set_other_texture_quality(quality);
     }
 
-    /// `None` until the zone knows the own `SimpleCharFullUpdate`.
-    pub fn new(dir: &Path, zone: &Zone, playfield: u32) -> Option<Self> {
+    /// `None` until the zone knows the own `SimpleCharFullUpdate`. `zone` is `&mut` only to reclaim the warmed
+    /// `ActorAssets` parked by the previous `Player` ([`Dynels::take_avatar_assets`](super::dynels::Dynels::take_avatar_assets));
+    /// nothing about the own dynel's data is mutated.
+    pub fn new(dir: &Path, zone: &mut Zone, playfield: u32) -> Option<Self> {
+        zone.own_update.as_ref()?;
+        let assets_hint = zone.world.take_avatar_assets();
         let u = zone.own_update.as_deref()?;
         let built = (|| -> anyhow::Result<Self> {
             let store = RecordStore::open(dir)?;
             store.set_other_texture_quality(zone.world.texture_quality());
-            let avatar = Avatar::new(&store, dir, zone.char_id, u)?;
+            let assets = match assets_hint {
+                Some(a) => a,
+                None => ActorAssets::new(&store)?,
+            };
+            let avatar = Avatar::new(&store, dir, zone.char_id, u, assets)?;
             let collision = Collision::load(&store, playfield).map_err(|e| eprintln!("collision {playfield}: {e:#}")).ok();
             let mut movement = Movement::new(u.pos, u.yaw().unwrap_or(0.0), u.run_speed);
             movement.set_body_radius(avatar.body_radius());
@@ -190,6 +199,12 @@ impl Player {
             })
         })();
         built.map_err(|e| eprintln!("player: {e:#}")).ok()
+    }
+
+    /// Reclaims the own avatar's `ActorAssets`, to hand to [`Dynels::stash_avatar_assets`](super::dynels::Dynels::stash_avatar_assets)
+    /// before this `Player` is dropped (a zone change or a re-placed own dynel).
+    pub fn into_avatar_assets(self) -> ActorAssets {
+        self.avatar.into_assets()
     }
 
     /// Loaded playfield surface used by authored effect collision queries (scene coordinates).
@@ -842,6 +857,48 @@ mod tests {
         assert_eq!(jump_land_clip(&Role::Run, true), "jump-land-run-2h");
         assert_eq!(jump_land_clip(&Role::Idle, true), "jump-land-idle-2h");
     }
+
+    /// The own avatar's model/rig does not change on a zone change (`zone-preload-proposal.md` §2.1: resolving the
+    /// model's rest pose dominated the measured ~120-140 ms `Player::new` stall on every zone change, cold or
+    /// warm). `drop_player`/`into_avatar_assets` (`flow.rs`) hand the warmed `ActorAssets` to the next `Player::new`
+    /// instead of discarding it; a second build through the same `(dir, zone, playfield)` path must land far below
+    /// the first build's cost.
+    #[test]
+    fn player_new_reuses_avatar_assets_across_zone_changes() {
+        use super::super::zone::Zone;
+        use std::time::Instant;
+        fn frames(rec: &str) -> Vec<Frame> {
+            rec.lines().filter_map(|l| {
+                let mut p = l.split(' ');
+                let (_, dir, hex) = (p.next()?, p.next()?, p.next()?);
+                let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+                (dir == "<").then(|| Frame::decode_with(&b, false).ok().flatten().map(|(f, _)| f)).flatten()
+            }).collect()
+        }
+        fn client() -> Option<std::path::PathBuf> {
+            let d = std::path::PathBuf::from(std::env::var_os("HOME")?).join("Games/ProjectRubiKa/client");
+            d.join("cd_image/rdb.db").exists().then_some(d)
+        }
+        let Some(dir) = client() else { return };
+        let own = 25988;
+        let mut zone = Zone::new(own as u32);
+        zone.world.start(dir.clone(), own);
+        for frame in frames(include_str!("../../../../docs/captures/zone_ithaca.rec")) {
+            zone.on_frame(&frame);
+        }
+        let playfield = zone.playfield.unwrap_or(800);
+        let t0 = Instant::now();
+        let player = Player::new(&dir, &mut zone, playfield).expect("capture has own character");
+        let cold = t0.elapsed();
+        // the production zone-change path (`Play::drop_player`): stash the warmed assets, then rebuild
+        zone.world.stash_avatar_assets(player.into_avatar_assets());
+        let t1 = Instant::now();
+        let player = Player::new(&dir, &mut zone, playfield).expect("second build with the same own character");
+        let warm = t1.elapsed();
+        drop(player);
+        eprintln!("player_new: cold={:.1}ms warm={:.1}ms", cold.as_secs_f64() * 1000.0, warm.as_secs_f64() * 1000.0);
+        assert!(warm.as_secs_f64() * 1000.0 < cold.as_secs_f64() * 1000.0 / 2.0, "warm build (reused ActorAssets) must be well under half the cold build: cold={cold:?} warm={warm:?}");
+    }
     #[test]
     fn effect_collision_uses_surface_normal_and_never_lowers_the_rock() {
         use ao_scene::{Instance, Mesh, Scene, Submesh, Vertex, IDENTITY};
@@ -990,7 +1047,7 @@ mod tests {
         if !animated {
             return None;
         }
-        let mut avatar = Avatar::new(store, dir, 7, &avatar::tests::own_update()).unwrap();
+        let mut avatar = Avatar::new(store, dir, 7, &avatar::tests::own_update(), ActorAssets::new(store).unwrap()).unwrap();
         avatar.set_pose(store, AvatarPose::still(Role::Idle)).unwrap();
         Some(avatar)
     }
