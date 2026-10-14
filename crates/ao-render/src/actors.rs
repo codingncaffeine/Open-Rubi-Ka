@@ -156,7 +156,7 @@ impl Renderer {
             let grows = &mut self.act.mesh_buffer_grows;
             for (i, mesh) in scene.meshes.iter().enumerate() {
                 let Some(gpu) = model.meshes[i].as_mut() else {
-                    model.topology[i] = (mesh.vertices.len(), mesh.submeshes.clone());
+                    model.topology[i] = (mesh.vertices.len(), submesh_shape(&mesh.submeshes));
                     continue;
                 };
                 let vbytes = (mesh.vertices.len() * 48) as u64;
@@ -199,7 +199,7 @@ impl Renderer {
                 let (lo, hi) = mesh.vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| (l.min(Vec3::from(v.pos)), h.max(Vec3::from(v.pos))));
                 let center = (lo + hi) * 0.5;
                 gpu.sphere = (center, mesh.vertices.iter().map(|v| (Vec3::from(v.pos) - center).length()).fold(0.0, f32::max));
-                model.topology[i] = (mesh.vertices.len(), mesh.submeshes.clone());
+                model.topology[i] = (mesh.vertices.len(), submesh_shape(&mesh.submeshes));
             }
             return;
         }
@@ -301,7 +301,7 @@ impl Renderer {
             let r = mesh.vertices.iter().map(|v| (Vec3::from(v.pos) - c).length()).fold(0.0, f32::max);
             meshes.push(Some(ModelMesh { vb, ib, vertex_capacity, index_capacity, nverts: mesh.vertices.len(), draws, submesh_mats, sphere: (c, r) }));
         }
-        let topology = scene.meshes.iter().map(|mesh| (mesh.vertices.len(), mesh.submeshes.clone())).collect();
+        let topology = scene.meshes.iter().map(|mesh| (mesh.vertices.len(), submesh_shape(&mesh.submeshes))).collect();
         self.act.models.insert(key, Model { meshes, mats, holo, views, view_of, topology });
         // actors of a replaced model rebuild their body buffer at the next pose
         for a in self.act.actors.values_mut().filter(|a| a.model == key) {
@@ -538,15 +538,75 @@ pub(crate) fn ensure_capacity(device: &wgpu::Device, buf: &mut wgpu::Buffer, cap
 
 /// Whether two submeshes need the same GPU bind group and pipeline: every `Submesh` field except `indices` (the
 /// triangle list, which varies frame to frame for dynamic actor geometry -- buff auras, particle effects -- and
-/// never affects which bind group/pipeline a draw uses). Strips `indices` and reuses the struct's derived
-/// `PartialEq` for the rest, so a new `Submesh` field is automatically covered here instead of silently ignored.
+/// never affects which bind group/pipeline a draw uses). Compares fields directly instead of cloning the whole
+/// struct (and its potentially large `indices` `Vec`) just to strip and compare it.
 pub(crate) fn same_material(a: &ao_scene::Submesh, b: &ao_scene::Submesh) -> bool {
-    let strip = |s: &ao_scene::Submesh| {
-        let mut s = s.clone();
-        s.indices.clear();
-        s
-    };
-    strip(a) == strip(b)
+    let ao_scene::Submesh {
+        indices: _,
+        texture,
+        texture_clamp,
+        blend,
+        sprite_alpha_test,
+        base_color,
+        two_sided,
+        emissive,
+        glow_mask,
+        prelit,
+        uv_scroll,
+        sky_fog,
+        uv_wave,
+        sun_flicker,
+        specular,
+        shininess,
+        env_texture,
+        liquid,
+    } = a;
+    *texture == b.texture
+        && *texture_clamp == b.texture_clamp
+        && *blend == b.blend
+        && *sprite_alpha_test == b.sprite_alpha_test
+        && *base_color == b.base_color
+        && *two_sided == b.two_sided
+        && *emissive == b.emissive
+        && *glow_mask == b.glow_mask
+        && *prelit == b.prelit
+        && *uv_scroll == b.uv_scroll
+        && *sky_fog == b.sky_fog
+        && *uv_wave == b.uv_wave
+        && *sun_flicker == b.sun_flicker
+        && *specular == b.specular
+        && *shininess == b.shininess
+        && *env_texture == b.env_texture
+        && *liquid == b.liquid
+}
+
+/// Material-and-shape summary of a mesh's submeshes for [`Model::topology`]: every field `same_material` compares,
+/// with `indices` left empty so storing it every frame (dynamic buff/particle/effect geometry) never allocates or
+/// copies the triangle list, only the handful of material fields actually needed to detect a change.
+fn submesh_shape(submeshes: &[ao_scene::Submesh]) -> Vec<ao_scene::Submesh> {
+    submeshes
+        .iter()
+        .map(|s| ao_scene::Submesh {
+            indices: Vec::new(),
+            texture: s.texture,
+            texture_clamp: s.texture_clamp,
+            blend: s.blend,
+            sprite_alpha_test: s.sprite_alpha_test,
+            base_color: s.base_color,
+            two_sided: s.two_sided,
+            emissive: s.emissive,
+            glow_mask: s.glow_mask,
+            prelit: s.prelit,
+            uv_scroll: s.uv_scroll,
+            sky_fog: s.sky_fog,
+            uv_wave: s.uv_wave,
+            sun_flicker: s.sun_flicker,
+            specular: s.specular,
+            shininess: s.shininess,
+            env_texture: s.env_texture,
+            liquid: s.liquid,
+        })
+        .collect()
 }
 
 /// Whether a draw belongs to the blended actor phase (client render list 6) rather than the opaque one (list 3).
