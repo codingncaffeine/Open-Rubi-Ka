@@ -8,7 +8,8 @@
 //! Hosted by [`ListWindow`] / [`Rollup::open_page`](super::hud_rollup::Rollup::open_page).
 //!
 //! UNRESOLVED / not ported: the saved `item_position_map` (free rearranging by drag inside the window; the icons stay in list order), the info
-//! signal (`itemid://k/i`, Shift / Ctrl click: no InfoView here, the click does nothing), the recharge seconds text over an icon (the grid canvas
+//! signal (`itemid://k/i`, Shift click: no InfoView here, the click does nothing; `FUN_10040a17` tests `GetQualifiers() & 3`,
+//! Shift only per `FUN_100bc5cf`; Ctrl still activates), the recharge seconds text over an icon (the grid canvas
 //! has no text item; the overlay shrinks like the hotbar's), the right-click popup.
 
 use super::hud::WindowKind;
@@ -213,7 +214,7 @@ impl HudActionWin {
                         }
                     }
                 } else if let Some(p) = self.press.take() {
-                    if button == MouseButton::Left && self.row_at(gui, x, y) == Some(p.key) && !(mods.shift || mods.ctrl) {
+                    if button == MouseButton::Left && self.row_at(gui, x, y) == Some(p.key) && !mods.shift {
                         // `N3Msg_PerformSpecialAction(identity)`: not listed = `Feedback_ActionIsNotAvailable`, else the action the entry shows
                         self.uses.push(list.find(p.key as u32).map_or(SlotUse::Unavailable, |e| SlotUse::SpecialAction(e.shown)));
                     }
@@ -236,5 +237,38 @@ impl HudActionWin {
         let r = gui.view_rect(win.win, "grid")?;
         let (cx, cy) = win.view.cell_pos(i, lv::ICON_32);
         Some((r.l + cx + lv::ICON_32 / 2.0, r.t + cy + lv::ICON_32 / 2.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_click_uses_action_while_shift_click_does_not() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut rollup = Rollup::new(&dir, (1280, 800));
+        let mut actions = HudActionWin::new(&dir, (1280, 800));
+        actions.open(&mut gui, &mut rollup);
+        let list = SpecialList::new();
+        let entry = &list.entries()[0];
+        let win = actions.win.as_mut().unwrap();
+        win.view.set_rows(vec![Row { key: entry.template().unwrap() as i32, ..Default::default() }]);
+        win.view.paint(&mut gui, win.win, lv::ICON_32);
+        let (x, y) = actions.cell_centre(&gui, 0).unwrap();
+        for new_mouse in [false, true] {
+            actions.new_mouse = new_mouse;
+            for (shift, ctrl) in [(false, false), (false, true), (true, false), (true, true)] {
+                let mods = ao_gui::Modifiers { shift, ctrl, ..Default::default() };
+                actions.input(&mut gui, &InputEvent::MouseDown { x, y, button: MouseButton::Left }, &list, mods, &mut []);
+                assert!(actions.press.is_some());
+                assert!(actions.take_uses().is_empty(), "use waits for release");
+                actions.input(&mut gui, &InputEvent::MouseUp { x, y, button: MouseButton::Left }, &list, mods, &mut []);
+                assert_eq!(actions.take_uses(), if shift { vec![] } else { vec![SlotUse::SpecialAction(entry.shown)] }, "Shift alone selects the unconnected info signal");
+                assert!(actions.press.is_none());
+            }
+        }
     }
 }

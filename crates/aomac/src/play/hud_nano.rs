@@ -8,6 +8,8 @@
 //!
 //! Interactions: double click = `N3Msg_CastNanoSpell(program, target)` (`FUN_100d3b11`, the target is the selected one), right click = the popup of `FUN_100d3fe4`
 //! ("LookAtNano" -> InfoView `itemid://`, "HideNano" / "UnHideNano"), drag = hotbar (`FUN_100d3807`).
+//! Shift-click inspects: `FUN_100d496c` constructs `ItemListViewBase_c` via `FUN_100419f8`, which connects `FUN_10040a17` (`GetQualifiers() & 3`).
+//! Ctrl alone remains ordinary selection / double-click casting (`FUN_100bc5cf`: Shift = 3, Ctrl = 0xc, Alt = 0x30).
 //! UNRESOLVED: recharge overlays and Programs' free icon-position / school / list-mode archives.
 
 use super::hud::WindowKind;
@@ -133,7 +135,7 @@ impl HudNano {
         self.drag.take()
     }
 
-    /// Native qualified clicks inspect; ordinary held/moved presses emit the nano drag signal.
+    /// Native Shift clicks inspect; ordinary held/moved presses emit the nano drag signal.
     pub(super) fn input(&mut self, gui: &Gui, ev: &ao_gui::InputEvent, mods: ao_gui::Modifiers) {
         use ao_gui::{InputEvent, MouseButton};
         match *ev {
@@ -143,7 +145,7 @@ impl HudNano {
                 self.press = None;
                 let Some(win) = self.win.as_ref() else { return };
                 let Some(id) = win.w.view.row_at(gui, win.w.win, x, y, lv::ICON_32) else { return };
-                self.qualified_click = mods.shift || mods.ctrl;
+                self.qualified_click = mods.shift;
                 if self.qualified_click {
                     self.urls.push(format!("itemid://{}/{}", nano::NANO_KIND, id));
                 } else {
@@ -515,6 +517,52 @@ mod tests {
         zone.set_target(Some(Identity { kind: outgoing::DYNEL_CHAR, instance: 7 }));
         programs.cast(&mut gui, &zone, 163449);
         assert_eq!(programs.take_outbox()[0].payload, nano::cast_nano(7, 163449, Identity { kind: outgoing::DYNEL_CHAR, instance: 7 }));
+    }
+
+    #[test]
+    fn programs_raw_ctrl_selects_and_casts_but_shift_inspects() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() || !dir.join("cd_image/gui").exists() {
+            eprintln!("skipping: no client");
+            return;
+        }
+        for (mods, inspect) in [(ao_gui::Modifiers { ctrl: true, ..Default::default() }, false), (ao_gui::Modifiers { shift: true, ..Default::default() }, true)] {
+            let size = (1100, 760);
+            let mut gui = Gui::new(&dir, None).unwrap();
+            let mut rollup = Rollup::new(&dir, size);
+            let mut programs = HudNano::new(&dir, size).unwrap();
+            let mut zone = Zone::new(7);
+            zone.nanos.programs = vec![163449];
+            // Give casting a valid target; this regression covers qualifiers, not target-required nano rejection.
+            zone.set_target(Some(Identity { kind: outgoing::DYNEL_CHAR, instance: 7 }));
+            programs.open(&mut gui, &mut rollup);
+            programs.set_page(4);
+            programs.update(&mut gui, &zone, 0.0);
+            gui.frame(0.0);
+            let (x, y) = programs.first_point(&gui);
+            for click in 0..2 {
+                let mut double_press = false;
+                for ev in [InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }] {
+                    programs.input(&gui, &ev, mods);
+                    for event in gui.input(ev) {
+                        double_press |= matches!(&event, Event::CanvasPress { clicks: 2, .. });
+                        programs.event(&mut gui, &event, &zone);
+                    }
+                }
+                assert_eq!(double_press, click == 1, "raw input must produce the grid double press");
+                assert_eq!(programs.win.as_ref().unwrap().w.view.selected, (!inspect).then_some(163449));
+                assert_eq!(programs.take_urls(), if inspect { vec!["itemid://53019/163449".to_owned()] } else { vec![] });
+                assert!(programs.take_drag().is_none());
+                let frames = programs.take_outbox();
+                if !inspect && click == 1 {
+                    assert_eq!(frames.len(), 1, "Ctrl double click must still cast");
+                    assert_eq!(frames[0].payload, nano::cast_nano(7, 163449, Identity { kind: outgoing::DYNEL_CHAR, instance: 7 }));
+                } else {
+                    assert!(frames.is_empty(), "only an ordinary double click casts");
+                }
+                gui.frame(0.01);
+            }
+        }
     }
 
     /// The Programs and NCU windows with real nano records: pages by school, effects with their remaining time.

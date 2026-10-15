@@ -6,7 +6,7 @@
 //!   -> `GlobalSignals +0xd4 (type, own, a, b)` -> `InventoryGUIModule_c::SlotStartTrade` [GUI 0x100c6ff4] -> `TradeView_c` [GUI 0x100e092f].
 //! * The window: shop list (`ItemContainerView_c` mode 1, the machine's stock; item identities `{0x6f, index}`), "Bought Items" list (mode 2 =
 //!   `N3Msg_TradeGetInventory(machine)`), "Credits" (`PartnerCashView`, the amount due), Accept / Decline.
-//! * A double click on a shop item (`FUN_100ca1e7`): with Shift / Ctrl held `N3Msg_TradeAddItem(own, item)` (`TradeIIR_t` op 5), else
+//! * A double click on a shop item (`FUN_100ca1e7`): with Ctrl held `N3Msg_TradeAddItem(own, item)` (`TradeIIR_t` op 5), else
 //!   `MoveItemToInventory(item)`; a double click on a bought item removes it (`N3Msg_TradeRemoveItem`, op 6). Accept = `N3Msg_TradeAccept` (op 1),
 //!   Decline / close / Esc (`esc_shops`) = `N3Msg_TradeAbort(true)` (op 2).
 
@@ -87,7 +87,7 @@ pub struct ShopUi {
     names: HashMap<(i32, i32), String>,
     feedback: Vec<&'static str>,
     shortages: Vec<(i32, u32)>,
-    /// Shift or Ctrl is held (`View::GetQualifiers() & 0xc` of `FUN_100ca1e7`; which bits are which keys is [INFERENCE]).
+    /// Ctrl is held (`View::GetQualifiers() & 0xc` of `FUN_100ca1e7`; GUI `100bc5cf` maps this mask to Ctrl).
     pub quick: bool,
     /// Every step, for the live harness.
     pub log: Vec<String>,
@@ -541,7 +541,7 @@ impl Interact {
                 let Some(id) = *id else { return true };
                 if *button == 1 && *clicks >= 2 {
                     match view.as_str() {
-                        // `FUN_100ca1e7`: Shift / Ctrl + double click = `N3Msg_TradeAddItem(own, item)`, a plain double click = `MoveItemToInventory(item)`
+                        // `FUN_100ca1e7`: Ctrl + double click = `N3Msg_TradeAddItem(own, item)`, a plain double click = `MoveItemToInventory(item)`
                         "shop_items" if (id as usize) < s.stock.len() => {
                             let item = Identity { kind: SHOP_ITEM, instance: id as i32 };
                             if !quick {

@@ -126,9 +126,11 @@ impl Play {
     /// * Left button: the HUD selects from the same merged hit list; a second click on a non-character runs its default action.
     pub(super) fn interact_mouse(&mut self, ev: &InputEvent, host: &Host) {
         if let Some(i) = self.interact.as_mut() {
-            i.shop.quick = host.mods.shift || host.mods.ctrl;
+            // GUI 100ca1e7: quick trade uses qualifier mask 0xc (Ctrl).
+            i.shop.quick = host.mods.ctrl;
             if matches!(ev, InputEvent::MouseDown { button: MouseButton::Left, .. }) {
-                i.use_ui.loot.info_click = host.mods.shift || host.mods.ctrl;
+                // GUI 10040a17 -> 100c9afc: information uses mask 3 (Shift).
+                i.use_ui.loot.info_click = host.mods.shift;
             }
             if let InputEvent::MouseMove { x, y } = ev {
                 i.trade.mouse = (*x, *y);
@@ -168,6 +170,99 @@ impl Play {
                 i.default_action_on(zone, id);
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ao_net::n3::inventory::{container_item_identity, InventoryUpdate};
+    use ao_net::n3::world::{AcgItem, InventoryEntry};
+    #[test]
+    fn mission_alternative_raw_shift_click_inspects_once_and_preserves_plain_double() {
+        use ao_net::n3::{mission_selection::{Alternative, Alternatives}, quest::Quest};
+        use super::super::hud_listview::{BORDER, ICON_32, SPACING};
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        for (shift, ctrl) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut play = Play::new(dir.clone(), None, None, None).unwrap();
+            play.gui.set_screen_size(1280, 800);
+            play.interact = Some(Interact::new(7, (1280, 800)));
+            let origin = Identity { kind: 51000, instance: 2 };
+            let quest = Quest { id: Identity { kind: 56000, instance: 3 }, name: "mission".into(), ..Default::default() };
+            let i = play.interact.as_mut().unwrap();
+            i.mission.open(&mut play.gui, (1280, 800), 1, origin).unwrap();
+            i.mission.alternatives(&mut play.gui, Alternatives {
+                difficulty: 50, dimensions: [0; 6], seed: 4, origin_type: 1, origin,
+                missions: vec![Alternative { quest, kind: 1 }],
+            });
+            let win = i.mission.window().unwrap();
+            let grid = play.gui.view_rect(win, "grid").unwrap();
+            let (x, y) = (grid.l + BORDER + 2.0, grid.t + BORDER + 2.0);
+            assert!(i.icon_hover_at(&play.gui, x, y));
+            assert!(!i.icon_hover_at(&play.gui, x + ICON_32 + SPACING, y), "empty alternative slots are not quest icons");
+            let mut host = Host::headless();
+            host.mods = ao_gui::Modifiers { shift, ctrl, ..Default::default() };
+            for click in 1..=2 {
+                // Same ordering as Play::input: capture qualifiers, then dispatch GUI events.
+                for ev in [
+                    InputEvent::MouseDown { x, y, button: MouseButton::Left },
+                    InputEvent::MouseUp { x, y, button: MouseButton::Left },
+                ] {
+                    play.interact_mouse(&ev, &host);
+                    for event in play.gui.input(ev) {
+                        play.interact.as_mut().unwrap().event(&mut play.gui, &event, &play.zone);
+                    }
+                }
+                let i = play.interact.as_mut().unwrap();
+                let expected = if shift || click == 2 { vec!["itemid://56000/3".to_owned()] } else { vec![] };
+                assert_eq!(i.mission.take_urls(), expected, "Shift={shift}, Ctrl={ctrl}, click={click}");
+                assert!(play.gui.is_enabled(win, "accept"), "inspection preserves native selection");
+                assert!(i.take_outbox().is_empty(), "inspection never requests or accepts a mission");
+            }
+        }
+    }
+
+
+    #[test]
+    fn shift_inspects_ctrl_keeps_container_activation_and_shop_quick() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut play = Play::new(dir, None, None, None).unwrap();
+        play.interact = Some(Interact::new(7, play.size));
+        let mut host = Host::headless();
+        for kind in [0xdead, 0xc76a] {
+            let container = Identity { kind, instance: 7 };
+            let update = InventoryUpdate {
+                capacity: 21, kind: 0, container, word: 0x70, flag: true,
+                entries: vec![InventoryEntry {
+                    slot: 3, a: 0, b: 0, id: Identity::default(),
+                    item: AcgItem { low_id: 1, high_id: 1, level: 1 },
+                }],
+            };
+            play.interact.as_mut().unwrap().use_ui.loot.update(&mut play.gui, None, play.size, container, "Items", &update, false);
+            let window = play.interact.as_ref().unwrap().use_ui.loot.window_of(container).unwrap();
+            let item = if kind == 0xdead { Identity { kind: 0x69, instance: 3 } } else { container_item_identity(update.word, 3) };
+            for shift in [true, false] {
+                host.mods = ao_gui::Modifiers { shift, ctrl: !shift, ..Default::default() };
+                play.interact_mouse(&InputEvent::MouseDown { x: 0.0, y: 0.0, button: MouseButton::Left }, &host);
+                let i = play.interact.as_mut().unwrap();
+                assert_eq!(i.shop.quick, !shift, "only Ctrl requests quick trade");
+                let gap = super::super::hud_stats::inv_grid::SPACING;
+                let (x, y) = super::super::hud_stats::inv_grid::cell_origin(0, 0, (gap, gap));
+                let press = Event::CanvasPress { window, view: "grid".into(), x: x + 2.0, y: y + 2.0, button: MouseButton::Left, clicks: 1 };
+                assert_eq!(i.use_ui.loot.event(&mut play.gui, &press, 1.0), Some(None));
+                if shift {
+                    assert_eq!(i.use_ui.loot.info_urls, [format!("itemid://{}/{}", item.kind, item.instance)]);
+                    assert_eq!(i.use_ui.loot.take(&mut play.gui, 0, 1.1), None);
+                } else {
+                    assert!(i.use_ui.loot.info_urls.is_empty(), "Ctrl must not inspect");
+                    assert_eq!(i.use_ui.loot.take(&mut play.gui, 0, 2.0), Some(item), "Ctrl must not suppress ordinary double-click activation");
+                }
+                i.use_ui.loot.info_urls.clear();
+            }
+            play.interact.as_mut().unwrap().use_ui.loot.close_all(&mut play.gui);
         }
     }
 }

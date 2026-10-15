@@ -118,7 +118,8 @@ impl HudStats {
                 self.wear.as_ref().is_some_and(|w| w.window == owner)
                     || self.inventory.as_ref().is_some_and(|i| i.window == owner)) => {}
             InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
-                self.info_click = mods.shift || mods.ctrl;
+                // GUI 10040a17: information uses qualifier mask 3 (Shift), not Ctrl.
+                self.info_click = mods.shift;
                 if self.info_click {
                     self.dnd.press = None;
                     self.item_hold = None;

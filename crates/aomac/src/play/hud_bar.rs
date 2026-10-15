@@ -460,8 +460,9 @@ impl ShortcutBar {
     /// Slot press / drag / drop with the client's "new mouse function" (`UseNewMouseFunc` default true, the hotbar item list sets its flag +0x319,
     /// `FUN_100d8c12` 0x100d8eb8). `MultiListView_c::MouseDown` 0x10133b63 captures the mouse and records the cell, `FUN_100410a0` (the down
     /// handler) arms the hold timer for a left press on an item; `MouseUp` 0x10133c28 emits the click only when the release is in the same cell
-    /// (and the capture was still held, i.e. the timer had not fired), `FUN_10040a17`: Shift / Ctrl -> the info signal (`FUN_100d765d`, no info
-    /// view here: nothing happens), else the **use** signal. Use therefore fires on the release, never on the press; a slot held for
+    /// (and the capture was still held, i.e. the timer had not fired), `FUN_10040a17`: `GetQualifiers() & 3` (Shift only, not Ctrl;
+    /// masks in `FUN_100bc5cf`) -> the info signal (`FUN_100d765d`, no info view here: nothing happens), else the **use** signal.
+    /// Use therefore fires on the release, never on the press; a slot held for
     /// `MouseButtonHoldDelay` starts its drag without moving (see [`Self::update`]); the legacy mode instead arms the timer on a right press.
     /// In new mode the right-click signal is not connected by `ShortcutBarView_c`. The drag follows `FUN_100d7ec1` (begin: not when locked), `FUN_100d8047`
     /// (drop on a slot of this bar: `MoveItem`) and `FUN_100d76cf` (after the drag ended the item is deleted if it still sits in its
@@ -492,7 +493,7 @@ impl ShortcutBar {
                     gui.close_window(d.ghost);
                     self.drop(gui, d, x, y);
                 } else if let Some(p) = self.press.take() {
-                    if button == MouseButton::Left && self.slot_at(gui, x, y) == Some(p.slot) && !(mods.shift || mods.ctrl) {
+                    if button == MouseButton::Left && self.slot_at(gui, x, y) == Some(p.slot) && !mods.shift {
                         self.activate(p.slot, list);
                     }
                 }
@@ -663,6 +664,29 @@ pub(super) fn default_count(dvalues: &super::dvalue::DValues) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctrl_click_uses_hotbar_slot_while_shift_click_does_not() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut bar = ShortcutBar::new(&mut gui, &dir, 0, (1280, 800)).unwrap();
+        bar.slots[0] = Some(Slot { kind: ao_net::n3::nano::NANO_KIND as u32, instance: 163449, name: "Shadow Touch".into(), icon: None, text: String::new() });
+        let list = SpecialList::new();
+        let (x, y) = bar.slot_screen_pos(&gui, 0);
+        for new_mouse in [false, true] {
+            bar.new_mouse = new_mouse;
+            for (shift, ctrl) in [(false, false), (false, true), (true, false), (true, true)] {
+                let mods = ao_gui::Modifiers { shift, ctrl, ..Default::default() };
+                bar.input(&mut gui, &InputEvent::MouseDown { x, y, button: MouseButton::Left }, &list, mods);
+                assert!(bar.press.is_some());
+                assert!(bar.take_uses().is_empty(), "use waits for release");
+                bar.input(&mut gui, &InputEvent::MouseUp { x, y, button: MouseButton::Left }, &list, mods);
+                assert_eq!(bar.take_uses(), if shift { vec![] } else { vec![SlotUse::Nano(163449)] }, "Shift alone selects the unconnected info signal");
+                assert!(bar.press.is_none());
+            }
+        }
+    }
 
     #[test]
     fn slot_hold_uses_the_configured_delay() {
