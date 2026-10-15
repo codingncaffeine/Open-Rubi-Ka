@@ -653,6 +653,7 @@ impl Player {
         let head_to_camera = head_position - host.camera.pos;
         let alpha = self.fader.step(&self.fade, head_to_camera.length_squared());
         self.avatar.set_animation_refresh(host.smooth_animations, host.camera.pos, host.previous_visible_actors.contains(&self.char_id));
+        host.dynamic_lights.extend(self.avatar.lights());
         zone.world.set_own_pick(None);
         if self.camera.show_avatar() {
             let mut frame = self.avatar.frame();
@@ -889,6 +890,126 @@ mod tests {
         assert_eq!(fight_target_position(&zone, own, own_pos), Some(own_pos));
     }
 
+    fn light_bar_appearance(on: bool) -> ao_net::n3::world::AppearanceUpdate {
+        let head = avatar::tests::own_update().head_mesh.expect("captured own head");
+        let mut attractors = vec![ao_net::n3::world::Attractor { a: 0, b: head, c: 0, d: 4 }];
+        if on {
+            attractors.push(ao_net::n3::world::Attractor { a: 5, b: 26163, c: 0, d: 0 });
+        }
+        ao_net::n3::world::AppearanceUpdate {
+            cloth: vec![],
+            attractors,
+            visual_flags: 31, extra: 0,
+        }
+    }
+
+    fn light_bar_player(dir: &Path, scale: i16) -> (Player, Zone) {
+        let mut update = avatar::tests::own_update();
+        update.pos = [0.0; 3];
+        update.monster_scale = scale;
+        let mut zone = Zone::new(7);
+        zone.own_update = Some(Box::new(update));
+        let mut player = Player::new(dir, &mut zone, 0).expect("own captured avatar");
+        player.collision = None;
+        player.zones = None;
+        player.movement.teleport([0.0; 3], 0.0);
+        zone.own_events.push(OwnEvent::Appearance(light_bar_appearance(true)));
+        (player, zone)
+    }
+
+    #[test]
+    fn own_light_bar_tracks_player_frame_even_when_body_hidden_and_unequips() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let (mut player, mut zone) = light_bar_player(&dir, 175);
+        let mut host = Host::headless();
+        player.fade = avatar::Fade { on: true, start: 100.0, end: 99.0, end_alpha: 1.0 };
+        player.camera.select_mode(3);
+        player.frame(0.0, &mut host, &mut zone, false);
+        assert_eq!(host.actors[0].alpha, 0.0, "body fade must not fade the worn light");
+        assert_eq!(host.dynamic_lights.len(), 1);
+        let authored = ao_formats::mesh::decode_mesh_lights(&player.store, 1010001, 26163, [0.0; 3]).unwrap()[0];
+        let actor = player.avatar.frame();
+        let mount = glam::Mat4::from_cols_array_2d(actor.parts.last().expect("back mount follows body"));
+        let local = mount.transform_point3(glam::Vec3::from(authored.pos));
+        let expected = glam::Mat4::from_cols_array_2d(&actor.transform).transform_point3(local);
+        assert!((glam::Vec3::from(host.dynamic_lights[0].pos) - expected).length() < 1e-5);
+        assert_eq!(host.dynamic_lights[0].color, authored.color);
+        assert_eq!(host.dynamic_lights[0].range, authored.range);
+        assert_eq!(host.dynamic_lights[0].atten, authored.atten);
+        assert_eq!(player.avatar.body_scale(), 1.75);
+        player.camera.set_prefs(&ControlPrefs { show_my_character: false, ..Default::default() });
+        player.camera.select_mode(0);
+        assert!(!player.camera.show_avatar());
+        for (pos, yaw) in [([3.0, 2.0, -4.0], 0.7), ([-2.0, 1.0, 5.0], -1.2)] {
+            zone.own_events.push(OwnEvent::Place { pos, yaw, full_reset: true });
+            host.actors.clear();
+            host.dynamic_lights.clear();
+            player.frame(0.0, &mut host, &mut zone, false);
+            assert!(host.actors.is_empty(), "first-person must really hide the body");
+            assert_eq!(host.dynamic_lights.len(), 1, "hidden own body still illuminates the world");
+            let world = glam::Mat4::from_translation(glam::Vec3::from(scene_pos(pos)))
+                * glam::Mat4::from_rotation_y(scene_yaw(yaw)) * glam::Mat4::from_scale(glam::Vec3::splat(1.75));
+            assert!((glam::Vec3::from(host.dynamic_lights[0].pos) - world.transform_point3(local)).length() < 1e-4);
+        }
+        zone.own_events.push(OwnEvent::Appearance(light_bar_appearance(false)));
+        host.dynamic_lights.clear();
+        player.frame(0.0, &mut host, &mut zone, false);
+        assert!(host.dynamic_lights.is_empty(), "unequipped light must disappear on the same frame");
+    }
+
+    /// Opt-in, offline own-avatar evidence: the real mesh 26163 on a synthetic back mount.
+    #[test]
+    fn own_light_bar_lights_the_ground_at_night() {
+        let Some(out) = std::env::var_os("AOMAC_SHOT_DIR").map(std::path::PathBuf::from) else { return };
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        struct Shot { gui: ao_gui::Gui, player: Player, zone: Zone, scene: Option<ao_scene::Scene> }
+        impl ao_render::Frontend for Shot {
+            fn gui(&self) -> &ao_gui::Gui { &self.gui }
+            fn input(&mut self, _: InputEvent, _: &mut Host) {}
+            fn frame(&mut self, dt: f32, size: (u32, u32), host: &mut Host) -> ao_gui::DrawList {
+                if let Some(scene) = self.scene.take() { host.set_scene(scene); }
+                self.player.frame(0.0, host, &mut self.zone, false);
+                let eye = if size.0 > 2000 { ao_render::Vec3::new(8.0, 4.0, 12.0) } else { ao_render::Vec3::new(3.0, 2.0, 5.0) };
+                host.camera = ao_render::Camera::look_at(eye, ao_render::Vec3::new(0.0, 1.0, 0.0));
+                self.gui.frame(dt)
+            }
+        }
+        std::fs::create_dir_all(&out).unwrap();
+        for (view, size) in [("close", (640, 480)), ("wide", (5120, 1440))] {
+            let (player, zone) = light_bar_player(&dir, 100);
+            let mut vertices = Vec::new();
+            let mut indices = Vec::new();
+            // Vertex-lit terrain needs subdivisions to show the authored six-metre light pool.
+            for z in 0..=40 {
+                for x in 0..=40 {
+                    vertices.push(ao_scene::Vertex { pos: [x as f32 * 0.25 - 5.0, 0.0, z as f32 * 0.25 - 5.0],
+                        normal: [0.0, 1.0, 0.0], color: ao_scene::WHITE, ..Default::default() });
+                    if x < 40 && z < 40 {
+                        let i = z * 41 + x;
+                        indices.extend_from_slice(&[i, i + 41, i + 42, i, i + 42, i + 1]);
+                    }
+                }
+            }
+            let scene = ao_scene::Scene {
+                meshes: vec![ao_scene::Mesh { vertices, submeshes: vec![ao_scene::Submesh::new(indices, None)] }],
+                instances: vec![ao_scene::Instance { mesh: 0, transform: ao_scene::IDENTITY }],
+                environment: Some(ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 400.0,
+                    fog_end: 800.0, ambient: [0.01; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 0.0 }),
+                ..Default::default()
+            };
+            let mut shot = Shot { gui: ao_gui::Gui::new(&dir, None).unwrap(), player, zone, scene: Some(scene) };
+            let mut renderer = ao_render::Offscreen::new(&shot, size).unwrap();
+            for (name, on, hidden) in [("off", false, false), ("on", true, false), ("hidden", true, true)] {
+                shot.zone.own_events.push(OwnEvent::Appearance(light_bar_appearance(on)));
+                shot.player.camera.set_prefs(&ControlPrefs { show_my_character: false, ..Default::default() });
+                shot.player.camera.select_mode(if hidden { 0 } else { 3 });
+                let list = renderer.frame(&mut shot, 0.016);
+                renderer.png(&shot, &list, &out.join(format!("own-light-bar-{view}-{name}.png"))).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn jump_land_clip_picks_walk_run_idle_and_the_rifle_2h_variant() {

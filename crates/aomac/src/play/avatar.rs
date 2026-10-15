@@ -663,14 +663,32 @@ impl Avatar {
         self.sample_pose.set(self.cadence.sample(smooth, distance_sq, self.rig.bounding_radius, previously_visible));
     }
 
-    /// The actor to draw this frame (CPU-skinned pose, never frustum culled).
-    pub fn frame(&self) -> ActorFrame {
+    fn refresh_pose(&self) {
         if self.sample_pose.replace(false) || self.current_skin.borrow().is_none() {
             let (skin, parts) = self.rig.pose_composed_cached(self.layers(), &mut self.pose_cache.borrow_mut());
             self.current_bounds.set(super::hud_pick::bounds_of(skin.iter().map(|vertex| &vertex.pos)));
             *self.current_skin.borrow_mut() = Some(Arc::new(skin));
             *self.current_parts.borrow_mut() = parts;
         }
+    }
+
+    /// Embedded worn lights remain active even when the camera hides or fades the own body.
+    /// Unresolved retail guess: Randy 0x1003ff72/0x1004ce96 show no own-character distinction,
+    /// but whether ShowMyCharacter hiding skips light Process upstream is not yet traced.
+    pub fn lights(&self) -> impl Iterator<Item = ao_scene::Light> + '_ {
+        if self.rig.has_mount_lights() {
+            self.refresh_pose();
+        }
+        self.rig.mount_lights(&self.current_parts.borrow()).into_iter().map(|light| ao_scene::Light {
+            pos: self.transform.transform_point3(Vec3::from(light.pos)).to_array(),
+            spot: light.spot.map(|spot| ao_scene::Spot { dir: self.transform.transform_vector3(Vec3::from(spot.dir)).to_array(), ..spot }),
+            ..light
+        })
+    }
+
+    /// The actor to draw this frame (CPU-skinned pose, never frustum culled).
+    pub fn frame(&self) -> ActorFrame {
+        self.refresh_pose();
         ActorFrame { id: self.id, model: MODEL_KEY, transform: self.transform.to_cols_array_2d(), parts: self.current_parts.borrow().clone(), part_attractors: self.rig.part_attractors(), skin: self.current_skin.borrow().as_ref().map(Arc::clone), always: true, alpha: 1.0, ..Default::default() }
     }
 
@@ -751,6 +769,19 @@ pub(super) mod tests {
         frame::Frame,
         n3::{self, dynel::Dynel, N3},
     };
+
+    #[test]
+    fn unlit_hidden_avatar_does_not_sample_a_pose_for_lights() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut update = own_update();
+        update.attractors.clear();
+        let avatar = Avatar::new(&store, &dir, 7, &update, ActorAssets::new(&store).unwrap()).unwrap();
+        assert!(avatar.current_skin.borrow().is_none());
+        assert!(avatar.lights().next().is_none());
+        assert!(avatar.current_skin.borrow().is_none(), "unlit hidden bodies must not skin just to collect lights");
+        assert!(avatar.sample_pose.get(), "light collection must leave the deferred body refresh intact");
+    }
 
     #[test]
     fn smooth_animation_toggle_changes_native_refresh_not_clip_time() {

@@ -502,6 +502,11 @@ impl ActorRig {
         (verts, parts)
     }
 
+    /// Whether any worn mesh needs a posed light transform.
+    pub fn has_mount_lights(&self) -> bool {
+        self.mounts.iter().any(|mount| !mount.lights.is_empty())
+    }
+
     /// Embedded mount lights (the Light Bar's `summon_light` and similar worn items) placed by `parts` (the per-mesh
     /// transforms [`ActorRig::pose`] returns), relative to the actor: still needs the actor's own world transform
     /// applied by the caller (`ao_scene::Light::pos`/`spot.dir` are points/directions in this mount-relative space).
