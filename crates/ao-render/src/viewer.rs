@@ -11,6 +11,7 @@ use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScroll
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::monitor::MonitorHandle;
+#[cfg(target_os = "macos")]
 use winit::platform::macos::WindowExtMacOS;
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
@@ -967,10 +968,16 @@ impl ApplicationHandler for App {
             {
                 if s.window.fullscreen().is_some() {
                     s.window.set_fullscreen(None);
+                    #[cfg(target_os = "macos")]
                     s.window.set_borderless_game(false);
                 } else {
+                    // "Borderless game" (hide the menu bar and dock) is a macOS notion; elsewhere borderless
+                    // fullscreen already covers the whole monitor, so the preference is read and left at that.
                     let borderless_game = s.gui.as_ref().is_some_and(|g| g.host.borderless_game);
+                    #[cfg(target_os = "macos")]
                     s.window.set_borderless_game(borderless_game);
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = borderless_game;
                     s.window.set_fullscreen(Some(Fullscreen::Borderless(s.window.current_monitor())));
                 }
                 s.save_window();

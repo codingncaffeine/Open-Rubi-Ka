@@ -15,6 +15,8 @@ struct Counts {
     last_native: Option<Instant>,
 }
 impl Counts {
+    // Fed by the native (macOS GameController) reader; elsewhere only the tests call it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn add(&mut self, dx: f32, dy: f32) {
         if self.active {
             self.native_report = true;
