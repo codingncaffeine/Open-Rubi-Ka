@@ -171,6 +171,8 @@ pub(super) struct HudStats {
     attack_timers: std::collections::HashMap<i32, (WindowId, i32)>,
     /// Open Reload timer bar.
     reload_timer: Option<(WindowId, i32)>,
+    /// Open Nano cast timer bar (own character only).
+    nano_timer: Option<(WindowId, i32)>,
 }
 
 /// Value of the first `<Bool name=NAME value=..>` below `e`.
@@ -239,6 +241,7 @@ impl HudStats {
             item_timer: None,
             attack_timers: Default::default(),
             reload_timer: None,
+            nano_timer: None,
         })
     }
 
@@ -978,6 +981,7 @@ impl HudStats {
         self.update_item_timer(gui);
         self.update_attack_timers(gui, zone);
         self.update_reload_timer(gui, zone);
+        self.update_nano_timer(gui, zone);
         self.refresh_stats(zone);
         self.update_skills(gui, zone);
         self.update_wear(gui, zone);
@@ -988,12 +992,13 @@ impl HudStats {
         }
     }
 
-    /// Lowest free-position slot (`hud_timerbar::pos_slot`) not already held by an open Item/Attack/Reload timer bar
-    /// (`TimerSystemModule_t::FindNextFreePos`'s linear scan over the shared stack).
+    /// Lowest free-position slot (`hud_timerbar::pos_slot`) not already held by an open Item/Attack/Reload/Nano timer
+    /// bar (`TimerSystemModule_t::FindNextFreePos`'s linear scan over the shared stack).
     fn free_timer_slot(&self) -> i32 {
         let mut used: Vec<i32> = self.attack_timers.values().map(|&(_, s)| s).collect();
         used.extend(self.item_timer.map(|(_, s)| s));
         used.extend(self.reload_timer.map(|(_, s)| s));
+        used.extend(self.nano_timer.map(|(_, s)| s));
         (0..).find(|n| !used.contains(n)).unwrap_or(0)
     }
 
@@ -1084,6 +1089,37 @@ impl HudStats {
             }
             None => {
                 if let Some((w, _)) = self.reload_timer.take() {
+                    gui.close_window(w);
+                }
+            }
+        }
+    }
+
+    /// `TimerSystemModule_t::StartTimerBar` type 3 ("Nano program"): [`super::dynels::Dynels::nano_bar_progress`], the
+    /// own character's active cast. docs/zone/combat-timers.md §4.
+    fn update_nano_timer(&mut self, gui: &mut Gui, zone: &Zone) {
+        match zone.world.nano_bar_progress(zone.char_id as i32) {
+            Some((progress, _total)) => {
+                let w = match self.nano_timer {
+                    Some((w, _)) => w,
+                    None => {
+                        let slot = self.free_timer_slot();
+                        match hud_timerbar::open(gui, "NanoTimerBar", hud_timerbar::LABEL_NANO, hud_timerbar::COLOR_NANO, hud_timerbar::pos_slot(slot)) {
+                            Ok(w) => {
+                                self.nano_timer = Some((w, slot));
+                                w
+                            }
+                            Err(e) => {
+                                eprintln!("hud: nano timer bar: {e:#}");
+                                return;
+                            }
+                        }
+                    }
+                };
+                hud_timerbar::set_progress(gui, w, progress);
+            }
+            None => {
+                if let Some((w, _)) = self.nano_timer.take() {
                     gui.close_window(w);
                 }
             }
@@ -1822,38 +1858,58 @@ mod tests {
         assert_eq!(s.hud.item_timer, None, "the bar closes itself along with the timer");
     }
 
-    /// Two Attack bars (dual hands) stacked under the Item bar, and a separate Reload bar, each at the retail free-slot
-    /// position (`hud_timerbar::pos_slot`, `FindNextFreePos`). `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac --
-    /// combat_timer_bars_stack_and_show_mid_fight` -> `combat-timer-bars.png`. docs/zone/combat-timers.md.
+    /// Two Attack bars (dual hands) stacked under the Item bar, a Reload bar and a Nano-cast bar, each at the retail
+    /// free-slot position (`hud_timerbar::pos_slot`, `FindNextFreePos`). `AOMAC_SHOT_DIR=/tmp/x cargo test --release
+    /// -p aomac -- combat_timer_bars_stack_and_show_mid_fight` -> `combat-timer-bars.png`. docs/zone/combat-timers.md.
     #[test]
     fn combat_timer_bars_stack_and_show_mid_fight() {
         let Some((mut s, mut o)) = shot() else { return };
+        if ao_rdb::RecordStore::open(&ao_gui::client_dir()).is_err() {
+            return;
+        }
         let own = s.zone.char_id as i32;
+        s.zone.world.start(ao_gui::client_dir(), own);
         s.zone.world.arms.wield(own, 500, 6, None, &[(0x126, 500), (0xd2, 500), (440, 100), (0x1a4, -1)]);
         s.zone.world.arms.wield(own, 501, 8, None, &[(0x126, 400), (0xd2, 400), (440, 100), (0x1a4, 2)]);
         s.zone.stats.insert(100, 600);
         s.zone.stats.insert(51, 0);
         s.zone.world.update_attack_bars(own, true, 0.0);
         assert_eq!(s.zone.world.attack_bar_progress(own, &s.zone.stats).len(), 2, "both hands open a bar");
-        s.zone.world.start_reload_bar(own, &s.zone.stats);
+        s.zone.world.start_reload_bar(own);
         assert!(s.zone.world.reload_bar_progress().is_some());
+        // Body Boost (29091), same real-rdb fixture as `dynels.rs`'s own nano tests.
+        let identity = Identity { kind: 50000, instance: own };
+        let cast_msg = ao_net::n3::Message {
+            header: ao_net::n3::N3Header { msg_type: ao_net::n3::dynel::CAST_NANO_SPELL, target: identity, flag: 0 },
+            sender: own as u32,
+            body: ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::CastNanoSpell(ao_net::n3::dynel::CastNanoSpell {
+                spell: 29091, target: identity, flag: true, source: identity, rest: vec![],
+            })),
+        };
+        s.zone.world.on_message(&cast_msg);
+        s.zone.world.nano_visual_frame(0.0, false, |_| None, |_, _| None);
+        assert!(s.zone.world.nano_bar_progress(own).is_some(), "Body Boost opens the own Nano bar");
         o.frame(&mut s, 0.016);
         assert_eq!(s.hud.attack_timers.len(), 2);
         assert!(s.hud.reload_timer.is_some());
+        assert!(s.hud.nano_timer.is_some());
         let mut slots: Vec<i32> = s.hud.attack_timers.values().map(|&(_, slot)| slot).collect();
         slots.push(s.hud.reload_timer.unwrap().1);
+        slots.push(s.hud.nano_timer.unwrap().1);
         slots.sort_unstable();
-        assert_eq!(slots, [0, 1, 2], "FindNextFreePos: lowest free slot each, no overlap with each other");
+        assert_eq!(slots, [0, 1, 2, 3], "FindNextFreePos: lowest free slot each, no overlap with each other");
         for &(w, _) in s.hud.attack_timers.values() {
             assert_eq!(s.gui.text(w, "label"), "Attack");
         }
         assert_eq!(s.gui.text(s.hud.reload_timer.unwrap().0, "label"), "Reload");
+        assert_eq!(s.gui.text(s.hud.nano_timer.unwrap().0, "label"), "Nano program");
         png(&mut s, &mut o, "combat-timer-bars");
-        // the fight stopping closes both Attack bars but leaves the still-counting Reload bar alone
+        // the fight stopping closes both Attack bars but leaves the still-counting Reload/Nano bars alone
         s.zone.world.update_attack_bars(own, false, 0.0);
         o.frame(&mut s, 0.016);
         assert!(s.hud.attack_timers.is_empty());
         assert!(s.hud.reload_timer.is_some());
+        assert!(s.hud.nano_timer.is_some());
     }
 
     /// The real `Hud`: the menu toggles open the windows, the frame close button (and `Close`) clears the menu state again; the NewChar template's

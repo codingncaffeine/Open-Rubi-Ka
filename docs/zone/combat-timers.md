@@ -1,106 +1,123 @@
-# Attack / Reload HUD timer bars
+# Attack / Reload / Nano HUD timer bars
 
 Code: `play/combat/arms.rs` (`round_delay`, `item_round_seconds`, `attack_slots`), `play/dynels.rs` (`update_attack_bars`,
-`restart_attack_bar`, `attack_bar_progress`, `start_reload_bar`, `reload_bar_progress`), `play/combat/glue.rs` (per-frame
-wiring), `play/hud_use.rs` (Reload trigger), `play/hud_stats.rs` (`update_attack_timers`, `update_reload_timer`,
-`free_timer_slot`), `play/hud_timerbar.rs` (`COLOR_ATTACK`/`LABEL_ATTACK`, `COLOR_RELOAD`/`LABEL_RELOAD`, `pos_slot`).
+`restart_attack_bar`, `attack_bar_progress`, `start_reload_bar`, `reload_bar_progress`, `nano_bar_progress`,
+`nano_cast_delay`), `play/combat/glue.rs` (per-frame wiring), `play/hud_use.rs` (Reload trigger), `play/hud_stats.rs`
+(`update_attack_timers`, `update_reload_timer`, `update_nano_timer`, `free_timer_slot`), `play/hud_timerbar.rs`
+(`COLOR_*`/`LABEL_*` per kind, `pos_slot`).
 
-## 1. The widget: `TimerBarBase_c` / `TimerSystemModule_t` (already ported)
+RE tooling: three new scripts were added to `~/aomac-ghidra/scripts` for this investigation (reusable): `FindScalar.java`
+(scan every instruction for a literal operand value), `DumpAsm.java` (raw disassembly of an address range, needed
+whenever the decompiler drops register-passed arguments), `ListSymRange.java` (every symbol in an address range, used
+to resolve an unnamed vtable slot to its owning class by position).
 
-`hud_timerbar.rs` already carries the faithful RE of the generic timer-bar widget from the "Logout" countdown
-(`/camp`, `hud_use.rs`) and the item wear/unwear delay bar (`hud_stats.rs`). Relevant evidence, re-confirmed here:
+## 1. The widget and the `TimerEntry_t` construction chain (hard evidence)
 
-* **Kind table** (`TimerSystemModule_t::StartTimerBar` [GUI 0x10051a27], `TimerEntry_t+0x14`): 1 = Attack (tint
-  `0xaaffaa`, text.mdb 10000 `Timer_Attack` = "Attack"), 2 = Special (`0xaaffff`, `Timer_Special` = "Special"), 3 = Nano
-  (`0xffaaaa`, `Timer_Nano` = "Nano program"), 4 = Item (`0xaaaaff`, `Timer_Item` = "Item", only shown when the duration
-  is at least [`hud_timerbar::MIN_SECONDS`] = 0.5 s, `_DAT_101a9f9c`), 5 = Reload (untinted `0xffffff`, `Timer_Reload` =
-  "Reload"). The English strings were read directly from the installed `cd_image/text/text.mdb` (`TextDb::by_key(10000,
-  key)`), not guessed.
-* **Position**: `TimerSystemModule_t::FindNextFreePos` [GUI 0x10051779] stacks concurrent bars 20 px apart starting at
-  `IPoint(0x28, (n + 2) * 0x14)` = (40, 40 + 20n), taking the lowest free slot index. `hud_timerbar::pos_slot(n)` and
-  `HudStats::free_timer_slot` (a linear scan over the slots held by the open Item/Attack/Reload bars) now implement the
-  real multi-bar stacking instead of a single hard-coded slot 0.
-* **Only `StartTimerBar` kind 4 ("Item") and the public `CreateTimer` overload ("Logout") were traced to their actual
-  Gamecode trigger.** Kind 1/2/3/5 are only reachable through `TimerSystemModule_t::StartTimerBar`, itself only called
-  from its own `InitialiseMessage`/`ShutdownMessage` (signal connect/disconnect, GUI `DumpCallers 0x10051a27`); the
-  `weak_ptr<TimerEntry_t>` that the signal actually carries is constructed by whoever emits it, which was **not**
-  found by searching GUI.dll for `TimerEntry_t` constructors, `CreateTimer`/`StartTimerBar` callers, or matching
-  Gamecode.dll strings (`AttackDelay`/`RechargeDelay`/`ReloadTime`/`Reload` do not appear as literal Gamecode strings;
-  `~/aomac-ghidra/re.sh Gamecode DumpRefs.java "AttackDelay"` etc. are empty). **[UNRESOLVED]** exact emission site of
-  the Attack/Special/Nano/Reload `TimerEntry_t`s; see §4.
+`hud_timerbar.rs` already carries the faithful RE of the generic timer-bar widget (`TimerBarBase_c`/`GameTimerBar_c`,
+GUI.dll) from the "Logout" countdown and the Item wear/unwear delay bar. `TimerSystemModule_t::StartTimerBar`
+[GUI 0x10051a27] colours/labels the bar by `TimerEntry_t+0x14` kind: 1 Attack (`0xaaffaa` "Attack"), 2 Special
+(`0xaaffff` "Special"), 3 Nano (`0xffaaaa` "Nano program"), 4 Item (`0xaaaaff` "Item"), 5 Reload (untinted `0xffffff`
+"Reload") -- English strings read directly from the installed `cd_image/text/text.mdb` (`TextDb::by_key(10000, key)`).
+Position: `TimerSystemModule_t::FindNextFreePos` [GUI 0x10051779] stacks concurrent bars 20 px apart from
+`IPoint(0x28, (n+2)*0x14)`, taking the lowest free slot (`hud_timerbar::pos_slot`, `HudStats::free_timer_slot`).
 
-## 2. Attack bar: design and evidence used
+**Every `TimerEntry_t` in Gamecode.dll is unambiguously identifiable**, independent of which kind it ends up as: its
+shared_ptr control block (`FUN_1003d9ec`) is built with `boost::detail::sp_counted_impl_p<TimerEntry_t>::vftable`
+(RTTI-typed, not a guess -- `~/aomac-ghidra/re.sh Gamecode DumpRefs.java "TimerEntry_t"` finds this exact mangled
+name). Its only wrapper, `FUN_1003da5d` (assign + wrap + a second helper), is called by exactly one place,
+`FUN_1003d7ce` -- the actual "construct `TimerEntry_t`, emit `GlobalSignals+0x1f8`" (`StartTimerBar`'s own signal,
+confirmed via `ShutdownMessage`'s `SignalBase_c::_Disconnect((SignalBase_c*)(GlobalSignals+0x1f8), ...)`) helper.
+`DumpCallers 1003d7ce` finds **exactly six** call sites, each independently traced below (§2-§5); there is no other
+`TimerEntry_t` constructor and no other emitter in either DLL -- `FUN_1009b415`/`FUN_1009b37e`, which looked like a
+second "kind-parameterised" constructor from their allocation-size pattern, turned out on closer reading to be plain
+`WeaponItem_t`/`DummyWeapon_t` member construction (`FUN_1009c0ca` sets `*extraout_ECX = WeaponItem_t::vftable`), an
+unrelated coincidence of object size, not a second TimerBar path.
 
-* **Duration formula (hard evidence, already ported)**: `chat::item_info_combat::delay` (the item-info tooltip's DPS
-  cell) already implements `FUN_1006772b`/`FUN_10067849`: hundredths of a second, `raw_stat + 75 - initiative_slope -
-  AggDef`, clamped to an item cap (stat 523 `AttackDelayCap` / 524 `RechargeDelayCap`) and a 1.0 s floor;
-  `initiative <= 1200` scales ×0.5, else `(initiative - 1200) / 6 + 600`. `combat::arms::round_delay` is the same
-  formula, factored out so both the tooltip and the HUD bar share one source of truth (`round_delay_matches_the_
-  item_info_dps_cell` pins the tooltip's own fixture against it). `item_round_seconds(item, stats)` sums
-  `round_delay(AttackDelay=stat 294)` + `round_delay(RechargeDelay=stat 210, recharge=true)`, in seconds.
-* **Which stat scales which**: the item's own `InitiativeSkill` (stat 440) names which of the character's skills
-  scales `AttackDelay`; `RechargeDelay` always uses the *same* value if it already lies in 0..=1200, else the
-  `FUN_10067849`-observed fallback skill 118 (Physical Initiative) — this is the tooltip's own established behaviour,
-  reused verbatim.
-* **Per-hand**: `Armory::attack_slots` (GC 0x10068969, already used by `in_attack_range`) is hands 8/6 if either is
-  wielded, else bare hands 0 — the same slot set `in_attack_range` already treats as "the attacking weapon(s)".
-  Dual-wielding therefore opens two concurrent Attack bars, one per hand, each keyed to that hand's own weapon.
-* **Start / restart**: there is no client-side round timer in this engine (docs/zone/combat-net.md §3: "no timer and
-  no timeout… no client-side attack repeat" — rounds are entirely server-driven). The Attack bar is the client's own
-  *visual prediction* of the round, exactly like the already-ported Item bar is a cosmetic prediction of an
-  equip/unequip delay that the server alone actually resolves (`hud_stats::update_item_timer`'s own comment). It opens
-  while `combat::module::Module::attacking()` is true, one per currently wielded attack slot, and **restarts at every
-  swing of that hand** — `CombatEvent::Hit`/`Miss` both carry `attacker`/`slot` (`combat/notes.rs::hit_of`, already
-  used to drive the swing animation/sound of that exact slot), so a swing that just landed or missed is read as "the
-  weapon fired, the round starts over" without inventing a second signal.
-* **[GUESS]**: that retail really restarts kind-1 "Attack" per swing rather than running once per whole fight, and
-  that AttackDelay+RechargeDelay (the DPS formula's own "round time") is the bar's total, not AttackDelay alone. Both
-  follow directly from what the `StartTimerBar` kind table and the DPS formula already prove client-side, but the
-  exact Gamecode call site that opens/closes/updates a kind-1 bar was not found (§1/§4), so this is the best-evidenced
-  reconstruction, not a traced call.
+## 2. Attack (kind 1): unchanged, now corroborated
 
-## 3. Reload bar: design, evidence, and the open gap
+Duration = `combat::arms::item_round_seconds` (initiative-scaled `AttackDelay`(294) + `RechargeDelay`(210), the same
+formula the item-info DPS tooltip already used, `chat::item_info_combat::delay`/`FUN_1006772b`/`FUN_10067849`).
+Per-hand (`Armory::attack_slots`, GC 0x10068969), restarts on each swing (`CombatEvent::Hit`/`Miss`'s `slot`).
+No direct Gamecode caller of kind 1 specifically was traced among the six `FUN_1003d7ce` sites (none of the six
+match an ordinary-attack context); this remains the pre-existing, evidence-grounded reconstruction. It is now
+corroborated, not merely analogous: kind 2 "Special" (§4) uses the *exact same two stats, summed, from the exact
+same `(**vtable+0x3c)(statId, 2)` effective-stat accessor*, on a sibling (special-attack) weapon-like item, which is
+strong indirect confirmation that an ordinary weapon's round bar uses the identical formula.
 
-* **Trigger (hard evidence)**: the hotbar Reload special action (id `0x6e`, `combat::action::RELOAD`,
-  `combat-net.md` §5.3's provider table) calls `FUN_1006949a` [GC], gated by `FUN_10029e66` (a null-check on the fight
-  controller's `+4` field; always true off the current no-fight-controller stub), which sends a bare
-  `CharacterActionIIR_t` action `0xd2` with every identity/param zero (`hud_use.rs`, unchanged from before this
-  change). No duration or ammo count travels on this message.
-* **No `ReloadTime` stat exists in this client's data.** Searched: `ao-formats/data/stat_names.txt` (full file, no
-  `Reload`/`Clip` entry besides the already-mapped ammo-count/clip-size pair stats 26/212 used by
-  `chat/item_info.rs::ammo`), `~/aomac-ghidra/re.sh Gamecode DumpRefs.java "ReloadTime" "Reload"` (empty — no literal
-  string), the action-0xd2 apply path (`FUN_1005d0d8`'s decompile, 1264 lines, no `0xd2`/`210` case) and `gui.md`
-  §10.7's own prior note ("UNRESOLVED: … Reload (stat 0x1a guess)" — that guess is about which stat feeds the hotbar
-  icon's disabled-overlay progress, not a timer duration, and was never resolved either).
-* **[GUESS] duration**: `Dynels::start_reload_bar` uses the *same* `item_round_seconds` the Attack bar uses, applied
-  to the first wielded hand that carries ammo (`item.ammo != -1`, stat `AmmoType` 420/`0x1a4`). This is the only
-  evidenced weapon timing this client's rdb carries; it is explicitly not a traced `ReloadTime` value. The bar is
-  purely a client-side cosmetic prediction — like the Attack and Item bars — and does not gate anything server-side;
-  it self-closes once its predicted duration elapses (`Dynels::update_attack_bars`).
-* **Not implemented**: an authoritative close on an ammo-count `StatIIR` (stat 26 reaching the clip's max again) once
-  the server actually finishes the reload, because no live reload capture exists to confirm the server announces it
-  that way rather than via a full item-stat replace. Left as a predicted-duration close only, labelled here so a
-  future capture can correct it.
+## 3. Reload (kind 5): traced to its exact caller, not a guess
 
-## 4. Not ported: Special / Nano kinds
+* **Message class**: `ReloadIIR_t` 0x26515E61 (present in `ao_net::n3::outgoing`'s known-class table, not yet
+  decoded into the `Misc`/`World` enums). Its apply is `FUN_10076780` (a bare vtable `Execute` slot, confirmed by
+  `DumpCallers` on it resolving to a `<no function>` DATA ref -- a vtable entry, not a direct call) -> `FUN_10069274`.
+* `FUN_10069274(ctrl, weaponIdentity, old, newCount, flag)`: reads the weapon's stat `0x1a` (26, the same
+  current-ammo stat `chat/item_info.rs::ammo` already reads as "count"), and if it is present (`-1 < count`), **sets**
+  stat `0x1a` to `newCount` (the clip refilling), calls `FUN_10068a89(weapon)`, then prints `Feedback_Reloading`.
+* `FUN_10068a89` is the one of the six `FUN_1003d7ce` callers that matters here. Its very first instructions
+  (`~/aomac-ghidra re.sh Gamecode DumpAsm.java 10068a89 10068ac7`) push the literal pair `(0xd2, 2)` into the item's
+  effective-stat accessor (`(**vtable+0x3c)(statId, mode)`, the same accessor used for `(0x1a,2)` ammo and `(0x126,2)`
+  AttackDelay elsewhere) before constructing the `TimerEntry_t` -- i.e. **the duration passed to kind 5 is the
+  weapon's own `RechargeDelay` stat (210/0xd2), alone, with no `AttackDelay` term and no initiative scaling** (no
+  `GameTime_t`/initiative-slope code runs anywhere in this function). `Dynels::start_reload_bar` now uses exactly
+  `item.recharge as f32 / 100.0` (the hundredths-to-seconds divisor is `StartTimerBar`'s own kind-4 branch constant
+  `_DAT_101adfa8 = 100.0`, read directly from GUI.dll).
+* **Trigger, as ported**: this client has no captured `ReloadIIR_t` to pin the wire layout from, so the bar is still
+  opened client-side when the player sends the Reload special action (`hud_use.rs` 0x6e, action id `RELOAD` ->
+  `CharacterActionIIR_t` 0xd2, `FUN_1006949a`/`FUN_10029e66`, unchanged by this pass) rather than on a decoded
+  `ReloadIIR_t`. The *duration value* is no longer a guess; the exact server-side trigger timing (whether retail
+  opens the bar on send or waits for `ReloadIIR_t`'s echo) remains unresolved for lack of a capture.
 
-Kinds 2 ("Special") and 3 ("Nano") were not wired to a bar. The special-attack recharge countdown already has its own,
-separately-RE'd mechanism — the hotbar icon's disabled overlay (`GFX_GUI_ICONFADER32` shrink + `%2ds`/`%2dm` text,
-fed by the relayed `CharacterActionIIR_t` action `0x14` "recharge feed", `hud_bar.rs` §"Recharge feed" /
-`hud_actionwin.rs`, already implemented before this change) — and no second, independent "Special" `TimerBarBase_c`
-bar was found triggered anywhere in the traced call graph. No client-visible nano cast-time bar was found either
-(nano casting in this engine's traffic is `CastNanoSpell`/`BuffIIR_c`, applied atomically, with no observed
-in-progress state to drive a fill). Both remain [UNRESOLVED GUESS: not present] until a capture or further Gamecode
-trace shows otherwise.
+## 4. Nano (kind 3): reuses an already-correct, independently-traced formula
 
-## 5. Regressions
+* **Trigger**: `CastNanoSpellIIR_t` 0x25314D6D apply [GC 0x10072306] -> `FUN_10051754(spell, &target, 1, flag, 1, 1,
+  &source, 0, 0)` (the exact call already documented in `docs/zone/dynel.md` §5, independently of this
+  investigation) -> tail `FUN_10050ed9`, whose address range (`asm 10050f85-10051064`) is *already* the one labelled
+  in `dynels.rs` as `nano_cast_delay`'s own GC evidence. Its caller chain is unambiguous: `DumpCallers 10051754`
+  finds the nano apply (0x10072306), the `CharacterActionIIR_t` dispatch's own case for `identity_b`-bearing nano
+  actions, and `FUN_100a9543`/`FUN_10071be4` (a `BuffIIR_c`-adjacent context, same shared helper reused for buffs).
+* **Duration**: `nano_cast_delay(template.stat(0x126), template.stat(0x20b), stat(who, 0x95), stat(who, 0x33),
+  template.stat(0))` was *already* ported (`dynels.rs`, predating this change) and already drives the nano casting
+  animation's `NanoCast.remaining` countdown -- nano templates reuse the item stat schema, `AttackDelay`(294) as
+  "cast time" and `AttackDelayCap`(523, stat `0x20b`) as its floor, scaled by the caster's own stat `0x95`
+  initiative and `0x33` AggDef. `NanoCast` now also stores `total` (the value `remaining` started at), so
+  `Dynels::nano_bar_progress(own)` can report `(1 - remaining/total, total)` without recomputing the formula.
+* **Port**: `hud_stats::update_nano_timer` opens/updates/closes the "Nano program" bar for the own character's
+  active, non-instant, unreleased cast. Regression `combat_timer_bars_stack_and_show_mid_fight` casts the real
+  installed Body Boost (template 29091, the same fixture `dynels.rs`'s own nano tests already use) through the real
+  `CastNanoSpellIIR_t` apply path (`Dynels::on_message` + `nano_visual_frame`) and checks the bar opens with label
+  "Nano program" at a free stacking slot alongside the Attack/Reload bars, shown in the offscreen screenshot.
+
+## 5. Special (kind 2): evidence found, **not yet ported**
+
+One of the six `FUN_1003d7ce` callers, `FUN_1003b947` (gated by `FUN_1003bac9(state)` on `state ∈ {3, 5, 0x20}`,
+called twice within itself depending on whether a `DummyItemBase_t` RTTI cast of the relevant item succeeds), reads
+**both** `AttackDelay`(0x126) and `RechargeDelay`(0xd2) of a `DummyItemBase_t` (the special-attack item base class
+`combat::arms` already models as `DummyWeapon_t`) via the same `(**vtable+0x3c)(statId, 2)` accessor as Reload, sums
+them for an internal `< 0x1f` (31 hundredths) refusal check, and passes both raw values into `FUN_1003d7ce`.
+
+What is **not** resolved: the exact message/state transition `{3, 5, 0x20}` corresponds to (not an obvious
+`CharSecSpecAttackIIR_t`/`SpecialAttackInfoIIR_t` apply address -- those already have a comprehensively-documented
+apply chain in `docs/zone/combat-log.md` §2.2 that does not mention this function), and which of `uStack_18`/
+`uStack_1c` in the two-word `TimerEntry_t` payload holds which value (`StartTimerBar`'s kind-4 branch reads only one
+of its two analogous fields, selected by a flag bit set after construction; kind 2's own read path in `StartTimerBar`
+was not decompiled bit-for-bit against this write). Implementing kind 2 now would mean guessing the receive-side
+trigger, which is exactly what was asked not to do. **Left unported**, flagged in `hud_timerbar.rs`'s module doc and
+here, pending either a live special-attack capture or further disassembly of `FUN_1003bac9`'s three callers (state
+transition producers) to identify the real message.
+
+The hotbar icon-fader recharge overlay (`CharacterActionIIR_t` action `0x14`, `hud_bar.rs`/`hud_special.rs`, already
+ported before this investigation) is a **separate, additional** indicator -- it existed independently of this
+`TimerEntry_t` mechanism and is not a substitute for the kind-2 bar.
+
+## 6. Regressions
 
 * `combat::arms::tests::round_delay_matches_the_item_info_dps_cell` / `item_round_seconds_sums_attack_and_recharge_in_
-  hundredths` / `attack_slots_follow_wielded_hands`: the shared formula against the tooltip's own fixture, and the
-  per-hand slot selection.
-* `dynels::tests::attack_and_reload_bars_track_hands_swings_and_fight_state`: the state machine in isolation (open on
-  fight start, restart on swing, ignore an untracked slot, clear on fight stop, Reload bar progress/self-close).
+  hundredths` / `attack_slots_follow_wielded_hands`: the Attack-bar formula against the tooltip's own fixture.
+* `dynels::tests::attack_and_reload_bars_track_hands_swings_and_fight_state`: the state machine (open on fight
+  start, restart on swing, ignore an untracked slot, clear on fight stop) and the exact Reload duration (raw
+  `RechargeDelay`/100, pinned to `5.0` for stat `0xd2 = 500`, no initiative term, no `AttackDelay` sum).
 * `combat::glue::health_tests::captured_fight_drives_the_attack_bar`: replays `docs/captures/zone_fight_ithaca.rec`
-  (the only real fight capture where the own character — Aomacvolk, bare-handed — actually fights) through a real
-  `Module` + `Zone` (real rdb if installed, skips otherwise), checking the Attack bar for slot 0 opens with a sane
-  initiative-scaled duration, restarts exactly once per own swing (hits + misses), and clears once the fight stops.
+  through a real `Module` + `Zone`, checking the Attack bar for the own character's bare hands opens, restarts once
+  per own swing and clears on `StopFight`.
+* `hud_stats::tests::combat_timer_bars_stack_and_show_mid_fight`: two Attack bars (dual hands), a Reload bar and a
+  real Body-Boost-driven Nano bar, each at a distinct `FindNextFreePos` slot with the retail label text, and an
+  offscreen screenshot (`combat-timer-bars.png`).

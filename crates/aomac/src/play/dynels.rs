@@ -898,6 +898,9 @@ struct NanoCast {
     target: i32,
     handle: u32,
     remaining: f32,
+    /// `remaining`'s starting value (`nano_cast_delay` at cast start): backs the HUD "Nano program" timer bar
+    /// (`nano_bar_progress`, kind 3 "Timer_Nano").
+    total: f32,
     finish: [i32; 2],
     release_anim: u32,
     released: bool,
@@ -1525,18 +1528,34 @@ impl Dynels {
         }).collect()
     }
 
-    /// Starts the Reload bar (`hud_use.rs` Reload special action 0x6e): duration from the first wielded hand carrying
-    /// ammo (`item.ammo != -1`). A no-op without a ranged hand (the action is only offered for one, `hud_special.rs`
-    /// `sync_equipment`).
-    pub fn start_reload_bar(&mut self, own: i32, stats: &HashMap<u32, i32>) {
+    /// Starts the Reload bar (`hud_use.rs` Reload special action 0x6e): duration = the ranged hand's raw
+    /// `RechargeDelay` stat (0xd2/210), read directly with **no** initiative scaling and **not** summed with
+    /// `AttackDelay` -- the exact value Gamecode passes to `TimerSystemModule_t::StartTimerBar` kind 5. Evidence
+    /// (`~/aomac-ghidra` Gamecode): `ReloadIIR_t` 0x26515E61 apply chain `FUN_10076780` -> `FUN_10069274` (sets
+    /// stat `0x1a`/26 ammo count, prints `Feedback_Reloading`) -> `FUN_10068a89`, whose first instruction literally
+    /// pushes `(0xd2, 2)` into the item's stat getter before constructing the `TimerEntry_t` (`FUN_1003d7ce`,
+    /// confirmed via the `boost::detail::sp_counted_impl_p<TimerEntry_t>` RTTI chain). docs/zone/combat-timers.md §3.
+    /// A no-op without a ranged hand (the action is only offered for one, `hud_special.rs::sync_equipment`).
+    pub fn start_reload_bar(&mut self, own: i32) {
         if let Some(item) = self.arms.attack_slots(own).iter().filter_map(|&s| self.arms.slot_item(own, s)).find(|i| i.ammo != -1) {
-            self.reload_bar = Some((0.0, super::combat::arms::item_round_seconds(item, stats)));
+            self.reload_bar = Some((0.0, item.recharge as f32 / 100.0));
         }
     }
 
     /// `(progress 0..1, total seconds)` of the open Reload bar, if any.
     pub fn reload_bar_progress(&self) -> Option<(f32, f32)> {
         self.reload_bar.map(|(elapsed, total)| ((elapsed / total).min(1.0), total))
+    }
+
+    /// `(progress 0..1, total seconds)` of the own character's active nano cast, for the HUD "Nano program" timer
+    /// bar (`TimerSystemModule_t::StartTimerBar` kind 3). Trigger and duration are both the already-ported
+    /// `CastNanoSpellIIR_t` apply / [`nano_cast_delay`] (GC `FUN_10051754`, confirmed caller of the apply at GC
+    /// 0x10072306 matching `dynel.rs`'s own documented `CastNanoSpellIIR_t` apply address; its tail constructs the
+    /// `TimerEntry_t` through the same `FUN_1003d7ce` chain as Reload). `None` while not casting, once released
+    /// (the effect already fired) or for an instant cast (duration 0, no bar in retail). docs/zone/combat-timers.md §4.
+    pub fn nano_bar_progress(&self, own: i32) -> Option<(f32, f32)> {
+        self.casting.iter().find(|c| c.who == own && !c.instant && !c.released && c.total > 0.0)
+            .map(|c| ((1.0 - c.remaining / c.total).clamp(0.0, 1.0), c.total))
     }
 
     /// `FUN_1006a9c5` selects a special clip but retains the slot's previous flags and damage.
@@ -1731,7 +1750,7 @@ impl Dynels {
             let remaining = nano_cast_delay(template.stat(0x126).unwrap_or(200), template.stat(0x20b).unwrap_or(1_234_567_890), stat(who, 0x95).unwrap_or(0), stat(who, 0x33).unwrap_or(0), template.stat(0).unwrap_or(1));
             let instant = template.stat(0).unwrap_or(1) & 0x80000 != 0;
             let release_anim = template.stat(if target == who { 0x17a } else { 0x179 }).unwrap_or(if target == who { 202 } else { 201 }) as u32;
-            self.casting.push(NanoCast { who, spell: cast.spell, target, handle: 0, remaining, release_anim, released: instant, release_seen: false, done: false, instant, finish_enabled: !instant || cast.flag, start_effect: if instant || self.nano_effect_categories & 4 == 0 { 49999 } else { template.stat(0x1ac).unwrap_or(49999) }, finish: if !instant || cast.flag { [template.stat(0x19e).unwrap_or(49999), template.stat(0x169).unwrap_or(49999)] } else { [49999; 2] } });
+            self.casting.push(NanoCast { who, spell: cast.spell, target, handle: 0, remaining, total: remaining, release_anim, released: instant, release_seen: false, done: false, instant, finish_enabled: !instant || cast.flag, start_effect: if instant || self.nano_effect_categories & 4 == 0 { 49999 } else { template.stat(0x1ac).unwrap_or(49999) }, finish: if !instant || cast.flag { [template.stat(0x19e).unwrap_or(49999), template.stat(0x169).unwrap_or(49999)] } else { [49999; 2] } });
             if !instant {
                 self.nano_sound(cast.spell, 0x10d, (who, own_pos), 0.2, 0.6);
                 let animation = template.stat(0x178).unwrap_or(203) as u32;
@@ -3110,7 +3129,7 @@ mod tests {
         assert_eq!(world.nano_visuals.len(), 2);
         assert_eq!(world.nano_casts.len(), 2);
         world.own = 42;
-        world.casting.push(NanoCast { who: 42, spell: 163449, target: 43, handle: 0, remaining: 2.0, finish: [49999; 2], release_anim: 201, released: false, release_seen: false, done: false, instant: false, finish_enabled: true, start_effect: 49999 });
+        world.casting.push(NanoCast { who: 42, spell: 163449, target: 43, handle: 0, remaining: 2.0, total: 2.0, finish: [49999; 2], release_anim: 201, released: false, release_seen: false, done: false, instant: false, finish_enabled: true, start_effect: 49999 });
         world.cancel_nano_visuals(43);
         assert!(world.casting.is_empty(), "target disappearance ends the caster's loop even without an effect renderer");
         assert_eq!(world.take_nano_animations(), [None]);
@@ -3956,8 +3975,9 @@ mod tests {
         assert!(d.attack_bar_progress(own, &stats).is_empty());
         // Reload: the ranged hand (AmmoType present) starts a bar and it clears once elapsed reaches its total
         assert!(d.reload_bar_progress().is_none());
-        d.start_reload_bar(own, &stats);
+        d.start_reload_bar(own);
         let (p0, reload_total) = d.reload_bar_progress().expect("a ranged hand is wielded");
+        assert_eq!(reload_total, 5.0, "raw RechargeDelay (stat 0xd2 = 500) / 100, no initiative scaling, no AttackDelay sum");
         assert_eq!(p0, 0.0);
         d.update_attack_bars(own, false, reload_total * 0.5);
         let (half, _) = d.reload_bar_progress().unwrap();
