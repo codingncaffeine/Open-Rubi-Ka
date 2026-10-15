@@ -843,7 +843,8 @@ impl Play {
                 Bg::GroundTextures(..) => {}
             }
         }
-        while let Some(ev) = self.fake_events.pop_front().or_else(|| self.session.as_ref().and_then(|s| s.poll())) {
+        while let Some((ev, replayed)) = self.fake_events.pop_front().map(|ev| (ev, true))
+            .or_else(|| self.session.as_ref().and_then(|s| s.poll()).map(|ev| (ev, false))) {
             if self.screen == Screen::Create && self.create_session_event(&ev, host) {
                 continue;
             }
@@ -880,7 +881,7 @@ impl Play {
                     self.awaiting_alive = false;
                     self.fight_reset();
                     self.interact_reset();
-                    let mut chat = chat::Chat::new();
+                    let mut chat = chat::Chat::new(!self.fake && !replayed);
                     if let Some((u, p)) = &self.login_cred {
                         chat.set_credentials(u, p);
                     }

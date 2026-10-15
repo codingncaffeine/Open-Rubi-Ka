@@ -727,7 +727,7 @@ fn root_chat_options_survive_restart_and_apply_live() {
     }
     assert_eq!(WinPrefs::from_dvalues(&restored), expected);
     let Some((mut gui, _)) = rig((1280, 800)) else { return };
-    let mut hub = super::super::Chat::new();
+    let mut hub = super::super::Chat::new(false);
     hub.set_prefs(&mut gui, &mut restored);
     assert!(!hub.warn_unsub);
     assert_eq!(hub.invite_action, super::super::social::InviteAction::Decline);

@@ -3,6 +3,19 @@
 Code: `crates/ao-net/src/chat.rs` (codec, `ChatSession`), probe `crates/ao-net/examples/chat_probe.rs`, app side `crates/aomac/src/play/chat/net.rs`.
 Captures: `docs/captures/chat_login_ithaca.rec` (live login of "Aomacvolk", username redacted, login key redacted).
 
+Fixture safety: `Play::pump` distinguishes queued fixture/replay events from session events. A queued `ZoneHandoff` or
+`--fake-charlist` creates the chat UI with networking disabled; `ChatNet::connect` returns before address resolution,
+attempt counting or socket creation, including retries. Session-sourced production handoffs retain networking, as do
+the explicit loopback `ChatNet`/`ChatSession` tests. Direct test-only chat hubs also disable networking.
+
+Credential audit (2026-10-15): the fixture path leaves `login_cred` absent, so the former accidental chat session submitted
+an empty username/password challenge response plus the captured character identity. The reported `LoggedIn` therefore
+means the server accepted that submission; no captured cookie is consumed by the chat login path. Server-side validation
+policy cannot be established from this client trace. The zone capture authentication fields are already length-preserving
+redactions (including both cookies in `zone_newchar_ithaca.rec`); chat capture usernames are repeated-byte placeholders and
+their challenge responses are masked. No replayable credential was found in those authentication fields, and no capture
+rewrite was needed. Capture parser tests retain their original framing and field lengths.
+
 ## Where the client does it
 
 * The zone server sends system message **0x43** right after the 0x7F control frame (docs/zone/misc.md §15): `i32 n; n x { i32 len; host; i32 port; f32 }`

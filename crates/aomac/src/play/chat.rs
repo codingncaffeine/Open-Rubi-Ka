@@ -169,8 +169,8 @@ fn ident_id(g: &str) -> Option<u64> {
 
 impl Chat {
     /// Created at the zone hand-off (the chat connection starts with the zone's 0x43 message); windows come with [`open`](Self::open).
-    pub fn new() -> Self {
-        let mut net = net::ChatNet::default();
+    pub fn new(network_enabled: bool) -> Self {
+        let mut net = net::ChatNet::new(network_enabled);
         net.set_trace(std::env::var_os("AOMAC_CHAT_TRACE").map(Into::into));
         let warn_unsub = true;
         let invite_action = social::InviteAction::Dialog;
@@ -1211,7 +1211,7 @@ mod tests {
         let mut gui = Gui::new(&client, None).unwrap();
         let texts = TextDb::load(&client).unwrap();
         let zone = Zone::default();
-        let mut c = Chat::new();
+        let mut c = Chat::new(false);
         c.afk_frame(&mut gui, 179.0, &zone, &texts, true);
         assert!(c.afk.is_none());
         c.afk_frame(&mut gui, 1.0, &zone, &texts, true);
@@ -1261,7 +1261,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         super::super::prefs::set_test_dir(&dir);
         let mut gui = Gui::new(&client, None).unwrap();
-        let mut c = Chat::new();
+        let mut c = Chat::new(false);
         c.open(&mut gui, (1280, 800), None).unwrap();
         let (zone, texts) = (Zone::default(), TextDb::load(&client).unwrap());
         let press = |c: &mut Chat, gui: &mut Gui, key: Key, mods: Modifiers, f: &crate::play::options::keys::FixedKeys| {

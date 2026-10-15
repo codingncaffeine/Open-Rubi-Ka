@@ -67,6 +67,8 @@ fn rotates(tries: u32, entries: usize) -> bool {
 #[derive(Default)]
 pub struct ChatNet {
     session: Option<ChatSession>,
+    /// Fixture/replay hubs still process chat events, but must never create a socket.
+    network_enabled: bool,
     /// The 0x43 server list (`ChatGUIModule_c+0x20`, 0x24-byte entries); the front entry is the one in use.
     servers: std::collections::VecDeque<(String, u16)>,
     user: String,
@@ -89,6 +91,10 @@ pub struct ChatNet {
 }
 
 impl ChatNet {
+    pub fn new(network_enabled: bool) -> Self {
+        Self { network_enabled, ..Self::default() }
+    }
+
     /// `cPlayerName` / `cPlayerPasswd` of the original, kept in memory for the chat login only.
     pub fn set_credentials(&mut self, user: &str, password: &str) {
         self.user = user.to_owned();
@@ -137,6 +143,9 @@ impl ChatNet {
     }
 
     fn connect(&mut self) -> Option<Out> {
+        if !self.network_enabled {
+            return None;
+        }
         if rotates(self.attempts, self.servers.len()) {
             self.servers.rotate_left(1);
         }
@@ -375,6 +384,35 @@ impl ChatNet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_never_connects_and_live_chat_still_connects_to_loopback() {
+        use std::net::{Ipv4Addr, TcpListener};
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = [
+            &1i32.to_be_bytes()[..], &9i32.to_be_bytes(), b"127.0.0.1",
+            &i32::from(port).to_be_bytes(), &0f32.to_be_bytes(),
+        ].concat();
+        let frame = Frame::system(1, 0, 0, 0x43, &body);
+        for enabled in [false, true] {
+            let mut net = ChatNet::new(enabled);
+            net.on_system_frame(&frame, 33512);
+            for _ in 0..3 {
+                net.update(60.0);
+            }
+            assert_eq!(net.attempts, u32::from(enabled));
+            assert_eq!(net.session.is_some(), enabled);
+            match listener.accept() {
+                Ok(_) => assert!(enabled, "replay created an outbound socket"),
+                Err(error) => {
+                    assert!(!enabled);
+                    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                }
+            }
+        }
+    }
 
     #[test]
     fn backoff_matches_client() {

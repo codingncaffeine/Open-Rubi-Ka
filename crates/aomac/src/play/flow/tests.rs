@@ -101,7 +101,7 @@ fn escape_info_mode_is_close_only_text_suppresses_and_dialogs_broadcast() {
     r.p.screen = Screen::InWorld;
     // Mirror the real first-world transition (Play::frame): login's editor no longer owns TextInputMode.
     r.p.gui.clear_focus();
-    r.p.chat = Some(super::super::chat::Chat::new());
+    r.p.chat = Some(super::super::chat::Chat::new(false));
     r.p.hud = Some(super::super::hud::Hud::new(&mut r.p.gui, &r.p.dir, (1280, 800)).unwrap());
     let selected = ao_net::msg::Identity { kind: 50000, instance: 77 };
     let esc = || InputEvent::Key { key: Key::Escape, pressed: true, mods: ao_gui::Modifiers::default() };
@@ -128,7 +128,7 @@ fn escape_info_mode_is_close_only_text_suppresses_and_dialogs_broadcast() {
 fn character_info_first_response_and_refresh_use_current_packet_stats() {
     let Some(mut r) = rig() else { return };
     r.p.zone = zone::Zone::new(42);
-    r.p.chat = Some(super::super::chat::Chat::new());
+    r.p.chat = Some(super::super::chat::Chat::new(false));
     r.p.chat.as_mut().unwrap().show_url(&mut r.p.gui, &r.p.zone, &r.p.text, "charid://50000/77");
     let window = r.p.gui.window_ids().into_iter().find(|&w| r.p.gui.view_names(w).iter().any(|name| name == "BrowserView")).unwrap();
     assert!(r.p.gui.text(window, "BrowserView").contains("Transferring information"));
@@ -174,7 +174,7 @@ fn stat_xp_feedback_uses_old_value_before_dispatch_applies_update() {
         ao_net::n3::outgoing::n3_frame(0, 42, w.0)
     };
     r.event(LoginEvent::ZoneFrame(stat_frame(100)));
-    r.p.chat = Some(super::super::chat::Chat::new());
+    r.p.chat = Some(super::super::chat::Chat::new(false));
     r.event(LoginEvent::ZoneFrame(stat_frame(137)));
     assert_eq!(r.p.zone.stat(52), Some(137));
     let lines = r.p.chat.as_ref().unwrap().pending_log_lines().collect::<Vec<_>>();
@@ -195,7 +195,7 @@ fn captured_health_damage_applies_before_same_batch_stat_feedback() {
     });
     r.p.zone.stats.insert(27, 46);
     r.p.zone.character_stats.entry(own as i32).or_default().insert(27, 46);
-    r.p.chat = Some(super::super::chat::Chat::new());
+    r.p.chat = Some(super::super::chat::Chat::new(false));
     let frames = captured(include_str!("../../../../../docs/captures/health_damage_stat_clamp.rec"));
     assert_eq!(frames.len(), 3);
     // One pump consumes the entire real incoming batch, without a frame/tick sync.
@@ -284,6 +284,28 @@ impl Rig {
     fn event(&mut self, ev: LoginEvent) {
         self.p.fake_events.push_back(ev);
         self.p.pump(&mut self.host);
+    }
+}
+
+#[test]
+fn fixture_handoffs_never_start_chat_connections() {
+    let Some(mut r) = rig() else { return };
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = [
+        &1i32.to_be_bytes()[..], &9i32.to_be_bytes(), b"127.0.0.1",
+        &i32::from(port).to_be_bytes(), &0f32.to_be_bytes(),
+    ].concat();
+    for fake in [false, true] {
+        r.p.fake = fake;
+        r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+        r.event(LoginEvent::ZoneFrame(ao_net::frame::Frame::system(1, 0, 0, 0x43, &body)));
+        for _ in 0..3 {
+            r.p.chat.as_mut().unwrap().update(&mut r.p.gui, 60.0, &r.p.text);
+        }
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock,
+            "fixture/replay handoff opened a chat socket");
     }
 }
 
