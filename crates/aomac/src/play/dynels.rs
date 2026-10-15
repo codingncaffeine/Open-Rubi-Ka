@@ -1066,6 +1066,23 @@ fn quat_yaw(q: &[f32; 4]) -> f32 {
 }
 
 impl Dynels {
+    /// Model readiness and per-instance triangles of actually skinned remote CAT bodies in the headless input fixture.
+    #[cfg(test)]
+    pub(super) fn cpu_benchmark_scene(&self) -> (bool, usize) {
+        let mut keys = self.chars.iter().filter(|(id, _)| **id != self.own)
+            .map(|(_, c)| c.next.unwrap_or(c.key))
+            .chain(self.props.values().map(|p| p.key));
+        let ready = self.want_placed.is_none()
+            && keys.all(|key| matches!(self.models.get(&key), Some(Model::Ready { .. })));
+        let triangles = self.chars.iter().filter(|(id, _)| **id != self.own).filter_map(|(_, c)| {
+            c.current_skin.as_ref()?;
+            c.bounds?;
+            let Model::Ready { built, .. } = self.models.get(&c.key)? else { return None };
+            Some(built.rig.as_ref()?.body_triangles().count())
+        }).sum();
+        (ready, triangles)
+    }
+
     pub fn character_template_stat(&self, id: i32, stat: u32) -> Option<i32> {
         let c = self.chars.get(&id)?;
         let Model::Ready { built, .. } = self.models.get(&c.key)? else { return None };

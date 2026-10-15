@@ -191,6 +191,178 @@ The actual dispatch probe passed on 2026-10-15: independent delivery **44.041 µ
 default-main callback still pending after **59.526583 ms**. This measures the
 queue-delivery dependency directly, not a retail or hardware-camera latency.
 
+### LMB versus RMB differential audit (2026-10-15)
+
+The user's later observation is **RMB turning is instant; only LMB orbit feels
+delayed**. Shared callback queues, presentation and cursor locking cannot by
+themselves explain that difference. The paths were compared rather than adding
+a second mouse backend or changing sensitivity:
+
+| Stage | LMB | RMB | Headless delay / loss |
+|---|---|---|---|
+| `Play::input` → `Player::mouse` | GUI ownership checked on press | same ownership check | No timer or redraw dependency |
+| `Controls::on_mouse_button` | pending `Look::Camera` | pending `Look::Turn` | Capture requested synchronously |
+| `Controls::on_mouse_motion` | `CamCmd::Orbit` | `MouseTurn` and `CamCmd::Pitch` | First report activates **and applies itself**; no pixel/time threshold |
+| Release classification | accumulated counts / 1000 compared with 0.02 | same | Release-only click decision; no motion held for classification |
+| Raw collection / cursor locking | same `State::set_look` / `RawMouse` | same | No LMB-only frame-late activation or grab |
+| Camera application | camera heading/vehicle orbit | avatar heading immediately; camera pitch uses the same rotation helper | Mode 2 manual orbit incorrectly entered passive camera steering |
+| Render | `flush_mouse` precedes `Frontend::frame` | same | Next eligible frame; not an extra LMB frame |
+
+Fresh retail decompiles: GUI `0x1002c2ee`, `0x1002c09b`, `0x1002c17b`,
+`0x1002c469`; Gamecode `0x10015f91`; N3 `0x1002118c`, `0x1001f537`.
+N3 `0x1002118c` computes a manual orbit from the **actual vehicle position**
+and calls `Vehicle_t::SetRelPos` for every third-person camera vehicle, including
+the damped fixed camera (mode 2). Its passive `SteeringCamArrive` is not an input
+smoothing filter. The port previously moved the actual vehicle only in chase
+mode 1; mode 2 changed its desired heading and waited for passive steering.
+Mode 3 already used the complete new heading on the first rendered frame, with
+radial-only return after occlusion. First-person also directly adds the angle.
+There is no evidence supporting removal of retail passive camera following.
+
+The fixed mode-2 path directly orbits the vehicle, and while resting stores
+the resulting actual offset so passive following cannot steer back to its
+pre-orbit target. Passive velocity, zoom and collision handling remain intact.
+`manual_orbit_has_no_deadzone_first_delta_loss_or_angular_smoothing_in_any_mode`
+replays the old target-only operation alongside the corrected command: one
+count (0.01 rad) on a resting 5 m boom produces old yaw **0** versus corrected
+yaw **0.01 rad** at the first 16 ms update. The old displacement is below
+`SteeringArrive`'s 0.1 m stopping radius, so a small first movement could be lost
+indefinitely rather than merely delayed one frame. Larger inputs were filtered
+through passive acceleration. This is a runnable deterministic comparison, not
+a measurement of the user's selected camera mode.
+
+`mouse_first_frame_timeline_across_camera_modes` routes real frontend presses
+and counts through all four camera modes, comparing LMB, Ctrl+RMB (the same
+camera-orbit command) and normal RMB. It checks synchronous capture, a complete
+first count, accumulated early counts and all-mode release-before-redraw.
+Normal RMB's first movement starts its movement state; its next report turns
+the heading. That existing retail movement FSM is not an LMB classifier.
+
+The complete release trace found two additional LMB defects:
+
+* First-person `EndLook` incorrectly routed its accumulated heading through
+  `Movement::mouse_turn`, whose retail RMB-start branch deliberately discards
+  its first horizontal delta and subsequently clamps turning speed. The view
+  therefore snapped back when the button was released. Retail Gamecode
+  `0x10019597` instead sends `MovementChanged(0x16, fmod(heading, 2π))`;
+  `0x10018b5c`, `0x1006b84b` and `0x1006ba23` establish the SYNC forward-update
+  transfer and wire order. `sync_camera_look` now emits that single SYNC with
+  pre-transfer rotation, applies the complete signed heading locally, and
+  rotates velocity without entering or clamping the RMB-start state.
+  `first_person_release_transfers_full_heading_once_without_mouse_turn_clamp`
+  covers stationary/running transfer, negative/wrapped angles, wire fields and
+  visual continuity.
+* The HUD separately classified world LMB releases using a 20-pixel cursor
+  path, despite Controls already classifying them from raw counts as retail
+  GUI `0x1002c469` does. A locked pointer need not move, so an orbit could
+  select the object beneath it on release. World selection now consumes only
+  the authoritative Controls click result and reuses interaction's merged hit
+  list; GUI target-dock/target-of-target clicks retain their GUI ownership.
+  This also removes duplicate world triangle picking on genuine click release.
+  Neither release defect is evidence of a delay before mode-3's first orbit.
+
+Native delivery still has an independent, shared limitation: reports that run
+before AppKit has delivered the press and `set_active(true)` are not retained.
+It affects both buttons, not just LMB, and synthetic frontend timelines cannot
+measure its physical occurrence or justify replaying pre-press pointer motion.
+Likewise native/AppKit deduplication's 100 ms grace intentionally discards fallback
+duplicates; it is not an LMB threshold.
+
+winit 0.30.13's macOS `window_delegate.rs:1123–1135` locks either button
+with `CGAssociateMouseAndMouseCursorPosition(false)` and unlocks with `true`;
+it does not warp or set an event-suppression interval. Its separate
+`set_cursor_position` implementation warps then reassociates, but the viewer
+never calls it. AppKit `mouseDown:`/`rightMouseDown:` and
+`mouseDragged:`/`rightMouseDragged:` route through the same winit helpers;
+there is no LMB-specific drag recognizer. The reported 250 ms warp-suppression
+default therefore cannot be assigned to this no-warp path as a measured delay.
+No deprecated `CGSetLocalEventsSuppressionInterval` call was added:
+the installed SDK marks it “No longer supported” since macOS 10.6. The supported
+`CGEventSourceSetLocalEventsSuppressionInterval` configures synthetic event
+sources, not an extra event source in this physical GCMouse path. See
+[Apple's suppression API](https://developer.apple.com/documentation/coregraphics/cgsetlocaleventssuppressioninterval(_:)).
+Real-window verification is needed to establish any association-side physical
+event suppression; the identical RMB grab is retained as the responsive control.
+
+The configured surface uses `AutoVsync` (unless the user disables it) and
+`desired_maximum_frame_latency = 1` (two Metal drawables, the platform minimum).
+A 16 ms synthetic redraw clock with press at 0 ms and motion at 1 ms therefore
+has its first eligible rendered camera update at 16 ms: 0 ms classifier delay
+and 15 ms redraw quantization. These are deterministic model times, not measured
+hardware-to-photon latency. Physical button-to-AppKit delivery, GCMouse versus
+AppKit ordering, cursor-lock suppression on the installed macOS version, GPU
+queue/compositor timing and the user's selected camera mode require a permitted
+real-window/hardware check. No window or HID injection was used for this audit.
+
+**Measured busy ICC CPU audit:** `mode3_icc_press_cpu_benchmark` replays
+`zone_ithaca.rec` as Testy in pf 4582 at 5120×1440, camera mode 3, outside GUI
+ownership. The real loaded scene had **65 remote characters, 31 posed pick
+bodies, 16,246 posed remote-body triangles and 6,026 submitted actor entries**.
+`BoundingBoxTargeting=0` is set through the actual DValue consumer and checked
+after frames; setting only the derived zone flag would be overwritten by prefs.
+The first LMB press after scene loading, before input warmups, took
+**22.125 µs thread CPU / 22.708 µs wall time**; its first delta frame took
+**1.277 ms CPU / 1.277 ms wall** and changed camera yaw by **0.009986639 rad**
+(the complete nominal 0.01 rad within f32/look-at error).
+
+Actual scopes in `Play::input`, **µs CPU median / p95**, 20 discarded warmups,
+200 measured samples per button:
+
+| Scope | LMB | RMB |
+|---|---:|---:|
+| Prelude / AFK activity | 0.417 / 0.667 | 0.416 / 0.834 |
+| GUI ownership (`wants_mouse`) | 2.583 / 3.208 | 2.584 / 3.125 |
+| `Player::mouse` | 0.125 / 0.250 | 0.125 / 0.250 |
+| `interact_mouse` | 0.125 / 0.125 | 0.125 / 0.125 |
+| Chat / screen dispatch | 0.167 / 0.334 | 0.167 / 0.375 |
+| HUD / click dispatch | 4.875 / 5.625 | 3.959 / 4.584 |
+| GUI input / event dispatch | 6.917 / 8.000 | 7.958 / 8.750 |
+| Full press, recorder disabled | 14.666 / 18.417 | 14.708 / 17.541 |
+| Full press wall time, recorder disabled | 14.875 / 18.917 | 14.959 / 17.958 |
+| Baseline `Play::frame` | 805.750 / 1345.708 | 793.334 / 957.792 |
+| First press+delta `Play::frame` | 798.958 / 1327.125 | 786.584 / 959.792 |
+
+Uninstrumented full-press wall maxima were **36.083 µs LMB / 22.375 µs RMB**;
+first press-frame wall maxima were **1.542 ms / 1.043 ms**. No 30–100 ms LMB
+press stall was reproduced. The frame/press CPU scopes exclude GPU rendering,
+native AppKit delivery, cursor association and asset-worker CPU; wall scopes
+include blocking on the measured thread, not window/compositor latency.
+Normal RMB receives its retail START event plus a subsequent count before the
+same eligible frame; the report does not pretend START itself turns the view.
+
+`populated_icc_left_mouse_down_does_not_pick_native_triangles` first aims a
+positive-control query through a real posed body to prove the native triangle
+counter is exercised, then asserts LMB down issues **zero** triangle queries.
+The source agrees: interaction picks on classified release/item drop, not
+press; target-dock press work is GUI rectangles; cursor hover picking exits
+before any ray test while `host.look` is true. There is no press-side picker to
+move to release. Isolated measured picker scopes cost **5.209 µs** for one
+versus **10.250 µs** for two calls (medians): this models the removed duplicate
+release work, **not** an old full-input timing measurement.
+
+A second headless run was profiled with `sample <test-pid> 1 1`: sampling
+succeeded, the benchmark passed, and sampled frame stacks included remote
+pose/surface alignment and collision work rather than a sustained press-handler
+stall. Under sampling the uninstrumented LMB/RMB press CPU medians were
+16.916/15.708 µs; these are a separate instrumented run, not the table above.
+No native input, real window, desktop capture or live session was used.
+
+Final headless verification: `cargo test --release --workspace -j 2` passed
+**1,912 tests** (62 ignored); strict
+`cargo clippy --release --workspace --all-targets -j 2 -- -D warnings` passed.
+The populated-scene zero-press-pick regression, first-person transfer regression,
+all-mode synthetic timeline and raw-click classification regressions are included.
+The ignored CPU benchmark and the standalone synthetic before/after command were
+also exercised successfully; no real-device timing is implied by these gates.
+
+**Remaining user symptom:** the saved login configuration selects mode 3,
+which already passes immediate-first-count regression. Fixing mode 2 and release
+bugs does **not** establish the cause of the user's mode-3 slight delay.
+The actual headless CPU audit rules out the proposed scene-picking/GUI press
+stall for this populated capture; native physical delivery/grab/display timing
+remains unmeasured and must not be reported as fixed.
+
+
 ### Drag release ordering (bug 6)
 
 **[RE]** GUI `0x1002c17b` activates pending look through `0x1002c09b` and

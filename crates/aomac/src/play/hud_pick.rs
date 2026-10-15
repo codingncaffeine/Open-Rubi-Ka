@@ -26,6 +26,17 @@
 
 use ao_render::Vec3;
 
+#[cfg(test)]
+thread_local! {
+    static TRIANGLE_PICK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts native triangle-query entries, including broad-phase misses, on this test thread.
+#[cfg(test)]
+pub(super) fn triangle_pick_calls() -> usize {
+    TRIANGLE_PICK_CALLS.with(std::cell::Cell::get)
+}
+
 /// A pickable character: the model-space box of its current pose and the actor transform (`ActorFrame::transform`, scene space).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PickBody {
@@ -113,6 +124,8 @@ impl PickBody {
     /// randy31 0x10056786: bounds broad phase, then the first front-facing triangle
     /// in native index order. Mounted heads/weapons are separate meshes, not body triangles.
     pub fn hit_triangles(&self, origin: Vec3, dir: Vec3, max_len: f32, vertices: &[ao_scene::Vertex], triangles: impl IntoIterator<Item = [usize; 3]>) -> Option<f32> {
+        #[cfg(test)]
+        TRIANGLE_PICK_CALLS.with(|calls| calls.set(calls.get() + 1));
         self.hit(origin, dir, max_len)?;
         let (origin, dir, length) = self.model_ray(origin, dir, max_len)?;
         for indices in triangles {

@@ -1109,6 +1109,8 @@ impl Frontend for Play {
     }
 
     fn input(&mut self, ev: InputEvent, host: &mut Host) {
+        #[cfg(test)]
+        let mut input_timing = tests::InputTiming::start();
         if let Some(hud) = self.hud.as_ref() {
             if let Some(chat) = self.chat.as_mut() { chat.configure_escape(&hud.dvalues); }
             if let Some(interact) = self.interact.as_mut() { interact.configure_escape(&hud.dvalues); }
@@ -1120,14 +1122,23 @@ impl Frontend for Play {
             }
         }
         let open = self.game_input_open();
+        #[cfg(test)]
+        tests::InputTiming::mark(&mut input_timing, 0);
         if let (Screen::InWorld, Some(p)) = (self.screen, self.player.as_mut()) {
             if let InputEvent::MouseDown { x, y, .. } | InputEvent::MouseUp { x, y, .. } | InputEvent::Wheel { x, y, .. } = ev {
                 if open || matches!(ev, InputEvent::MouseUp { .. }) {
-                    p.mouse(&ev, self.gui.wants_mouse(x, y), host);
+                    let wants_mouse = self.gui.wants_mouse(x, y);
+                    #[cfg(test)]
+                    tests::InputTiming::mark(&mut input_timing, 1);
+                    p.mouse(&ev, wants_mouse, host);
                 }
             }
         }
+        #[cfg(test)]
+        tests::InputTiming::mark(&mut input_timing, 2);
         self.interact_mouse(&ev, host);
+        #[cfg(test)]
+        tests::InputTiming::mark(&mut input_timing, 3);
         match (self.screen, &ev) {
             (Screen::Loading, _) => return, // full-screen InvisibleButton swallows input
             (Screen::Create, _) if self.create_input(&ev, host) => return,
@@ -1164,8 +1175,10 @@ impl Frontend for Play {
         if self.screen == Screen::InWorld && self.chat.as_mut().is_some_and(|c| c.input(&mut self.gui, &ev, &self.zone, &self.text, fixed)) {
             return;
         }
+        #[cfg(test)]
+        tests::InputTiming::mark(&mut input_timing, 4);
         if let Some(h) = self.hud.as_mut() {
-            h.input(&mut self.gui, &mut self.zone, self.player.as_ref(), &ev, &host.camera, &host.lens.unwrap_or_default(), host.mods);
+            h.input(&mut self.gui, &mut self.zone, self.player.as_ref(), &ev, host.mods);
             // CTRL / ALT + left click on a character: select (done) and `N3Msg_SwitchTarget` (`FUN_1002c469`)
             let clicked = h.take_click();
             if let (Some(id), Some(p)) = (clicked, self.player.as_ref()) {
@@ -1183,6 +1196,8 @@ impl Frontend for Play {
                 return;
             }
         }
+        #[cfg(test)]
+        tests::InputTiming::mark(&mut input_timing, 5);
         for e in self.gui.input(ev) {
             if self.chat.as_mut().is_some_and(|c| c.event(&mut self.gui, &e, &self.zone, &self.text)) {
                 continue;
@@ -1195,6 +1210,8 @@ impl Frontend for Play {
             }
             self.handle(e, host);
         }
+        #[cfg(test)]
+        tests::InputTiming::mark(&mut input_timing, 6);
     }
 
     fn game_input(&mut self, ev: ao_render::GameInput, host: &mut Host) {

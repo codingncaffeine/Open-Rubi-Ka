@@ -464,13 +464,13 @@ impl Player {
                 Cmd::ToggleWalk => self.movement.toggle_run(self.clock),
                 Cmd::Camera(cc) => {
                     if let Some(turn) = self.camera.apply(&cc) {
-                        self.movement.mouse_turn(turn, 0.0, self.clock);
+                        self.movement.sync_camera_look(turn, self.clock);
                         self.movement.end_mouse_look(self.clock);
                     } else if cc == CamCmd::EndLook {
                         self.movement.end_mouse_look(self.clock);
                     }
                 }
-                // selection clicks are the HUD's (`Hud::input`); item pick-up has no consumer yet
+                // Controls-classified world clicks are consumed by `Play::interact_mouse`; item pick-up has no consumer yet.
                 // attack / sit / special attacks belong to the combat layer (`combat::Module`, run by the flow)
                 Cmd::Attack | Cmd::SwitchTarget | Cmd::Sit | Cmd::Special(_) => self.game.push(c),
                 Cmd::Click(b) => self.clicks.push(b),

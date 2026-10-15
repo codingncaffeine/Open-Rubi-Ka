@@ -755,6 +755,16 @@ impl Hud {
         self.click.take()
     }
 
+    /// Only `Controls::Cmd::Click` authorizes a world release (`FUN_1002c469`, raw-count path <= 0.02).
+    pub(super) fn world_click(&mut self, zone: &mut Zone, list: &[ao_net::msg::Identity], mods: ao_gui::Modifiers) {
+        match self.target.click_identities(zone, list, mods) {
+            Some(super::hud_target::WorldClick::Select(id)) => self.click = Some(id),
+            Some(super::hud_target::WorldClick::Info(id)) => self.target.info = Some(id),
+            Some(super::hud_target::WorldClick::ObjectInfo(id)) => self.help_urls.push(format!("itemid://{}/{}", id.kind, id.instance)),
+            None => {}
+        }
+    }
+
     /// The character a Shift + click asked the info page of since the last call (`ShowURL("charid://50000/<id>")`, hud_target.rs).
     pub(super) fn take_info(&mut self) -> Option<i32> {
         self.target.info.take()
@@ -1062,8 +1072,7 @@ impl Hud {
     }
 
     /// Mouse-down outside an open sub menu closes it (the original's popup menus lose focus).
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn input(&mut self, gui: &mut Gui, zone: &mut Zone, player: Option<&super::player::Player>, ev: &InputEvent, cam: &ao_render::Camera, lens: &ao_scene::Lens, mods: ao_gui::Modifiers) {
+    pub(super) fn input(&mut self, gui: &mut Gui, zone: &mut Zone, player: Option<&super::player::Player>, ev: &InputEvent, mods: ao_gui::Modifiers) {
         self.target_ncu.input(gui, ev, mods);
         self.winb.raid_bar_input(gui, ev, &self.dvalues);
         for s in &mut self.shortcuts {
@@ -1106,15 +1115,8 @@ impl Hud {
             let payload = ao_net::n3::outgoing::set_stat(zone.char_id as i32, ao_net::n3::outgoing::STAT_AGG_DEF, v);
             self.outbox.push(ao_net::n3::outgoing::n3_frame(0, zone.char_id, payload));
         }
-        // target docks, world click-to-select (hud_target.rs) and the Tab target keys
-        if let Some(pos) = self.target.input(gui, zone, player, ev) {
-            match self.target.world_click(zone, player, cam, lens, self.size, pos, mods) {
-                Some(super::hud_target::WorldClick::Select(id)) => self.click = Some(id),
-                Some(super::hud_target::WorldClick::Info(id)) => self.target.info = Some(id),
-                Some(super::hud_target::WorldClick::ObjectInfo(id)) => self.help_urls.push(format!("itemid://{}/{}", id.kind, id.instance)),
-                None => {}
-            }
-        }
+        // Target docks own GUI presses independently of the world camera's release classification.
+        self.target.input(gui, zone, player, ev);
         if std::mem::take(&mut self.target.attack) {
             self.uses.push(SlotUse::SpecialAction(0xb));
         }
@@ -1808,14 +1810,12 @@ mod tests {
         let mut hud = Hud::new(&mut gui, &dir, (1280, 800)).unwrap();
         let mut zone = Zone::new(123);
         let ev = InputEvent::Key { key: ao_gui::Key::Escape, pressed: true, mods: ao_gui::Modifiers::default() };
-        let cam = ao_render::Camera::look_at(glam::Vec3::ZERO, -glam::Vec3::Z);
-        let lens = ao_scene::Lens::default();
         for close in [true, false] {
             hud.close_kind(&mut gui, WindowKind::Character);
             hud.dvalues.set_i64("esc_wear", i64::from(close));
             hud.open(&mut gui, WindowKind::Character);
             zone.set_target(Some(ao_net::msg::Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: 456 }));
-            hud.input(&mut gui, &mut zone, None, &ev, &cam, &lens, ao_gui::Modifiers::default());
+            hud.input(&mut gui, &mut zone, None, &ev, ao_gui::Modifiers::default());
             assert_eq!(zone.selected_target(), None);
             assert_eq!(hud.is_open(WindowKind::Character), !close);
         }
@@ -1824,7 +1824,7 @@ mod tests {
         assert!(gui.text_focused());
         let selected = ao_net::msg::Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: 456 };
         zone.set_target(Some(selected));
-        hud.input(&mut gui, &mut zone, None, &ev, &cam, &lens, ao_gui::Modifiers::default());
+        hud.input(&mut gui, &mut zone, None, &ev, ao_gui::Modifiers::default());
         assert_eq!(zone.selected_target(), Some(selected));
         assert!(hud.is_open(WindowKind::Character));
     }
@@ -2060,7 +2060,7 @@ mod tests {
             &self.gui
         }
         fn input(&mut self, ev: InputEvent, host: &mut Host) {
-            self.hud.input(&mut self.gui, &mut self.zone, None, &ev, &host.camera, &host.lens.unwrap_or_default(), host.mods);
+            self.hud.input(&mut self.gui, &mut self.zone, None, &ev, host.mods);
             for e in self.gui.input(ev) {
                 self.hud.event(&mut self.gui, &e, &self.zone);
             }
@@ -2434,8 +2434,7 @@ mod tests {
 
     /// One input event through the HUD and the GUI, like `Shot::input`.
     fn send(s: &mut Shot, ev: InputEvent) {
-        let cam = ao_render::Camera::look_at(glam::Vec3::ZERO, -glam::Vec3::Z);
-        s.hud.input(&mut s.gui, &mut s.zone, None, &ev, &cam, &ao_scene::Lens::default(), Default::default());
+        s.hud.input(&mut s.gui, &mut s.zone, None, &ev, Default::default());
         for e in s.gui.input(ev) {
             s.hud.event(&mut s.gui, &e, &s.zone);
         }

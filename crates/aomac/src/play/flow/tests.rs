@@ -4,6 +4,268 @@ use super::*;
 use std::net::{Ipv4Addr, TcpListener};
 use std::time::{Duration, Instant};
 
+// POSIX thread CPU time excludes descheduling and the background asset workers.
+// These probes are test-only; production input contains no clocks or recorder.
+fn input_cpu_now() -> Duration {
+    #[repr(C)]
+    struct Timespec { seconds: std::os::raw::c_long, nanos: std::os::raw::c_long }
+    unsafe extern "C" {
+        fn clock_gettime(clock: std::os::raw::c_int, time: *mut Timespec) -> std::os::raw::c_int;
+    }
+    let mut time = Timespec { seconds: 0, nanos: 0 };
+    let clock = if cfg!(target_os = "macos") { 16 } else { 3 }; // Darwin / Linux CLOCK_THREAD_CPUTIME_ID
+    // SAFETY: clock_gettime writes the supplied native timespec, which remains live for the call.
+    assert_eq!(unsafe { clock_gettime(clock, &mut time) }, 0);
+    Duration::new(time.seconds as u64, time.nanos as u32)
+}
+
+thread_local! {
+    static INPUT_TIMING: std::cell::Cell<Option<[Duration; 7]>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) struct InputTiming {
+    last: Duration,
+    stages: [Duration; 7],
+}
+
+impl InputTiming {
+    pub(super) fn start() -> Option<Self> {
+        INPUT_TIMING.with(|slot| slot.get().map(|_| Self { last: input_cpu_now(), stages: [Duration::ZERO; 7] }))
+    }
+
+    pub(super) fn mark(timer: &mut Option<Self>, index: usize) {
+        if let Some(timer) = timer {
+            let now = input_cpu_now();
+            timer.stages[index] += now - timer.last;
+            timer.last = now;
+        }
+    }
+}
+
+impl Drop for InputTiming {
+    fn drop(&mut self) {
+        INPUT_TIMING.with(|slot| slot.set(Some(self.stages)));
+    }
+}
+
+fn populated_icc_press_rig() -> Option<Rig> {
+    let mut r = rig()?;
+    let size = (5120, 1440);
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 25988 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_ithaca.rec")));
+    r.enter();
+    r.p.player.as_mut().expect("captured Testy player").select_camera_mode(3);
+    // Play::frame derives the live picker flag from this preference every frame.
+    r.p.hud.as_mut().expect("ICC HUD").dvalues.set_i64("BoundingBoxTargeting", 0);
+    assert!(r.p.zone.dynels.len() > 50, "requires the populated ICC capture");
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        r.p.frame(0.016, size, &mut r.host);
+        if r.p.zone.world.cpu_benchmark_scene().0 { break; }
+        assert!(Instant::now() < deadline, "ICC actor models did not finish loading");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for _ in 0..60 { r.p.frame(0.016, size, &mut r.host); }
+    assert!(r.p.zone.triangle_targeting, "native triangle targeting must survive Play::frame preference refresh");
+    let bodies = r.p.zone.world.pick_bodies(r.p.zone.char_id as i32);
+    let (_, posed_triangles) = r.p.zone.world.cpu_benchmark_scene();
+    eprintln!("ICC picker fixture: remote_chars={} posed_pick_bodies={} posed_remote_body_triangles={posed_triangles} native_triangles={}",
+        r.p.zone.world.chars.len(), bodies.len(), r.p.zone.triangle_targeting);
+    assert!(posed_triangles > 0, "requires real skinned remote CAT bodies, not only loaded templates");
+    Some(r)
+}
+
+#[test]
+fn populated_icc_left_mouse_down_does_not_pick_native_triangles() {
+    let Some(mut r) = populated_icc_press_rig() else { return };
+    let (x, y, button) = (2560.0, 720.0, ao_gui::MouseButton::Left);
+    assert!(!r.p.gui.wants_mouse(x, y) && r.p.game_input_open());
+    assert!(r.p.zone.world.cpu_benchmark_scene().1 > 0, "real triangle bodies must be loaded");
+    let before = super::super::hud_pick::triangle_pick_calls();
+    for body in r.p.zone.world.pick_bodies(r.p.zone.char_id as i32).into_iter()
+        .filter(|body| body.id != r.p.zone.char_id as i32) {
+        let local = (glam::Vec3::from(body.bounds.0) + glam::Vec3::from(body.bounds.1)) * (0.5 * body.scale);
+        let centre = glam::Vec3::from(body.pos) + glam::Quat::from_rotation_y(body.yaw) * local;
+        let camera = ao_render::Camera::look_at(centre + glam::Vec3::Z * 3.0, centre);
+        let ray = super::super::hud_target::pick_ray(&camera, &r.host.lens.unwrap_or_default(),
+            (5120.0, 1440.0), (x, y));
+        std::hint::black_box(super::super::interact_use::pick_objects(&ray, &r.p.zone, r.p.player.as_ref()));
+        if super::super::hud_pick::triangle_pick_calls() > before { break; }
+    }
+    assert!(super::super::hud_pick::triangle_pick_calls() > before,
+        "aiming through loaded remote body centres must exercise native triangle queries");
+    let before = super::super::hud_pick::triangle_pick_calls();
+    r.p.input(InputEvent::MouseDown { x, y, button }, &mut r.host);
+    assert_eq!(super::super::hud_pick::triangle_pick_calls(), before,
+        "LMB press must only arm camera capture, not pick triangles");
+    assert!(r.host.look);
+    r.p.game_input(ao_render::GameInput::MouseMotion { dx: 10.0, dy: 0.0, dt: 0.016 }, &mut r.host);
+    r.p.input(InputEvent::MouseUp { x, y, button }, &mut r.host);
+}
+
+/// Actual CPU scopes, not a callback scheduler model, GPU time, or OS event latency.
+#[test]
+#[ignore = "loads real ICC assets and prints warmed thread-CPU distributions"]
+fn mode3_icc_press_cpu_benchmark() {
+    let mut r = populated_icc_press_rig().expect("CPU benchmark requires the installed client assets");
+    let size = (5120, 1440);
+    let (x, y) = (2560.0, 720.0);
+    let (_, triangles) = r.p.zone.world.cpu_benchmark_scene();
+    let owns_mouse = r.p.gui.wants_mouse(x, y);
+    eprintln!("ICC zone_ithaca.rec Testy mode=3 dynels={} actors={} posed_remote_body_triangles={} native_triangles={} gui_owns_mouse={owns_mouse} text_focused={} input_open={}",
+        r.p.zone.dynels.len(), r.host.actors.len(), triangles, r.p.zone.triangle_targeting,
+        r.p.gui.text_focused(), r.p.game_input_open());
+    assert!(triangles > 0 && !r.host.actors.is_empty());
+    assert!(!owns_mouse && r.p.game_input_open(), "press must reach the world");
+
+    fn report(name: &str, samples: &mut [Duration]) {
+        samples.sort_unstable();
+        let n = samples.len();
+        let us = |d: Duration| d.as_secs_f64() * 1e6;
+        eprintln!("{name}: n={n} median={:.3}us p95={:.3}us max={:.3}us sum={:.3}us",
+            us(samples[n / 2]), us(samples[(n * 95).div_ceil(100) - 1]), us(samples[n - 1]),
+            us(samples.iter().copied().sum()));
+    }
+
+    const WARM: usize = 20;
+    const SAMPLES: usize = 200;
+    let names = ["prelude", "Gui.wants_mouse", "Player.mouse", "interact_mouse",
+        "chat.input+screen_dispatch", "Hud.input+click_dispatch", "Gui.input+event_dispatch"];
+    // First button press after scene loading, before any input warmups: catches
+    // one-off input cache stalls. This is not a cold process or unloaded scene.
+    let button = ao_gui::MouseButton::Left;
+    INPUT_TIMING.with(|slot| slot.set(Some([Duration::ZERO; 7])));
+    let wall = Instant::now();
+    let cpu = input_cpu_now();
+    r.p.input(InputEvent::MouseDown { x, y, button }, &mut r.host);
+    let press_cpu = input_cpu_now() - cpu;
+    let press_wall = wall.elapsed();
+    let recorded = INPUT_TIMING.with(|slot| slot.replace(None)).unwrap();
+    eprintln!("FIRST LMB press before input warmups: threadCPU={:.3}us wall={:.3}us",
+        press_cpu.as_secs_f64() * 1e6, press_wall.as_secs_f64() * 1e6);
+    for (name, elapsed) in names.iter().zip(recorded) {
+        eprintln!("FIRST LMB {name}: threadCPU={:.3}us", elapsed.as_secs_f64() * 1e6);
+    }
+    assert!(r.host.look);
+    let camera_before = r.host.camera.yaw;
+    r.p.game_input(ao_render::GameInput::MouseMotion { dx: 1.0, dy: 0.0, dt: 0.016 }, &mut r.host);
+    let wall = Instant::now();
+    let cpu = input_cpu_now();
+    r.p.frame(0.016, size, &mut r.host);
+    let frame_cpu = input_cpu_now() - cpu;
+    let frame_wall = wall.elapsed();
+    let turn = (r.host.camera.yaw - camera_before + std::f32::consts::PI)
+        .rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+    assert!((turn - 0.01).abs() < 1e-4, "first LMB count must orbit in its first frame");
+    eprintln!("FIRST LMB press+delta frame: threadCPU={:.3}us wall={:.3}us turn={turn}",
+        frame_cpu.as_secs_f64() * 1e6, frame_wall.as_secs_f64() * 1e6);
+    r.p.game_input(ao_render::GameInput::MouseMotion { dx: -11.0, dy: 0.0, dt: 0.016 }, &mut r.host);
+    r.p.input(InputEvent::MouseUp { x, y, button }, &mut r.host);
+    r.p.frame(0.016, size, &mut r.host);
+    for button in [ao_gui::MouseButton::Left, ao_gui::MouseButton::Right] {
+        let mut press = Vec::with_capacity(SAMPLES);
+        let mut stages: [Vec<Duration>; 7] = std::array::from_fn(|_| Vec::with_capacity(SAMPLES));
+        let mut first_frame = Vec::with_capacity(SAMPLES);
+        let mut baseline = Vec::with_capacity(SAMPLES);
+        let mut release = Vec::with_capacity(SAMPLES);
+        let mut plain_press = Vec::with_capacity(SAMPLES);
+        let mut click_release = Vec::with_capacity(SAMPLES);
+        let mut press_wall_samples = Vec::with_capacity(SAMPLES);
+        let mut plain_press_wall_samples = Vec::with_capacity(SAMPLES);
+        let mut frame_wall_samples = Vec::with_capacity(SAMPLES);
+        let mut baseline_wall_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..WARM + SAMPLES {
+            let wall = Instant::now();
+            let before = input_cpu_now();
+            r.p.frame(0.016, size, &mut r.host);
+            let baseline_cpu = input_cpu_now() - before;
+            let baseline_wall = wall.elapsed();
+            INPUT_TIMING.with(|slot| slot.set(Some([Duration::ZERO; 7])));
+            let wall = Instant::now();
+            let before = input_cpu_now();
+            r.p.input(InputEvent::MouseDown { x, y, button }, &mut r.host);
+            let press_cpu = input_cpu_now() - before;
+            let press_wall = wall.elapsed();
+            let recorded = INPUT_TIMING.with(|slot| slot.replace(None)).unwrap();
+            assert!(r.host.look, "{button:?} press must capture in input");
+            // Alternate direction to keep the warmed scene/camera local rather than orbiting around ICC.
+            let delta = if sample % 2 == 0 { 1.0 } else { -1.0 };
+            let camera_before = r.host.camera.yaw;
+            r.p.game_input(ao_render::GameInput::MouseMotion { dx: delta, dy: 0.0, dt: 0.016 }, &mut r.host);
+            if button == ao_gui::MouseButton::Right {
+                // Retail RMB START discards its delta; the next event is movement.
+                // Deliver that event before the same first frame, not after a redraw.
+                r.p.game_input(ao_render::GameInput::MouseMotion { dx: delta, dy: 0.0, dt: 0.016 }, &mut r.host);
+            }
+            let wall = Instant::now();
+            let before = input_cpu_now();
+            r.p.frame(0.016, size, &mut r.host);
+            let frame_cpu = input_cpu_now() - before;
+            let frame_wall = wall.elapsed();
+            let turn = (r.host.camera.yaw - camera_before + std::f32::consts::PI)
+                .rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+            assert!((turn - 0.01 * delta).abs() < 1e-4,
+                "{button:?} movement after START must affect the same first frame; turn={turn}");
+            // Make this a drag so repeated releases do not select/use nearby NPCs.
+            r.p.game_input(ao_render::GameInput::MouseMotion { dx: 10.0 * delta, dy: 0.0, dt: 0.016 }, &mut r.host);
+            let before = input_cpu_now();
+            r.p.input(InputEvent::MouseUp { x, y, button }, &mut r.host);
+            let release_cpu = input_cpu_now() - before;
+            assert!(!r.host.look);
+            r.p.frame(0.016, size, &mut r.host);
+            let wall = Instant::now();
+            let before = input_cpu_now();
+            r.p.input(InputEvent::MouseDown { x, y, button }, &mut r.host);
+            let plain_press_cpu = input_cpu_now() - before;
+            let plain_press_wall = wall.elapsed();
+            let before = input_cpu_now();
+            r.p.input(InputEvent::MouseUp { x, y, button }, &mut r.host);
+            let click_cpu = input_cpu_now() - before;
+            if sample >= WARM {
+                press.push(press_cpu);
+                for (samples, elapsed) in stages.iter_mut().zip(recorded) { samples.push(elapsed); }
+                first_frame.push(frame_cpu);
+                baseline.push(baseline_cpu);
+                release.push(release_cpu);
+                plain_press.push(plain_press_cpu);
+                click_release.push(click_cpu);
+                press_wall_samples.push(press_wall);
+                plain_press_wall_samples.push(plain_press_wall);
+                frame_wall_samples.push(frame_wall);
+                baseline_wall_samples.push(baseline_wall);
+            }
+        }
+        eprintln!("{button:?}: {WARM} discarded warmups; LMB=one count, RMB=START then one count before same first frame; dt=16ms; no GPU/window");
+        report("full Play::input MouseDown (stage recorder enabled)", &mut press);
+        report("full Play::input MouseDown (stage recorder disabled)", &mut plain_press);
+        for (name, samples) in names.iter().zip(&mut stages) { report(name, samples); }
+        report("baseline Play::frame", &mut baseline);
+        report("first press+delta Play::frame", &mut first_frame);
+        report("full Play::input drag MouseUp (not click picking)", &mut release);
+        report("full Play::input click MouseUp (one authoritative pick)", &mut click_release);
+        report("WALL full Play::input MouseDown (stage recorder enabled)", &mut press_wall_samples);
+        report("WALL full Play::input MouseDown (stage recorder disabled)", &mut plain_press_wall_samples);
+        report("WALL baseline Play::frame", &mut baseline_wall_samples);
+        report("WALL first press+delta Play::frame", &mut frame_wall_samples);
+    }
+    // Isolated native picker scopes model only the removed duplicate computation;
+    // they are NOT measured old Play::input or end-to-end before/after latency.
+    let ray = super::super::hud_target::pick_ray(&r.host.camera, &r.host.lens.unwrap_or_default(),
+        (size.0 as f32, size.1 as f32), (x, y));
+    for count in [1, 2] {
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..WARM + SAMPLES {
+            let before = input_cpu_now();
+            for _ in 0..count {
+                std::hint::black_box(super::super::interact_use::pick_objects(&ray, &r.p.zone, r.p.player.as_ref()));
+            }
+            let elapsed = input_cpu_now() - before;
+            if sample >= WARM { samples.push(elapsed); }
+        }
+        report(&format!("MODELED release native pick_objects x{count}, not old full input"), &mut samples);
+    }
+}
+
 #[test]
 fn nano_audio_logs_oneshots_and_refusals_not_successful_rearms() {
     assert!(log_nano_sound(0.0, &[11]));
@@ -836,6 +1098,44 @@ fn mouse_look_captures_before_the_next_frame_not_after() {
     assert!(turned.abs() > 0.5 && turned.abs() < 1.5, "turned {turned} rad without an intervening frame() before the first motion");
 }
 
+/// Cursor capture freezes absolute pointer coordinates: only Controls' raw-count
+/// release result may select the character under that unchanged pointer.
+#[test]
+fn world_lmb_release_uses_raw_click_classification_not_frozen_cursor_pixels() {
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    r.enter();
+    r.p.player.as_mut().unwrap().select_camera_mode(3);
+    let size = (1280, 800);
+    for _ in 0..30 { r.p.frame(0.016, size, &mut r.host); }
+    // Use the actual posed character from the capture, with the retail
+    // BoundingBoxTargeting preference, rather than a fabricated picking result.
+    r.p.zone.triangle_targeting = false;
+    let body = r.p.zone.world.pick_bodies(r.p.zone.char_id as i32).into_iter()
+        .find(|b| b.id == r.p.zone.char_id as i32).expect("third-person own body is pickable");
+    let local = (glam::Vec3::from(body.bounds.0) + glam::Vec3::from(body.bounds.1)) * (0.5 * body.scale);
+    let centre = glam::Vec3::from(body.pos) + glam::Quat::from_rotation_y(body.yaw) * local;
+    r.host.camera = ao_render::Camera::look_at(centre + glam::Vec3::Z * 3.0, centre);
+    let (x, y, button) = (640.0, 400.0, ao_gui::MouseButton::Left);
+    assert!(!r.p.gui.wants_mouse(x, y));
+    let ray = super::super::hud_target::pick_ray(&r.host.camera, &r.host.lens.unwrap_or_default(), (1280.0, 800.0), (x, y));
+    let under = super::super::interact_use::pick_objects(&ray, &r.p.zone, r.p.player.as_ref())[0];
+    assert_eq!(under.kind, ao_net::n3::outgoing::DYNEL_CHAR);
+    for (raw_counts, selects) in [(21.0, false), (1.0, true), (0.0, true)] {
+        r.p.zone.set_target(None);
+        r.p.input(InputEvent::MouseDown { x, y, button }, &mut r.host);
+        assert!(r.host.look);
+        if raw_counts != 0.0 {
+            r.p.game_input(ao_render::GameInput::MouseMotion { dx: raw_counts, dy: 0.0, dt: 0.016 }, &mut r.host);
+        }
+        // No MouseMove and no redraw: the real locked-cursor release ordering.
+        r.p.input(InputEvent::MouseUp { x, y, button }, &mut r.host);
+        assert!(!r.host.look);
+        assert_eq!(r.p.zone.selected_target(), selects.then_some(under), "{raw_counts} raw counts");
+    }
+}
+
 /// Viewer release ordering: flush queued raw counts, then dispatch MouseUp,
 /// without a redraw between the press and release. A tiny delta still orbits;
 /// the 0.02 threshold classifies only the eventual click, never look activation.
@@ -923,6 +1223,87 @@ fn lmb_press_to_first_orbit_before_and_after_native_queue_backlog() {
         assert_eq!(r.p.zone.own().unwrap().yaw, avatar, "orbit must not turn the avatar");
         r.p.input(ao_gui::InputEvent::MouseUp { x, y, button }, &mut r.host);
         assert!(!r.host.look);
+    }
+}
+
+/// Synthetic event times, not measured native latency: press at 0 ms, one count at
+/// 1 ms, first redraw at 16 ms. Compare capture and the actual camera/heading consumers.
+#[test]
+fn mouse_first_frame_timeline_across_camera_modes() {
+    let size = (5120, 1440);
+    let (x, y) = (2560.0, 720.0);
+    let angle = |a: f32, b: f32| (a - b + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+    let motion = |r: &mut Rig, dx| {
+        // `dt` is the host frame duration, not the synthetic event timestamp.
+        r.p.game_input(ao_render::GameInput::MouseMotion { dx, dy: 0.0, dt: 0.016 }, &mut r.host);
+    };
+    for mode in 0..=3 {
+        let Some(mut r) = rig() else { return };
+        r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+        r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+        r.enter();
+        r.p.player.as_mut().unwrap().select_camera_mode(mode);
+        assert_eq!(r.p.player.as_ref().unwrap().camera_mode(), mode);
+        for _ in 0..120 { r.p.frame(0.016, size, &mut r.host); }
+        assert!(!r.p.gui.wants_mouse(x, y));
+
+        // Retail RMB's first movement starts the turn; its next movement changes
+        // heading. Mode 1's chase camera need not follow that heading immediately.
+        let button = ao_gui::MouseButton::Right;
+        let yaw0 = r.p.zone.own().unwrap().yaw.unwrap_or(0.0);
+        r.p.input(InputEvent::MouseDown { x, y, button }, &mut r.host); // t=0
+        assert!(r.host.look, "mode {mode}: RMB captures at t=0 before a frame");
+        motion(&mut r, 1.0); // t=1
+        r.p.frame(0.016, size, &mut r.host); // t=16
+        let started = angle(r.p.zone.own().unwrap().yaw.unwrap_or(0.0), yaw0);
+        assert!(started.abs() < 1e-4, "mode {mode}: initial RMB delta starts the turn");
+        motion(&mut r, 2.0); // t=17
+        r.p.frame(0.016, size, &mut r.host); // t=32
+        let turned = angle(r.p.zone.own().unwrap().yaw.unwrap_or(0.0), yaw0);
+        eprintln!("synthetic mode={mode} RMB capture=0ms delta=1ms frame16_heading={started:.6} delta=17ms frame32_heading={turned:.6} rad");
+        assert!((turned - 0.02).abs() < 1e-4, "mode {mode}: next RMB delta turns on its first eligible frame");
+        r.p.input(InputEvent::MouseUp { x, y, button }, &mut r.host);
+        assert!(!r.host.look);
+
+        for (label, button, ctrl) in [
+            ("LMB", ao_gui::MouseButton::Left, false),
+            ("Ctrl+RMB", ao_gui::MouseButton::Right, true),
+        ] {
+            for _ in 0..120 { r.p.frame(0.016, size, &mut r.host); }
+            if ctrl {
+                r.p.game_input(ao_render::GameInput::Key { code: ao_render::KeyCode::ControlLeft, pressed: true, repeat: false }, &mut r.host);
+            }
+            let camera0 = r.host.camera.yaw;
+            let yaw0 = r.p.zone.own().unwrap().yaw.unwrap_or(0.0);
+            r.p.input(InputEvent::MouseDown { x, y, button }, &mut r.host); // t=0
+            assert!(r.host.look, "mode {mode}: {label} captures at t=0 before a frame");
+            motion(&mut r, 1.0); // t=1, below the click-classification threshold
+            r.p.frame(0.016, size, &mut r.host); // t=16
+            let first = angle(r.host.camera.yaw, camera0);
+            eprintln!("synthetic mode={mode} {label} capture=0ms delta=1ms frame16_camera={first:.6} rad");
+            assert!((first - 0.01).abs() < 1e-4, "mode {mode}: {label} applies the full first count without a threshold or delay");
+            assert!(angle(r.p.zone.own().unwrap().yaw.unwrap_or(0.0), yaw0).abs() < 1e-4);
+            r.p.input(InputEvent::MouseUp { x, y, button }, &mut r.host);
+            assert!(!r.host.look);
+
+            // A second drag starts, delivers several early deltas and releases
+            // entirely between redraws, including first-person EndLook's heading transfer.
+            for _ in 0..120 { r.p.frame(0.016, size, &mut r.host); }
+            let camera0 = r.host.camera.yaw;
+            r.p.input(InputEvent::MouseDown { x, y, button }, &mut r.host); // t=0
+            assert!(r.host.look);
+            for dx in [1.0, 2.0, 3.0] { motion(&mut r, dx); } // t=1,2,3
+            r.p.input(InputEvent::MouseUp { x, y, button }, &mut r.host); // t=4
+            assert!(!r.host.look);
+            r.p.frame(0.016, size, &mut r.host); // t=16
+            let total = angle(r.host.camera.yaw, camera0);
+            eprintln!("synthetic mode={mode} {label} deltas=1,2,3ms release=4ms frame16_camera={total:.6} rad");
+            assert!((total - 0.06).abs() < 1e-4, "mode {mode}: {label} loses none of the early counts");
+            if ctrl {
+                r.p.game_input(ao_render::GameInput::Key { code: ao_render::KeyCode::ControlLeft, pressed: false, repeat: false }, &mut r.host);
+            }
+            r.p.player.as_mut().unwrap().take_clicks();
+        }
     }
 }
 

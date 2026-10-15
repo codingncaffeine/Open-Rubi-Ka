@@ -158,6 +158,11 @@ impl Play {
         let list = pick_objects(&ray, &self.zone, self.player.as_ref());
         let target = self.zone.selected_target();
         let Some(id) = target.filter(|t| list.contains(t)).or_else(|| list.first().copied()) else { return };
+        if button == MouseButton::Left {
+            if let Some(h) = self.hud.as_mut() {
+                h.world_click(&mut self.zone, &list, host.mods);
+            }
+        }
         let (now, zone) = (self.time, &self.zone);
         let Some(i) = self.interact.as_mut() else { return };
         match button {

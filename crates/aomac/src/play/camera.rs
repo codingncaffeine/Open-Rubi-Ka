@@ -376,6 +376,8 @@ pub struct Camera3p {
     prev_view: bool,
     /// The look target of the last frame (what an orbit of the vehicle swings about).
     pivot: Vec3,
+    /// Avatar heading at the last pivot sample, for storing a vehicle orbit in avatar space.
+    avatar_yaw: f32,
     /// Seconds the camera has been blind (`n3Camera_t +0x178`).
     blind_time: f32,
     /// `DAT_1005c87c` of `FUN_10020bdb`: the no-bob camera is following the head.
@@ -417,6 +419,7 @@ impl Camera3p {
             views: None,
             prev_view: false,
             pivot: Vec3::ZERO,
+            avatar_yaw: 0.0,
             blind_time: 0.0,
             no_bob_following: false,
         }
@@ -512,9 +515,9 @@ impl Camera3p {
             CamCmd::PrevView => self.prev_view = true,
             CamCmd::EndLook => {
                 if self.first_person {
-                    let turn = self.fp_yaw.rem_euclid(2.0 * PI);
+                    let turn = self.fp_yaw % (2.0 * PI);
                     self.fp_yaw = 0.0;
-                    return Some(if turn > PI { turn - 2.0 * PI } else { turn });
+                    return Some(turn);
                 }
             }
         }
@@ -547,15 +550,15 @@ impl Camera3p {
         } else {
             self.yaw_off += dx;
             self.elev = (self.elev + dy).clamp(-MAX_ELEVATION_SIN.asin(), MAX_ELEVATION_SIN.asin());
-            if self.mode == 1 {
+            if self.mode != 3 {
                 self.orbit_vehicle(dx, dy);
             }
         }
     }
 
-    /// `FUN_1002118c` @N3 0x1002118c for the plain chase camera (modes != 3 place the vehicle directly): the camera swings about
-    /// the look target by `dx` about the vertical and `dy` of elevation (refused when it would pass `|sin| > 0.9999`); when
-    /// the vehicle is (nearly) at rest (`< 0.02`, `_DAT_1003e2e0`) `Update` + `ForcedUpdate` then store the new distance.
+    /// `FUN_1002118c` @N3 0x1002118c for modes 1/2: `SetRelPos` moves the actual vehicle before passive steering.
+    /// The camera swings about the look target by `dx` about the vertical and `dy` of elevation (refused when it would pass
+    /// `|sin| > 0.9999`); at rest (`< 0.02`, `_DAT_1003e2e0`) `Update` + `ForcedUpdate` store the new offset/distance.
     fn orbit_vehicle(&mut self, dx: f32, dy: f32) {
         let off = self.vehicle.pos - self.pivot;
         let len = off.length();
@@ -572,6 +575,13 @@ impl Camera3p {
             self.vehicle.dist = len;
         }
         self.vehicle.pos = self.pivot + Vec3::new(x * k, len * el.sin(), z * k);
+        if self.mode == 2 && self.vehicle.vel.length() < ORBIT_REST_SPEED {
+            // The fixed vehicle's event update keeps the new actual offset, not the old desired heading.
+            // Rebase at rest so an orbit after passive following/occlusion cannot steer back on the next frame.
+            self.yaw_off = (-x).atan2(z) - self.avatar_yaw;
+            self.elev = el;
+            self.dist = len;
+        }
     }
 
     /// `n3Camera_t` wheel handler (N3 @0x100200ef): `ZoomSpeed / 10` metres per notch, accumulated; scrolling the
@@ -659,6 +669,7 @@ impl Camera3p {
         let local = Vec3::new(self.head_local.x, self.pivot_height, self.head_local.z);
         let pivot = feet + glam::Quat::from_rotation_y(super::zone::scene_yaw(avatar_yaw)) * local;
         self.pivot = pivot;
+        self.avatar_yaw = avatar_yaw;
         if self.first_person {
             return Camera { pos: pivot, yaw: avatar_yaw + self.fp_yaw, pitch: -self.fp_pitch, roll: 0.0 };
         }
@@ -977,6 +988,103 @@ mod tests {
         let mut c = Camera3p::new(&ControlPrefs { rmb_mouse_look_3rd: false, ..Default::default() }, Some(Vec3::Y * 1.5));
         c.apply(&CamCmd::Pitch { dy: 0.2 });
         assert!(near(c.orbit().1, DEFAULT_DIRECTION[1].asin()));
+    }
+
+    #[test]
+    fn manual_orbit_has_no_deadzone_first_delta_loss_or_angular_smoothing_in_any_mode() {
+        let mut old = cam();
+        let mut fixed = cam();
+        old.select_mode(2);
+        fixed.select_mode(2);
+        old.update([0.0; 3], 0.0, 0.016);
+        fixed.update([0.0; 3], 0.0, 0.016);
+        // Original mode-2 Orbit changed only the desired heading, leaving the actual vehicle untouched.
+        old.yaw_off += 0.01;
+        fixed.apply(&CamCmd::Orbit { dx: 0.01, dy: 0.0 });
+        let before = old.update([0.0; 3], 0.0, 0.016);
+        let after = fixed.update([0.0; 3], 0.0, 0.016);
+        assert!(before.yaw.abs() < 1e-6, "sub-0.1 m displacement is halted by arrive_step");
+        assert!((after.yaw - 0.01).abs() < 1e-6);
+        println!("mode2 first delta=0.01 rad at 1ms, update=16ms: target-only yaw={:.8}, direct-vehicle yaw={:.8}", before.yaw, after.yaw);
+        for mode in 0..=3 {
+            for delta in [0.0001, 0.01, 0.3] {
+                for dt in [0.001, 0.016, 0.1] {
+                    let mut c = cam();
+                    c.select_mode(mode);
+                    let before = c.update([0.0; 3], 0.0, 0.016);
+                    // Camera-level counterpart of press t=0, first count t=1 ms, render t=16 ms:
+                    // commands already contain the complete sensitivity-scaled angular delta.
+                    c.apply(&CamCmd::Orbit { dx: delta, dy: delta });
+                    if mode == 1 || mode == 2 {
+                        let immediate = Camera::look_at(c.vehicle.pos, c.pivot);
+                        assert!((immediate.yaw - before.yaw - delta).abs() < 1e-6, "mode {mode}");
+                        assert!((immediate.pitch - before.pitch + delta).abs() < 1e-6, "mode {mode}");
+                    }
+                    for _ in 0..3 {
+                        let eye = c.update([0.0; 3], 0.0, dt);
+                        assert!((eye.yaw - before.yaw - delta).abs() < 1e-6, "mode {mode}, delta {delta}, dt {dt}");
+                        assert!((eye.pitch - before.pitch + delta).abs() < 1e-6, "mode {mode}, delta {delta}, dt {dt}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn left_and_right_drag_pitch_move_the_same_camera_immediately_in_each_mode() {
+        for mode in 0..=3 {
+            let mut left = cam();
+            let mut right = cam();
+            left.select_mode(mode);
+            right.select_mode(mode);
+            left.update([0.0; 3], 0.0, 0.016);
+            right.update([0.0; 3], 0.0, 0.016);
+            left.apply(&CamCmd::Orbit { dx: 0.0, dy: 0.01 });
+            right.apply(&CamCmd::Pitch { dy: 0.01 });
+            for _ in 0..3 {
+                let l = left.update([0.0; 3], 0.0, 0.016);
+                let r = right.update([0.0; 3], 0.0, 0.016);
+                assert!((l.pos - r.pos).length() < 1e-6, "mode {mode}");
+                assert_eq!((l.yaw, l.pitch), (r.yaw, r.pitch), "mode {mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn damped_manual_orbit_rebases_actual_resting_offset_without_snapback() {
+        let mut c = cam();
+        c.select_mode(2);
+        c.update([0.0; 3], 0.7, 0.016);
+        // An actual eye displaced from the desired boom, as after passive following or occlusion.
+        let off = Vec3::new(-0.4_f32.sin(), 0.2, 0.4_f32.cos()).normalize() * 2.0;
+        c.vehicle.snap(c.pivot + off);
+        let before = Camera::look_at(c.vehicle.pos, c.pivot);
+        c.apply(&CamCmd::Orbit { dx: 0.3, dy: 0.1 });
+        let immediate = Camera::look_at(c.vehicle.pos, c.pivot);
+        assert!((immediate.yaw - before.yaw - 0.3).abs() < 1e-6);
+        assert!((immediate.pitch - before.pitch + 0.1).abs() < 1e-6);
+        assert!((c.dist - 2.0).abs() < 1e-6);
+        for _ in 0..120 {
+            let eye = c.update([0.0; 3], 0.7, 0.016);
+            assert!((eye.pos - immediate.pos).length() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn manual_orbit_preserves_moving_vehicle_velocity_and_passive_distance() {
+        for mode in [1, 2] {
+            let mut c = cam();
+            c.select_mode(mode);
+            c.update([0.0; 3], 0.0, 0.016);
+            c.vehicle.vel = Vec3::X;
+            c.vehicle.dist = 7.0;
+            let before = Camera::look_at(c.vehicle.pos, c.pivot);
+            c.apply(&CamCmd::Orbit { dx: 0.01, dy: 0.0 });
+            let immediate = Camera::look_at(c.vehicle.pos, c.pivot);
+            assert!((immediate.yaw - before.yaw - 0.01).abs() < 1e-6);
+            assert_eq!(c.vehicle.vel, Vec3::X);
+            assert_eq!(c.vehicle.dist, 7.0);
+        }
     }
 
     #[test]

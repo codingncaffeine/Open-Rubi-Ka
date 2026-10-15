@@ -840,6 +840,12 @@ impl Movement {
         self.movement_changed(action, 0.0, 0.0);
     }
 
+    /// `N3Msg_EndCameraMouseLook` [GC 0x10019597]: transfer the first-person camera offset with SYNC, not mouse steering.
+    pub fn sync_camera_look(&mut self, turn: f32, now: f32) {
+        self.sync_clock(now);
+        self.movement_changed(id::SYNC, turn, 0.0);
+    }
+
     /// Set the current host frame delta before dispatching its aggregated mouse input.
     pub fn set_mouse_frame_dt(&mut self, dt: f32) {
         self.mouse_frame_dt = dt;
@@ -1219,21 +1225,19 @@ impl Movement {
             };
         }
         if local {
-            // dynel->vtbl[0x74] = n3Dynel_t::VehicleForwardUpdate(zero, rot, dx, dy): the yaw part. While moving this calls
-            // `Vehicle_t::SetRelPosRot` (docs/zone/movement.md §3: "client+0xFC := 1"), not just `SetRelRot`: the rotation
-            // carries the velocity with it, the same as a keyboard turn while moving (`step`'s `in_turn` branch below
-            // rotates `vel`, the body then follows it through `OrientationMode 0`). Without this, `vel` keeps pointing at
-            // the pre-turn heading and every following physics tick's OrientationMode-0 sync (`step`, "the body faces the
-            // velocity") snaps `yaw` back towards it, fighting the mouse by up to the full turn every tick ("turning
-            // against a wall") whenever the character is moving under its own velocity (running/walking/swimming/flying).
-            self.yaw = wrap(self.yaw + f1);
-            self.look_dirty = true;
-            if self.vel != [0.0, 0.0] {
-                let (s, c) = f1.sin_cos();
-                self.vel = [self.vel[0] * c + self.vel[1] * s, -self.vel[0] * s + self.vel[1] * c];
-            }
+            self.apply_look(f1);
         } else {
             self.emit(action, f1, f2);
+        }
+    }
+
+    /// `n3Dynel_t::VehicleForwardUpdate` yaw: carry velocity with the rotation so OrientationMode 0 cannot undo it.
+    fn apply_look(&mut self, turn: f32) {
+        self.yaw = wrap(self.yaw + turn);
+        self.look_dirty = true;
+        if self.vel != [0.0, 0.0] {
+            let (s, c) = turn.sin_cos();
+            self.vel = [self.vel[0] * c + self.vel[1] * s, -self.vel[0] * s + self.vel[1] * c];
         }
     }
 
@@ -1255,7 +1259,10 @@ impl Movement {
             }
         }
         if feat & 6 != 0 && (feat & 4 != 0 || (8 < action && action < 15)) {
-            // action 0x16: VehicleForwardUpdate(pos, rot, 0, 0) changes nothing for the own, already placed dynel.
+            // FUN_1006b84b: SYNC applies its pose and look fields locally before the FSM transition.
+            if action == id::SYNC && f1 != 0.0 {
+                self.apply_look(f1);
+            }
             let gm_fly_ok = self.stats.gm_level & 1 != 0;
             if !(action == id::SWITCH_FLY && !gm_fly_ok) {
                 self.transition(action);
@@ -2350,6 +2357,44 @@ mod tests {
         m.mouse_turn(0.0, 0.0, 0.0);
         m.mouse_turn(1.0, 0.0, 1.0);
         assert!((m.yaw() - 1.0).abs() < 1e-6, "default TurnSpeed0 is unclamped");
+    }
+
+    #[test]
+    fn first_person_release_transfers_full_heading_once_without_mouse_turn_clamp() {
+        use super::super::{camera::Camera3p, controls::{CamCmd, ControlPrefs}};
+        use std::f32::consts::TAU;
+
+        for moving in [false, true] {
+            for offset in [0.4, -0.4, 4.0, -4.0, TAU + 0.7, -TAU - 0.7] {
+                let mut m = Movement::new([0.0; 3], 0.3, 0);
+                if moving {
+                    m.action(id::FORWARD_START, 0.0);
+                    run(&mut m, &Flat(0.0), 1.0);
+                }
+                m.take_outgoing();
+                m.stats.turn_speed = 1;
+                m.set_mouse_frame_dt(0.001);
+                let before = m.yaw();
+                let mut camera = Camera3p::new(&ControlPrefs { third_person: false, ..Default::default() }, None);
+                camera.apply(&CamCmd::Orbit { dx: offset, dy: 0.0 });
+                let visual = camera.update(m.pos(), m.yaw(), 0.0).yaw;
+                let turn = camera.apply(&CamCmd::EndLook).unwrap();
+                assert_eq!(turn, offset % TAU, "retail fmod preserves sign and angles beyond pi");
+                m.sync_camera_look(turn, 1.0);
+                m.end_mouse_look(1.0);
+                let out = m.take_outgoing();
+                assert_eq!(out.len(), 1, "release must not synthesize mouse-turn start/stop records");
+                assert_eq!(out[0].action, id::SYNC);
+                assert_eq!(out[0].look, [turn, 0.0]);
+                assert!((yaw_of(out[0].rot) - before).abs() < 1e-5, "wire pose precedes applying its look delta");
+                assert!(wrap(yaw_of(out[0].rot) + out[0].look[0] - m.yaw()).abs() < 1e-5);
+                let released = camera.update(m.pos(), m.yaw(), 0.0).yaw;
+                assert!(wrap(released - visual).abs() < 1e-5, "no visual heading jump on release");
+                assert!(m.update(0.016, &Flat(0.0)).is_empty(), "no duplicate release sync");
+                assert!(wrap(m.yaw() - visual).abs() < 1e-5, "moving velocity must retain the transferred heading");
+                assert_eq!(m.fsm().turn, 1);
+            }
+        }
     }
 
     #[test]

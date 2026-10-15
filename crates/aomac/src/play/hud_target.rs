@@ -25,10 +25,6 @@ use ao_net::n3::outgoing::DYNEL_CHAR;
 
 /// `GetLengthOfViewcone` (far − near) at the default view distance: 800 − 0.5 m (docs/formats.md, statel LOD).
 const VIEW_LENGTH: f32 = 799.5;
-/// Pointer path length (px) up to which a press and release on the world still is a click: `ActionViewMouseHandler_c`
-/// accumulates the mouse-look movement in `+0x1c` and `FUN_1002c469` requires it `< 0.02` (GUI `_DAT_101aeaf4`) in the units of
-/// `InputConfig_t::FrameProcess` (raw counts / 1000), i.e. 20 counts; counts and GUI pixels are taken as equal.
-const CLICK_PATH: f32 = 20.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Ray {
@@ -64,7 +60,7 @@ pub fn click_target<T: Copy + PartialEq>(list: &[T], current: Option<T>) -> Opti
     }
 }
 
-/// What a world click did ([`HudTarget::world_click`]).
+/// What a world click did ([`HudTarget::click_identities`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WorldClick {
     /// The character became the target.
@@ -318,9 +314,6 @@ pub(super) struct HudTarget {
     last: Option<Identity>,
     mouse: (f32, f32),
     pressed: Option<(bool, Part)>,
-    /// A left press on the world (not on the GUI) is pending: `(accumulated pointer path length, last position)`; the release
-    /// is a click while the path is within [`CLICK_PATH`] (`ActionViewMouseHandler_c` `+0x1c`).
-    world_down: Option<(f32, (f32, f32))>,
     /// The `Targetstarget` preference ("Show Target's Target", `LoginPrefs.xml`, default false): the hostile window shows the
     /// target-of-target button.
     pub(super) targets_target: bool,
@@ -345,7 +338,7 @@ fn esc(s: &str) -> String {
 impl HudTarget {
     /// Creates the two health-bar windows (`CCFriendlyHealthBar` / `CCHostileHealthBar`) and fills the control-centre target docks.
     pub(super) fn new(gui: &mut Gui, cc: WindowId, size: (u32, u32)) -> anyhow::Result<Self> {
-        let mut t = HudTarget { cc, size, bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], in_attack_range: false, last: None, mouse: (-1.0, -1.0), pressed: None, world_down: None, targets_target: false, bars_enabled: [true; 2], tot: None, tot_down: false, attack: false, info: None, tip_targets: vec![] };
+        let mut t = HudTarget { cc, size, bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], in_attack_range: false, last: None, mouse: (-1.0, -1.0), pressed: None, targets_target: false, bars_enabled: [true; 2], tot: None, tot_down: false, attack: false, info: None, tip_targets: vec![] };
         t.create_bars(gui)?;
         // `TargetHeader_c` 0x10073884 measures all four captions before clearing the initial text.
         let cap = ["Selection", "Nano Target", "Fighting Target", "Nano / Fighting", "Target"]
@@ -486,6 +479,7 @@ impl HudTarget {
     /// itself is selected, not the next one in the list, and the caller attacks it (`N3Msg_SwitchTarget` = `DefaultAttack(target,
     /// true)`, `flow.rs` via `Hud::take_click`). The right button and the double click (`N3Msg_DefaultActionOnDynel`) are
     /// `interact_play.rs`.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn world_click(&mut self, zone: &mut Zone, player: Option<&super::player::Player>, cam: &Camera, lens: &Lens, vp: (u32, u32), mouse: (f32, f32), mods: ao_gui::Modifiers) -> Option<WorldClick> {
         let ray = pick_ray(cam, lens, (vp.0 as f32, vp.1 as f32), mouse);
@@ -498,8 +492,8 @@ impl HudTarget {
         self.mouse
     }
 
-    /// [`HudTarget::world_click`] on a given hit list.
-    fn click_identities(&mut self, zone: &mut Zone, list: &[Identity], mods: ao_gui::Modifiers) -> Option<WorldClick> {
+    /// Apply a Controls-authorized world click to the merged hit list.
+    pub(super) fn click_identities(&mut self, zone: &mut Zone, list: &[Identity], mods: ao_gui::Modifiers) -> Option<WorldClick> {
         let current = zone.selected_target();
         let under = object_under(list, current)?;
         // GUI 0x1002c469 checks the character attack qualifier before the inspect qualifier.
@@ -518,44 +512,30 @@ impl HudTarget {
         self.click_identities(zone, &ids, mods)
     }
 
-    /// Raw mouse input before the GUI: dock buttons (hit-tested on their canvases) and world clicks. Returns `Some(pos)` when a
-    /// world click completed: the left press was on the world (the pointer not over the GUI) and the pointer travelled at most
-    /// [`CLICK_PATH`] up to the release.
-    pub(super) fn input(&mut self, gui: &Gui, zone: &mut Zone, player: Option<&super::player::Player>, ev: &InputEvent) -> Option<(f32, f32)> {
+    /// GUI-owned dock and target-of-target clicks. World releases are classified by `Controls`, not pointer pixels.
+    pub(super) fn input(&mut self, gui: &Gui, zone: &mut Zone, player: Option<&super::player::Player>, ev: &InputEvent) {
         match *ev {
             InputEvent::MouseMove { x, y } => {
                 self.mouse = (x, y);
-                if let Some((path, last)) = &mut self.world_down {
-                    *path += ((x - last.0).powi(2) + (y - last.1).powi(2)).sqrt();
-                    *last = (x, y);
-                }
             }
             InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
                 self.mouse = (x, y);
                 self.pressed = self.dock_at(gui, x, y);
                 self.tot_down = self.tot_at(gui, x, y);
-                self.world_down = (self.pressed.is_none() && !self.tot_down && !gui.wants_mouse(x, y)).then_some((0.0, (x, y)));
             }
             InputEvent::MouseUp { x, y, button: MouseButton::Left } => {
                 self.mouse = (x, y);
                 let press = self.pressed.take();
                 if let Some((hostile, part)) = press.filter(|p| self.dock_at(gui, x, y) == Some(*p)) {
                     self.dock_click(zone, player, hostile, part);
-                    return None;
+                    return;
                 }
                 if std::mem::take(&mut self.tot_down) && self.tot_at(gui, x, y) {
                     self.tot_click(zone);
-                    return None;
-                }
-                if let Some((path, _)) = self.world_down.take() {
-                    if path <= CLICK_PATH && !gui.wants_mouse(x, y) {
-                        return Some((x, y));
-                    }
                 }
             }
             _ => {}
         }
-        None
     }
 
     /// The pointer is over the visible target-of-target button of the hostile window.
@@ -1327,7 +1307,7 @@ mod tests {
         assert!(r.r > r.l && r.b > r.t);
         let (x, y) = ((r.l + r.r) / 2.0, (r.t + r.b) / 2.0);
         for ev in [InputEvent::MouseDown { x, y, button: MouseButton::Left }, InputEvent::MouseUp { x, y, button: MouseButton::Left }] {
-            assert_eq!(fe.ht.input(&fe.gui, &mut fe.zone, None, &ev), None, "not a world click");
+            fe.ht.input(&fe.gui, &mut fe.zone, None, &ev);
         }
         assert_eq!(fe.zone.target, Some(1));
         fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);
@@ -1398,7 +1378,7 @@ mod tests {
     struct HudTargetLite(HudTarget);
     impl Default for HudTargetLite {
         fn default() -> Self {
-            HudTargetLite(HudTarget { cc: 0, size: (0, 0), bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], in_attack_range: false, last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, bars_enabled: [true; 2], tot: None, tot_down: false, attack: false, info: None, tip_targets: vec![] })
+            HudTargetLite(HudTarget { cc: 0, size: (0, 0), bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], in_attack_range: false, last: None, mouse: (0.0, 0.0), pressed: None, targets_target: false, bars_enabled: [true; 2], tot: None, tot_down: false, attack: false, info: None, tip_targets: vec![] })
         }
     }
 }
