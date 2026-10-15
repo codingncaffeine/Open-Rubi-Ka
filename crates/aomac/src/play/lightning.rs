@@ -22,15 +22,15 @@ const FAN_ACTOR_BASE: u32 = 0xd000_0000;
 pub const BOLT_MODEL: u64 = 0xb017_0000_0000_0000;
 /// High `id` range for bolt-segment actors, distinct from [`FAN_ACTOR_BASE`] and `combat::effects`' `ACTOR_BASE`.
 const BOLT_ACTOR_BASE: u32 = 0xc000_0000;
-/// `bolt_segments`' quad corners, local order `(a - half, a + half, b - half, b + half)`.
-pub const BOLT_INDICES: [u32; 6] = [0, 1, 2, 1, 3, 2];
+/// `10052182`: two perpendicular strips connecting adjacent four-corner sections.
+pub const BOLT_INDICES: [u32; 12] = [0, 1, 4, 1, 5, 4, 2, 3, 6, 3, 7, 6];
 
 /// The shared bolt-segment submesh: additive, untextured, two-sided, same reasoning as [`fan_model`].
 pub fn bolt_model() -> Scene {
     let mut sub = Submesh::new(BOLT_INDICES.to_vec(), None);
     sub.blend = Blend::Additive;
     sub.two_sided = true;
-    Scene { meshes: vec![Mesh { vertices: vec![Vertex::default(); 4], submeshes: vec![sub] }], ..Default::default() }
+    Scene { meshes: vec![Mesh { vertices: vec![Vertex::default(); 8], submeshes: vec![sub] }], ..Default::default() }
 }
 
 /// The shared fan submesh ([`lightning::FAN_INDICES`]): additive, untextured, two-sided (the native fan is a flat
@@ -54,12 +54,7 @@ struct ActiveFan {
 
 struct ActiveBolt {
     id: u32,
-    /// World-space quad corners: `(a - half, a + half, b - half, b + half)`.
-    verts: [[f32; 3]; 4],
-    /// Same lifetime budget as a fan ([`lightning::FAN_LIFETIME`]): no native lifetime constant was traced for
-    /// kind 9 (see the `ao_formats::lightning` module doc), so the port reuses the one decoded FX8/FX9 constant
-    /// rather than inventing a second one.
-    life: f32,
+    bolt: lightning::Bolt,
 }
 
 /// Per-zone lightning state: the native storm schedules plus the render/audio side this port adds.
@@ -99,27 +94,20 @@ impl LightningFx {
                 self.fans.push(ActiveFan { id, verts, color: lightning::fan_color(&mut self.rng), life: lightning::FAN_LIFETIME });
             }
             for (source, ground) in strike.bolts() {
-                for seg in lightning::bolt_segments(source, ground, &mut self.rng) {
-                    let verts = [
-                        [seg.a[0] - seg.half_width, seg.a[1], seg.a[2]],
-                        [seg.a[0] + seg.half_width, seg.a[1], seg.a[2]],
-                        [seg.b[0] - seg.half_width, seg.b[1], seg.b[2]],
-                        [seg.b[0] + seg.half_width, seg.b[1], seg.b[2]],
-                    ];
-                    let id = BOLT_ACTOR_BASE | (self.next_id & 0x0fff_ffff);
-                    self.next_id = self.next_id.wrapping_add(1);
-                    self.bolts.push(ActiveBolt { id, verts, life: lightning::FAN_LIFETIME });
-                }
+                let bolt = lightning::Bolt::new(source, ground, &mut self.rng);
+                let id = BOLT_ACTOR_BASE | (self.next_id & 0x0fff_ffff);
+                self.next_id = self.next_id.wrapping_add(bolt.points.len() as u32 - 1);
+                self.bolts.push(ActiveBolt { id, bolt });
             }
         }
         for fan in &mut self.fans {
             fan.life -= dt;
         }
         for bolt in &mut self.bolts {
-            bolt.life -= dt;
+            bolt.bolt.advance(dt, &mut self.rng);
         }
         self.fans.retain(|f| !lightning::fan_expired(f.life));
-        self.bolts.retain(|b| !lightning::fan_expired(b.life));
+        self.bolts.retain(|b| b.bolt.life > 0.0);
         strikes
     }
 
@@ -148,12 +136,23 @@ impl LightningFx {
                 fan.verts.iter().enumerate().map(|(i, &pos)| Vertex { pos, color: if i == 4 { center } else { [0.0; 4] }, ..Default::default() }).collect();
             ActorFrame { id: fan.id, model: FAN_MODEL, transform: IDENTITY, skin: Some(Arc::new(verts)), always: true, ..Default::default() }
         });
-        // No `SetFXColor` was traced for kind 9 (see the module doc); a plain bright white-blue flash, full alpha
-        // for its whole (short, reused-fan) lifetime rather than inventing an undecoded flicker curve.
-        const BOLT_COLOR: [f32; 4] = [0.7, 0.85, 1.0, 1.0];
-        let bolt_actors = bolts.iter().map(|bolt| {
-            let verts: Vec<Vertex> = bolt.verts.iter().map(|&pos| Vertex { pos, color: BOLT_COLOR, ..Default::default() }).collect();
-            ActorFrame { id: bolt.id, model: BOLT_MODEL, transform: IDENTITY, skin: Some(Arc::new(verts)), always: true, ..Default::default() }
+        let bolt_actors = bolts.iter().flat_map(|active| {
+            let n = active.bolt.points.len();
+            active.bolt.points.windows(2).enumerate().map(move |(i, points)| {
+                let verts = (0..8).map(|j| {
+                    let section = j / 4;
+                    let mut pos = points[section];
+                    match j % 4 {
+                        0 => pos[0] -= 0.5,
+                        1 => pos[0] += 0.5,
+                        2 => pos[2] -= 0.5,
+                        _ => pos[2] += 0.5,
+                    }
+                    let alpha = if i + section == 0 || i + section == n - 1 { 0.0 } else { 1.0 };
+                    Vertex { pos, color: [200.0 / 255.0, 1.0, 1.0, alpha], ..Default::default() }
+                }).collect();
+                ActorFrame { id: active.id + i as u32, model: BOLT_MODEL, transform: IDENTITY, skin: Some(Arc::new(verts)), always: true, ..Default::default() }
+            })
         });
         fan_actors.chain(bolt_actors).collect()
     }
@@ -167,7 +166,7 @@ impl LightningFx {
     /// Active bolt-segment count, for tests.
     #[cfg(test)]
     pub fn bolt_count(&self) -> usize {
-        self.bolts.len()
+        self.bolts.iter().map(|b| b.bolt.points.len() - 1).sum()
     }
 }
 
@@ -206,8 +205,7 @@ mod tests {
         assert_eq!(actors.len(), fan_actors.len() + bolt_actors.len(), "every actor is a fan or a bolt segment");
         assert_eq!(fan_actors.len(), fx.fan_count());
         assert_eq!(bolt_actors.len(), fx.bolt_count());
-        // every strike fires at least the main bolt (`BOLT_SEGMENTS - 1` segments), even with no companions.
-        assert!(bolt_actors.len() >= strikes.len() * (lightning::BOLT_SEGMENTS - 1), "the main bolt fires unconditionally per strike");
+        // FX9 lives less than 0.5s; this half-second step may already retire all bolts.
         for actor in &fan_actors {
             let skin = actor.skin.as_ref().unwrap();
             assert_eq!(skin.len(), 5);
@@ -219,8 +217,8 @@ mod tests {
         }
         for actor in &bolt_actors {
             let skin = actor.skin.as_ref().unwrap();
-            assert_eq!(skin.len(), 4, "a-left, a-right, b-left, b-right");
-            assert!(skin.iter().all(|v| v.color[3] > 0.0), "bolts render fully lit, not transparent");
+            assert_eq!(skin.len(), 8, "two crossed strips");
+            assert!(skin.iter().all(|v| v.color[..3] == [200.0 / 255.0, 1.0, 1.0]));
         }
     }
 
@@ -237,6 +235,27 @@ mod tests {
         assert!(fx.fan_count() > 0);
         fx.tick(false, lightning::FAN_LIFETIME + 0.1, [0.0, 0.0, 0.0], 60.0, 5.0);
         assert_eq!(fx.fan_count(), 0, "fans must expire after FAN_LIFETIME");
+    }
+
+    #[test]
+    fn bolt_cross_sections_keep_native_colour_and_endpoint_alpha() {
+        let mut fx = LightningFx::default();
+        let bolt = lightning::Bolt::new([0.0, 30.0, 0.0], [0.0, -40.0, 0.0], &mut CrtRand::default());
+        let n = bolt.points.len();
+        fx.bolts.push(ActiveBolt { id: BOLT_ACTOR_BASE, bolt });
+        let actors = fx.actors();
+        assert_eq!(actors.len(), n - 1);
+        for (i, actor) in actors.iter().enumerate() {
+            let vertices = actor.skin.as_ref().unwrap();
+            for (j, v) in vertices.iter().enumerate() {
+                assert_eq!(v.color[..3], [200.0 / 255.0, 1.0, 1.0]);
+                assert_eq!(v.color[3], if i + j / 4 == 0 || i + j / 4 == n - 1 { 0.0 } else { 1.0 });
+            }
+            assert!((vertices[1].pos[0] - vertices[0].pos[0] - 1.0).abs() < 1e-6);
+            assert!((vertices[3].pos[2] - vertices[2].pos[2] - 1.0).abs() < 1e-6);
+        }
+        fx.tick(false, 0.5, [0.0; 3], 60.0, 0.0);
+        assert!(fx.actors().is_empty());
     }
 
     #[test]

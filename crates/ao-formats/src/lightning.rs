@@ -71,13 +71,11 @@
 //!   touches it, matching a value set once at construction and never re-rolled per strike.
 //!
 //! # Not reproduced (UNRESOLVED)
-//! * FX kind 9 (`VisualEnvFX_t::StartFX(9)`), resolved this session: the visible lightning bolt
-//!   itself, `VisualLightning_t` (see [`BOLT_SEGMENTS`]'s doc for the full trace). One fires
-//!   unconditionally per strike (the main bolt, `source` to `ground`) plus one per
-//!   [`Strike::companions`] entry ([`Strike::bolts`], [`bolt_segments`]). Remaining gaps: the
-//!   exact native segment count and cross-section orientation ([`BOLT_SEGMENTS`]'s doc) and the
-//!   bolt's own color/lifetime (no `SetFXColor`/`SetFXLifeTime` call was found for kind 9 in
-//!   `FUN_100508bd`/`FUN_10050d3e`; the live-wiring section below documents the port's defaults).
+//! * FX9 `VisualLightning_t` count, colour, lifetime and crossed-strip geometry are decoded in
+//!   [`Bolt`]. One fires unconditionally per strike plus one per [`Strike::companions`] entry.
+//!   Native count is chosen on visual initialization; exact pool reuse/RNG ordering remains
+//!   unresolved (searched `10065807/10060935/10052182`). This transient representation draws
+//!   on spawn. Secondary FX44/45 emitted by `10051e5a` are not reproduced here.
 //! * `FUN_10050d3e` (the FXS pool's "additional instance" path, vtable+0x54): the fan math is
 //!   fully reproduced ([`additional_instance_fans`]), but **when** the native client summons it
 //!   instead of reusing the primary FX8 instance (presumably FXS resource-pool occupancy — e.g.
@@ -97,8 +95,7 @@
 //!   effect renderer (`aomac::play::combat::effects`) is bound 1:1 to RDB-templated, dynel-addressed GC effect
 //!   classes — FX8/FX9 have no RDB template (pure native weather code) and are not bound to a dynel, so `LightningFx`
 //!   draws fan quads and bolt ribbons as a small parallel list of transient additive actors alongside it instead of
-//!   fabricating a template that does not exist. The bolt's undecoded color/lifetime use a plain white-blue flash at
-//!   [`FAN_LIFETIME`] (the only decoded native FX8/FX9 lifetime constant) rather than inventing unrelated ones.
+//!   fabricating a template that does not exist. FX9 uses its own decoded [`Bolt`] lifetime and colour.
 //!   `SM_Sandy_Env_NearLightning`'s `delay = distance / 100` s is now routed through
 //!   the same per-frame delayed-command queue as GC4000 authored effect sounds (`ao_audio::Audio::play_effect_sound`
 //!   / `game::Runtime::effect_delays`), which already matches the native SI10003f61/SI1000567d replay semantics
@@ -216,62 +213,50 @@ pub fn fan_expired(remaining: f32) -> bool {
     remaining < FAN_EXPIRE_EPSILON
 }
 
-/// `VisualEnvFX_t::StartFX(9)`'s own visual class, `VisualLightning_t` (DisplaySystem.dll, its
-/// own pool slot in `FUN_10063188`'s factory `case 9: … FUN_10065807()`; ctor `FUN_10065807`:
-/// `VisualLightning_t::vftable`, render priority 5 vs. `VisualCloudlight_t`'s 0). Its geometry
-/// builder is `FUN_10051bca`: `n` points from `source` to `ground` (`n = param_1[0xb9]`, whose
-/// own native setter was not traced — see [`BOLT_SEGMENTS`]'s doc), each interior point jittered
-/// independently in X/Z by `rand() % 4000 / 1000.0 − 2.0` (`_DAT_1008aa78 = 1000.0`,
-/// `_DAT_1008a128 = 2.0`, both confirmed by a raw float read: a ±2 m horizontal zigzag per
-/// point), connected by quads whose half-width tapers from `_DAT_1008a130 = 2.0`
-/// ([`BOLT_TAPER_START`]) at the source down to 0 at the ground (`local_28 -= 2.0 / n` every
-/// step) built from a ±0.5 unit-square corner template (`_DAT_1008ade8 = -0.5`,
-/// `_DAT_10089d90 = 0.5`, [`BOLT_QUAD_HALF`]). [`bolt_segments`] reproduces this: the exact
-/// segment count and whether the quads are a direction-aligned 3D billboard or flat in the XZ
-/// plane (matching FX8's own flat fan quads, used here) were not traced further — see the module
-/// doc's "Not reproduced".
-pub const BOLT_TAPER_START: f32 = 2.0;
-/// `_DAT_1008a128` / `_DAT_1008aa78`: raw draw `rand() % 4000`, then `/ 1000.0 − 2.0`.
-const BOLT_JITTER_RAW_MOD: i32 = 4000;
-const BOLT_JITTER_DIVISOR: f32 = 1000.0;
-const BOLT_JITTER_HALF: f32 = 2.0;
-/// `_DAT_1008ade8` / `_DAT_10089d90`: the quad corner template is `±0.5` before the taper scale.
-pub const BOLT_QUAD_HALF: f32 = 0.5;
-/// `param_1[0xb9]`: not decoded (no `SetFX*` call sets it in `FUN_100508bd`/`FUN_10050d3e`, nor
-/// the ctor, which zeroes it — most likely an `FXS_t` resource-template field, not traced). The
-/// source-to-ground span is always a fixed 70 m ([`GROUND_BELOW_SOURCE`]), so a fixed count
-/// (rather than one scaled by strike distance) is plausible; this is a documented default, not a
-/// decoded native constant.
-pub const BOLT_SEGMENTS: usize = 8;
-
-/// One flat quad of a lightning bolt ribbon ([`bolt_segments`]): a strip from `a` to `b`,
-/// `half_width` wide in X/Z at each end (the quad's 4 corners are `a`/`b` each ± `half_width` in
-/// X), tapering to 0 by the ground end.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BoltSegment {
-    pub a: [f32; 3],
-    pub b: [f32; 3],
-    pub half_width: f32,
+/// Native FX9 (DisplaySystem `10052182`, `10051bca`, `10051e5a`).
+/// Initialization chooses 5..14 cross-sections; each has fixed ±0.5 X/Z corners.
+/// The taper is a jitter envelope, not ribbon width. Colour bytes are BGRA
+/// (255,255,200,A), with transparent first/last sections, opaque interior.
+pub struct Bolt {
+    pub points: Vec<[f32; 3]>,
+    pub life: f32,
 }
 
-/// `FUN_10051bca`: [`BOLT_SEGMENTS`] points linearly interpolated from `source` to `ground`
-/// (endpoints exact, interior points independently jittered in X/Z), turned into
-/// `BOLT_SEGMENTS - 1` tapering quads. `rng` draws 2 values per interior point (X jitter, Z
-/// jitter), matching `FUN_1008449f`'s per-point draw pair.
-pub fn bolt_segments(source: [f32; 3], ground: [f32; 3], rng: &mut CrtRand) -> Vec<BoltSegment> {
-    let n = BOLT_SEGMENTS;
-    let last = (n - 1) as f32;
-    let jitter = |rng: &mut CrtRand| (rng.rand() % BOLT_JITTER_RAW_MOD) as f32 / BOLT_JITTER_DIVISOR - BOLT_JITTER_HALF;
-    let points: Vec<[f32; 3]> = (0..n)
-        .map(|i| {
-            let t = i as f32 / last;
-            let base = [source[0] + (ground[0] - source[0]) * t, source[1] + (ground[1] - source[1]) * t, source[2] + (ground[2] - source[2]) * t];
-            if i == 0 || i == n - 1 { base } else { [base[0] + jitter(rng), base[1], base[2] + jitter(rng)] }
-        })
-        .collect();
-    (0..n - 1)
-        .map(|i| BoltSegment { a: points[i], b: points[i + 1], half_width: BOLT_QUAD_HALF * (BOLT_TAPER_START - BOLT_TAPER_START * i as f32 / last) })
-        .collect()
+impl Bolt {
+    pub fn new(source: [f32; 3], ground: [f32; 3], rng: &mut CrtRand) -> Self {
+        let n = (rng.rand() % 10 + 5) as usize;
+        let life = (rng.rand() % 500) as f32 / 1000.0;
+        let mut t = 0.0;
+        let mut taper = 2.0;
+        let step = 2.0 / n as f32;
+        let points = (0..n).map(|i| {
+            let x = (rng.rand() % 4000) as f32 / 1000.0 - 2.0;
+            let z = (rng.rand() % 4000) as f32 / 1000.0 - 2.0;
+            let mut p = std::array::from_fn(|j| source[j] + (ground[j] - source[j]) / (n - 1) as f32 * i as f32);
+            p[0] += x * t * taper;
+            p[2] += z * t * taper;
+            t += step;
+            taper -= step;
+            p
+        }).collect();
+        Self { points, life }
+    }
+
+    /// `10051e5a`: decrement first; survivors drift in X/Z by rand()%16000/1000−8,
+    /// multiplied by the same envelope and frame delta. No alpha fade.
+    pub fn advance(&mut self, dt: f32, rng: &mut CrtRand) {
+        self.life -= dt;
+        if self.life <= 0.0 { return; }
+        let step = 2.0 / self.points.len() as f32;
+        let mut t = 0.0;
+        let mut taper = 2.0;
+        for p in &mut self.points {
+            p[0] += ((rng.rand() % 16000) as f32 / 1000.0 - 8.0) * t * taper * dt;
+            p[2] += ((rng.rand() % 16000) as f32 / 1000.0 - 8.0) * t * taper * dt;
+            t += step;
+            taper -= step;
+        }
+    }
 }
 
 /// The `SM_Sandy_Env_NearLightning` cue (`FUN_100b9850`).
@@ -464,21 +449,22 @@ mod tests {
     }
 
     #[test]
-    fn bolt_segments_endpoints_are_exact_and_width_tapers_toward_the_ground() {
-        let mut crt = CrtRand::default();
-        let segs = bolt_segments([0.0, 30.0, 0.0], [0.0, -40.0, 0.0], &mut crt);
-        assert_eq!(segs.len(), BOLT_SEGMENTS - 1);
-        assert_eq!(segs[0].a, [0.0, 30.0, 0.0], "the first point is the exact source, never jittered");
-        assert_eq!(segs.last().unwrap().b, [0.0, -40.0, 0.0], "the last point is the exact ground, never jittered");
-        assert!((segs[0].half_width - BOLT_QUAD_HALF * BOLT_TAPER_START).abs() < 1e-5, "full width at the source");
-        assert!(segs.last().unwrap().half_width < segs[0].half_width * 0.2, "narrow near the ground");
-        // monotonically non-increasing width, and every jittered interior point stays within the ±2 m zigzag box.
-        for w in segs.windows(2) {
-            assert!(w[0].half_width >= w[1].half_width);
-        }
-        for seg in &segs[1..] {
-            assert!((-2.0..=2.0).contains(&(seg.a[0])), "{seg:?}");
-        }
+    fn bolt_native_count_lifetime_and_drift() {
+        let mut expected = CrtRand::default();
+        let n = (expected.rand() % 10 + 5) as usize;
+        let life = (expected.rand() % 500) as f32 / 1000.0;
+        let mut bolt = Bolt::new([0.0, 30.0, 0.0], [0.0, -40.0, 0.0], &mut CrtRand::default());
+        assert_eq!(bolt.points.len(), n);
+        assert_eq!(bolt.life, life);
+        assert_eq!(bolt.points[0], [0.0, 30.0, 0.0]);
+        assert!((bolt.points[n-1][1] + 40.0).abs() < 0.0001);
+        let before = bolt.points.clone();
+        bolt.advance(0.001, &mut expected);
+        assert_eq!(bolt.points[0], before[0]);
+        assert!(bolt.points.iter().zip(&before).all(|(a,b)| a[1] == b[1]));
+        assert!((bolt.life - (life - 0.001)).abs() < 1e-6);
+        bolt.advance(1.0, &mut expected);
+        assert!(bolt.life <= 0.0);
     }
 
     #[test]
