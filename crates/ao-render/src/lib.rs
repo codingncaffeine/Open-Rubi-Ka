@@ -39,6 +39,12 @@ fn srgb_to_linear(c: f32) -> f32 {
     c.powf(2.2)
 }
 
+/// Native camera-relative sky units: scale geometry/offset by far/1000, never the camera translation.
+fn sky_instance_matrix(matrix: Mat4, pivot_offset: Vec3, camera: Vec3, scale: f32) -> Mat4 {
+    Mat4::from_cols(matrix.x_axis * scale, matrix.y_axis * scale, matrix.z_axis * scale,
+        (camera + (pivot_offset + matrix.w_axis.truncate()) * scale).extend(1.0))
+}
+
 /// Inverse of [`srgb_to_linear`]: the scene contract's `c^2.2` colours back to the client's framebuffer-space values.
 fn gamma(c: f32) -> f32 {
     c.max(0.0).powf(1.0 / 2.2)
@@ -155,6 +161,8 @@ struct Globals {
     water_g: [f32; 4],
     /// x = active dynamic light count (`Renderer::set_dynamic_lights`), yzw unused.
     dyn_info: [i32; 4],
+    /// x = DotStars per-FXS-frame Counter (not elapsed seconds).
+    sky_counter: [f32; 4],
 }
 
 /// One submesh draw. Scene pipes use `material_pipe`; sky draws use `sky_material_pipe`.
@@ -186,9 +194,11 @@ const MESH_EFFECT_STRIDE: usize = SKY_GLOW_PIPE + 1;
 /// Append sky-only cull variants without moving world/actor pipeline slots.
 const SKY_CULL_PIPE: usize = SKY_GLOW_PIPE + 1;
 const SKY_NATIVE_PIPE: usize = SKY_CULL_PIPE + 8;
-const SKY_LAST_PIPE: usize = SKY_NATIVE_PIPE + 2;
+const SKY_POINT_PIPE: usize = SKY_NATIVE_PIPE + 3;
+const SKY_LAST_PIPE: usize = SKY_POINT_PIPE;
 
 fn sky_material_pipe(s: &ao_scene::Submesh) -> usize {
+    if s.sky_points { return SKY_POINT_PIPE; }
     if !s.two_sided {
         SKY_CULL_PIPE + s.blend as usize
     } else {
@@ -378,7 +388,7 @@ struct GroundRun {
     scratch: Vec<u32>,
     materials: Vec<Option<wgpu::BindGroup>>,
     has_shadow: Vec<bool>,
-    texture_materials: Vec<(usize, TextureKey, [f32; 24])>,
+    texture_materials: Vec<(usize, TextureKey, [f32; 28])>,
 }
 
 /// Sky backdrop with its own mesh/material tables, so [`Renderer::set_sky`] can swap it while the world stays.
@@ -403,7 +413,7 @@ struct SkyGpu {
     /// offset, so a given sky submesh's uniform is stable tick to tick) reuses the existing uniform buffer and
     /// bind group instead of creating new ones. Bounded by the sky's own small, fairly static material count
     /// (sun, moon, stars, a handful of cloud/overlay layers); never pruned, same as the rest of this cache.
-    mat_of: HashMap<(Option<TextureKey>, bool, [u32; 24]), usize>,
+    mat_of: HashMap<(Option<TextureKey>, bool, [u32; 28]), usize>,
     mats: Vec<wgpu::BindGroup>,
     draws: Vec<(Draw, u32)>, // (draw, index into `xf`) in scene order
     xf: Vec<Mat4>,
@@ -412,6 +422,9 @@ struct SkyGpu {
     bufs: Vec<wgpu::Buffer>, // ring of per-frame instance transforms (translation = camera)
     colors: Vec<ColorAnim>,
     clouds: Vec<CloudAnim>,
+    /// Pose-only resource snapshot: no textures or world geometry; sun fans retain their tiny alpha buffers.
+    pose: Scene,
+    fan_alpha: Vec<(usize, f32)>,
     /// `set_sky` calls that fell through to a full rebuild (every GPU buffer/bind group recreated), since the
     /// renderer started: a regression counter, not drained. In steady state (a stable sky mesh/material set) this
     /// must stop climbing even as `LiveSky` keeps calling `set_sky` with new per-tick vertex data.
@@ -430,6 +443,12 @@ struct CloudAnim {
     time: f32,
 }
 
+// Authored FXS objects survive preceding layers becoming invisible; mesh slots do not.
+fn cloud_object_key(scene: &Scene, mesh: usize) -> (bool, usize) {
+    scene.sky_pose_objects.iter().find(|&&(slot, _)| scene.sky.get(slot).is_some_and(|instance| instance.mesh == mesh))
+        .map_or((false, mesh), |&(_, object)| (true, object))
+}
+
 /// A sky mesh whose vertex colours are re-simulated every frame ([`ao_scene::SkyColors`]).
 struct ColorAnim {
     mesh: usize,
@@ -439,11 +458,11 @@ struct ColorAnim {
 }
 
 /// Material uniform of a submesh (see `shader.wgsl` `Mat`).
-fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 24] {
+fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 28] {
     let [wu, au, wv, av] = s.uv_wave;
     let [fr, fg, fb] = s.sky_fog_color.unwrap_or([0.0; 3]);
     let fog_mode = if !s.sky_fog { 0.0 } else if s.sky_fog_color.is_some() { 2.0 } else { 1.0 };
-    [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], fog_mode, s.sun_flicker as u32 as f32, wu, au, wv, av, s.specular[0], s.specular[1], s.specular[2], s.shininess, s.texture_clamp as u32 as f32, fr, fg, fb]
+    [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], fog_mode, s.sun_flicker as u32 as f32, wu, au, wv, av, s.specular[0], s.specular[1], s.specular[2], s.shininess, s.texture_clamp as u32 as f32, fr, fg, fb, s.uv_camera[0], s.uv_camera[1], s.uv_camera[2], s.uv_camera[3]]
 }
 
 /// Last-frame counters (after frustum culling).
@@ -562,6 +581,7 @@ pub struct Renderer {
     pub day_time_rate: f32,
     // per-frame scratch
     frame: usize,
+    sky_dot_counter: f32,
     vis: Vec<[[f32; 4]; 4]>,
     vis_src: Vec<u32>,
     vis_range: Vec<std::ops::Range<u32>>,
@@ -584,6 +604,18 @@ fn default_environment(radius: f32) -> Environment {
         sun_dir: Vec3::new(0.4, 0.8, 0.3).normalize().to_array(),
         sun_specular: 1.0,
     }
+}
+
+/// GC100b7273/100b749f feed the active camera planes to VisualFog::AddClipPlanes.
+/// Reapply every frame: live sky snapshots can replace the model between lens updates.
+fn apply_camera_fog(env: &mut Environment, model: &mut ao_scene::FogModel, lens: ao_scene::Lens, far: f32, eye: [f32; 3], density_scale: f32) {
+    model.near = lens.near;
+    model.far = far;
+    let (color, end) = model.at_scaled(eye, density_scale);
+    if env.sky_color == env.fog_color {
+        env.sky_color = color;
+    }
+    (env.fog_color, env.fog_start, env.fog_end) = (color, lens.near, end);
 }
 
 /// Left, right, bottom, top, near, far planes (normalised, normals point inside).
@@ -674,6 +706,7 @@ fn build_pipelines(
                 };
                 ("fs_blend", Some(wgpu::BlendState { color: component, alpha: component }), true)
             },
+            14 => ("fs_sky_add", Some(wgpu::BlendState { color: one_one, alpha: one_one }), false),
             _ => (fs, state, depth_write),
         };
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -684,7 +717,7 @@ fn build_pipelines(
             layout: Some(if effect == 1 || (8..=11).contains(&effect) { holo_pipeline_layout } else { layout }),
             vertex: wgpu::VertexState {
                 module: shader,
-                entry_point: Some(if (8..=11).contains(&effect) { "vs_ground" } else if matches!(effect, 12 | 13) { "vs_liquid" } else if actor && matches!(effect, 1 | 2 | 4..=6) { "vs_actor" } else if sky { "vs_sky" } else if env { "vs_env" } else if actor { "vs_actor" } else { "vs" }),
+                entry_point: Some(if effect == 14 { "vs_sky_points" } else if (8..=11).contains(&effect) { "vs_ground" } else if matches!(effect, 12 | 13) { "vs_liquid" } else if actor && matches!(effect, 1 | 2 | 4..=6) { "vs_actor" } else if sky { "vs_sky" } else if env { "vs_env" } else if actor { "vs_actor" } else { "vs" }),
                 compilation_options: Default::default(),
                 buffers: &[
                     wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vert_attrs },
@@ -702,6 +735,7 @@ fn build_pipelines(
                 targets: &[Some(wgpu::ColorTargetState { format, blend: state, write_mask: wgpu::ColorWrites::ALL })],
             }),
             primitive: wgpu::PrimitiveState {
+                topology: if effect == 14 { wgpu::PrimitiveTopology::PointList } else { wgpu::PrimitiveTopology::TriangleList },
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: (!two_sided && !matches!(effect, 1 | 4..=6)).then_some(wgpu::Face::Back),
                 ..Default::default()
@@ -739,8 +773,9 @@ fn build_pipelines(
             .map(|b| (b, false, true, false, false, false)))
         .chain([Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha]
             .map(|b| (b, true, true, false, false, false)));
-    assert_eq!(pipe_specs.clone().count(), native_liquid::PIPE, "native liquid passes must follow the last sky pipeline");
+    assert_eq!(pipe_specs.clone().count(), SKY_POINT_PIPE, "point list follows triangle sky pipelines");
     let pipes: Vec<_> = pipe_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false, 0))
+        .chain(std::iter::once(mk(Blend::Additive, true, true, false, false, false, false, 14)))
         .chain((12..=13).map(|effect| mk(Blend::AlphaBlend, true, false, false, false, false, false, effect))).collect();
     assert_eq!(pipes.len(), native_liquid::PIPE + 2);
     let actor_pipes = (0..=7).flat_map(|effect| pipe_specs.clone().take(MESH_EFFECT_STRIDE).map(move |spec| (effect, spec)))
@@ -922,6 +957,7 @@ impl Renderer {
             dyn_light_buf,
             dyn_light_count: 0,
             frame: 0,
+            sky_dot_counter: 0.0,
             vis: vec![],
             vis_src: vec![],
             vis_range: vec![],
@@ -1023,6 +1059,7 @@ impl Renderer {
 
     /// Replaces the GPU-side scene.
     pub fn upload(&mut self, scene: &Scene) {
+        self.sky_dot_counter = 0.0;
         self.water_light = scene.water_light;
         self.sky.clouds.clear();
         self.ground_state.recreate();
@@ -1073,7 +1110,7 @@ impl Renderer {
             Job::Mip { .. } => self.upload_built_texture(b.as_ref().expect("built in parallel above")),
         }).collect();
         // One bind group per distinct (texture, base colour, emissive, glow mask).
-        let mut mat_of: HashMap<(usize, bool, [u32; 24]), usize> = HashMap::new();
+        let mut mat_of: HashMap<(usize, bool, [u32; 28]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
         let mut material = |dev: &Renderer, view: usize, s: &ao_scene::Submesh, ground_scale: Option<[f32; 2]>| {
             let mut u = mat_uniform(s);
@@ -1376,11 +1413,27 @@ impl Renderer {
             .collect();
         let mut old_clouds=std::mem::take(&mut self.sky.clouds);
         self.sky.clouds=scene.single_clouds.iter().map(|layer| {
-            let mut run=old_clouds.iter().position(|old|old.layer.mesh==layer.mesh && old.layer.altitude==layer.altitude)
+            let mut run=old_clouds.iter().position(|old|cloud_object_key(&self.sky.pose,old.layer.mesh)==cloud_object_key(scene,layer.mesh))
                 .map(|i|old_clouds.swap_remove(i)).unwrap_or_else(||CloudAnim {
                     layer:layer.clone(),sim:Default::default(),vertices:scene.meshes[layer.mesh].vertices.clone(),
                     indices:[ao_scene::cloud::Clouds::indices(2,0,30),ao_scene::cloud::Clouds::indices(10,0,30)],grid:0,time:self.time});
             run.layer=layer.clone();run.grid=0;run
+        }).collect();
+        self.sky.pose = Scene {
+            day_time: scene.day_time,
+            sky: scene.sky.clone(),
+            sky_pose_objects: scene.sky_pose_objects.clone(),
+            sky_yaw: scene.sky_yaw.clone(),
+            sky_wave_spin: scene.sky_wave_spin.clone(),
+            environment: scene.environment,
+            meshes: scene.meshes.iter().map(|mesh| ao_scene::Mesh {
+                vertices: if mesh.submeshes.iter().any(|sub| sub.sun_flicker) { mesh.vertices.clone() } else { vec![] },
+                ..Default::default()
+            }).collect(),
+            ..Scene::default()
+        };
+        self.sky.fan_alpha = self.sky.pose.sky.iter().filter_map(|instance| {
+            self.sky.pose.meshes.get(instance.mesh)?.vertices.first().map(|vertex| (instance.mesh, vertex.color[3]))
         }).collect();
         if let Some(env) = scene.environment {
             self.env = env;
@@ -1392,6 +1445,25 @@ impl Renderer {
             }
             self.fog = Some(model);
         }
+    }
+
+    /// Reuses the loaded sky buffers; the frame callback changes only matrices and the sun fans' byte alpha.
+    fn apply_sky_pose(&mut self) {
+        for (matrix, instance) in self.sky.xf.iter_mut().zip(&self.sky.pose.sky) {
+            *matrix = Mat4::from_cols_array_2d(&instance.transform);
+        }
+        self.sky.wave.copy_from_slice(&self.sky.pose.sky_wave_spin);
+        for (mesh, alpha) in &mut self.sky.fan_alpha {
+            let data = &self.sky.pose.meshes[*mesh];
+            let next = data.vertices[0].color[3];
+            if next != *alpha {
+                if let Some(Some((vertices, _))) = self.sky.meshes.get(*mesh) {
+                    self.queue.write_buffer(vertices, 0, bytemuck::cast_slice(&data.vertices));
+                }
+                *alpha = next;
+            }
+        }
+        if let Some(env) = self.sky.pose.environment { self.env.sun_dir = env.sun_dir; }
     }
 
     /// `set_sky` calls since the renderer started that fell through to a full rebuild, for leak regressions: in
@@ -1510,12 +1582,12 @@ impl Renderer {
     /// `VisualCamera_t::GetLengthOfViewcone` (far - near) both come from the camera's planes (docs/chat/dvalue.md).
     pub fn set_lens(&mut self, lens: ao_scene::Lens) {
         if let Some(far) = lens.far {
-            let near = self.fog.as_ref().map_or(lens.near, |f| f.near);
             if let Some(f) = &mut self.fog {
+                f.near = lens.near;
                 f.far = far;
             }
             if let Some(l) = &mut self.lod {
-                l.lod.view_length = far - near;
+                l.lod.view_length = far - lens.near;
             }
         }
         self.lens = lens;
@@ -1616,20 +1688,20 @@ impl Renderer {
         self.step_movers();
         self.pose_far_away(cam.pos);
         let mut env = self.env;
-        if self.screen.fog_disabled { env.fog_start=f32::MAX;env.fog_end=f32::MAX; }
-        if let Some((color, end)) = self.fog.as_ref().filter(|_|!self.screen.fog_disabled).map(|m| m.at_scaled(cam.pos.to_array(), self.fog_density_scale)) {
-            if env.sky_color == env.fog_color {
-                env.sky_color = color;
-            }
-            (env.fog_color, env.fog_end) = (color, end);
-        }
+        // Select the projection before local fog evaluation: volumes must never
+        // shorten the camera far plane or change normalized sky geometry.
         let far = self.lens.far.unwrap_or_else(|| (env.fog_end * 1.1).max(50.0));
+        if self.screen.fog_disabled { env.fog_start=f32::MAX;env.fog_end=f32::MAX; }
+        if let Some(model) = self.fog.as_mut().filter(|_| !self.screen.fog_disabled) {
+            apply_camera_fog(&mut env, model, self.lens, far, cam.pos.to_array(), self.fog_density_scale);
+        }
         let aspect = t.size.0 as f32 / t.size.1.max(1) as f32;
         let vp = Mat4::perspective_rh(self.lens.vertical_fov(aspect), aspect, self.lens.near, far) * Mat4::look_to_rh(cam.pos, cam.forward(), cam.up());
         let v4 = |c: [f32; 3], w| Vec4::new(c[0], c[1], c[2], w).to_array();
         let g4 = |c: [f32; 3], w| v4(c.map(gamma), w);
         let w = ao_scene::wave_curves(self.time);
         let (water_color, water_dir) = self.water_light.unwrap_or_default();
+        self.sky_dot_counter = (self.sky_dot_counter + 0.01) % 1.0;
         let g = Globals {
             view_proj: vp.to_cols_array_2d(),
             eye: cam.pos.extend(far).to_array(),
@@ -1648,6 +1720,7 @@ impl Renderer {
             water_dir: v4(Vec3::from_array(water_dir).normalize_or_zero().to_array(), 0.0),
             water_g: g4(water_color, env.sun_specular),
             dyn_info: [self.dyn_light_count, 0, 0, 0],
+            sky_counter: [self.sky_dot_counter, 0.0, 0.0, 0.0],
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
 
@@ -1730,7 +1803,15 @@ impl Renderer {
                         m = r * m;
                         off = r.transform_vector3(off) + p - r.transform_vector3(p);
                     }
-                    Mat4::from_cols(m.x_axis, m.y_axis, m.z_axis, (cam.pos + off).extend(1.0)).to_cols_array_2d()
+                    if self.sky.pose.sky_yaw.contains(&i) {
+                        let forward = cam.forward();
+                        let yaw = Mat4::from_rotation_y((-forward.x).atan2(-forward.z));
+                        m = yaw * m;
+                        off = yaw.transform_vector3(off);
+                    }
+                    // VisualSingleCloud already generates camera-relative metre positions at the live far.
+                    let cloud = self.sky.clouds.iter().any(|cloud| self.sky.pose.sky.get(i).is_some_and(|instance| instance.mesh == cloud.layer.mesh));
+                    sky_instance_matrix(m, off, cam.pos, if cloud { 1.0 } else { far / 1000.0 }).to_cols_array_2d()
                 })
                 .collect();
             self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&xf));
@@ -2137,6 +2218,59 @@ mod sky_tests {
     use ao_scene::{Instance, Mesh, SkySpin, Submesh, Texture, TextureKey, Vertex, IDENTITY};
 
     #[test]
+    fn native_fog_start_and_end_follow_camera_planes_after_snapshot_refresh() {
+        let original = default_environment(400.0);
+        for far in [800.0, 1600.0] {
+            for near in [0.2, 0.5] {
+                // A newly delivered snapshot still has its offline placeholder planes.
+                let mut model = ao_scene::FogModel { near: 0.5, far: 800.0, base_density: 1.0, ..Default::default() };
+                let mut env = original;
+                let lens = ao_scene::Lens { near, far: Some(far), ..Default::default() };
+                apply_camera_fog(&mut env, &mut model, lens, far, [0.0; 3], 1.0);
+                assert_eq!(env.fog_start, near);
+                assert_eq!((model.near, model.far), (near, far));
+                assert!((env.fog_end - (near + 5.0)).abs() < 0.0001);
+                model.base_density = 0.025;
+                apply_camera_fog(&mut env, &mut model, lens, far, [0.0; 3], 1.0);
+                assert!((env.fog_end - (far - (far - near - 5.0) * 0.025)).abs() < 0.0001);
+            }
+        }
+    }
+
+    #[test]
+    fn native_sky_scale_keeps_angles_and_real_projection_depth() {
+        let camera = Vec3::new(150.0, 80.0, -40.0);
+        let local = Vec3::new(120.0, 90.0, -300.0);
+        let base = Mat4::from_translation(Vec3::new(10.0, 0.0, -20.0));
+        let mut previous_angle: Option<Vec3> = None;
+        for far in [800.0, 1600.0] {
+            let matrix = sky_instance_matrix(base, Vec3::ZERO, camera, far / 1000.0);
+            let relative = matrix.transform_point3(local) - camera;
+            assert!((relative - (local + base.w_axis.truncate()) * (far / 1000.0)).length() < 0.001);
+            let angle = relative.normalize();
+            if let Some(previous) = previous_angle { assert!((angle - previous).length() < 1e-6); }
+            previous_angle = Some(angle);
+            let projection = Mat4::perspective_rh(1.0, 1.6, 0.2, far);
+            let clip = projection * relative.extend(1.0);
+            assert!(clip.z > 0.0 && clip.z < clip.w, "sky has its real depth, not z=w");
+            let beyond = projection * Vec3::new(0.0, 0.0, -far * 1.01).extend(1.0);
+            assert!(beyond.z > beyond.w, "native far clipping remains enabled");
+            // Source fog uses eye depth, which scales along with the projection far.
+            assert!((-relative.z / far - 0.32).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn cloud_identity_survives_preceding_sky_mesh_changes() {
+        let mut old=Scene {sky:vec![Instance {mesh:3,transform:IDENTITY}],sky_pose_objects:vec![(0,42)],..Scene::default()};
+        let new=Scene {sky:vec![Instance {mesh:7,transform:IDENTITY}],sky_pose_objects:vec![(0,42)],..Scene::default()};
+        assert_eq!(cloud_object_key(&old,3),cloud_object_key(&new,7));
+        old.sky_pose_objects[0].1=43;
+        assert_ne!(cloud_object_key(&old,3),cloud_object_key(&new,7));
+        assert_ne!(cloud_object_key(&Scene::default(),3),cloud_object_key(&Scene::default(),7));
+    }
+
+    #[test]
     fn framebuffer_clear_preserves_encoded_bytes() {
         let c = framebuffer_clear([0.0, 0.5, 1.0]);
         assert_eq!((c.r, c.a), (0.0, 1.0));
@@ -2169,6 +2303,35 @@ mod sky_tests {
     }
 
     #[test]
+    fn horizon_camera_uv_tracks_live_eye_x_and_mirrored_z() {
+        let mut sky = scene([0.0; 2], None);
+        let texture = sky.textures.values_mut().next().unwrap();
+        texture.height = 2;
+        texture.rgba = vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255];
+        for vertex in &mut sky.meshes[0].vertices { vertex.uv = [0.25, 0.25]; vertex.color = [1.0; 4]; }
+        let material = &mut sky.meshes[0].submeshes[0];
+        material.uv_camera = [1.0 / 51200.0, 0.0, 0.0, -1.0 / 51200.0];
+        assert_eq!(&mat_uniform(material)[24..], &material.uv_camera);
+        for (name, eye, expected) in [
+            ("origin", [0.0, 0.0, 0.0], [255, 0, 0]),
+            ("east", [25600.0, 0.0, 0.0], [0, 255, 0]),
+            ("scene_south", [0.0, 0.0, 25600.0], [0, 0, 255]),
+        ] {
+            let path = std::env::temp_dir().join(format!("ao-horizon-camera-{}-{name}.png", std::process::id()));
+            render_to_png_at(&sky, eye, [eye[0], eye[1], eye[2] - 1.0], 64, 64, &path, 0.0)
+                .expect("horizon camera UV regression requires an offscreen GPU adapter");
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+            let mut pixels = vec![0; decoder.output_buffer_size()];
+            decoder.next_frame(&mut pixels).unwrap();
+            let center = &pixels[(32 * 64 + 32) * 4..][..3];
+            assert!((0..3).all(|channel| (i32::from(center[channel]) - expected[channel]).abs() < 3),
+                "{name}: live camera UV expected {expected:?}, got {center:?}");
+        }
+    }
+
+    #[test]
     fn sky_material_pipes_preserve_existing_slots_and_cover_every_blend() {
         assert_eq!((ENV_PIPE, ENV_BLEND_PIPE, FADE_PIPE, SPRITE_PIPE, NATIVE_BLEND_PIPE), (12, 14, 16, 20, 22));
         assert_eq!((MESH_EFFECT_PIPE, MESH_EFFECT_STRIDE), (31, 31), "actor effect slots must not move");
@@ -2187,6 +2350,72 @@ mod sky_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn native_sky_points_are_single_pixels_with_one_one_blend_and_source_fog() {
+        let mut s = Scene {
+            lens: Some(ao_scene::Lens { far: Some(800.0), ..Default::default() }),
+            environment: Some(ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.0; 3],
+                fog_start: 0.0, fog_end: 800.0, ..default_environment(400.0) }),
+            ..Scene::default()
+        };
+        s.meshes.push(Mesh {
+            vertices: vec![Vertex { pos: [12.0, 17.0, -500.0], color: [1.0, 1.0, 1.0, 0.0], ..Default::default() }],
+            submeshes: vec![Submesh { sky_points: true, sky_fog: true, sky_fog_color: Some([0.0; 3]),
+                two_sided: true, blend: Blend::Additive, ..Submesh::new(vec![0], None) }],
+        });
+        s.sky.push(Instance { mesh: 0, transform: IDENTITY });
+        assert_eq!(sky_material_pipe(&s.meshes[0].submeshes[0]), SKY_POINT_PIPE);
+        for width in [64, 128] {
+            for far in [800.0, 1600.0] {
+                s.lens.as_mut().unwrap().far = Some(far);
+                s.environment.as_mut().unwrap().fog_end = far;
+                let path = std::env::temp_dir().join(format!("ao-render-{}-native-dot.png", std::process::id()));
+                render_to_png_at(&s, [0.0; 3], [0.0, 0.0, -1.0], width, width, &path, 0.0)
+                    .expect("native point regression requires an offscreen GPU adapter");
+                let bytes = std::fs::read(&path).unwrap();
+                let _ = std::fs::remove_file(path);
+                let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+                let mut rgba = vec![0; decoder.output_buffer_size()];
+                let info = decoder.next_frame(&mut rgba).unwrap();
+                let colored: Vec<_> = rgba[..info.buffer_size()].chunks_exact(4).filter(|p| p[..3] != [0, 0, 0]).collect();
+                assert_eq!(colored.len(), 1, "point size is one framebuffer pixel, independent of viewport/far");
+                assert!(colored[0][..3].iter().all(|&c| (127..=129).contains(&c)),
+                    "half-depth black source fog leaves half RGB, even with alpha zero (ONE/ONE): {:?}", colored[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn dot_counter_steps_per_frame_not_elapsed_time_or_sky_snapshot() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).expect("native counter regression requires GPU");
+        let s = Scene::default();
+        r.upload(&s);
+        let targets = Targets::new(&r, 8, 8);
+        let output = r.device.create_texture_tracked(&wgpu::TextureDescriptor {
+            label: None, size: wgpu::Extent3d { width: 8, height: 8, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: r.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+        });
+        let view = output.create_view_tracked(&Default::default());
+        let camera = Camera::look_at(Vec3::ZERO, -Vec3::Z);
+        let mut expected = 0.0_f32;
+        for time in [0.0, 500.0, 500.0] {
+            r.seek(time);
+            assert_eq!(r.sky_dot_counter, expected, "seeking time is not an FXS frame");
+            r.set_sky(&s);
+            assert_eq!(r.sky_dot_counter, expected, "resource refresh retains counter history");
+            r.render(&view, &targets, &camera);
+            expected = (expected + 0.01) % 1.0;
+            assert_eq!(r.sky_dot_counter, expected);
+        }
+        r.sky_dot_counter = 0.995;
+        r.render(&view, &targets, &camera);
+        assert!((r.sky_dot_counter - 0.005).abs() < 0.000001);
+        r.upload(&s);
+        assert_eq!(r.sky_dot_counter, 0.0, "new scene resets the FXS object's counter");
     }
 
     /// Randy 0x10041ede defaults to CULL_CW (2); only explicit CULL_NONE (1) disables it.
@@ -2225,7 +2454,7 @@ mod sky_tests {
         s.meshes[0].submeshes[0].texture = None;
         s.meshes[0].submeshes[0].sky_fog = true;
         for v in &mut s.meshes[0].vertices {
-            v.normal = [0.75, 0.0, 0.0]; // same angular geometry, distance = 75% of live far
+            v.pos = v.pos.map(|c| c * 75.0); // eye depth = 75% of normalized far; lateral range differs
             v.color = [1.0, 0.0, 0.0, 1.0];
         }
         let mut previous = None;
@@ -2270,7 +2499,7 @@ mod sky_tests {
             ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 0.0,
         });
         for v in &mut s.meshes[0].vertices {
-            v.normal = [0.5, 0.0, 0.0]; // 50% fog at live far, independent of mesh position
+            v.pos = v.pos.map(|c| c * 50.0); // eye depth = 50% of normalized far
             v.color = [1.0; 4];
         }
         let shot = |s: &Scene, name: &str| pixels(s, 0.0, name).expect("source fog regression requires an offscreen GPU adapter");
@@ -2817,6 +3046,40 @@ mod sky_tests {
         // sun along +Z towards the eye: N.H = 1 on the whole quad, so the highlight is the full material specular
         assert!(centre(&on) > 200, "specular {}", centre(&on));
         assert_eq!(centre(&off), 0);
+    }
+
+    #[test]
+    fn world_and_water_use_vertex_eye_depth_not_radial_fragment_fog() {
+        for liquid in [false, true] {
+            let mut s = lit_quad(20.0, [0.0; 3], 1.0, 0.0);
+            s.lights.clear();
+            let sub = &mut s.meshes[0].submeshes[0];
+            sub.emissive = [1.0; 3];
+            sub.liquid = liquid;
+            let env = s.environment.as_mut().unwrap();
+            env.fog_start = 0.0;
+            env.fog_end = 20.0;
+            // Corners exceed range20 but eye-depth10: native vertex fog is half.
+            let Some(png) = pixels(&s, 0.0, if liquid { "water_eye_fog" } else { "world_eye_fog" }) else { return };
+            assert!((126..=129).contains(&centre(&png)), "linear vertex eye fog (liquid={liquid}): {}", centre(&png));
+        }
+    }
+
+    #[test]
+    fn sky_emissive_saturates_before_texture_gain_and_clips_at_native_far() {
+        let mut s = scene([0.0; 2], None);
+        let key = s.meshes[0].submeshes[0].texture.unwrap();
+        s.textures.get_mut(&key).unwrap().rgba = vec![64, 64, 64, 255, 64, 64, 64, 255];
+        for v in &mut s.meshes[0].vertices { v.color = [0.0, 0.0, 0.0, 1.0]; }
+        let sub = &mut s.meshes[0].submeshes[0];
+        sub.emissive = [1.0; 3];
+        sub.base_color = [2.0_f32.powf(2.2), 2.0_f32.powf(2.2), 2.0_f32.powf(2.2), 1.0];
+        let Some(png) = pixels(&s, 0.0, "sky_emissive_gain") else { return };
+        assert!((126..=130).contains(&centre(&png)), "black diffuse plus emissive1, then texture64*2: {}", centre(&png));
+        s.environment = Some(ao_scene::Environment { sky_color: [0.0; 3], ..default_environment(100.0) });
+        for v in &mut s.meshes[0].vertices { v.pos = v.pos.map(|c| c * 101.0); }
+        let Some(clipped) = pixels(&s, 0.0, "sky_far_clip") else { return };
+        assert_eq!(centre(&clipped), 0, "normalized depth1010 must be clipped by the native far plane");
     }
 }
 

@@ -27,7 +27,7 @@ mod wildlife;
 pub use camera::{camera_views, CameraViews};
 pub use record::{parse as parse_resource, CameraAttractor, Record};
 pub use ao_scene::FogVolume;
-pub use sky::{open_weather, sun_dir, SkyClock, DEFAULT_DAY_TIME};
+pub use sky::{open_weather, sun_dir, SkyClock, Tweaks, DEFAULT_DAY_TIME};
 pub use spawn::{floor_below, scene_bounds, support_below};
 pub use zone::{zone_locator, ZoneLocator};
 pub use wildlife::{wildlife_geometry, WildlifeGeometry};
@@ -178,7 +178,8 @@ pub fn load_playfield_report_on_day(store: &RecordStore, client_dir: &Path, id: 
         report.terrain_cells = tm.cells_x * tm.cells_z;
         report.cell_size = tm.cell_size;
         report.ground.start = scene.instances.len();
-        terrain::build(store, id, &tm, &mut scene, day_time)?;
+        let shadow_time = tweaks.as_ref().map_or_else(|| sky::ground_shadow_time(day_time), |t| t.ground_shadow_time(day_time));
+        terrain::build(store, id, &tm, &mut scene, shadow_time)?;
         terrain = Some(tm);
     } else {
         report.ground.start = scene.instances.len();

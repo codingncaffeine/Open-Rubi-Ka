@@ -63,6 +63,7 @@ fn backdrop_after_live_sky_matches_fresh_pixels() {
         o.host.live_sky = Some(Some(ao_render::LiveSky {
             start: 100.0,
             scale: 10.0,
+            pose: None,
             source: Box::new(move |time| {
                 started_tx.send(time).unwrap();
                 release_rx.recv().unwrap();

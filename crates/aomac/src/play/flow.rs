@@ -1341,7 +1341,10 @@ impl Frontend for Play {
                     host.set_scene(*s);
                     // the live sky follows the server's `GameTime` from here on (1 `GameDayTime` second per real second)
                     let sky = self.world_sky.take().map(|c| c.on_day(self.zone.game_day as u32));
-                    host.live_sky = Some(sky.map(|mut c| ao_render::LiveSky { start: self.zone.day_time(), scale: 1.0, source: Box::new(move |t| c.at(t)) }));
+                    host.live_sky = Some(sky.map(|mut c| {
+                        let pose = Box::new(c.pose_source());
+                        ao_render::LiveSky { start: self.zone.day_time(), scale: 1.0, source: Box::new(move |t| c.at(t)), pose: Some(pose) }
+                    }));
                     host.camera = Camera::look_at(eye, at);
                     // `PlayfieldInit` -> `SandyInterfaceModule_t::ActivateGameZone`: the district music / ambience / emitters of the new playfield
                     // replace the old ones (none: leave the playfield, nothing keeps playing from the previous zone)

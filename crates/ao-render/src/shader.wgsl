@@ -16,6 +16,7 @@ struct G {
     water_dir: vec4<f32>,
     water_g: vec4<f32>,    // authored WaterLightCurrent, not doubled GroundLightCurrent
     dyn_info: vec4<i32>,   // x = active dynamic (per-frame moving) light count in `dyn_lights`, yzw unused
+    sky_counter: vec4<f32>, // x = DotStars Counter += .01 per FXS frame, independent of time/dt
 }
 struct Mat {
     color: vec4<f32>,
@@ -24,6 +25,7 @@ struct Mat {
     wave: vec4<f32>,     // sky: (curve_u, amp_u, curve_v, amp_v) uv offset amp * GameWaveCurve; scroll.w = 1 for a flickering sun fan
     spec: vec4<f32>,     // rgb = material specular (spec * shin_str, 0 = SPECULARENABLE off), w = power
     flags: vec4<f32>,    // x = texture clamp; yzw = linear explicit sky fog colour
+    uv_camera: vec4<f32>, // u/v translation coefficients for AO camera X/Z
 }
 @group(0) @binding(0) var<uniform> g: G;
 @group(0) @binding(1) var<storage, read> lights: array<vec4<f32>>; // pairs: (pos, range), (colour, 0)
@@ -71,6 +73,12 @@ struct VOut {
     @location(8) fade: f32,
     @location(9) @interpolate(flat) effect: u32,
     @location(10) @interpolate(flat) effect_time: f32,
+    @location(11) fog: f32,
+}
+
+// Randy10041876: linear vertex fog, no table/range fog (10042065).
+fn vertex_fog(depth: f32) -> f32 {
+    return clamp((depth - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
 }
 
 fn vtx(v: VIn) -> VOut {
@@ -80,6 +88,7 @@ fn vtx(v: VIn) -> VOut {
     var o: VOut;
     o.clip = g.vp * wp;
     o.wpos = wp.xyz;
+    o.fog = vertex_fog(-(g.view * wp).z);
     o.n = (model * vec4<f32>(v.normal, 0.0)).xyz;
     o.uv = v.uv;
     o.color = v.color;
@@ -141,20 +150,26 @@ fn vs_actor(v: VIn, @location(8) emissive: vec4<f32>, @location(9) specular: vec
     return o;
 }
 
-// Sky: pinned to the far plane so domes larger than the view distance are not clipped.
-@vertex
-fn vs_sky(v: VIn) -> VOut {
+// Sky shares the native camera projection, clipping and vertex fog.
+fn sky_vertex(v: VIn) -> VOut {
     var o = vtx(v);
-    o.clip.z = o.clip.w;
-    if mat.scroll.z > 0.5 {
-        // ScaleByViewDistance: authored distance / 1000 becomes metres at the live projection far.
-        o.n.x = v.normal.x * g.eye.w;
-    }
+    let camera_xz = vec2<f32>(g.eye.x, -g.eye.z);
+    o.uv += vec2<f32>(dot(mat.uv_camera.xy, camera_xz), dot(mat.uv_camera.zw, camera_xz));
+    // Native material emissive adds before vertex saturation, not tex*(1+emissive).
+    o.light = min(to_g(v.color.rgb) + to_g(mat.emissive.rgb), vec3<f32>(1.0));
     if mat.scroll.w > 0.5 && v.normal.z >= 0.0 {
         // e_SunRays rim alpha * (255 - trunc(255 * curve[i & 7])) / 255 (FUN_1005a3a9), interpolated per vertex like the client
         let k = u32(v.normal.z + 0.5) & 7u;
         o.color.a = o.color.a * (1.0 - floor(255.0 * g.wave[k >> 2u][k & 3u]) / 255.0);
     }
+    return o;
+}
+@vertex
+fn vs_sky(v: VIn) -> VOut { return sky_vertex(v); }
+@vertex
+fn vs_sky_points(v: VIn) -> VOut {
+    var o = sky_vertex(v);
+    o.uv.x += g.sky_counter.x;
     return o;
 }
 
@@ -298,7 +313,6 @@ fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
     if mode == 1u && !a2c && alpha < 0.5 {
         discard;
     }
-    let to_eye = g.eye.xyz - i.wpos;
     var light = i.light;
     var spec = i.spec;
     if mat.emissive.w > 1.5 && i.effect != 2u && i.effect != 4u && i.effect != 5u && i.effect != 6u {
@@ -310,7 +324,7 @@ fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
     }
     // texture stage MODULATE, then the specular add (both clamped to the framebuffer range), then fog: all in gamma space
     let lit = min(srgb_enc(t.rgb) * i.tint * light + spec, vec3<f32>(1.0));
-    let f = select(clamp((length(to_eye) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0), 0.0, i.effect == 2u || (i.effect >= 4u && i.effect <= 6u));
+    let f = select(i.fog, 0.0, i.effect == 2u || (i.effect >= 4u && i.effect <= 6u));
     // opaque/test: fog towards fog colour, alpha 1; blend: same with alpha; additive: fade out instead of tinting.
     let add = mode == 3u;
     let rgb = select(mix(lit, g.fog_g.rgb, f), lit, add);
@@ -321,24 +335,25 @@ fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
     return vec4<f32>(rgb, a);
 }
 
-// Sky: unlit; optional source fog precedes the native blend equation. Opaque ignores alpha.
+// Sky: prelit vertex colour; optional source fog precedes the native blend equation.
 fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
     let wu = u32(mat.wave.x);
     let wv = u32(mat.wave.z);
     let wobble = vec2<f32>(mat.wave.y * g.wave[wu >> 2u][wu & 3u], mat.wave.w * g.wave[wv >> 2u][wv & 3u]);
-    let c = sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z + wobble) * i.color * mat.color;
+    let t = sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z + wobble);
+    let alpha = t.a * i.color.a * mat.color.a;
     let a2c = g.fog.w > 0.5; // audit item 4, see `shade`
-    if mode == 1u && !a2c && c.a < 0.5 {
+    if mode == 1u && !a2c && alpha < 0.5 {
         discard;
     }
-    var rgb = srgb_enc(clamp(c.rgb * (vec3<f32>(1.0) + mat.emissive.rgb), vec3<f32>(0.0), vec3<f32>(1.0)));
+    // MODULATE2X / stage-1 TFACTOR live in material RGB, after saturated lighting.
+    var rgb = clamp(srgb_enc(t.rgb) * i.light * to_g(mat.color.rgb), vec3<f32>(0.0), vec3<f32>(1.0));
     if mat.scroll.z > 0.5 {
         // D3D fog follows the texture stage in gamma space, before blending (as in shade).
-        let fog_color = select(g.fog_g.rgb, srgb_enc(mat.flags.yzw), mat.scroll.z > 1.5);
-        rgb = mix(rgb, fog_color, clamp((i.n.x - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0));
+        let fog_color = select(g.fog_g.rgb, to_g(mat.flags.yzw), mat.scroll.z > 1.5);
+        rgb = mix(rgb, fog_color, i.fog);
     }
-    // Preserve the sky's existing shading; only move the former target encoding before gamma-space blending.
-    return vec4<f32>(rgb, select(1.0, c.a, mode >= 2u || (mode == 1u && a2c)));
+    return vec4<f32>(rgb, select(1.0, alpha, mode >= 2u || (mode == 1u && a2c)));
 }
 
 @fragment
@@ -365,7 +380,7 @@ fn fs_holo(i: VOut) -> @location(0) vec4<f32> {
     let t0 = sample_clamped(holo0, vec2<f32>(0.0, i.wpos.y + fract(0.2 * i.effect_time)));
     let t1 = sample_clamped(holo1, i.uv + vec2<f32>(fract(0.15 * i.effect_time), 0.0));
     let rgb = min(srgb_enc(t0.rgb) + srgb_enc(t1.rgb), vec3<f32>(1.0));
-    let f = clamp((length(g.eye.xyz - i.wpos) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
+    let f = i.fog;
     return vec4<f32>(mix(rgb, g.fog_g.rgb, f), t0.a * i.color.a * mat.color.a * i.fade);
 }
 @fragment
@@ -392,7 +407,7 @@ fn vs_env(v: VIn) -> VOut {
 @fragment
 fn fs_env(i: VOut) -> @location(0) vec4<f32> {
     let t = sample_clamped(tex, i.uv);
-    let f = clamp((length(g.eye.xyz - i.wpos) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
+    let f = i.fog;
     return vec4<f32>(mix(srgb_enc(t.rgb), g.fog_g.rgb, f), 1.0);
 }
 
@@ -409,7 +424,7 @@ fn vs_ground(v: VIn) -> VOut {
     return o;
 }
 fn ground_fog(i: VOut) -> f32 {
-    return clamp((length(g.eye.xyz - i.wpos) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
+    return i.fog;
 }
 fn ground_palette(i: VOut) -> vec3<f32> {
     return sample_clamped(holo0, vec2<f32>(i.wpos.x, -i.wpos.z) * mat.wave.xz).rgb;

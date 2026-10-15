@@ -77,7 +77,7 @@ pub enum Blend {
     SourceColorOne,
 }
 
-/// Triangle list sharing the parent mesh's vertex buffer.
+/// Primitive list sharing the parent mesh's vertex buffer (triangles unless `sky_points`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Submesh {
     pub indices: Vec<u32>,
@@ -109,6 +109,8 @@ pub struct Submesh {
     /// Texture coordinate drift in uv units per second (added to the vertex uv, wrapped by the sampler): scrolling clouds,
     /// water-like layers. `[0, 0]` = static.
     pub uv_scroll: [f32; 2],
+    /// Native DotStars: one-pixel point list, ONE/ONE blend, and Counter += .01 per rendered FXS frame.
+    pub sky_points: bool,
     /// Sky submeshes only: vertex `normal.x` is the distance as a fraction of camera far (authored distance / 1000) in
     /// the client's fogged sky; the renderer applies live camera far and fog end, then fogs source RGB before blending.
     pub sky_fog: bool,
@@ -118,6 +120,9 @@ pub struct Submesh {
     /// ([`wave_curves`]) added to the vertex uv every frame (a tweak `ScrollMatrix` translation driven by `GAME.GameWaveCurve*`;
     /// the constant part is baked into the uv). `amp == 0` = off.
     pub uv_wave: [f32; 4],
+    /// Sky texture translation from native camera X/Z (AO Z = negative scene Z):
+    /// `(u_from_x, u_from_z, v_from_x, v_from_z)`, added to the baked HQ-origin offset.
+    pub uv_camera: [f32; 4],
     /// Sky submeshes only (`e_SunRays`): vertex `normal.z` is the fan rim index `i` (`-1` = centre); the renderer scales the rim
     /// alpha by `(255 - table[i & 7]) / 255` with `table` = [`sun_flicker_table`] (`FUN_1005a3a9`).
     pub sun_flicker: bool,
@@ -149,9 +154,11 @@ impl Submesh {
             glow_mask: false,
             prelit: false,
             uv_scroll: [0.0; 2],
+            sky_points: false,
             sky_fog: false,
             sky_fog_color: None,
             uv_wave: [0.0; 4],
+            uv_camera: [0.0; 4],
             sun_flicker: false,
             specular: [0.0; 3],
             shininess: 0.0,
@@ -364,6 +371,10 @@ pub struct Scene {
     /// Sky domes/backdrops: instances of `meshes` drawn first, depth-write off, unfogged,
     /// with the transform's translation replaced by the camera position. Not in `instances`.
     pub sky: Vec<Instance>,
+    /// `(sky instance, flattened tweak object)` identities, also used for exact per-frame sky poses.
+    pub sky_pose_objects: Vec<(usize, usize)>,
+    /// Sky instances with native `RotationType e_LockToCameraY` (camera yaw, never pitch).
+    pub sky_yaw: Vec<usize>,
     /// Dynamic fog: the playfield's base fog plus the local fog volumes of the statel file; the renderer re-evaluates it
     /// at the camera every frame and overrides `environment.fog_color` / `fog_end` (and the clear colour when it equals
     /// the fog colour). `None` = the static environment fog.

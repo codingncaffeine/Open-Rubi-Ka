@@ -103,7 +103,7 @@ pub fn refresh_textures(store: &RecordStore, tm: &Tilemap, patches: &[(usize, [i
     }
     scene.textures
 }
-pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, day_time: f32) -> Result<()> {
+pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, shadow_time: f32) -> Result<()> {
     let (cx, cz, cs) = (tm.verts_x - 1, tm.verts_z - 1, tm.cell_size);
     let patch = patch_cells(tm);
     // texture id per cell
@@ -121,7 +121,7 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, day_
     // Cells whose tile texture does not exist stay untextured.
     tex.iter_mut().filter(|t| missing.contains(t)).for_each(|t| *t = NONE);
     let mips: BTreeMap<_, _> = keys.iter().map(|(&id, key)| (id, tile_mip(&scene.textures[key]))).collect();
-    let shade = store.get(SHADOWS, id).ok().flatten().and_then(|d| shadow::parse(&d).ok()).map(|l| shadow::at_time(&l, super::sky::ground_shadow_time(day_time)));
+    let shade = store.get(SHADOWS, id).ok().flatten().and_then(|d| shadow::parse(&d).ok()).map(|l| shadow::at_time(&l, shadow_time));
     let shadow_uv_scale = shade.as_ref().map_or([0.0; 2], |s| [0.5 / (cs * s.w as f32), 1.0 / (cs * s.h as f32)]);
     let shadow_texture = shade.as_ref().map(|s| {
         let key = TextureKey { rdb_type: SHADOWS, id };
@@ -297,7 +297,7 @@ mod tests {
         let rec = record::parse(&raw).unwrap();
         let tm = super::super::ground::parse(&store.get(super::super::TILEMAP, rec.tilemap).unwrap().unwrap()).unwrap();
         let mut scene = Scene::default();
-        build(&store, 4582, &tm, &mut scene, crate::playfield::DEFAULT_DAY_TIME).unwrap();
+        build(&store, 4582, &tm, &mut scene, super::super::sky::ground_shadow_time(crate::playfield::DEFAULT_DAY_TIME)).unwrap();
         assert!(!scene.meshes.is_empty());
         let mut patches = scene.meshes.iter();
         let patch = patch_cells(&tm);

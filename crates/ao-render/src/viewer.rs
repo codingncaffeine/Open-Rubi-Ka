@@ -232,6 +232,8 @@ pub trait Frontend {
     fn frame(&mut self, dt: f32, size: (u32, u32), host: &mut Host) -> ao_gui::DrawList;
 }
 
+type SkyPoseSource = Box<dyn FnMut(f32, &mut Scene) + Send>;
+
 /// Live time of day: `source(day_time)` returns a scene holding only the sky, its new textures and the environment
 /// ([`Renderer::set_sky`]); it runs on a worker thread, about twice a second of real time.
 pub struct LiveSky {
@@ -240,16 +242,19 @@ pub struct LiveSky {
     /// Game seconds per real second.
     pub scale: f32,
     pub source: Box<dyn FnMut(f32) -> Scene + Send>,
+    /// Exact per-frame poses of already-loaded resources; never waits for the worker.
+    pub pose: Option<SkyPoseSource>,
 }
 
 /// Worker thread + clock of a [`LiveSky`].
 struct LiveRun {
-    day_time: f32,
+    day_time: f64,
     scale: f32,
     since: f32,
     busy: bool,
     req: std::sync::mpsc::Sender<f32>,
     resp: std::sync::mpsc::Receiver<Scene>,
+    pose: Option<SkyPoseSource>,
 }
 
 impl LiveRun {
@@ -264,19 +269,23 @@ impl LiveRun {
                 }
             }
         });
-        Self { day_time: live.start, scale: live.scale, since: f32::MAX, busy: false, req, resp }
+        Self { day_time: f64::from(live.start), scale: live.scale, since: f32::MAX, busy: false, req, resp, pose: live.pose }
     }
 
     /// Advances the clock by `dt` real seconds; the freshly computed sky, if one arrived.
     fn tick(&mut self, dt: f32) -> Option<Scene> {
-        self.day_time += dt * self.scale;
+        self.day_time += f64::from(dt) * f64::from(self.scale);
         self.since += dt;
         let got = self.resp.try_recv().ok();
         self.busy &= got.is_none();
-        if !self.busy && self.since >= 0.5 && self.req.send(self.day_time).is_ok() {
+        if !self.busy && self.since >= 0.5 && self.req.send(self.day_time as f32).is_ok() {
             (self.busy, self.since) = (true, 0.0);
         }
         got
+    }
+
+    fn pose(&mut self, scene: &mut Scene) {
+        if let Some(pose) = &mut self.pose { pose(self.day_time as f32, scene); }
     }
 
     fn apply_host(live: &mut Option<Self>, host: &mut Host) {
@@ -284,7 +293,7 @@ impl LiveRun {
             *live = next.map(Self::new);
         }
         if let (Some(time), Some(run)) = (host.sky_clock.take(), live.as_mut()) {
-            run.day_time = time;
+            run.day_time = f64::from(time);
         }
     }
 
@@ -293,7 +302,13 @@ impl LiveRun {
             renderer.day_time_rate = run.scale;
             if let Some(sky) = run.tick(dt) {
                 renderer.set_sky(&sky);
-                return sky.environment.map(|env| env.sun_dir.map(|v| -v));
+            }
+            if run.pose.is_some() {
+                run.pose(&mut renderer.sky.pose);
+                renderer.apply_sky_pose();
+                return renderer.sky.pose.environment.map(|env| env.sun_dir.map(|v| -v));
+            } else if let Some(env) = renderer.sky.pose.environment {
+                return Some(env.sun_dir.map(|v| -v));
             }
         }
         None
@@ -1152,6 +1167,90 @@ impl Offscreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_sky_renderer_frame_positions_survive_delayed_worker_responses() {
+        fn sample(time: f32) -> Scene {
+            let mesh = ao_scene::Mesh {
+                vertices: [[time - 1.0, 0.0, -100.0], [time + 1.0, 0.0, -100.0], [time, 1.0, -100.0]]
+                    .map(|pos| ao_scene::Vertex { pos, color: [1.0; 4], ..Default::default() }).into(),
+                submeshes: vec![ao_scene::Submesh::new(vec![0, 1, 2], None)],
+            };
+            Scene {
+                day_time: time, meshes: vec![mesh],
+                sky: vec![ao_scene::Instance { mesh: 0, transform: ao_scene::IDENTITY }],
+                sky_pose_objects: vec![(0, 0)], ..Scene::default()
+            }
+        }
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("sky integration regression requires an offscreen GPU adapter");
+        renderer.upload(&sample(100.0));
+        let (started, requests) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let mut live = Some(LiveRun::new(LiveSky {
+            start: 100.0, scale: 1.0,
+            source: Box::new(move |time| {
+                let _ = started.send(time);
+                let _ = blocked.recv();
+                sample(time)
+            }),
+            pose: Some(Box::new(|time, scene| {
+                scene.sky[0].transform = ao_scene::IDENTITY;
+                scene.sky[0].transform[3][0] = time - scene.day_time;
+            })),
+        }));
+        let mut elapsed = 0.0f64;
+        let mut previous = 100.0;
+        println!("renderer_celestial_csv,frame,dt,modeled_old_hold_x,observed_callback_x,baked_time");
+        for frame in 0..120 {
+            let dt = if frame % 2 == 0 { 1.0 / 60.0 } else { 1.0 / 30.0 };
+            elapsed += f64::from(dt);
+            LiveRun::advance(&mut live, &mut renderer, dt);
+            if matches!(frame, 29 | 59 | 89) {
+                let requested = requests.recv_timeout(std::time::Duration::from_secs(5)).expect("resource request");
+                release.send(()).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while renderer.sky.pose.day_time != requested {
+                    LiveRun::advance(&mut live, &mut renderer, 0.0);
+                    assert!(std::time::Instant::now() < deadline, "resource response must be applied");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            let baked = renderer.sky.pose.day_time;
+            let observed = renderer.sky.xf[0].transform_point3(Vec3::new(baked, 0.0, -100.0)).x;
+            assert!((f64::from(observed) - 100.0 - elapsed).abs() < 0.00002);
+            assert!((observed - previous - dt).abs() < 0.00003, "frame {frame}: actual renderer matrix must advance proportionally to dt");
+            println!("renderer_celestial_csv,{frame},{dt:.9},{:.9},{observed:.9},{baked:.9}",
+                100.0 + (elapsed / 0.5).floor() * 0.5);
+            previous = observed;
+        }
+        drop(release);
+    }
+
+    #[test]
+    fn live_sky_poses_advance_every_frame_without_waiting_for_resource_samples() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let mut run = LiveRun::new(LiveSky {
+            start: 4478.0,
+            scale: 1.0,
+            source: Box::new(move |_| { let _ = blocked.recv(); Scene::default() }),
+            pose: Some(Box::new(|time, scene| scene.spawn = Some([time, 0.0, 0.0]))),
+        });
+        let mut pose = Scene::default();
+        let mut elapsed = 0.0f64;
+        let mut previous = 4478.0;
+        for frame in 0..120 {
+            let dt = if frame % 2 == 0 { 1.0 / 60.0 } else { 1.0 / 30.0 };
+            elapsed += f64::from(dt);
+            assert!(run.tick(dt).is_none(), "resource worker remains blocked");
+            run.pose(&mut pose);
+            let position = pose.spawn.unwrap()[0];
+            assert!((f64::from(position) - 4478.0 - elapsed).abs() < 0.0005);
+            assert!((position - previous - dt).abs() < 0.001, "frame {frame}: no held pose or coarse jump");
+            previous = position;
+        }
+        drop(release); // let the worker exit without a leaked blocked thread
+    }
     #[test]
     fn mouse_lag_fix_defaults_to_no_gpu_barrier() {
         assert!(!Host::headless().mouse_lag_fix);
@@ -1184,7 +1283,7 @@ mod tests {
         let gui = ao_gui::Gui::new(&dir, None).unwrap();
         let mut fe = Idle(gui);
         let mut o = Offscreen::new(&fe, (320, 200)).unwrap();
-        o.host.live_sky = Some(Some(LiveSky { start: 100.0, scale: 10.0, source: Box::new(|t| Scene { spawn: Some([t, 0.0, 0.0]), ..Scene::default() }) }));
+        o.host.live_sky = Some(Some(LiveSky { start: 100.0, scale: 10.0, source: Box::new(|t| Scene { spawn: Some([t, 0.0, 0.0]), ..Scene::default() }), pose: None }));
         let rss = || -> u64 {
             let pid = std::process::id();
             let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().unwrap();
@@ -1299,7 +1398,7 @@ mod tests {
     #[test]
     fn live_sky_requests_at_the_scaled_clock_and_returns_the_worker_result() {
         let source = Box::new(|t: f32| Scene { spawn: Some([t, 0.0, 0.0]), ..Scene::default() });
-        let mut live = LiveRun::new(LiveSky { start: 100.0, scale: 10.0, source });
+        let mut live = LiveRun::new(LiveSky { start: 100.0, scale: 10.0, source, pose: None });
         // the first tick asks at once (clock 100 + 0.1 s * 10), later ticks wait for the answer and 0.5 s
         assert!(live.tick(0.1).is_none() && live.busy);
         let sky = (0..200).find_map(|_| {

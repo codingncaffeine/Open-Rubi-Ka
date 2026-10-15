@@ -15,7 +15,7 @@ pub struct CloudLayer {
     pub wind: [f32; 3],
     pub storm: f32,
     pub thick: f32,
-    /// AO GameSunDirection.y.
+    /// Native GameSunDirection.y, independent of FXS GAME overrides.
     pub sun_y: f32,
     /// GroundLightCurrent (gamma space) used by10054e07, not CloudLightCurrent.
     pub light: [f32; 3],
@@ -114,9 +114,9 @@ impl Clouds {
         for i in 0..COUNT {
             let speed=self.sheets[i].speed;
             let p=&mut self.sheets[i].position;
-            p[0]+=layer.wind[0]*speed*dt*100.0+delta[0]*10.0;
+            p[0]+=layer.wind[0]*speed*dt*100.0+delta[0]/10.0;
             p[1]+=layer.wind[1]*speed*dt*100.0;
-            p[2]+=layer.wind[2]*speed*dt*100.0+delta[2]*10.0;
+            p[2]+=layer.wind[2]*speed*dt*100.0+delta[2]/10.0;
             if p[0]<=-1600.0 || p[0]>=1600.0 || p[2]<=-1600.0 || p[2]>=1600.0 || moved {self.respawn(i,moved,layer.altitude);}
             let s=&self.sheets[i];
             let distance=((s.position[0]*s.position[0]+(s.position[1]-layer.altitude).powi(2)+s.position[2]*s.position[2]).sqrt()/1500.0).min(1.0).powi(2);
@@ -178,7 +178,45 @@ mod tests {
         let speed=sim.sheets[0].speed;
         let mut windy=layer.clone();windy.wind=[1.0,0.0,0.0];windy.storm=1.0;
         sim.update(&windy,10,[1.0,0.0,0.0],0.01,1000.0,&mut mesh.vertices);
-        assert!((sim.sheets[0].position[0]-(old[0]+speed-10.0)).abs()<0.00001);
+        assert!((sim.sheets[0].position[0]-(old[0]+speed-0.1)).abs()<0.00001);
         assert_eq!(mesh.vertices[0].color[3],0.0);
+    }
+    #[test]
+    fn native_bend_can_cross_horizon_without_camera_height_parallax() {
+        let layer=CloudLayer {mesh:0,altitude:100.0,wind:[0.0;3],storm:0.0,thick:0.0,sun_y:0.0,light:[0.0;3],light_direction:[0.0,1.0,0.0],ambient:[0.0;3]};
+        let mut sim=Clouds::default();let mut mesh=Clouds::mesh();
+        sim.update(&layer,2,[0.0;3],0.0,1000.0,&mut mesh.vertices);
+        for sheet in &mut sim.sheets {sheet.position=[1500.0,100.0,0.0];}
+        sim.update(&layer,2,[0.0;3],0.0,1000.0,&mut mesh.vertices);
+        let original=mesh.vertices.clone();
+        // At r=1500 the native centre is 100-1.5*100=-50, with a .5-radian tilt.
+        let centre_y=mesh.vertices[..4].iter().map(|v|v.pos[1]).sum::<f32>()/4.0;
+        assert!((centre_y+50.0).abs()<0.001);
+        assert!(mesh.vertices[..4].iter().any(|v|v.pos[1] < -50.0));
+        sim.update(&layer,2,[0.0,1000.0,0.0],0.0,1000.0,&mut mesh.vertices);
+        assert_eq!(mesh.vertices,original,"native camera translation cancels before perspective");
+        sim.update(&layer,2,[0.0,1000.0,0.0],0.0,500.0,&mut mesh.vertices);
+        for (scaled,full) in mesh.vertices.iter().zip(&original) {
+            for j in 0..3 {assert_eq!(scaled.pos[j],full.pos[j]*0.5);}
+        }
+    }
+    #[test]
+    fn native_cloud_light_adds_quantized_emissive_ambient_and_ground_tint() {
+        let mut layer=CloudLayer {mesh:0,altitude:100.0,wind:[0.0;3],storm:0.0,thick:0.0,sun_y:-1.0,light:[1.0,0.5,0.0],light_direction:[0.0,1.0,0.0],ambient:[0.1;3]};
+        let mut sim=Clouds::default();let mut mesh=Clouds::mesh();
+        sim.update(&layer,10,[0.0;3],0.0,1000.0,&mut mesh.vertices);
+        for sheet in &mut sim.sheets {
+            sheet.position=[0.0,100.0,0.0];sheet.opacity=1.0;
+            for vertex in &mut sheet.vertices {vertex.normal=[0.0,1.0,0.0];}
+        }
+        sim.update(&layer,10,[0.0;3],0.0,1000.0,&mut mesh.vertices);
+        let grey=35.0/255.0;
+        for j in 0..3 {
+            let expected=linear(grey+0.1+grey*layer.light[j]*0.55);
+            assert!((mesh.vertices[0].color[j]-expected).abs()<1e-6);
+        }
+        layer.sun_y=1.0;
+        sim.update(&layer,10,[0.0;3],0.0,1000.0,&mut mesh.vertices);
+        assert_eq!(mesh.vertices[0].color,[1.0;4],"native daylight emissive can saturate all channels");
     }
 }

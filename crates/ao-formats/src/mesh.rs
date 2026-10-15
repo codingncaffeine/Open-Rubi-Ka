@@ -70,6 +70,7 @@ pub fn load_animated_mesh(store: &RecordStore, id: u32) -> Result<Option<(Scene,
             let mut builder = Builder {
                 ar, mesh: Mesh::default(), groups: HashMap::new(), have_texture: &mut textures,
                 visited: vec![], object_space: true, overrides: &[], slot: 0, last_tex: None,
+                generic_materials: &[],
             };
             let state = node.ref1("delta_state").and_then(|i| ar.objects.get(i));
             for mesh in ar.objects[data].refs("mesh") {
@@ -166,6 +167,13 @@ fn generic_mesh_archive(ar: &Archive, default: &Object, index: Option<usize>, ca
         Ok(())
     }
     collect(ar, ar.root, &mut nodes, &mut vec![false; ar.objects.len()], 0)?;
+    // GenericMesh resource loader10061505 resets the first SimpleMesh's material
+    // in every data node before MeshIndex selection. References share identity:
+    // every use of that material must see the reset, not just submesh slot0.
+    let generic_materials: Vec<usize> = nodes.iter().filter_map(|&i| {
+        let data = ar.objects.get(ar.objects[i].ref1("data")?)?;
+        ar.objects.get(*data.refs("mesh").first()?)?.ref1("material")
+    }).collect();
     let selected = match index {
         Some(i) => std::slice::from_ref(nodes.get(i).context("MeshIndex out of range")?),
         None => nodes.as_slice(),
@@ -173,6 +181,7 @@ fn generic_mesh_archive(ar: &Archive, default: &Object, index: Option<usize>, ca
     let mut builder = Builder {
         ar, mesh: Mesh::default(), groups: HashMap::new(), have_texture,
         visited: vec![], object_space: true, overrides: &[], slot: 0, last_tex: None,
+        generic_materials: &generic_materials,
     };
     for &i in selected {
         let node = &ar.objects[i];
@@ -333,6 +342,8 @@ struct Builder<'a, 'b> {
     /// bound (resolved, inherited, or overridden) so a run of channel-less `SimpleMesh`es all reuse the last
     /// real texture instead of resetting to none/white.
     last_tex: Option<TextureKey>,
+    /// Material identities reset by DisplaySystem's generic resource loader10061505.
+    generic_materials: &'b [usize],
 }
 
 fn decode_archive(bytes: &[u8], object_space: bool, have_texture: impl FnMut(TextureKey) -> bool) -> Result<Mesh> {
@@ -351,6 +362,7 @@ fn decode_archive_with(bytes: &[u8], object_space: bool, overrides: &[(u32, u32)
         overrides,
         slot: 0,
         last_tex: inherited,
+        generic_materials: &[],
     };
     b.node(ar.root, &IDENTITY, 0)?;
     b.mesh.submeshes.retain(|s| !s.indices.is_empty());
@@ -387,6 +399,7 @@ impl Builder<'_, '_> {
     fn material(&mut self, node_ds: Option<&Object>, sm: &Object) -> MatKey {
         let objs = &self.ar.objects;
         let mat = sm.ref1("material").and_then(|m| objs.get(m));
+        let generic = sm.ref1("material").is_some_and(|i| self.generic_materials.contains(&i));
         let mat_ds = mat.and_then(|m| m.ref1("delta_state")).and_then(|d| objs.get(d));
         let state = |ty: i32| {
             [mat_ds, node_ds].into_iter().flatten().find_map(|ds| ds.all("rst_type").zip(ds.all("rst_value")).filter(|&(t, _)| le(t) == Some(ty)).last().and_then(|(_, v)| le(v)))
@@ -429,7 +442,7 @@ impl Builder<'_, '_> {
         let a = mat.and_then(|m| m.f32s::<1>("opac")).map_or(1.0, |o| o[0]);
         // EMISSIVEMATERIALSOURCE (148) stays at the device default MATERIAL for archive meshes: the emissive is `emis` as is
         // (the luminance test of `FUN_1004ac5f` @1004ac5f only runs for `ConvertToLightmap`).
-        let emis = mat.and_then(|m| m.f32s::<3>("emis")).unwrap_or([0.0; 3]);
+        let emis = if generic { [0.0; 3] } else { mat.and_then(|m| m.f32s::<3>("emis")).unwrap_or([0.0; 3]) };
         let emissive = emis.map(lin);
         // Mode 5 of `FUN_10040645` (texture-alpha glow): stage 0 COLOROP = ADD, COLORARG1 = TEXTURE|ALPHAREPLICATE.
         let stage0 = |ty: i32| [mat_ds, node_ds].into_iter().flatten().find_map(|ds| tss(ds, 0, ty));
@@ -441,7 +454,7 @@ impl Builder<'_, '_> {
         let spec = mat.and_then(|m| m.f32s::<3>("spec")).unwrap_or([0.0; 3]);
         let strength = mat.and_then(|m| m.f32s::<1>("shin_str")).map_or(0.0, |v| v[0]);
         let shininess = mat.and_then(|m| m.f32s::<1>("shin")).map_or(0.0, |v| v[0]);
-        let (specular, shininess) = if state(D3DRS_SPECULARENABLE) == Some(1) { (spec.map(|c| lin(c * strength)), shininess) } else { ([0.0; 3], 0.0) };
+        let (specular, shininess) = if !generic && state(D3DRS_SPECULARENABLE) == Some(1) { (spec.map(|c| lin(c * strength)), shininess) } else { ([0.0; 3], 0.0) };
         MatKey { texture: tex, blend, two_sided: state(D3DRS_CULLMODE) == Some(D3DCULL_NONE), color: [1.0, 1.0, 1.0, a], emissive, glow_mask, specular, shininess }
     }
 
@@ -657,6 +670,57 @@ mod tests {
             }
             assert!(generic_mesh_archive(&ar, default, Some(usize::MAX), false, &mut |_| false).is_err());
         }
+    }
+
+    #[test]
+    fn generic_resource_resets_raw_cloud_material_emission_and_specular() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        let Ok(store) = RecordStore::open(&dir) else { return };
+        for id in [227651, 227745] {
+            let bytes = store.get(MESH_TYPE, id).unwrap().unwrap();
+            let raw = decode_archive(&bytes, true, |_| false).unwrap();
+            assert_eq!(raw.submeshes[0].emissive, [1.0; 3], "raw archive {id} really authors emissive1");
+            let mut scene = Scene::default();
+            let decoded = decode_generic_mesh(&store, id, None, true, &mut scene).unwrap().unwrap();
+            for sub in &scene.meshes[decoded].submeshes {
+                assert_eq!(sub.emissive, [0.0; 3], "10061505 clears first material emission");
+                assert_eq!(sub.specular, [0.0; 3]);
+                assert_eq!(sub.base_color[..3], [1.0; 3]);
+            }
+        }
+    }
+
+    #[test]
+    fn generic_material_reset_follows_shared_identity_not_submesh_slot() {
+        use crate::archive::Member;
+        let one = [1usize, 3].map(|i| (i as u32).to_le_bytes());
+        let rgb: Vec<u8> = [0.5f32; 3].into_iter().flat_map(f32::to_le_bytes).collect();
+        let scalar = 1.0f32.to_le_bytes();
+        let state = 5u32.to_le_bytes();
+        let material = || Object { members: vec![
+            Member { name: "emis", data: &rgb }, Member { name: "spec", data: &rgb },
+            Member { name: "shin_str", data: &scalar }, Member { name: "shin", data: &scalar },
+            Member { name: "delta_state", data: &state },
+        ] };
+        let mesh = |i: usize| Object { members: vec![Member { name: "material", data: &one[i][..] }] };
+        let rs = D3DRS_SPECULARENABLE.to_le_bytes();
+        let enabled = 1i32.to_le_bytes();
+        let ar = Archive { root: 0, animation_ranges: vec![], objects: vec![
+            mesh(0), material(), mesh(1), material(), mesh(0),
+            Object { members: vec![Member { name: "rst_type", data: &rs }, Member { name: "rst_value", data: &enabled }] },
+        ] };
+        let mut textures = |_| false;
+        let mut builder = Builder { ar: &ar, mesh: Mesh::default(), groups: HashMap::new(), have_texture: &mut textures,
+            visited: vec![], object_space: true, overrides: &[], slot: 0, last_tex: None, generic_materials: &[1] };
+        for i in [0, 4] {
+            let material = builder.material(None, &ar.objects[i]);
+            assert_eq!(material.emissive, [0.0; 3]);
+            assert_eq!(material.specular, [0.0; 3]);
+        }
+        let other = builder.material(None, &ar.objects[2]);
+        assert_eq!(other.emissive, [0.5f32.powf(2.2); 3], "another material identity must retain its authored properties");
+        assert_eq!(other.specular, [0.5f32.powf(2.2); 3]);
     }
 
     #[test]

@@ -107,8 +107,8 @@ pub struct Zone {
     pub counts: BTreeMap<u32, u32>,
     pub frames: u32,
     pub in_play_sent: bool,
-    /// `GameDayTime` (0..6480 s) at the last [`Zone::tick`], from the last `GameTimeIIR_t` (see [`day_time_of`]).
-    pub clock: Option<f32>,
+    /// Native double game-seconds accumulator (`GameTime_t+0x50`), converted to the float sky interface on read.
+    pub clock: Option<f64>,
     /// `GameTime_t+0x4C`, the game day (`GameTimeIIR_t.arg3`); seeds the weather schedule (docs/zone/world.md §10).
     pub game_day: i32,
     /// The own character's raw stats: `FullCharacterIIR_t` (stats_a, stats_b, u8, i16) then every own `StatIIR_t`.
@@ -274,11 +274,11 @@ impl Zone {
     /// The sky clock (`GameDayTime`, 0..6480 s) now: the server's `GameTimeIIR_t` advanced by the frames since, or the
     /// viewer's frozen default before the server sent one.
     pub fn day_time(&self) -> f32 {
-        self.clock.unwrap_or(ao_formats::playfield::DEFAULT_DAY_TIME)
+        self.clock.map_or(ao_formats::playfield::DEFAULT_DAY_TIME, |time| time as f32 / TIME_SPEED)
     }
     /// `GameTime_t::GetCurrentTimeInSeconds` (GC 0x100050a6), within the 27-hour game day.
     pub fn game_seconds(&self) -> Option<i32> {
-        self.clock.map(|time| (time * TIME_SPEED) as i32)
+        self.clock.map(|time| time as i32)
     }
 
 
@@ -302,7 +302,7 @@ impl Zone {
             *t += f64::from(dt);
         }
         if let Some(t) = &mut self.clock {
-            *t = (*t + dt).rem_euclid(GAME_DAY_SECS / TIME_SPEED);
+            *t = (*t + f64::from(dt) * f64::from(TIME_SPEED)).rem_euclid(f64::from(GAME_DAY_SECS));
         }
     }
 
@@ -537,7 +537,7 @@ impl Zone {
                 return ZoneEvent::Playfield(id);
             }
             N3::World(World::GameTime(t)) => {
-                self.clock = Some(day_time_of(t.time));
+                self.clock = Some(f64::from(t.time).rem_euclid(f64::from(GAME_DAY_SECS)));
                 self.game_day = t.arg3;
                 self.server_unix = Some(f64::from(t.arg4));
                 return ZoneEvent::Time;
@@ -850,11 +850,6 @@ const GAME_DAY_SECS: f32 = 97_200.0;
 /// `GameTime_t::TimeSpeed` (`+0x5c`, ctor default 15): game seconds per real second.
 const TIME_SPEED: f32 = 15.0;
 
-/// `GameTimeIIR_t.time` (game seconds into the 27 hour day, `GameTime_t+0x50 = fmod(time, 97200)` [GC 0x1000b526]) as the sky's
-/// `GameDayTime` (0..6480 s): `DayTimeForGroundShadows = GameDayTime * 15` is that in-day time (table bounds up to 97700, docs/formats.md).
-pub fn day_time_of(server_time: f32) -> f32 {
-    server_time.rem_euclid(GAME_DAY_SECS) / TIME_SPEED
-}
 
 /// Scene-space forward vector for a server heading `yaw` (`2*atan2(y, w)`): in server space a character walks along
 /// `(sin yaw, 0, cos yaw)` (x, y, z), mirrored like [`scene_pos`]. VERIFIED against the live captures: for every moving
@@ -1105,7 +1100,20 @@ mod tests {
         z.tick(2005.0);
         assert!((z.day_time() - 3.0).abs() < 1e-2, "{}", z.day_time());
         assert_eq!(z.game_seconds(), Some(45), "native integer time wraps with the game day");
-        assert_eq!(day_time_of(97_200.0 + 15.0), 1.0);
+        z.clock = Some(97_215.0);
+        z.tick(0.0);
+        assert_eq!(z.day_time(), 1.0);
+    }
+
+    #[test]
+    fn game_clock_accumulates_native_double_precision_before_float_export() {
+        let mut zone = Zone::new(1);
+        zone.clock = Some(67_170.0);
+        let dt = 1.0 / 60.0;
+        for _ in 0..36_000 { zone.tick(dt); }
+        let expected = 67_170.0 + f64::from(dt) * 15.0 * 36_000.0;
+        assert!((zone.clock.unwrap() - expected).abs() < 1e-6);
+        assert!((zone.day_time() - 5078.0).abs() < 0.001, "no float-accumulator drift after ten minutes");
     }
 
     /// `StartTeleportTry` runs once while the trier lives; the trier fails after 30 s (`RunFunction`), and the playfield change kills it.

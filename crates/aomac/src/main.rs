@@ -237,7 +237,8 @@ fn main() -> Result<()> {
                     let start = time_of_day.unwrap_or(ao_formats::playfield::DEFAULT_DAY_TIME);
                     if let (Some(scale), None) = (time_scale, &opts.screenshot) {
                         if let Some(mut clock) = ao_formats::playfield::SkyClock::open(&dir, id)? {
-                            live = Some(ao_render::LiveSky { start, scale, source: Box::new(move |t| clock.at(t)) });
+                            let pose = Box::new(clock.pose_source());
+                            live = Some(ao_render::LiveSky { start, scale, source: Box::new(move |t| clock.at(t)), pose: Some(pose) });
                         }
                     }
                     let store = RecordStore::open(&dir)?;

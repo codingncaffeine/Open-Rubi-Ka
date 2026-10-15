@@ -1,10 +1,10 @@
 //! The part of the FXS tweak language that the sky objects use: `Object` blocks, left-to-right expressions and
 //! quaternions (`v(axis), degrees`, `q(x,y,z,w)`, `a [ROT] b`).
 //!
-//! Evaluation context (offline, no game running): `GAME.CurrentDayTime` / `DayTimeFactor` come from the requested time of
-//! day; every other value the game writes every frame (`GameDeltaTime`, wind, the `Counter` fields that integrate delta
-//! time, the `GameWaveCurve*` waves) is 0, i.e. the baked sky is a still frame at that time (the renderer animates the
-//! waves, see `layers::wave_spins` / `uv_wave`).
+//! Evaluation context: native `GameDayTime` / `GameSun*Rotation` remain live; the final GAME object maps them to
+//! `CurrentDayTime` / `DayTimeFactor` / `Sun*Rotation` (ICC freezes those interfaces). Per-frame delta, wind, integrated
+//! counters and `GameWaveCurve*` are zero in a baked still frame; the renderer animates the waves
+//! (see `layers::wave_spins` / `uv_wave`).
 
 use std::collections::HashMap;
 
@@ -56,9 +56,9 @@ enum Block {
 
 const TYPES: [&str; 8] = ["Unsigned", "Float", "Vector", "Quaternion", "String", "Matrix", "Object", "Color"];
 
-/// All objects of the flattened (comment free) script text, in file order.
+/// Named objects of the flattened script; a later definition replaces the whole object (FXS1000132f).
 pub fn parse_objects(text: &str) -> Vec<Obj> {
-    let mut out = Vec::new();
+    let mut out: Vec<Obj> = Vec::new();
     let mut cur: Option<Obj> = None;
     let mut stack: Vec<Block> = Vec::new();
     let mut pending = Block::Plain;
@@ -85,7 +85,13 @@ pub fn parse_objects(text: &str) -> Vec<Obj> {
         }
         if t == "}" {
             if stack.pop().is_none() || stack.is_empty() {
-                out.extend(cur.take());
+                if let Some(object) = cur.take() {
+                    if let Some(previous) = out.iter_mut().find(|o| o.name == object.name && object.name != "Noname") {
+                        *previous = object;
+                    } else {
+                        out.push(object);
+                    }
+                }
             }
             continue;
         }
@@ -100,10 +106,12 @@ pub fn parse_objects(text: &str) -> Vec<Obj> {
                 obj.states.insert(state.to_string(), value.trim_start_matches("Unsigned").trim().to_string());
             }
         } else if let Some(rest) = t.strip_prefix("TextureStage:") {
-            // TextureStage: stage, stage, e_D3DTSS_<NAME>, value (stage 0 only is used by the sky)
+            // TextureStage: state blob, texture stage, e_D3DTSS_<NAME>, value.
             let parts: Vec<&str> = rest.split(',').map(|p| p.trim().trim_start_matches("Unsigned").trim()).collect();
-            if let [_, _, name, value] = parts[..] {
-                obj.states.insert(name.replace("e_D3DTSS_", "TSS_"), value.to_string());
+            if let [_, stage, name, value] = parts[..] {
+                let stage: u32 = stage.trim_end_matches('u').parse().unwrap_or(0);
+                let prefix = if stage == 0 { "TSS_".to_string() } else { format!("TSS{stage}_") };
+                obj.states.insert(name.replace("e_D3DTSS_", &prefix), value.to_string());
             }
         } else if t.starts_with("Texture:") {
             if obj.texture.is_none() {
@@ -129,6 +137,14 @@ pub fn parse_objects(text: &str) -> Vec<Obj> {
                 let Some(next) = lines.next() else { break };
                 expr.push(' ');
                 expr.push_str(next.trim());
+            }
+            if array && ty == "Float" {
+                let mut peek = lines.clone();
+                while let Some(next) = peek.next().filter(|line| line.trim_start().starts_with(|c: char| c.is_ascii_digit() || matches!(c, '-' | '+' | '.'))) {
+                    expr.push(' ');
+                    expr.push_str(next.trim());
+                    lines = peek.clone();
+                }
             }
             // `Vector Vertex [5]:` lists one `v( .. )` per line
             if array && expr.contains("v(") {
@@ -186,16 +202,19 @@ fn binary(b: &[u8], p: &mut usize, var: &dyn Fn(&str) -> Option<f32>, nest: u32)
     loop {
         skip_ws(b, p);
         let Some(&op) = b.get(*p) else { return Some(acc) };
-        if !b"+-*/%".contains(&op) {
+        let clamp = (op == b'<' && b.get(*p + 1) == Some(&b'|')) || (op == b'|' && b.get(*p + 1) == Some(&b'>'));
+        if !b"+-*/%".contains(&op) && !clamp {
             return Some(acc);
         }
-        *p += 1;
+        *p += if clamp { 2 } else { 1 };
         let rhs = primary(b, p, var, nest)?;
         acc = match op {
             b'+' => acc + rhs,
             b'-' => acc - rhs,
             b'*' => acc * rhs,
             b'/' => acc / rhs,
+            b'<' => acc.min(rhs),
+            b'|' => acc.max(rhs),
             _ => acc % rhs,
         };
     }
@@ -249,7 +268,7 @@ fn primary(b: &[u8], p: &mut usize, var: &dyn Fn(&str) -> Option<f32>, nest: u32
                 let index = binary(b, p, var, nest + 1)?;
                 skip_ws(b, p);
                 (b.get(*p) == Some(&b']')).then(|| *p += 1)?;
-                return var(&format!("{name}[{}]", index.max(0.0).round() as i64));
+                return var(&format!("{name}[{index}]"));
             }
             var(name)
         }
@@ -335,6 +354,9 @@ pub struct Ctx {
     pub day_time: f32,
     pub sun1: Quat,
     pub sun2: Quat,
+    /// Native exports remain live even when the script's interface time/suns are frozen.
+    pub game_exports: Option<(f32, [Quat; 2])>,
+    pub day_factor: Option<f32>,
     /// `GAME.ThickCloudsIntensity` (written by the game from the weather).
     pub cloud_intensity: f32,
     /// `GAME.OffsetFromHQ_X/Z`: the playfield's universe position relative to Omni-HQ.
@@ -355,7 +377,20 @@ pub struct Ctx {
 impl Ctx {
     /// A context for expressions that do not depend on the game (offsets, counters, colours).
     pub fn at(day_time: f32) -> Ctx {
-        Ctx { day_time, sun1: Quat::IDENTITY, sun2: Quat::IDENTITY, cloud_intensity: 0.0, hq_offset: [0.0; 2], delta_time: 0.0, wind: [0.0; 2], night: 0.0, counters: Default::default(), waves: [0.0; 16] }
+        Ctx { day_time, sun1: Quat::IDENTITY, sun2: Quat::IDENTITY, game_exports: None, day_factor: None, cloud_intensity: 0.0, hq_offset: [0.0; 2], delta_time: 0.0, wind: [0.0; 2], night: 0.0, counters: Default::default(), waves: [0.0; 16] }
+    }
+
+    /// DisplaySystem1005cdcf writes GameDayTime/GameSun*Rotation, not the authored interface fields.
+    pub fn bind_game(&mut self, game: &Obj) {
+        self.game_exports = Some((self.day_time, [self.sun1, self.sun2]));
+        let time = game.field("CurrentDayTime").and_then(|e| eval_field(game, self, e, 0));
+        let factor = game.field("DayTimeFactor").and_then(|e| eval_field(game, self, e, 0));
+        let sun1 = game.field("Sun1Rotation").and_then(|e| rotation(game, self, e, 0));
+        let sun2 = game.field("Sun2Rotation").and_then(|e| rotation(game, self, e, 0));
+        if let Some(time) = time { self.day_time = time; }
+        self.day_factor = factor;
+        if let Some(sun1) = sun1 { self.sun1 = sun1; }
+        if let Some(sun2) = sun2 { self.sun2 = sun2; }
     }
 }
 
@@ -381,10 +416,12 @@ fn spend() -> Option<()> {
 
 /// Value of `name` in `obj`'s expressions (`This.X` follows the field, depth limited because the `Counter` fields
 /// integrate themselves).
-fn variable(obj: &Obj, ctx: &Ctx, name: &str, depth: u32) -> Option<f32> {
+fn variable(objects: &[Obj], obj: &Obj, ctx: &Ctx, name: &str, depth: u32) -> Option<f32> {
     match name {
-        "GAME.CurrentDayTime" | "GAME.GameDayTime" => Some(ctx.day_time),
-        "GAME.DayTimeFactor" => Some(ctx.day_time / DAY_LENGTH),
+        "GAME.GameDayTime" => Some(ctx.game_exports.map_or(ctx.day_time, |e| e.0)),
+        "This.GameDayTime" if obj.name == "GAME" => Some(ctx.game_exports.map_or(ctx.day_time, |e| e.0)),
+        "GAME.CurrentDayTime" => Some(ctx.day_time),
+        "GAME.DayTimeFactor" => Some(ctx.day_factor.unwrap_or(ctx.day_time / DAY_LENGTH)),
         "GAME.ThickCloudsIntensity" => Some(ctx.cloud_intensity),
         "GAME.OffsetFromHQ_X" => Some(ctx.hq_offset[0]),
         "GAME.OffsetFromHQ_Z" => Some(ctx.hq_offset[1]),
@@ -397,35 +434,88 @@ fn variable(obj: &Obj, ctx: &Ctx, name: &str, depth: u32) -> Option<f32> {
         _ if name.starts_with("GAME.GameWaveCurve") => name["GAME.GameWaveCurve".len()..].parse::<usize>().ok().and_then(|k| ctx.waves.get(k).copied()).or(Some(0.0)),
         _ if name.starts_with("GAME.") => Some(0.0),
         _ if name.ends_with(".Counter") => {
-            let key = name.strip_prefix("This.").map_or_else(|| name.to_string(), |f| format!("{}.{f}", obj.name));
-            Some(ctx.counters.get(&key).map_or(0.0, |rate| rate * ctx.delta_time))
+            let rate = if let Some(field) = name.strip_prefix("This.") {
+                counter(ctx, &obj.name, field)
+            } else {
+                ctx.counters.get(name).copied().unwrap_or(0.0)
+            };
+            Some(rate * ctx.delta_time)
         }
-        // `This.Field[idx]` (array type declarations, e.g. `Float WaterLightR [2]: 0.25,0.75`); the index was
-        // already resolved to an integer literal by `primary`'s `[ .. ]` handling.
         _ if name.contains('[') => {
-            let (base, idx) = name.split_once('[')?;
-            let idx: usize = idx.strip_suffix(']')?.parse().ok()?;
-            let field = base.strip_prefix("This.").unwrap_or(base);
-            obj.field(field)?.split(',').nth(idx)?.trim().parse().ok()
+            let (base, index) = name.split_once('[')?;
+            let index: f32 = index.strip_suffix(']')?.parse().ok()?;
+            let (owner, field) = field_owner(objects, obj, base)?;
+            let values = super::eval_list(owner.field(field)?);
+            (!values.is_empty()).then(|| super::sample(&values, index))
         }
         _ => {
-            let field = name.strip_prefix("This.")?;
-            // a self-integrating field (`ScrollU: This.ScrollU + ...`, counters) is 0 inside its own expression; elsewhere its
-            // per-second growth (`ctx.counters`, filled by `layers`) times the elapsed time
-            if obj.field(field).is_some_and(|e| e.contains(name)) {
-                return Some(ctx.counters.get(&format!("{}.{field}", obj.name)).map_or(0.0, |rate| rate * ctx.delta_time));
+            let (owner, field) = field_owner(objects, obj, name)?;
+            if owner.field(field).is_some_and(|e| e.contains(name)) {
+                return Some(counter(ctx, &owner.name, field) * ctx.delta_time);
             }
             spend()?;
-            (depth < 4).then(|| eval_field(obj, ctx, obj.field(field)?, depth + 1)).flatten().or(Some(0.0))
+            (depth < MAX_NEST).then(|| eval_field_in(objects, owner, ctx, owner.field(field)?, depth + 1)).flatten()
         }
     }
 }
 
-pub fn eval_field(obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<f32> {
-    if depth == 0 {
-        reset_budget();
+fn counter(ctx: &Ctx, object: &str, field: &str) -> f32 {
+    // ponytail: scan the small cached counter map; nested maps if many live counters need fast borrowed lookups.
+    ctx.counters.iter().find_map(|(key, &rate)| {
+        (key.strip_prefix(object)?.strip_prefix('.')? == field).then_some(rate)
+    }).unwrap_or(0.0)
+}
+
+fn field_owner<'a>(objects: &'a [Obj], obj: &'a Obj, name: &'a str) -> Option<(&'a Obj, &'a str)> {
+    let (owner, field) = name.split_once('.')?;
+    Some((if owner == "This" { obj } else { objects.iter().find(|o| o.name == owner)? }, field))
+}
+
+/// Objects-aware scalar lookup for cross-object colour tracks and authored field chains.
+pub fn eval_field_in(objects: &[Obj], obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<f32> {
+    if depth == 0 { reset_budget(); }
+    eval(expr, &|name| variable(objects, obj, ctx, name, depth))
+}
+
+/// Packed ARGB expressions retain every unsigned bit instead of round-tripping through f32.
+pub fn unsigned(objects: &[Obj], obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<u32> {
+    if depth == 0 { reset_budget(); }
+    spend()?;
+    if depth >= MAX_NEST { return None; }
+    let expr = expr.trim();
+    if expr.contains('|') {
+        return expr.split('|').try_fold(0, |acc, term| Some(acc | unsigned(objects, obj, ctx, term, depth + 1)?));
     }
-    eval(expr, &|n| variable(obj, ctx, n, depth))
+    if let Some(hex) = expr.strip_prefix("0x") {
+        if let Ok(value) = u32::from_str_radix(hex.trim_end_matches('u'), 16) { return Some(value); }
+    }
+    if let Some((owner, field)) = field_owner(objects, obj, expr) {
+        if let Some(value) = owner.field(field) { return unsigned(objects, owner, ctx, value, depth + 1); }
+    }
+    let bytes = expr.as_bytes();
+    let mut position = 0;
+    let variable = |name: &str| variable(objects, obj, ctx, name, depth + 1);
+    let mut value = primary(bytes, &mut position, &variable, 0)? as u32;
+    loop {
+        skip_ws(bytes, &mut position);
+        let Some(&op) = bytes.get(position) else { return Some(value) };
+        if !b"+-*/%".contains(&op) { return None; }
+        position += 1;
+        let rhs = primary(bytes, &mut position, &variable, 0)?;
+        let result = match op {
+            b'+' => value as f32 + rhs,
+            b'-' => value as f32 - rhs,
+            b'*' => value as f32 * rhs,
+            b'/' => value as f32 / rhs,
+            _ => value as f32 % rhs,
+        };
+        // FXS10005600 unsigned/float arithmetic and1000a9b7 final conversion use this biased FISTP.
+        value = (result - 0.49999).round_ties_even() as i64 as u32;
+    }
+}
+
+pub fn eval_field(obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<f32> {
+    eval_field_in(&[], obj, ctx, expr, depth)
 }
 
 /// `Float` field value (e.g. `Scale`), `default` when absent or not computable.
@@ -436,8 +526,14 @@ pub fn float(obj: &Obj, ctx: &Ctx, name: &str, default: f32) -> f32 {
 /// `[x, y, z]` of a `v( .. )` literal.
 pub fn vector(obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<[f32; 3]> {
     let inner = expr.trim().strip_prefix("v(")?.split(')').next()?;
-    let c: Vec<f32> = inner.split(',').map(|e| eval_field(obj, ctx, e, depth)).collect::<Option<_>>()?;
-    c.try_into().ok()
+    components(obj, ctx, inner, depth)
+}
+
+fn components<const N: usize>(obj: &Obj, ctx: &Ctx, inner: &str, depth: u32) -> Option<[f32; N]> {
+    let mut expressions = inner.split(',');
+    let mut values = [0.0; N];
+    for value in &mut values { *value = eval_field(obj, ctx, expressions.next()?, depth)?; }
+    expressions.next().is_none().then_some(values)
 }
 
 /// Rotation expression → quaternion; `None` for anything the sky does not use.
@@ -458,23 +554,31 @@ pub fn rotation(obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<Quat> {
 }
 
 fn term_rotation(obj: &Obj, ctx: &Ctx, term: &str, depth: u32) -> Option<Quat> {
+    if obj.name == "GAME" {
+        match term {
+            "This.GameSun1Rotation" => return Some(ctx.game_exports.map_or(ctx.sun1, |e| e.1[0])),
+            "This.GameSun2Rotation" => return Some(ctx.game_exports.map_or(ctx.sun2, |e| e.1[1])),
+            _ => {}
+        }
+    }
     if let Some(f) = term.strip_prefix("This.") {
         return rotation(obj, ctx, obj.field(f)?, depth + 1);
     }
     match term {
         "GAME.Sun1Rotation" => return Some(ctx.sun1),
         "GAME.Sun2Rotation" => return Some(ctx.sun2),
+        "GAME.GameSun1Rotation" => return Some(ctx.game_exports.map_or(ctx.sun1, |e| e.1[0])),
+        "GAME.GameSun2Rotation" => return Some(ctx.game_exports.map_or(ctx.sun2, |e| e.1[1])),
         _ => {}
     }
     if let Some(rest) = term.strip_prefix("v(") {
         let (axis, angle) = rest.split_once(')')?;
-        let axis = vector(obj, ctx, &format!("v({axis})"), depth)?;
+        let axis = components(obj, ctx, axis, depth)?;
         return Some(Quat::axis_angle(axis, eval_field(obj, ctx, angle.trim().trim_start_matches(',').trim(), depth)?));
     }
     let rest = term.strip_prefix("q(")?;
-    let c: Vec<f32> = rest.split(')').next()?.split(',').map(|e| eval_field(obj, ctx, e, depth)).collect::<Option<_>>()?;
-    // FXS stores the four values in written order = (x, y, z, w)
-    let [x, y, z, w]: [f32; 4] = c.try_into().ok()?;
+    // FXS stores the four values in written order = (x, y, z, w).
+    let [x, y, z, w] = components(obj, ctx, rest.split(')').next()?, depth)?;
     Some(Quat { w, x, y, z })
 }
 
@@ -532,6 +636,25 @@ Object Next
     }
 
     #[test]
+    fn texture_stages_keep_independent_state_and_texture_factor_binding() {
+        let objects = parse_objects(concat!(
+            "Object Station\n{\n Unsigned TFACTOR: 0x80402010\n StateBlob 0u:\n{\n",
+            " RenderState: Unsigned 0u, Unsigned e_D3DRENDERSTATE_TEXTUREFACTOR, This.TFACTOR\n",
+            " TextureStage: Unsigned 0u, Unsigned 0u, Unsigned e_D3DTSS_COLORARG2, Unsigned e_D3DTA_DIFFUSE\n",
+            " TextureStage: Unsigned 0u, Unsigned 1u, Unsigned e_D3DTSS_COLORARG2, Unsigned e_D3DTA_TFACTOR\n",
+            " TextureStage: Unsigned 0u, Unsigned 0u, Unsigned e_D3DTSS_ALPHAARG2, Unsigned e_D3DTA_TEXTURE\n",
+            " TextureStage: Unsigned 0u, Unsigned 1u, Unsigned e_D3DTSS_ALPHAARG2, Unsigned e_D3DTA_TFACTOR\n}\n}\n"
+        ));
+        let o = &objects[0];
+        assert_eq!(o.states["TSS_COLORARG2"], "e_D3DTA_DIFFUSE");
+        assert_eq!(o.states["TSS1_COLORARG2"], "e_D3DTA_TFACTOR");
+        assert_eq!(o.states["TSS_ALPHAARG2"], "e_D3DTA_TEXTURE");
+        assert_eq!(o.states["TSS1_ALPHAARG2"], "e_D3DTA_TFACTOR");
+        assert_eq!(o.states["TEXTUREFACTOR"], "This.TFACTOR");
+        assert_eq!(o.field("TFACTOR"), Some("0x80402010"));
+    }
+
+    #[test]
     fn expressions_run_left_to_right() {
         let none = |_: &str| None;
         assert_eq!(eval("2 + 3 * 4", &none), Some(20.0));
@@ -539,6 +662,23 @@ Object Next
         assert_eq!(eval("255u * 0.5 * 0x01000000", &none), Some(127.5 * 16777216.0));
         assert_eq!(eval("(1 + 2) * 3 % 4", &none), Some(1.0));
         assert!(eval("1 +", &none).is_none());
+    }
+
+    #[test]
+    fn packed_atmosphere_tint_preserves_unsigned_bits_and_cross_object_array_samples() {
+        let objects = parse_objects(concat!(
+            "Object Atmosphere\n{\n Float ColorTopR [4]: 0, 0.2,\n 0.4, 0.8\n}\n",
+            "Object Station\n{\n Float ColorR: Atmosphere.ColorTopR[GAME.DayTimeFactor] + 0.3 <| 1\n",
+            " Unsigned AtmR: 0xFF * This.ColorR * 0x00010000\n Unsigned AtmI: 0x80000000\n",
+            " Unsigned AtmColor: This.AtmI | This.AtmR | 0x00001234\n Unsigned TFACTOR: This.AtmColor\n}\n"
+        ));
+        let o = &objects[1];
+        let ctx = Ctx::at(0.4 * DAY_LENGTH);
+        assert!((eval_field_in(&objects, o, &ctx, "This.ColorR", 0).unwrap() - 0.62).abs() < 1e-6);
+        let red = 158u32 << 16; // 255*.62 = 158.1 -> unsigned158 before shifting.
+        assert_eq!(unsigned(&objects, o, &ctx, "This.TFACTOR", 0), Some(0x80000000 | red | 0x1234));
+        assert_eq!(eval("2 + 3 <| 4 * 2", &|_| None), Some(8.0));
+        assert_eq!(eval("-1 |> 0", &|_| None), Some(0.0));
     }
 
     #[test]
@@ -552,6 +692,19 @@ Object Next
         // the moon's tilted orbit really leaves the horizon: +Z reaches a positive height at some time
         let up = (0..48).map(|k| rotation(moon, &ctx(k as f32 * 135.0), moon.field("Rotation").unwrap(), 0).unwrap().rotate([0.0, 0.0, 1.0])[1]).fold(f32::MIN, f32::max);
         assert!(up > 0.5, "{up}");
+    }
+
+    #[test]
+    fn counter_lookups_borrow_qualified_and_self_names() {
+        let objects = parse_objects("Object A\n{\n Float Counter: This.Counter + 1\n Float ScrollU: This.ScrollU + 1\n}\n");
+        let ctx = Ctx {
+            delta_time: 2.0,
+            counters: [("A.Counter".into(), 3.0), ("A.ScrollU".into(), 5.0), ("AB.Counter".into(), 99.0)].into(),
+            ..Ctx::at(0.0)
+        };
+        for (expression, expected) in [("This.Counter", 6.0), ("A.Counter", 6.0), ("This.ScrollU", 10.0), ("Missing.Counter", 0.0)] {
+            assert_eq!(eval_field(&objects[0], &ctx, expression, 0), Some(expected));
+        }
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //! § Sky): star dome / nebula (`Universe`), dot stars, moons, the atmosphere gradient, suns and flares (`e_SunRays`), thick
 //! cloud dome, single clouds, the `Horizon` map and the Shadowlands vortex.
 //!
-//! All sky objects are `e_LockToCamera` with `ZFUNC ALWAYS` and no z write, so only their order and angular size matter:
-//! meshes are baked at `Scale` times their authored size (the renderer pins the sky to the far plane).
+//! Meshes use normalized far=1000; the renderer applies native far/1000 scale,
+//! camera translation and the shared camera projection (including clipping).
 
 use super::aurora;
 use super::script::{self, Ctx, Obj, Quat};
@@ -12,7 +12,7 @@ use crate::character::NameTable;
 use crate::mesh::{decode_generic_mesh, MESH_TYPE};
 use crate::texture::decode_texture;
 use ao_rdb::RecordStore;
-use ao_scene::{Blend, Instance, Mesh, Scene, SkyColors, SkySpin, SkyWaveSpin, Submesh, TextureKey, Vertex, IDENTITY, WHITE};
+use ao_scene::{Blend, Instance, Mesh, Scene, SkyColors, SkySpin, SkyWaveSpin, Submesh, TextureKey, Vertex, IDENTITY};
 use std::collections::HashMap;
 
 const TEXTURES: u32 = 1_010_004;
@@ -41,23 +41,21 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
         o.fields.iter().filter_map(|(k, v)| Some((k.clone(), script::eval(v, &|_| None)? as u32))).collect()
     });
     let ctx = Ctx {
-        day_time: sky.day_time,
-        sun1: super::sun_rotation(sky.sun_ao),
-        sun2: super::sun_rotation(sky.sun2_ao),
         cloud_intensity: sky.weather.thick_clouds_intensity(),
-        hq_offset: hq_offset(objs),
+        hq_offset: sky.hq_offset,
         delta_time: 0.0,
         wind: [0.0; 2],
         night: sky.night,
         counters: counters(objs),
         waves: [0.0; 16],
+        ..super::game_context(objs, sky.day_time)
     };
     scene.water_light=water_light(objs,&ctx);
     let mut b = Builder { store, names, ctx, objs, sky, scene, sorts };
     // (sort, mesh, constant spin, aurora simulation, wave driven turns)
-    type Layer = (u32, Mesh, Option<SkySpin>, Option<(ao_scene::aurora::GloomySky, f32)>, Vec<SkyWaveSpin>, Option<f32>);
-    let mut layers: Vec<Layer> = vec![(b.sorts.get("Atmosphere").copied().unwrap_or(ATMOSPHERE_SORT), dome, None, None, vec![], None)];
-    for o in objs.iter().filter(|o| o.field("Priority").is_some_and(|p| p.trim() == "e_RenderPriority_PreRendering")) {
+    type Layer = (u32, Mesh, Option<SkySpin>, Option<(ao_scene::aurora::GloomySky, f32)>, Vec<SkyWaveSpin>, Option<f32>, Option<usize>);
+    let mut layers: Vec<Layer> = vec![(b.sorts.get("Atmosphere").copied().unwrap_or(ATMOSPHERE_SORT), dome, None, None, vec![], None, objs.iter().position(|o| o.name == "Atmosphere"))];
+    for (object, o) in objs.iter().enumerate().filter(|(_, o)| o.field("Priority").is_some_and(|p| p.trim() == "e_RenderPriority_PreRendering")) {
         let mut colors = None;
         let mesh = match o.fxid() {
             "GloomySky" => b.gloomy_sky(o).map(|(m, sim, gain)| {
@@ -66,31 +64,100 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
             }),
             "GenericMeshObject" => b.mesh_object(o).map(|m| b.fogged(o, m)),
             "SunRays" => b.sun_rays(o),
-            "SingleCloud" => b.single_clouds(o),
+            "SingleCloud" => b.single_clouds(o).map(|m| b.fogged(o, m)),
             "GenericVisualObject" => b.dot_points(o).map(|m| b.fogged(o, m)),
             _ => None,
         };
-        // a layer whose every vertex alpha is 0 (sun below the horizon, `TFACTOR` 0) draws nothing
-        if let Some(m) = mesh.filter(|m| m.vertices.iter().any(|v| v.color[3] > 0.0)) {
+        // Keep invisible sun fans: their native horizon fade is evaluated every frame, including sunrise.
+        if let Some(m) = mesh.filter(|m| o.fxid() == "SunRays" || m.vertices.iter().any(|v| v.color[3] > 0.0)) {
             let spin = if o.fxid() == "GenericMeshObject" { b.spin(o) } else { None };
             let altitude=(o.fxid()=="SingleCloud").then(||script::float(o,&b.ctx,"Altitude",100.0));
-            layers.push((b.sort(o), m, spin, colors, wave_spins(o, &b.ctx), altitude));
+            layers.push((b.sort(o), m, spin, colors, wave_spins(o, &b.ctx), altitude, Some(object)));
         }
     }
     layers.sort_by_key(|l| l.0);
-    for (_, m, spin, colors, waves, cloud_altitude) in layers {
+    for (_, m, spin, colors, waves, cloud_altitude, object) in layers {
         scene.meshes.push(m);
         if let Some(altitude)=cloud_altitude {
             scene.single_clouds.push(ao_scene::cloud::CloudLayer {mesh:scene.meshes.len()-1,altitude,
                 wind:[sky.weather.high_altitude_wind_rate[0],0.0,sky.weather.high_altitude_wind_rate[1]],
                 storm:sky.weather.storm_intensity(),thick:sky.weather.thick_clouds_intensity(),
-                sun_y:sky.sun_ao[1],light:sky.sun.unwrap_or([0.0;3]),light_direction:sky.sun_dir,ambient:sky.ambient.unwrap_or([0.0;3])});
+                sun_y:super::sun_ao(sky.day_time)[1],light:sky.sun.unwrap_or([0.0;3]),light_direction:sky.sun_dir,ambient:sky.ambient.unwrap_or([0.0;3])});
         }
         scene.sky_colors.extend(colors.map(|(sim, gain)| SkyColors { mesh: scene.meshes.len() - 1, sim, gain }));
         scene.sky.push(Instance { mesh: scene.meshes.len() - 1, transform: IDENTITY });
+        scene.sky_pose_objects.extend(object.map(|object| (scene.sky.len() - 1, object)));
+        if object.is_some_and(|index| objs[index].field("RotationType").is_some_and(|value| value.trim() == "e_LockToCameraY")) {
+            scene.sky_yaw.push(scene.sky.len() - 1);
+        }
         scene.sky_spin.extend(spin.map(|s| SkySpin { instance: scene.sky.len() - 1, ..s }));
         scene.sky_wave_spin.extend(waves.into_iter().map(|w| SkyWaveSpin { instance: scene.sky.len() - 1, ..w }));
     }
+}
+
+/// Exact FXS rotation/scale relative to the resource snapshot, not interpolation between coarse worker samples.
+pub(super) fn pose_source(objs: Vec<Obj>, hq_offset: [f32; 2]) -> impl FnMut(f32, &mut Scene) + Send {
+    let mut base = Ctx { hq_offset, counters: counters(&objs), ..Ctx::at(0.0) };
+    let mut current = base.clone();
+    let game = objs.iter().position(|o| o.name == "GAME");
+    move |time, snapshot| {
+        for (ctx, time) in [(&mut base, snapshot.day_time), (&mut current, time)] {
+            ctx.day_time = time.rem_euclid(super::DAY_LENGTH);
+            let [sun1, sun2] = super::sun_positions(ctx.day_time);
+            ctx.sun1 = super::sun_rotation(sun1);
+            ctx.sun2 = super::sun_rotation(sun2);
+            ctx.day_factor = None;
+            if let Some(game) = game { ctx.bind_game(&objs[game]); }
+        }
+        for &(instance, object) in &snapshot.sky_pose_objects {
+            let Some(o) = objs.get(object).filter(|o| matches!(o.fxid(), "GenericMeshObject" | "SunRays")) else { continue };
+            let Some(expr) = o.field("Rotation") else { continue };
+            let (Some(q0), Some(q1)) = (script::rotation(o, &base, expr, 0), script::rotation(o, &current, expr, 0)) else { continue };
+            let ratio = if o.fxid() == "SunRays" { 1.0 } else { sky_scale(o, &current, q1) / sky_scale(o, &base, q0) };
+            let inverse = Quat { w: q0.w, x: -q0.x, y: -q0.y, z: -q0.z };
+            let relative = inverse.then(q1);
+            let axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+                .map(|axis| scene(relative.rotate(scene(axis))).map(|v| v * ratio));
+            let before = scene(sky_offset(o, &base));
+            let after = scene(sky_offset(o, &current));
+            let translation: [f32; 3] = std::array::from_fn(|k| after[k] - (0..3).map(|j| axes[j][k] * before[j]).sum::<f32>());
+            let Some(inst) = snapshot.sky.get_mut(instance) else { continue };
+            inst.transform = [
+                [axes[0][0], axes[0][1], axes[0][2], 0.0],
+                [axes[1][0], axes[1][1], axes[1][2], 0.0],
+                [axes[2][0], axes[2][1], axes[2][2], 0.0],
+                [translation[0], translation[1], translation[2], 1.0],
+            ];
+            if o.fxid() == "SunRays" {
+                if let Some(mesh) = snapshot.meshes.get_mut(inst.mesh) {
+                    let alpha = sun_alpha(q1);
+                    if mesh.vertices.first().is_some_and(|vertex| vertex.color[3] != alpha) {
+                        for vertex in &mut mesh.vertices { vertex.color[3] = alpha; }
+                    }
+                }
+            }
+            // Wave turns are expressed in the current sun frame, not the last worker sample's frame.
+            for wave in snapshot.sky_wave_spin.iter_mut().filter(|wave| wave.instance == instance) {
+                current.waves[wave.curve & 15] = 1.0;
+                let turn = script::rotation(o, &current, expr, 0).and_then(|q| q.spin_from(q1));
+                current.waves[wave.curve & 15] = 0.0;
+                if let Some((axis, degrees)) = turn {
+                    wave.axis = scene(axis);
+                    wave.degrees = -degrees;
+                    wave.pivot = after;
+                }
+            }
+        }
+        if let Some(env) = &mut snapshot.environment {
+            env.sun_dir = scene(current.sun1.rotate(super::SUN_LOCAL));
+        }
+    }
+}
+
+/// DS1005a3a9: quartic horizon fade, converted to a byte before the rim modulation.
+fn sun_alpha(rotation: Quat) -> f32 {
+    let height = rotation.rotate([0.0, 0.0, -1.0])[1];
+    ((height * 100.0).clamp(0.0, 1.0).powi(4) * 255.0).trunc() / 255.0
 }
 
 /// DS1005d589 binds the actual SunLight formulas, not merely the RGB tracks.
@@ -246,7 +313,7 @@ fn scene_v(v: [f32; 3]) -> [f32; 3] {
 }
 
 /// Growth per second of every `Counter` field that integrates `GameDeltaTime` (`Counter: GAME.GameDeltaTime * 3 + This.Counter
-/// % 360`), keyed `Object.Counter`; per-frame counters without a time term (`DotStars`) are not time driven here.
+/// % 360`), keyed `Object.Counter`; DotStars' time-independent counter is stepped by the native point renderer once per frame.
 fn counters(objs: &[Obj]) -> std::collections::HashMap<String, f32> {
     let at = |o: &Obj, e: &str, dt: f32| script::eval_field(o, &Ctx { delta_time: dt, ..Ctx::at(0.0) }, e, 0);
     objs.iter()
@@ -258,20 +325,6 @@ fn counters(objs: &[Obj]) -> std::collections::HashMap<String, f32> {
         .collect()
 }
 
-/// `PlayfieldData.UniversePosition` (`RKPP.<name>`) minus `RKPP.Omni_1_HQ`: `GAME.OffsetFromHQ_X/Z` of a camera standing at
-/// the playfield's origin.
-fn hq_offset(objs: &[Obj]) -> [f32; 2] {
-    let rkpp = objs.iter().find(|o| o.name == "RKPP");
-    let pos = |name: &str| -> Option<[f32; 3]> {
-        let o = rkpp?;
-        script::vector(o, &Ctx::at(0.0), o.field(name)?, 0)
-    };
-    let pf = objs.iter().find(|o| o.name == "PlayfieldData").and_then(|o| o.field("UniversePosition")).and_then(|e| e.trim().strip_prefix("RKPP."));
-    match (pf.and_then(pos), pos("Omni_1_HQ")) {
-        (Some(p), Some(h)) => [p[0] - h[0], p[2] - h[2]],
-        _ => [0.0; 2],
-    }
-}
 
 /// How an object is lit (`SunlightType`).
 enum Light {
@@ -315,22 +368,15 @@ impl Builder<'_> {
     /// Fog is applied to the sampled source RGB before the native blend equation.
     /// In particular, black fog on `SourceColorOne` must not become a black
     /// alpha-blended overlay: that darkens the destination even at black texels.
-    /// The scenery-at/after-Horizon default remains a guess; cloud layers without
-    /// explicit FOGENABLE stay excluded from that default.
+    /// VisualFog10058443 installs frame fog; GenericMesh1005c334 brackets each
+    /// object with StateBlob::Set10025032 / Reset10024d1e. Missing state inherits it.
     fn fogged(&self, o: &Obj, mut mesh: Mesh) -> Mesh {
-        let horizon = self.sorts.get("Horizon").copied().unwrap_or(u32::MAX);
-        let cloud_layer = o.field("SunlightType").map(str::trim).is_some_and(|t| t.starts_with("e_SunLight_CloudLayer"));
-        if !o.flag("FOGENABLE").unwrap_or(!cloud_layer && self.sort(o) >= horizon) {
+        if !o.flag("FOGENABLE").unwrap_or(true) {
             return mesh;
         }
         let colour = o.states.get("FOGCOLOR")
             .and_then(|c| u32::from_str_radix(c.trim_start_matches("0x"), 16).ok())
             .map(|c| [16, 8, 0].map(|s| srgb_to_linear(((c >> s) & 255) as f32 / 255.0)));
-        // mesh_object has already consumed the lighting normals. The renderer
-        // converts this normalized distance to metres using live camera far.
-        for v in &mut mesh.vertices {
-            v.normal[0] = v.pos.iter().map(|c| c * c).sum::<f32>().sqrt() / 1000.0;
-        }
         for submesh in &mut mesh.submeshes {
             submesh.sky_fog = true;
             submesh.sky_fog_color = colour;
@@ -353,9 +399,20 @@ impl Builder<'_> {
         let light = self.light(o);
         let lit = o.flag("LIGHTING") != Some(false);
         let gain = if o.states.get("TSS_COLOROP").is_some_and(|v| v == "e_D3DTOP_MODULATE2X") { 2.0 } else { 1.0 };
+        let ambient = o.states.get("AMBIENT")
+            .and_then(|c| u32::from_str_radix(c.trim_start_matches("0x"), 16).ok())
+            .map(|c| [16, 8, 0].map(|s| ((c >> s) & 255) as f32 / 255.0))
+            .unwrap_or_else(|| self.scene.environment.map_or(self.sky.ambient.unwrap_or([0.0; 3]), |e| e.ambient.map(|c| c.max(0.0).powf(1.0 / 2.2))));
+        let factor = o.field("TFACTOR").and_then(|e| script::unsigned(self.objs, o, &self.ctx, e, 0)).unwrap_or(u32::MAX);
+        let stage1_rgb = o.states.get("TSS1_COLOROP").is_some_and(|v| v == "e_D3DTOP_MODULATE")
+            && o.states.get("TSS1_COLORARG1").is_some_and(|v| v == "e_D3DTA_CURRENT")
+            && o.states.get("TSS1_COLORARG2").is_some_and(|v| v == "e_D3DTA_TFACTOR");
+        let stage1_alpha = o.states.get("TSS1_ALPHAOP").is_some_and(|v| v == "e_D3DTOP_MODULATE")
+            && o.states.get("TSS1_ALPHAARG1").is_some_and(|v| v == "e_D3DTA_CURRENT")
+            && o.states.get("TSS1_ALPHAARG2").is_some_and(|v| v == "e_D3DTA_TFACTOR");
         // `ALPHAOP SELECTARG2` with `ALPHAARG2 = TFACTOR`: the alpha is the top byte of `TFACTOR`
         let alpha = match (o.states.get("TSS_ALPHAARG2").map(String::as_str), o.field("TFACTOR")) {
-            (Some("e_D3DTA_TFACTOR"), Some(e)) => script::eval_field(o, &self.ctx, e, 0).map_or(1.0, |t| ((t as u32) >> 24) as f32 / 255.0),
+            (Some("e_D3DTA_TFACTOR"), Some(e)) => script::unsigned(self.objs, o, &self.ctx, e, 0).map_or(1.0, |t| (t >> 24) as f32 / 255.0),
             _ => 1.0,
         };
         let scroll = if o.states.contains_key("TSS_TEXTURETRANSFORMFLAGS") { scroll_matrix(o, &self.ctx) } else { [1.0, 0.0, 0.0, 1.0, 0.0, 0.0] };
@@ -368,23 +425,19 @@ impl Builder<'_> {
                 Light::Unlit => [1.0; 3],
                 Light::Moon(l) | Light::Cloud(l) => {
                     let d = (0..3).map(|k| v.normal[k] * to_sun[k]).sum::<f32>().max(0.0);
-                    l.map(|c| c * d)
+                    std::array::from_fn(|k| l[k] * d + ambient[k])
                 }
             };
-            // cloud layers thin out towards the horizon (haze) instead of ending in the straight line where the fogged horizon
-            // dish starts [GUESS: the client's own cloud/fog blend was not found]
-            let haze = match light {
-                Light::Cloud(_) => (v.pos[1] / v.pos.iter().map(|c| c * c).sum::<f32>().sqrt().max(1e-6) / 0.25).clamp(0.0, 1.0),
-                _ => 1.0,
-            };
-            v.color = [srgb_to_linear(c[0] * gain), srgb_to_linear(c[1] * gain), srgb_to_linear(c[2] * gain), alpha * haze];
+            v.color = [srgb_to_linear(c[0]), srgb_to_linear(c[1]), srgb_to_linear(c[2]), alpha];
             v.uv = [v.uv[0] * scroll[0] + v.uv[1] * scroll[2] + scroll[4], v.uv[0] * scroll[1] + v.uv[1] * scroll[3] + scroll[5]];
         }
         let uv_scroll = self.uv_scroll(o);
         let uv_wave = uv_wave(o, &self.ctx);
+        let uv_camera = if o.states.contains_key("TSS_TEXTURETRANSFORMFLAGS") { uv_camera(o, &self.ctx) } else { [0.0; 4] };
         for s in &mut mesh.submeshes {
             s.uv_scroll = uv_scroll;
             s.uv_wave = uv_wave;
+            s.uv_camera = uv_camera;
             s.blend = object_blend(o, s.blend);
             match o.states.get("CULLMODE").map(String::as_str) {
                 Some("e_D3DCULL_NONE") => s.two_sided = true,
@@ -392,16 +445,13 @@ impl Builder<'_> {
                 _ => {}
             }
             if !lit {
-                s.base_color = WHITE;
+                s.emissive = [0.0; 3];
             }
-        }
-        // Opaque unlit backdrops (star dome / nebula belt, horizon dish, vortex) end in a straight line at elevation 0:
-        // fade their rim out over the last 6 degrees below the horizon so the sky meets them without a seam [GUESS]
-        if matches!(light, Light::Unlit) && mesh.submeshes.iter().all(|s| s.blend == Blend::Opaque) {
-            if self.sort(o) < self.sorts.get("Atmosphere").copied().unwrap_or(ATMOSPHERE_SORT) {
-                below_horizon_fade(&mut mesh);
-            } else {
-                rim_fade(&mut mesh);
+            for (k, shift) in [16, 8, 0].into_iter().enumerate() {
+                s.base_color[k] = srgb_to_linear(gain * if stage1_rgb { ((factor >> shift) & 255) as f32 / 255.0 } else { 1.0 });
+            }
+            if stage1_alpha {
+                s.base_color[3] *= (factor >> 24) as f32 / 255.0;
             }
         }
         Some(mesh)
@@ -470,8 +520,7 @@ impl Builder<'_> {
     #[allow(clippy::approx_constant)] // the client's literal 3.14 (double 1008c380), not pi
     fn sun_rays(&mut self, o: &Obj) -> Option<Mesh> {
         let q = script::rotation(o, &self.ctx, o.field("Rotation")?, 0)?;
-        let c = q.rotate([0.0, 0.0, -1.0]);
-        let fade = if c[1] <= 0.0 { return None } else if c[1] < 0.01 { (100.0 * c[1]).powi(4) } else { 1.0 };
+        let fade = sun_alpha(q);
         let key = self.texture(o.texture.as_deref()?)?;
         let col = ["ColorR", "ColorG", "ColorB"].map(|n| script::float(o, &self.ctx, n, 255.0) / 255.0).map(srgb_to_linear);
         let size = script::float(o, &self.ctx, "Size", 6.0);
@@ -480,9 +529,9 @@ impl Builder<'_> {
         let blend = if o.states.get("DESTBLEND").is_some_and(|v| v == "e_D3DBLEND_ONE") { Blend::Additive } else { Blend::AlphaBlend };
         let color = [col[0], col[1], col[2], fade];
         let mut mesh = Mesh::default();
-        // the sky is drawn on a sphere of 300 m, the client's fan sits at 100 units: scale by 3
+        // Native 100-unit fan; the renderer applies ScaleByViewDistance (far/1000).
         let mut push = |local: [f32; 3], uv: [f32; 2], rim: f32| {
-            let p = q.rotate(local).map(|v| v * 3.0);
+            let p = q.rotate(local);
             mesh.vertices.push(Vertex { pos: scene(p), normal: [0.0, -1.0, rim], uv, color });
         };
         for i in 0..n - 1 {
@@ -509,40 +558,16 @@ impl Builder<'_> {
         Some(mesh)
     }
 
-    /// `e_GenericVisualObject` with a `<name>Mesh` blueprint (`DotStars`): `Vertices` dots at random points on the
-    /// blueprint's surface (`e_RandomOnSurface`), scaled so its farthest vertex lies at `Size`, additive, each dot
-    /// coloured by a random texel (`e_Random` texture mapping) of the object's texture.
+    /// FXS BlueprintGenerateMesh1000e863 / BlueprintRender1000e500: surface points, not angular billboards.
     fn dot_points(&mut self, o: &Obj) -> Option<Mesh> {
         let bp = self.objs.iter().find(|b| b.name == format!("{}Mesh", o.name))?;
         let corners: Vec<[f32; 3]> = bp.field("Vertex")?.split("v(").skip(1).filter_map(|s| script::vector(bp, &self.ctx, &format!("v({}", s.split(')').next()?), 0)).collect();
         let tris: Vec<u32> = super::eval_list(bp.field("Indice")?).iter().map(|&v| v as u32).collect();
         let n = script::float(bp, &self.ctx, "Vertices", 0.0) as usize;
-        let far = corners.iter().map(|c| c.iter().map(|v| v * v).sum::<f32>().sqrt()).fold(f32::MIN, f32::max);
         let key = self.texture(o.texture.as_deref()?)?;
-        if corners.is_empty() || tris.len() < 3 || n == 0 || far <= 0.0 {
-            return None;
-        }
-        let mut rng = Lcg(0x9E37_79B9);
-        let mut mesh = Mesh::default();
-        let mut idx = Vec::new();
-        for _ in 0..n {
-            let t = (rng.next() * (tris.len() / 3) as f32) as usize % (tris.len() / 3);
-            let tri = [0, 1, 2].map(|k| corners[tris[t * 3 + k] as usize % corners.len()]);
-            let (mut a, mut b) = (rng.next(), rng.next());
-            if a + b > 1.0 {
-                (a, b) = (1.0 - a, 1.0 - b);
-            }
-            let p: [f32; 3] = std::array::from_fn(|k| tri[0][k] + (tri[1][k] - tri[0][k]) * a + (tri[2][k] - tri[0][k]) * b);
-            let l = p.iter().map(|v| v * v).sum::<f32>().sqrt();
-            if l <= 0.0 {
-                continue;
-            }
-            let uv = (rng.next(), rng.next());
-            let base = mesh.vertices.len() as u32;
-            quad(&mut mesh, scene(p.map(|c| c / l)), (300.0 * 0.1f32.to_radians(), 300.0 * 0.1f32.to_radians()), [1.0; 4], [uv; 4]);
-            idx.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
-        }
-        mesh.submeshes.push(Submesh { two_sided: true, blend: Blend::Additive, ..Submesh::new(idx, Some(key)) });
+        let mut mesh = dot_surface(&corners, &tris, n, script::float(bp, &self.ctx, "Size", 1.0))?;
+        mesh.submeshes.push(Submesh { two_sided: true, blend: Blend::Additive, sky_points: true,
+            ..Submesh::new((0..n as u32).collect(), Some(key)) });
         Some(mesh)
     }
 }
@@ -563,25 +588,6 @@ fn object_blend(o: &Obj, prev: Blend) -> Blend {
     }
 }
 
-/// Vertex alpha 1 at 6 degrees below the horizon and lower, 0 at elevation 0 and above; the
-/// submeshes become alpha blended.
-fn rim_fade(mesh: &mut Mesh) {
-    for v in &mut mesh.vertices {
-        let sin_el = v.pos[1] / v.pos.iter().map(|c| c * c).sum::<f32>().sqrt().max(1e-6);
-        v.color[3] *= (-sin_el / 6f32.to_radians().sin()).clamp(0.0, 1.0);
-    }
-    mesh.submeshes.iter_mut().for_each(|s| s.blend = Blend::AlphaBlend);
-}
-
-/// Star dome / nebula belt: the client's atmosphere strip hides everything below the horizon (our dome only reaches 15 degrees
-/// down), so the backdrop fades out from the horizon (alpha 1) to 10 degrees below it (0); alpha blended.
-fn below_horizon_fade(mesh: &mut Mesh) {
-    for v in &mut mesh.vertices {
-        let sin_el = v.pos[1] / v.pos.iter().map(|c| c * c).sum::<f32>().sqrt().max(1e-6);
-        v.color[3] *= (1.0 + sin_el / 10f32.to_radians().sin()).clamp(0.0, 1.0);
-    }
-    mesh.submeshes.iter_mut().for_each(|s| s.blend = Blend::AlphaBlend);
-}
 
 /// `Matrix ScrollMatrix` as the 2x3 affine texture transform `[m00 m01 m10 m11 m20 m21]` (identity when absent).
 fn scroll_matrix(o: &Obj, ctx: &Ctx) -> [f32; 6] {
@@ -594,30 +600,28 @@ fn scroll_matrix(o: &Obj, ctx: &Ctx) -> [f32; 6] {
     }
 }
 
-/// Camera facing quad of half width/height `half` (metres at 300 m) at `dir * 300`.
-fn quad(mesh: &mut Mesh, dir: [f32; 3], half: (f32, f32), color: [f32; 4], uv: [(f32, f32); 4]) {
-    let up = if dir[1].abs() > 0.99 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
-    let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
-    let norm = |a: [f32; 3]| {
-        let l = a.iter().map(|v| v * v).sum::<f32>().sqrt();
-        a.map(|v| v / l)
-    };
-    let r = norm(cross(up, dir));
-    let u = cross(dir, r);
-    for ((sx, sy), (tu, tv)) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].into_iter().zip(uv) {
-        let pos = std::array::from_fn(|k| dir[k] * 300.0 + r[k] * sx * half.0 + u[k] * sy * half.1);
-        mesh.vertices.push(Vertex { pos, normal: dir.map(|c| -c), uv: [tu, tv], color });
+/// Native sampling is nested lerp (not uniform triangle area): lerp(lerp(A,B,a),C,b)*Size.
+/// FXS10001dff, helpers10001d26/10001d64/10001ce8; random position pass precedes the UV pass (1000e863).
+fn dot_surface(corners: &[[f32; 3]], tris: &[u32], n: usize, size: f32) -> Option<Mesh> {
+    if n == 0 || n > u32::MAX as usize || tris.len() < 3 || !tris.len().is_multiple_of(3)
+        || tris.iter().any(|&i| i as usize >= corners.len()) { return None; }
+    // Unresolved: retail rand is process-global, reseeded/consumed by other effects. Local seed1 is reproducible,
+    // not the retail realization; preserve its CRT algorithm, draw order and discrete mapping, not invented equivalence.
+    let mut rng = crate::weather::CrtRand::default();
+    let random = |rng: &mut crate::weather::CrtRand| (rng.rand() % 10000) as f32 / 10000.0;
+    let mut vertices = Vec::with_capacity(n);
+    for _ in 0..n {
+        let t = (rng.rand() as usize % (tris.len() / 3)) * 3;
+        let [a, b, c] = [0, 1, 2].map(|k| corners[tris[t + k] as usize]);
+        let (u, v) = (random(&mut rng), random(&mut rng));
+        let p = std::array::from_fn(|k| {
+            let edge = a[k] + (b[k] - a[k]) * u;
+            (edge + (c[k] - edge) * v) * size
+        });
+        vertices.push(Vertex { pos: scene(p), color: [1.0; 4], ..Vertex::default() });
     }
-}
-
-/// Fixed seed generator (the sky must look the same on every load).
-struct Lcg(u32);
-
-impl Lcg {
-    fn next(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        (self.0 >> 8) as f32 / (1u32 << 24) as f32
-    }
+    for vertex in &mut vertices { vertex.uv = [random(&mut rng), random(&mut rng)]; }
+    Some(Mesh { vertices, submeshes: vec![] })
 }
 
 /// Turns driven by `GameWaveCurve*` (`Sun1_Moving`: `RotMove = v(0,0,1), GAME.GameWaveCurve0 * 4 - 2`, `Rotation = This.RotMove [ROT]
@@ -656,6 +660,22 @@ fn uv_wave(o: &Obj, base: &Ctx) -> [f32; 4] {
     out
 }
 
+/// Affine ScrollMatrix translation coefficients [u/cameraAOx,u/cameraAOz,v/cameraAOx,v/cameraAOz].
+/// Evaluate about zero to avoid subtracting large native HQ offsets when extracting a one-metre coefficient.
+fn uv_camera(o: &Obj, base: &Ctx) -> [f32; 4] {
+    let mut ctx = base.clone();
+    ctx.hq_offset = [0.0; 2];
+    let zero = scroll_matrix(o, &ctx);
+    let mut coefficients = [0.0; 4];
+    for axis in 0..2 {
+        ctx.hq_offset = std::array::from_fn(|k| if k == axis { 1.0 } else { 0.0 });
+        let unit = scroll_matrix(o, &ctx);
+        coefficients[axis] = unit[4] - zero[4];
+        coefficients[axis + 2] = unit[5] - zero[5];
+    }
+    coefficients
+}
+
 /// Indices `N` of the `GAME.GameWaveCurveN` variables `expr` reads, following `This.<field>` references of `o` (depth limited).
 fn wave_curves_read(o: &Obj, expr: &str, depth: u32) -> Vec<usize> {
     let mut out: Vec<usize> = vec![];
@@ -674,6 +694,159 @@ fn wave_curves_read(o: &Obj, expr: &str, depth: u32) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn horizon_camera_uv_uses_native_hq_base_and_live_ao_camera_axes() {
+        let objects = script::parse_objects(concat!(
+            "Object Horizon\n{\n Matrix ScrollMatrix: m(1,0,0,0\n 0,1,0,0\n",
+            " GAME.OffsetFromHQ_X / 51200.0, GAME.OffsetFromHQ_Z / -51200.0,1,0\n 0,0,0,1)\n}\n"
+        ));
+        let ctx = Ctx { hq_offset: super::super::native_hq_offset(4582), ..Ctx::at(0.0) };
+        let coefficients = uv_camera(&objects[0], &ctx);
+        assert_eq!(coefficients, [1.0 / 51200.0, 0.0, 0.0, -1.0 / 51200.0]);
+        let baked = scroll_matrix(&objects[0], &ctx);
+        for eye in [[0.0, 100.0, 0.0], [1010.4, 24.0, -663.1], [2010.4, 24.0, -1663.1]] {
+            let camera = [eye[0], -eye[2]];
+            let uv = [
+                baked[4] + coefficients[0] * camera[0] + coefficients[1] * camera[1],
+                baked[5] + coefficients[2] * camera[0] + coefficients[3] * camera[1],
+            ];
+            let native = [(camera[0] - 43809.0) / 51200.0, (camera[1] - 27521.0) / -51200.0];
+            assert!((0..2).all(|k| (uv[k] - native[k]).abs() < 1e-7));
+        }
+        assert_eq!(uv_camera(&Obj::default(), &ctx), [0.0; 4]);
+    }
+
+    #[test]
+    fn dot_surface_uses_native_nested_lerp_and_separate_random_uv_pass() {
+        let corners = [[0.0, 0.3, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, 0.0, -1.0]];
+        let tris = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1];
+        // CRT seed1: face41%4, a18467%10000, b6334%10000; UV only after all 3*n position draws.
+        let mesh = dot_surface(&corners, &tris, 2, 990.0).unwrap();
+        let edge = [0.0, 0.3 * (1.0 - 0.8467), 0.8467];
+        let expected = scene([-0.6334 * 990.0, edge[1] * (1.0 - 0.6334) * 990.0, edge[2] * (1.0 - 0.6334) * 990.0]);
+        assert!((0..3).all(|k| (mesh.vertices[0].pos[k] - expected[k]).abs() < 0.0001));
+        assert_eq!(mesh.vertices[0].uv, [0.1478, 0.9358]);
+        let all = dot_surface(&corners, &tris, 500, 990.0).unwrap();
+        assert_eq!(all.vertices.len(), 500, "one vertex per native point, not four billboard corners");
+        assert!(all.vertices.iter().all(|v| {
+            let [x, y, z] = v.pos;
+            y >= 0.0 && ((x.abs() + z.abs()) / 990.0 + y / 297.0 - 1.0).abs() < 0.00001
+                && v.color == [1.0; 4] && v.uv.iter().all(|u| (0.0..1.0).contains(u))
+        }), "points stay on authored pyramid faces, not a normalized sphere");
+        assert!(dot_surface(&corners, &[0, 1, 9], 1, 990.0).is_none());
+    }
+
+    #[test]
+    fn icc_frozen_interfaces_keep_frame_poses_and_lighting_fixed() {
+        let objects = script::parse_objects(concat!(
+            "Object GAME\n{\n Float CurrentDayTime: 2648.69\n Float DayTimeFactor: This.CurrentDayTime / 6480\n",
+            " Quaternion Sun1Rotation: q(0.900351,-0.0951056,0.344078,0.248863)\n",
+            " Quaternion Sun2Rotation: q(0.836913,-0.1626300,0.384351,0.354122)\n}\n",
+            "Object Sun1\n{\n Unsigned FXID: e_SunRays\n Quaternion Rotation: GAME.Sun1Rotation\n}\n",
+            "Object Sun2\n{\n Unsigned FXID: e_SunRays\n Quaternion Rotation: GAME.Sun2Rotation\n}\n",
+            "Object Moon\n{\n Unsigned FXID: e_GenericMeshObject\n Quaternion Rotation: v(0,1,1), GAME.CurrentDayTime / 3240 * 360 + 90\n}\n"
+        ));
+        let expected = scene(super::super::rot(super::super::SUN1_ROT).rotate(super::super::SUN_LOCAL));
+        let mut pose = pose_source(objects, [0.0; 2]);
+        let mut snapshot = Scene {
+            sky: (0..3).map(|mesh| Instance { mesh, transform: IDENTITY }).collect(),
+            sky_pose_objects: (0..3).map(|index| (index, index + 1)).collect(),
+            environment: Some(ao_scene::Environment {
+                sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 0.5, fog_end: 800.0,
+                ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 1.0,
+            }),
+            ..Scene::default()
+        };
+        for baked in [0.0, 3240.0] {
+            snapshot.day_time = baked;
+            for time in [0.0, 3240.0, 6481.0] {
+                pose(time, &mut snapshot);
+                for instance in &snapshot.sky {
+                    assert!((0..4).all(|i| (0..4).all(|j| (instance.transform[i][j] - IDENTITY[i][j]).abs() < 1e-5)));
+                }
+                let actual = snapshot.environment.as_ref().unwrap().sun_dir;
+                assert!((0..3).all(|k| (actual[k] - expected[k]).abs() < 1e-6));
+                assert_eq!(snapshot.day_time, baked, "native clock must not be rewritten");
+            }
+        }
+    }
+
+    #[test]
+    fn celestial_frame_positions_follow_dt_across_resource_snapshot_replacement() {
+        // Authored Tweak_Rubi-Ka_Sun/Moon1..3 expressions; no client assets/GPU needed.
+        let expressions = [
+            ("Sun1", "GAME.Sun1Rotation"), ("Sun2", "GAME.Sun2Rotation"),
+            ("Moon1", "v(0,1,0), GAME.CurrentDayTime / 6480 * -360 - 90"),
+            ("Moon2", "v(0,1,1), GAME.CurrentDayTime / 3240 * 360 + 90"),
+            ("Moon3", "v(0,1,-1), GAME.CurrentDayTime / 2160 * 360 + 60"),
+        ];
+        let objs: Vec<_> = expressions.iter().enumerate().map(|(index, (name, rotation))| Obj {
+            name: (*name).into(),
+            fields: [
+                ("FXID".into(), if index < 2 { "e_SunRays" } else { "e_GenericMeshObject" }.into()),
+                ("Rotation".into(), (*rotation).into()),
+                ("Scale".into(), "11".into()),
+                ("ScaleType".into(), "e_ScaleByViewDistanceAndDirectionHeigh".into()),
+                ("InitDirection".into(), "v(-1,0,0)".into()),
+            ].into(),
+            ..Obj::default()
+        }).collect();
+        let orbit = |index: usize, time: f32| {
+            let q = match index {
+                0 | 1 => super::super::sun_rotation(super::super::sun_positions(time)[index]),
+                2 => Quat::axis_angle([0.0, 1.0, 0.0], time / 6480.0 * -360.0 - 90.0),
+                3 => Quat::axis_angle([0.0, 1.0, 1.0], time / 3240.0 * 360.0 + 90.0),
+                _ => Quat::axis_angle([0.0, 1.0, -1.0], time / 2160.0 * 360.0 + 60.0),
+            };
+            let height = q.rotate([-1.0, 0.0, 0.0])[1].max(0.0);
+            let scale = if index < 2 { 1.0 } else { 11.0 * (0.1 + 0.9 * (1.0 - height)) };
+            scene(q.rotate([0.0, 0.0, -100.0]).map(|value| value * scale))
+        };
+        let transform = |matrix: [[f32; 4]; 4], point: [f32; 3]| -> [f32; 3] {
+            std::array::from_fn(|k| matrix[3][k] + (0..3).map(|j| matrix[j][k] * point[j]).sum::<f32>())
+        };
+        let distance = |a: [f32; 3], b: [f32; 3]| (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f32>().sqrt();
+        let mut pose = pose_source(objs, [0.0; 2]);
+        let start = 2648.69;
+        let mut snapshot = Scene {
+            sky: (0..5).map(|mesh| Instance { mesh, transform: IDENTITY }).collect(),
+            sky_pose_objects: (0..5).map(|index| (index, index)).collect(),
+            ..Scene::default()
+        };
+        let mut previous = std::array::from_fn::<_, 5, _>(|index| orbit(index, start));
+        let mut held = previous;
+        let mut first_rate = [0.0; 5];
+        let mut before_plateaus = [0; 5];
+        let mut elapsed = 0.0f64;
+        println!("celestial_csv,object,frame,dt,baked_time,before_x,before_y,before_z,after_x,after_y,after_z,delta");
+        for frame in 0..120 {
+            let dt = if frame % 2 == 0 { 1.0 / 60.0 } else { 1.0 / 30.0 };
+            elapsed += f64::from(dt);
+            let time = start + elapsed as f32;
+            // Replace resource geometry every half-second, as the real worker does;
+            // the per-frame pose must neither reset nor wait for that snapshot.
+            snapshot.day_time = start + ((elapsed / 0.5).floor() * 0.5) as f32;
+            pose(time, &mut snapshot);
+            for index in 0..5 {
+                let before = orbit(index, snapshot.day_time);
+                let after = transform(snapshot.sky[index].transform, before);
+                let expected = orbit(index, time);
+                assert!(distance(after, expected) < 0.001, "frame {frame} {}: {after:?} != {expected:?}", expressions[index].0);
+                let delta = distance(after, previous[index]);
+                let rate = delta / dt;
+                if frame == 0 { first_rate[index] = rate; }
+                assert!(delta > 0.0 && (rate / first_rate[index] - 1.0).abs() < 0.1,
+                    "frame {frame} {}: displacement {delta} must follow dt {dt}, rate {rate}", expressions[index].0);
+                before_plateaus[index] += usize::from(before == held[index]);
+                println!("celestial_csv,{},{frame},{dt:.9},{:.6},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{delta:.9}",
+                    expressions[index].0, snapshot.day_time, before[0], before[1], before[2], after[0], after[1], after[2]);
+                held[index] = before;
+                previous[index] = after;
+            }
+        }
+        assert!(before_plateaus.iter().all(|&count| count > 100), "the old 2Hz hold reproduces the reported stepping");
+    }
 
     #[test]
     fn native_locked_scale_and_position_use_projection_relative_units() {
@@ -778,16 +951,10 @@ Object VortexHorizon
         assert_eq!(object_blend(rim, Blend::Opaque), Blend::SourceColorOne);
     }
 
-    /// Daytime ICC pf 4582 report: a flat light-grey sheet with a dark-blue jagged edge replaced the real sky gradient.
-    /// Two independent bugs compounded: (1) `fogged()`'s ground-scenery default guess (`sort >= Horizon`) also caught
-    /// `HorizonClouds` (no `FOGENABLE` of its own, `SunlightType e_SunLight_CloudLayer0`), adding a near-opaque
-    /// fog-coloured overlay submesh that flattened its textured cloud detail into one solid colour; (2) `Light::Cloud`
-    /// used a flat `CloudLightCurrent` tint with no direction term, so `HorizonCloudsRim`'s self-modulated glow blend
-    /// (`src² + dst`) saturated uniformly under the bright daytime tint instead of varying with the surface normal, as
-    /// `CloudLightDirection` (`Tweak_Rubi-Ka_SunLight.txt`: `GAME.Sun1Rotation`, the same value as the Moon lights'
-    /// `SpaceLight*Direction`) implies it should.
+    /// Native frame fog survives per-object Set/Reset; GenericMesh resource loading
+    /// clears cloud material emission before lighting and texture MODULATE2X.
     #[test]
-    fn real_horizon_clouds_skip_the_ground_fog_guess_and_shade_directionally_at_noon() {
+    fn real_sky_materials_preserve_native_fog_emissive_blend_and_alpha() {
         let Some(t) = real_tweaks(4582) else { return };
         let Some(home) = std::env::var_os("HOME") else { return };
         let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
@@ -798,32 +965,43 @@ Object VortexHorizon
             o.fields.iter().filter_map(|(k, v)| Some((k.clone(), script::eval(v, &|_| None)? as u32))).collect()
         });
         let ctx = Ctx {
-            day_time: sky.day_time,
-            sun1: super::super::sun_rotation(sky.sun_ao),
-            sun2: super::super::sun_rotation(sky.sun2_ao),
             cloud_intensity: sky.weather.thick_clouds_intensity(),
-            hq_offset: hq_offset(&objs),
+            hq_offset: sky.hq_offset,
             delta_time: 0.0,
             wind: [0.0; 2],
             night: sky.night,
             counters: counters(&objs),
             waves: [0.0; 16],
+            ..super::super::game_context(&objs, sky.day_time)
         };
         let mut scene = Scene::default();
         let mut b = Builder { store: &store, names, ctx, objs: &objs, sky: &sky, scene: &mut scene, sorts };
 
         let clouds = objs.iter().find(|o| o.name == "HorizonClouds").expect("HorizonClouds");
         let mesh = b.mesh_object(clouds).expect("HorizonClouds mesh");
+        assert!(mesh.vertices.iter().all(|v| v.color[3] == 1.0), "cloud alpha must not acquire an invented horizon haze");
         assert!(mesh.submeshes.iter().all(|s| !s.two_sided), "base cloud material keeps native default culling");
+        assert!(mesh.submeshes.iter().all(|s| s.emissive == [0.0; 3] && s.specular == [0.0; 3]), "10061505 resets the generic resource's first material");
         let n_submeshes = mesh.submeshes.len();
         let fogged = b.fogged(clouds, mesh);
-        assert_eq!(fogged.submeshes.len(), n_submeshes, "CloudLayer sky objects must not be swept into the ground-fog default guess");
-        assert!(fogged.submeshes.iter().all(|s| !s.sky_fog));
+        assert_eq!(fogged.submeshes.len(), n_submeshes, "source fog does not add overlay geometry");
+        assert!(fogged.submeshes.iter().all(|s| s.sky_fog && s.sky_fog_color.is_none()), "missing FOGENABLE inherits frame fog");
+        let mut unfogged = clouds.clone();
+        unfogged.states.insert("FOGENABLE".into(), "e_FALSE".into());
+        let mesh = b.mesh_object(&unfogged).unwrap();
+        assert!(b.fogged(&unfogged, mesh).submeshes.iter().all(|s| !s.sky_fog));
         let mut no_cull = clouds.clone();
         no_cull.states.insert("CULLMODE".into(), "e_D3DCULL_NONE".into());
         assert!(b.mesh_object(&no_cull).unwrap().submeshes.iter().all(|s| s.two_sided));
         let horizon = objs.iter().find(|o| o.name == "Horizon").expect("Horizon");
         let dish = b.mesh_object(horizon).expect("horizon dish");
+        assert!(dish.submeshes.iter().all(|s| s.blend == Blend::Opaque), "explicit opaque Horizon must remain opaque at its rim");
+        assert!(dish.vertices.iter().all(|v| v.color[3] == 1.0));
+        let universe = objs.iter().find(|o| o.name == "Universe").expect("Universe");
+        let backdrop = b.mesh_object(universe).expect("Universe mesh");
+        assert!(backdrop.submeshes.iter().all(|s| s.blend == Blend::Opaque));
+        assert!(backdrop.vertices.iter().all(|v| v.color[3] == 1.0), "no below-horizon backdrop fade");
+        assert!(backdrop.submeshes.iter().all(|s| s.emissive == [0.0; 3]), "LIGHTING FALSE ignores the asset's emissive1");
         let bounds: [[f32; 2]; 3] = std::array::from_fn(|k| {
             dish.vertices.iter().fold([f32::INFINITY, f32::NEG_INFINITY], |[lo, hi], v| [lo.min(v.pos[k]), hi.max(v.pos[k])])
         });
@@ -833,9 +1011,7 @@ Object VortexHorizon
         let rim = objs.iter().find(|o| o.name == "HorizonCloudsRim").expect("HorizonCloudsRim");
         let rim_mesh = b.mesh_object(rim).expect("HorizonCloudsRim mesh");
         assert!(rim_mesh.submeshes.iter().all(|s| s.two_sided), "rim material explicitly sets CULL_NONE");
-        let reds: Vec<f32> = rim_mesh.vertices.iter().map(|v| v.color[0]).collect();
-        let (min_r, max_r) = reds.iter().fold((f32::MAX, f32::MIN), |(mn, mx), &r| (mn.min(r), mx.max(r)));
-        assert!(max_r - min_r > 0.05, "CloudLayer lighting must vary with the surface normal like CloudLightDirection implies, not be a flat tint ({min_r}..{max_r})");
+        assert!(rim_mesh.submeshes.iter().all(|s| s.emissive == [0.0; 3] && s.base_color[..3] == [srgb_to_linear(2.0); 3]), "native reset precedes lighting; MODULATE2X follows saturation");
         let original_vertices = rim_mesh.vertices.clone();
         let mut culled = rim.clone();
         culled.states.insert("CULLMODE".into(), "e_D3DCULL_CW".into());
@@ -853,8 +1029,29 @@ Object VortexHorizon
         assert_eq!(material.sky_fog_color, Some([0.0; 3]));
         for (v, original) in fogged.vertices.iter().zip(original_vertices) {
             assert_eq!(v.color, original.color, "source fog must preserve the texture/vertex alpha mask");
-            let distance = v.pos.iter().map(|c| c * c).sum::<f32>().sqrt() / 1000.0;
-            assert!((v.normal[0] - distance).abs() < 1e-6);
+            assert_eq!(v.normal, original.normal, "fog uses camera depth in the vertex shader, not overwritten normals");
         }
+        for (name, alpha) in [("BattleStation_01", 48), ("BattleStation_02", 128), ("BattleStation_03", 128), ("BattleStation_04", 128)] {
+            let station = objs.iter().find(|o| o.name == name).expect("BattleStation");
+            let station_mesh = b.mesh_object(station).expect("station");
+            let factor = script::unsigned(&objs, station, &b.ctx, station.field("TFACTOR").unwrap(), 0).unwrap();
+            assert_eq!(factor >> 24, alpha);
+            assert!([16, 8, 0].iter().all(|shift| (factor >> shift) & 255 > 0), "authored atmosphere tint must not become black");
+            for submesh in station_mesh.submeshes {
+                assert!((submesh.base_color[3] - alpha as f32 / 255.0).abs() < 1e-6);
+                assert!(submesh.base_color[..3].iter().all(|&channel| channel > 0.0));
+                assert_eq!(submesh.base_color[..3], [16, 8, 0].map(|s| srgb_to_linear(((factor >> s) & 255) as f32 / 255.0)));
+            }
+        }
+        let dots = objs.iter().find(|o| o.name == "DotStars").expect("DotStars");
+        let points = b.dot_points(dots).expect("native dots");
+        let points = b.fogged(dots, points);
+        assert_eq!(points.vertices.len(), 500);
+        assert!(points.vertices.iter().all(|v| v.color == ao_scene::WHITE));
+        let material = &points.submeshes[0];
+        assert!(material.sky_points && material.sky_fog);
+        assert_eq!(material.sky_fog_color, Some([0.0; 3]));
+        assert_eq!(material.uv_scroll, [0.0; 2]);
+        assert_eq!(material.indices, (0..500).collect::<Vec<u32>>());
     }
 }

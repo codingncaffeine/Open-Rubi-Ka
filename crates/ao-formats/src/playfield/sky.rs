@@ -12,9 +12,9 @@
 //!   record ambient (`VisualAmbientLight_t::AddAmbientLight` keeps the maximum, DisplaySystem @0x10059d2c).
 //! * `Sun1`: additive `newsun_frame01.png` rays, colour (255,155,55), rotated by `GAME.Sun1Rotation`.
 //!
-//! The server clock drives the native binary-sun orbit (Gamecode 0x100b879b/0x100b9044).
-//! Offline scenes use `Tweak_GAME_FrozenTime.txt`'s `CurrentDayTime 2648.69`; its authored
-//! Sun1/Sun2 quaternions are independent regression fixtures, never ephemeris calibration inputs.
+//! The server clock drives native GameSun* exports (Gamecode 0x100b879b/0x100b9044), then the final GAME object maps
+//! its sky interfaces. ICC explicitly includes `Tweak_GAME_FrozenTime.txt`, freezing sky time and both suns even live.
+//! The offline default time is 2648.69; frozen quaternions remain independent ephemeris fixtures, not calibration inputs.
 
 mod aurora;
 mod layers;
@@ -43,7 +43,7 @@ pub const WIND_WARMUP: f32 = 30.0;
 pub(super) const ATMOSPHERE_FOG_DENSITY: f32 = 0.025;
 
 /// All tweak files a playfield includes, concatenated (comments removed).
-pub struct Tweaks(String);
+pub struct Tweaks(String, u32);
 
 impl Tweaks {
     pub fn load(client_dir: &Path, id: u32, outdoor: bool) -> Option<Self> {
@@ -52,12 +52,20 @@ impl Tweaks {
         let first = if dir.join(&own).is_file() { own } else if outdoor { "Tweak_Playfield_OutdoorDefault.txt".into() } else { "Tweak_Playfield_IndoorDefault.txt".into() };
         let mut text = String::new();
         flatten(&dir, &first, &mut HashSet::new(), &mut text, false);
-        (!text.is_empty()).then_some(Tweaks(text))
+        (!text.is_empty()).then_some(Tweaks(text, id))
     }
 
     /// Every `Object` of the flattened script.
     pub fn objects(&self) -> Vec<script::Obj> {
         script::parse_objects(&self.0)
+    }
+
+    pub(super) fn ground_shadow_time(&self, day_time: f32) -> f32 {
+        let objects = self.objects();
+        let ctx = game_context(&objects, day_time);
+        objects.iter().find(|o| o.name == "GAME")
+            .and_then(|o| o.field("DayTimeForGroundShadows").and_then(|e| script::eval_field(o, &ctx, e, 0)))
+            .unwrap_or_else(|| ground_shadow_time(day_time))
     }
 
     /// Values of `Float <name> [N]: ...` (first definition).
@@ -90,7 +98,7 @@ impl Tweaks {
         self.0.lines().find_map(|l| l.trim_start().strip_prefix("Float")?.trim_start().strip_prefix(name)?.trim_start().strip_prefix(':')?.split_whitespace().next()?.parse().ok())
     }
 
-    /// Array `name` at day time factor `f` (linear interpolation over the entries, [INFERENCE]: FXS array access).
+    /// Array `name` at factor `f` (FXS10003d24: N*f, cyclic last-to-first segment).
     fn at(&self, name: &str, f: f32) -> Option<f32> {
         let a = self.array(name)?;
         (!a.is_empty()).then(|| sample(&a, f))
@@ -99,6 +107,61 @@ impl Tweaks {
     fn rgb(&self, names: [&str; 3], f: f32) -> Option<[f32; 3]> {
         Some([self.at(names[0], f)?, self.at(names[1], f)?, self.at(names[2], f)?])
     }
+}
+
+/// Gamecode100bb7c9 origin registry (double constants101680d8..10168380);100bb5a2 uses origin zero on a miss.
+/// This is not RKPP: in this client ICC4582 is absent and Jobe4526 uses the native HQ origin.
+fn native_hq_offset(playfield: u32) -> [f32; 2] {
+    let [x, z] = match playfield {
+        505 => [35214.0, 44566.0],
+        540 => [39621.0, 40670.0],
+        545 => [39122.0, 40646.0],
+        550 => [37085.0, 39823.0],
+        551 => [37078.0, 41004.0],
+        560 => [41975.0, 45030.0],
+        565 => [41959.0, 42152.0],
+        566 => [42862.0, 42389.0],
+        567 => [41950.0, 42166.0],
+        570 => [45486.0, 45364.0],
+        585 => [39721.0, 39418.0],
+        586 => [39743.0, 40342.0],
+        590 => [42836.0, 36053.0],
+        595 => [46219.0, 35172.0],
+        600 => [41975.0, 39148.0],
+        605 => [46248.0, 32165.0],
+        610 => [42839.0, 33283.0],
+        615 => [46680.0, 24729.0],
+        620 => [46689.0, 27892.0],
+        625 => [41891.0, 30614.0],
+        630 => [43499.0, 27918.0],
+        635 => [40889.0, 33041.0],
+        640 => [47921.0, 39716.0],
+        646 => [46178.0, 39071.0],
+        647 => [46175.0, 39073.0],
+        650 => [40866.0, 36044.0],
+        655 => [37182.0, 31311.0],
+        665 => [31002.0, 29384.0],
+        670 => [37169.0, 27031.0],
+        685 => [34495.0, 29814.0],
+        687 => [34518.0, 29814.0],
+        695 => [39962.0, 27028.0],
+        696 => [41950.0, 27705.0],
+        700 | 4526 => [43204.0, 27102.0],
+        705 => [43756.0, 26526.0],
+        710 => [43308.0, 27595.0],
+        716 | 717 => [44526.0, 24729.0],
+        730 => [34049.0, 30363.0],
+        735 => [33917.0, 30370.0],
+        740 => [33837.0, 30358.0],
+        760 => [38486.0, 33943.0],
+        790 => [38062.0, 36352.0],
+        791 => [38081.0, 37660.0],
+        795 => [33860.0, 39227.0],
+        800 => [37107.0, 38360.0],
+        _ => [0.0, 0.0],
+    };
+    //100b8917 subtracts universe(PF700,local(605,0,419)); local constants10167f0c/10167f08.
+    [x - (43204.0 + 605.0), z - (27102.0 + 419.0)]
 }
 
 /// `in_object`: the file is the body of an `Object` (an include inside an object block). Those are templates that every
@@ -175,10 +238,12 @@ fn eval_list(s: &str) -> Vec<f32> {
     out
 }
 
+/// FXS10003d24 Float array interpolation; vector arrays10003e31 use the same N*f indexing.
 fn sample(a: &[f32], f: f32) -> f32 {
-    let p = f.clamp(0.0, 1.0) * (a.len() - 1) as f32;
-    let (i, t) = (p as usize, p.fract());
-    a[i] * (1.0 - t) + a[(i + 1).min(a.len() - 1)] * t
+    let p = f * a.len() as f32;
+    let i = ((p - 0.49999).round_ties_even() as i32 as u32 as usize).min(a.len() - 1);
+    let next = if i + 1 < a.len() { i + 1 } else { 0 };
+    (a[i] as f64 + (a[next] as f64 - a[i] as f64) * (p - i as f32) as f64) as f32
 }
 
 /// Everything the tweak scripts contribute to a scene (colours in sRGB 0..1 like the client's D3D values).
@@ -199,11 +264,12 @@ pub struct Sky {
     cloud_light: [f32; 3],
     /// Unit vector towards the sun in scene space.
     pub sun_dir: [f32; 3],
-    /// Unit vectors towards sun 1 and sun 2 in AO space (left handed).
+    /// Unit vector towards the mapped sun 1 in AO space (left handed).
     sun_ao: [f32; 3],
-    sun2_ao: [f32; 3],
-    /// `GAME.CurrentDayTime` the sky was evaluated at.
+    /// Native `GAME.GameDayTime`; weather and native cloud sun-height stay live when sky interfaces freeze.
     day_time: f32,
+    /// Native HQ offsets at local camera origin; material coefficients add the live camera displacement.
+    hq_offset: [f32; 2],
     /// `GAME.CurrentNightIntensity` (`NightIntensity` track of `Tweak_GAME.txt`, 1 when the script has none).
     night: f32,
     /// `ThickCloudsIntensity` / `HighAltitudeWind` source (`crate::weather`); clear sky until [`Sky::set_weather`].
@@ -227,7 +293,6 @@ fn rot(q: [f32; 4]) -> script::Quat {
 }
 
 /// Where a `GAME.SunNRotation` points the sun: the `SunRays` fan sits at local z = -100 (`FUN_1005a7f6` DisplaySystem).
-#[cfg(test)]
 const SUN_LOCAL: [f32; 3] = [0.0, 0.0, -1.0];
 
 /// Native binary-sun positions (Gamecode 0x100b86ca/0x100b8ea6/0x100b9044).
@@ -279,9 +344,18 @@ pub fn sun_dir(day_time: f32) -> [f32; 3] {
     [d[0], d[1], -d[2]]
 }
 
+/// Native exports followed by the final GAME object's authored interface mapping.
+fn game_context(objects: &[script::Obj], day_time: f32) -> script::Ctx {
+    let [sun1, sun2] = sun_positions(day_time);
+    let mut ctx = script::Ctx { sun1: sun_rotation(sun1), sun2: sun_rotation(sun2), ..script::Ctx::at(day_time) };
+    if let Some(game) = objects.iter().find(|o| o.name == "GAME") { ctx.bind_game(game); }
+    ctx
+}
+
 impl Sky {
     pub fn new(t: &Tweaks, day_time: f32) -> Option<Sky> {
-        let f = day_factor(day_time);
+        let ctx = game_context(&t.objects(), day_time);
+        let f = ctx.day_factor.unwrap_or_else(|| day_factor(ctx.day_time));
         let colour = |side: &str| -> Option<([f32; 3], f32)> {
             let i = t.at(&format!("Color{side}I"), f)?;
             let c = t.rgb([&format!("Color{side}R"), &format!("Color{side}G"), &format!("Color{side}B")].map(|s| s.as_str()), f)?;
@@ -295,8 +369,8 @@ impl Sky {
         let sun = t.rgb(["GroundLightR", "GroundLightG", "GroundLightB"], f).map(|c| c.map(|v| (v * 2.0).min(1.0)));
         let ambient = t.at("AmbientLight", f).map(|a| [a; 3]).or_else(|| t.rgb(["AmbientLightR", "AmbientLightG", "AmbientLightB"], f));
         let cloud_light = t.rgb(["CloudLightR", "CloudLightG", "CloudLightB"], f).unwrap_or([1.0; 3]);
-        let [sun_ao, sun2_ao] = sun_positions(day_time);
-        Some(Sky { top, bottom, top_i, bottom_i, fog, sun, ambient, sun_specular: t.scalar("SpecularLightIntensity").unwrap_or(1.0), cloud_light, sun_dir: [sun_ao[0], sun_ao[1], -sun_ao[2]], sun_ao, sun2_ao, day_time, night: t.at("NightIntensity", f).unwrap_or(1.0), weather: crate::weather::State::clear() })
+        let sun_ao = ctx.sun1.rotate(SUN_LOCAL);
+        Some(Sky { top, bottom, top_i, bottom_i, fog, sun, ambient, sun_specular: t.scalar("SpecularLightIntensity").unwrap_or(1.0), cloud_light, sun_dir: [sun_ao[0], sun_ao[1], -sun_ao[2]], sun_ao, day_time, hq_offset: native_hq_offset(t.1), night: t.at("NightIntensity", f).unwrap_or(1.0), weather: crate::weather::State::clear() })
     }
 
     /// The weather of the playfield at this moment (`ThickCloudsIntensity`, `HighAltitudeWind`).
@@ -304,49 +378,29 @@ impl Sky {
         self.weather = w;
     }
 
-    /// Camera-locked sky dome (`Scene::sky`, drawn unlit and unfogged by the renderer): the atmosphere strip's gradient
-    /// fogged at render time with the live fog (the client draws the strip with `FOGENABLE`; `Submesh::sky_fog`, vertex normal.x = distance / camera far). Vertex alpha is the strip's
-    /// intensity `I`: the dome lets the star dome, dot stars and moons behind it show through at night.
-    pub fn dome(&self) -> Mesh {
-        const SEG: usize = 24;
-        const ELEV: [f32; 12] = [-15.0, 0.0, 4.0, 9.0, 16.0, 25.0, 35.0, 45.0, 55.0, 65.0, 78.0, 90.0];
-        let radius = 400.0;
-        let mut vertices = Vec::new();
-        let (bottom, top) = (self.bottom.map(srgb_to_linear), self.top.map(srgb_to_linear));
-        for &e in &ELEV {
-            let (er, tan) = (e.to_radians(), e.to_radians().tan());
-            // ray from the camera hits the strip (y = 0 @ z = 1000 -> y = 400 @ z = 200 -> y = 400 @ z = -500)
-            let s = if e <= 0.0 { 0.0 } else { (1000.0 * tan / (400.0 + 800.0 * tan)).min(1.0) };
-            let dist = if e <= 0.0 { 1000.0 } else if s < 1.0 { (400.0 * s).hypot(1000.0 - 800.0 * s) } else { 400.0 / er.sin() };
-            let d = dist / 1000.0;
-            let c = [0, 1, 2].map(|k| bottom[k] * (1.0 - s) + top[k] * s);
-            let alpha = self.bottom_i * (1.0 - s) + self.top_i * s;
-            for j in 0..=SEG {
-                let a = j as f32 / SEG as f32 * std::f32::consts::TAU;
-                vertices.push(Vertex {
-                    pos: [radius * er.cos() * a.cos(), radius * er.sin(), radius * er.cos() * a.sin()],
-                    normal: [d, 0.0, 0.0],
-                    color: [c[0], c[1], c[2], alpha],
-                    ..Default::default()
-                });
-            }
-        }
-        let mut indices = Vec::new();
-        for r in 0..ELEV.len() - 1 {
-            for j in 0..SEG {
-                let a = (r * (SEG + 1) + j) as u32;
-                let b = a + SEG as u32 + 1;
-                indices.extend([a, b, a + 1, a + 1, b, b + 1]);
-            }
-        }
+    /// Native yaw-locked `AtmosphereMesh` strip, in scene coordinates at normalized far=1000.
+    /// FXS `GetPoint10001efd` multiplies each authored point by Size=1000;
+    /// DisplaySystem `1005c917` then applies camera far/1000 and camera yaw only.
+    pub fn atmosphere(&self) -> Mesh {
+        let vertices = [
+            [-1000.0, 0.0, -1000.0], [1000.0, 0.0, -1000.0],
+            [-1000.0, 400.0, -200.0], [1000.0, 400.0, -200.0],
+            [-1000.0, 400.0, 500.0], [1000.0, 400.0, 500.0],
+        ].into_iter().enumerate().map(|(i, pos)| {
+            let (rgb, alpha) = if i < 2 { (self.bottom, self.bottom_i) } else { (self.top, self.top_i) };
+            let rgb = rgb.map(srgb_to_linear);
+            Vertex { pos, color: [rgb[0], rgb[1], rgb[2], alpha], ..Default::default() }
+        }).collect();
+        // Expand the native triangle strip; culling is explicitly disabled.
+        let indices = vec![0, 1, 2, 2, 1, 3, 2, 3, 4, 4, 3, 5];
         Mesh { vertices, submeshes: vec![Submesh { two_sided: true, blend: ao_scene::Blend::AlphaBlend, sky_fog: true, ..Submesh::new(indices, None) }] }
     }
 }
 
-/// Adds the sky of the playfield's tweak script to `scene.sky`: the atmosphere dome and every `BackgroundSort` object
+/// Adds the sky of the playfield's tweak script to `scene.sky`: the atmosphere strip and every `BackgroundSort` object
 /// (see `layers`).
 pub fn emit(sky: &Sky, tweaks: &Tweaks, store: &ao_rdb::RecordStore, scene: &mut Scene) {
-    layers::emit(sky, &tweaks.objects(), store, scene, sky.dome());
+    layers::emit(sky, &tweaks.objects(), store, scene, sky.atmosphere());
 }
 
 /// `Color` (sRGB) of the playfield's `e_ClearScreen` object (`Tweak_BlackBackground`, `Color 0xFFFF0000`, included by
@@ -401,10 +455,15 @@ impl SkyClock {
         self
     }
 
+    /// Per-frame scripted poses, independent of the resource/colour worker's cadence.
+    pub fn pose_source(&self) -> impl FnMut(f32, &mut Scene) + Send + 'static {
+        layers::pose_source(self.tweaks.objects(), native_hq_offset(self.tweaks.1))
+    }
+
     /// A scene with only `sky`, `meshes`, new `textures`, `environment` and the base `fog_model` (no volumes) filled in.
     pub fn at(&mut self, day_time: f32) -> Scene {
         let day_time = day_time.rem_euclid(DAY_LENGTH);
-        let mut scene = Scene::default();
+        let mut scene = Scene { day_time, ..Scene::default() };
         let Some(mut sky) = Sky::new(&self.tweaks, day_time) else { return scene };
         sky.set_weather(weather_at(&self.env, self.day, day_time));
         let mut environment = super::environment::to_scene(&self.env, true, Some(&sky));
@@ -446,18 +505,96 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_horizon_offsets_use_registered_origins_and_unknown_local_fallback() {
+        assert_eq!(native_hq_offset(700), [-605.0, -419.0]);
+        assert_eq!(native_hq_offset(566), [-947.0, 14868.0]);
+        assert_eq!(native_hq_offset(716), [717.0, -2792.0]);
+        assert_eq!(native_hq_offset(4526), [-605.0, -419.0], "native table, not authored RKPP.Jobe");
+        for unknown in [0, 4582, u32::MAX] {
+            assert_eq!(native_hq_offset(unknown), [-43809.0, -27521.0]);
+        }
+        let Some(tweaks) = real_tweaks(4582) else { return };
+        assert_eq!(tweaks.1, 4582);
+        assert_eq!(Sky::new(&tweaks, 0.0).unwrap().hq_offset, [-43809.0, -27521.0]);
+    }
+
+    #[test]
     fn expressions_run_left_to_right_with_optional_commas() {
         assert_eq!(eval_list(" 0 / 255,  64 / 255, 1.0"), vec![0.0, 64.0 / 255.0, 1.0]);
         assert_eq!(eval_list("23 / 255 * 0.0   57 / 255 * 3  0.5"), vec![0.0, 57.0 / 255.0 * 3.0, 0.5]);
         assert_eq!(eval_list("-1.5, 2"), vec![-1.5, 2.0]);
     }
+    #[test]
+    fn final_game_object_freezes_interfaces_but_not_native_exports() {
+        let t = Tweaks(concat!(
+            "Object GAME\n{\n Float Obsolete: 1\n Float CurrentDayTime: This.GameDayTime\n}\n",
+            "Object GAME\n{\n Float GameDayTime: 0\n Float CurrentDayTime: 2648.69\n",
+            " Float DayTimeFactor: This.CurrentDayTime / 6480\n Float DayTimeForGroundShadows: 2648.69 * 15\n",
+            " Quaternion Sun1Rotation: q(0.900351,-0.0951056,0.344078,0.248863)\n",
+            " Quaternion Sun2Rotation: This.GameSun2Rotation\n}\n"
+        ).into(), 0);
+        let objects = t.objects();
+        assert_eq!(objects.len(), 1);
+        assert!(objects[0].field("Obsolete").is_none(), "duplicate Object replaces, not merges");
+        for time in [0.0, 3240.0] {
+            let ctx = game_context(&objects, time);
+            assert_eq!(ctx.day_time, DEFAULT_DAY_TIME);
+            assert_eq!(ctx.day_factor, Some(DEFAULT_DAY_TIME / DAY_LENGTH));
+            assert_eq!(script::eval_field(&objects[0], &ctx, "GAME.GameDayTime", 0), Some(time));
+            let expected = rot(SUN1_ROT).rotate(SUN_LOCAL);
+            let actual = ctx.sun1.rotate(SUN_LOCAL);
+            assert!((0..3).all(|k| (actual[k] - expected[k]).abs() < 1e-6));
+            let expected = sun_positions(time)[1];
+            let actual = ctx.sun2.rotate(SUN_LOCAL);
+            assert!((0..3).all(|k| (actual[k] - expected[k]).abs() < 1e-5));
+            assert_eq!(t.ground_shadow_time(time), DEFAULT_DAY_TIME * 15.0);
+        }
+    }
+
+    #[test]
+    fn real_icc_freezes_fxs_sky_but_clouds_keep_native_sun_height() {
+        let Some(t) = real_tweaks(4582) else { return };
+        let (night, noon) = (Sky::new(&t, 0.0).unwrap(), Sky::new(&t, 3240.0).unwrap());
+        assert_eq!(night.top, noon.top);
+        assert_eq!(night.sun_dir, noon.sun_dir);
+        assert_eq!(night.night, noon.night);
+        assert_eq!((night.day_time, noon.day_time), (0.0, 3240.0), "weather and physical clock remain live");
+        let mapped = game_context(&t.objects(), 0.0);
+        for (actual, authored) in [mapped.sun1, mapped.sun2].map(|q| q.rotate(SUN_LOCAL)).into_iter().zip([SUN1_ROT, SUN2_ROT]) {
+            let expected = rot(authored).rotate(SUN_LOCAL);
+            assert!((0..3).all(|k| (actual[k] - expected[k]).abs() < 1e-6));
+        }
+        let Some(dir) = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Games/ProjectRubiKa/client")) else { return };
+        let Ok(store) = ao_rdb::RecordStore::open(&dir) else { return };
+        let mut heights = Vec::new();
+        for sky in [&night, &noon] {
+            let mut snapshot = Scene::default();
+            emit(sky, &t, &store, &mut snapshot);
+            let cloud = snapshot.single_clouds.first().expect("ICC SingleCloud layer");
+            assert!((cloud.sun_y - sun_ao(sky.day_time)[1]).abs() < 1e-6);
+            assert_eq!(cloud.light_direction, sky.sun_dir, "FXS ground light remains frozen");
+            assert!(snapshot.meshes[cloud.mesh].submeshes.iter().all(|material| material.sky_fog), "native SingleCloud inherits frame fog");
+            heights.push(cloud.sun_y);
+        }
+        assert!(heights[0] < 0.0 && heights[1] > 0.0);
+    }
+
 
     #[test]
     fn arrays_follow_continuation_lines_and_interpolate() {
-        let t = Tweaks("Object A\n{\n  Float  Foo [3]:  0 / 2, 1\n                  4\n  Float Bar: 1\n}\n".into());
+        let t = Tweaks("Object A\n{\n  Float  Foo [3]:  0 / 2, 1\n                  4\n  Float Bar: 1\n}\n".into(), 0);
         assert_eq!(t.array("Foo").unwrap(), vec![0.0, 1.0, 4.0]);
         assert!(t.array("Bar").is_none());
-        assert!((t.at("Foo", 0.75).unwrap() - 2.5).abs() < 1e-6);
+        assert!((t.at("Foo", 0.75).unwrap() - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn float_arrays_follow_native_count_scaled_cyclic_end_and_unsigned_clamp() {
+        // FXS10003d24, N=4, x=N*f; indices >=N (including converted negative indices) clamp to3.
+        for (factor, expected) in [(0.0, 0.0), (0.125, 5.0), (0.25, 10.0), (0.75, 30.0), (0.875, 15.0), (1.0, 0.0), (1.125, -15.0), (-0.125, 135.0)] {
+            assert_eq!(sample(&[0.0, 10.0, 20.0, 30.0], factor), expected, "{factor}");
+        }
+        assert_eq!(sample(&[7.0], 0.75), 7.0);
     }
 
     fn real_tweaks(id: u32) -> Option<Tweaks> {
@@ -553,9 +690,9 @@ mod tests {
 
     #[test]
     fn clear_screen_object_gives_the_background_colour() {
-        let t = Tweaks("Object S\n{\n  Unsigned FXID: e_ClearScreen\n  Unsigned Color: 0xFFFF0000\n}\n".into());
+        let t = Tweaks("Object S\n{\n  Unsigned FXID: e_ClearScreen\n  Unsigned Color: 0xFFFF0000\n}\n".into(), 0);
         assert_eq!(clear_color(&t), Some([1.0, 0.0, 0.0]));
-        assert_eq!(clear_color(&Tweaks("Object A\n{\n  Unsigned FXID: e_GenericMeshObject\n}\n".into())), None);
+        assert_eq!(clear_color(&Tweaks("Object A\n{\n  Unsigned FXID: e_GenericMeshObject\n}\n".into(), 0)), None);
         if let (Some(indoor), Some(rk)) = (real_tweaks(125), real_tweaks(566)) {
             assert_eq!(clear_color(&indoor), Some([1.0, 0.0, 0.0]), "Tweak_BlackBackground");
             assert_eq!(clear_color(&rk), None, "Rubi-Ka outdoors has no ClearScreen");
@@ -590,6 +727,23 @@ mod tests {
         assert!(by("RKPP").is_some() && by("PlayfieldData").unwrap().field("UniversePosition") == Some("RKPP.Newland_City"));
         let (noon, night) = (Sky::new(&t, 3300.0).unwrap(), Sky::new(&t, 0.0).unwrap());
         assert!(noon.top_i > 0.99 && night.top_i < 0.1, "{} {}", noon.top_i, night.top_i);
+    }
+
+    #[test]
+    fn atmosphere_is_the_native_six_vertex_strip_not_a_below_horizon_dome() {
+        let Some(t) = real_tweaks(566) else { return };
+        let sky = Sky::new(&t, 3300.0).unwrap();
+        let mesh = sky.atmosphere();
+        assert_eq!(mesh.vertices.iter().map(|v| v.pos).collect::<Vec<_>>(), vec![
+            [-1000.0, 0.0, -1000.0], [1000.0, 0.0, -1000.0],
+            [-1000.0, 400.0, -200.0], [1000.0, 400.0, -200.0],
+            [-1000.0, 400.0, 500.0], [1000.0, 400.0, 500.0],
+        ]);
+        assert_eq!(mesh.submeshes[0].indices, [0, 1, 2, 2, 1, 3, 2, 3, 4, 4, 3, 5]);
+        assert!(mesh.submeshes[0].sky_fog && mesh.submeshes[0].two_sided);
+        assert_eq!(mesh.submeshes[0].blend, ao_scene::Blend::AlphaBlend);
+        assert!(mesh.vertices[..2].iter().all(|v| v.color[3] == sky.bottom_i));
+        assert!(mesh.vertices[2..].iter().all(|v| v.color[3] == sky.top_i));
     }
 
     #[test]

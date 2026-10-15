@@ -231,7 +231,7 @@ impl Renderer {
             })),
             _ => None,
         };
-        let mut mat_of: HashMap<(usize, bool, [u32; 24]), usize> = HashMap::new();
+        let mut mat_of: HashMap<(usize, bool, [u32; 28]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
         let mut meshes = vec![];
         for mesh in &scene.meshes {
@@ -257,7 +257,7 @@ impl Renderer {
                 }
                 let count = indices.len() as u32 - first;
                 let view = s.texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0);
-                let mut bind = |view: usize, clamp: bool, u: [f32; 24]| {
+                let mut bind = |view: usize, clamp: bool, u: [f32; 28]| {
                     *mat_of.entry((view, clamp, u.map(f32::to_bits))).or_insert_with(|| {
                         let ub = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                             label: None,
@@ -280,7 +280,7 @@ impl Renderer {
                 let mat = bind(view, s.texture_clamp, mat_uniform(s));
                 let pipe = material_pipe(s);
                 // the env layer redraws the same triangles right after them, in the same phase (`FUN_10056ed6`)
-                let env = s.env_texture.and_then(|k| view_of.get(&k).copied()).map(|ev| (bind(ev, false, [0.0; 24]), env_pipe(s.blend, s.two_sided)));
+                let env = s.env_texture.and_then(|k| view_of.get(&k).copied()).map(|ev| (bind(ev, false, [0.0; 28]), env_pipe(s.blend, s.two_sided)));
                 submesh_mats.push((mat, pipe, env));
                 if count == 0 {
                     continue;
@@ -552,9 +552,11 @@ pub(crate) fn same_material(a: &ao_scene::Submesh, b: &ao_scene::Submesh) -> boo
         glow_mask,
         prelit,
         uv_scroll,
+        sky_points,
         sky_fog,
         sky_fog_color,
         uv_wave,
+        uv_camera,
         sun_flicker,
         specular,
         shininess,
@@ -571,9 +573,11 @@ pub(crate) fn same_material(a: &ao_scene::Submesh, b: &ao_scene::Submesh) -> boo
         && *glow_mask == b.glow_mask
         && *prelit == b.prelit
         && *uv_scroll == b.uv_scroll
+        && *sky_points == b.sky_points
         && *sky_fog == b.sky_fog
         && *sky_fog_color == b.sky_fog_color
         && *uv_wave == b.uv_wave
+        && *uv_camera == b.uv_camera
         && *sun_flicker == b.sun_flicker
         && *specular == b.specular
         && *shininess == b.shininess
@@ -599,9 +603,11 @@ fn submesh_shape(submeshes: &[ao_scene::Submesh]) -> Vec<ao_scene::Submesh> {
             glow_mask: s.glow_mask,
             prelit: s.prelit,
             uv_scroll: s.uv_scroll,
+            sky_points: s.sky_points,
             sky_fog: s.sky_fog,
             sky_fog_color: s.sky_fog_color,
             uv_wave: s.uv_wave,
+            uv_camera: s.uv_camera,
             sun_flicker: s.sun_flicker,
             specular: s.specular,
             shininess: s.shininess,
@@ -735,9 +741,11 @@ mod tests {
             |s| s.glow_mask = true,
             |s| s.prelit = true,
             |s| s.uv_scroll = [1.0, 0.0],
+            |s| s.sky_points = true,
             |s| s.sky_fog = true,
             |s| s.sky_fog_color = Some([0.1, 0.2, 0.3]),
             |s| s.uv_wave = [1.0, 0.0, 0.0, 0.0],
+            |s| s.uv_camera = [1.0, 0.0, 0.0, 0.0],
             |s| s.sun_flicker = true,
             |s| s.specular = [1.0, 0.0, 0.0],
             |s| s.shininess = 10.0,

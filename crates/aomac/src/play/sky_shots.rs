@@ -141,3 +141,133 @@ fn icc_sky_layer_screenshots() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// One landmark-inferred view of the user's current-client screenshot, not retail visual proof.
+/// `AOMAC_SHOT_DIR=/tmp/icc-retail cargo test --release -p aomac icc_retail_sky_screenshots -- --nocapture`
+/// Optional scene-space calibration: AOMAC_SKY_EYE=x,y,z; AOMAC_SKY_YAW/PITCH (radians);
+/// AOMAC_SKY_TIME (game seconds), AOMAC_SKY_WIDE=0|1. Reuse identical values before/after.
+#[test]
+fn icc_retail_sky_screenshots() -> anyhow::Result<()> {
+    use std::fmt::Write;
+    let Some(out) = std::env::var_os("AOMAC_SHOT_DIR").map(PathBuf::from) else { return Ok(()) };
+    let dir = ao_gui::client_dir();
+    anyhow::ensure!(dir.join("cd_image/rdb.db").exists(), "no installed client at {}", dir.display());
+    let scalar = |name: &str, default: f32| -> anyhow::Result<f32> {
+        let value = std::env::var(name).map_or(Ok(default), |s| s.parse::<f32>())?;
+        anyhow::ensure!(value.is_finite(), "{name} must be finite");
+        Ok(value)
+    };
+    // [INFERENCE] Calibrated against the user's current-client screenshot landmarks.
+    // Baseline camera-view-i: wreck mast ~(-3,+3), shuttle antenna ~(-5,0),
+    // overhang right edge ~(+7,0) pixels relative to the 2090x1083 screenshot.
+    // Foreground shoreline/grass still differs; this is not an exact recovered camera.
+    let mut eye = Vec3::new(933.5, 26.0, -748.0);
+    if let Ok(value) = std::env::var("AOMAC_SKY_EYE") {
+        let xyz = value.split(',').map(str::parse::<f32>).collect::<Result<Vec<_>, _>>()?;
+        anyhow::ensure!(xyz.len() == 3 && xyz.iter().all(|v| v.is_finite()), "AOMAC_SKY_EYE must be finite x,y,z");
+        eye = Vec3::new(xyz[0], xyz[1], xyz[2]);
+    }
+    let yaw = scalar("AOMAC_SKY_YAW", 3.765)?;
+    let pitch = scalar("AOMAC_SKY_PITCH", 0.046)?;
+    let time = scalar("AOMAC_SKY_TIME", 2648.69)?;
+    anyhow::ensure!((0.0..6480.0).contains(&time), "AOMAC_SKY_TIME must be in 0..6480");
+    let wide = scalar("AOMAC_SKY_WIDE", 0.0)?;
+    anyhow::ensure!(wide == 0.0 || wide == 1.0, "AOMAC_SKY_WIDE must be 0 or 1");
+    let store = ao_rdb::RecordStore::open(&dir)?;
+    let scene = ao_formats::playfield::load_playfield_at(&store, &dir, 4582, time)?;
+    assert!(!scene.sky.is_empty(), "ICC must supply authored sky layers");
+    let mut lens = camera::lens(scene.lens.unwrap_or_default(), wide == 1.0);
+    lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
+    let mut shot = Shot {
+        gui: Gui::new(&dir, None)?,
+        scene: None,
+        camera: Camera { pos: eye, yaw, pitch, roll: 0.0 },
+        lens,
+    };
+    let mut report = format!(
+        "reference=user current-client Screenshot 2026-10-15 at 16.50.21.png (NOT retail visual proof)\nsize=2090x1083\ncamera=INFERRED, not recovered from screenshot\n\
+         eye={eye:?} yaw={yaw} pitch={pitch} direction={:?} lens={lens:?}\n\
+         time={time} (game seconds, NOT screenshot/chat wall time)\n\
+         default_camera_source=offscreen landmark calibration camera-view-i; initial area located from docs/zone/camera.md ICC idle capture\n\
+         default_camera_residuals_approx_pixels= wreck_mast(-3,+3), shuttle_antenna(-5,0), overhang_right_edge(+7,0)\n\
+         default_camera_limit=foreground grass/shoreline differs; no exact camera or saved preferences recovered\n\
+         screenshot_landmarks=left sea wreck; raised shuttle right; grass beach; overhang upper-left\n\
+         native_ICC_game_time=2648.69, authored FrozenTime override via FXS duplicate-object replacement; independent of wall16:50\n\
+         scene_environment={:?}\n\
+         Combined frame contains installed static playfield and sky, not captured avatar/NPCs/HUD.\n",
+        shot.camera.forward(), scene.environment,
+    );
+    let names = ao_formats::character::NameTable::load(&store)?;
+    let tweaks = ao_formats::playfield::Tweaks::load(&dir, 4582, true)
+        .ok_or_else(|| anyhow::anyhow!("missing ICC tweaks"))?;
+    let objects = tweaks.objects();
+    writeln!(report, "\nAuthored pre-render objects (including objects hidden at this game time):")?;
+    for (index, object) in objects.iter().enumerate().filter(|(_, o)| {
+        o.field("Priority").is_some_and(|p| p.trim() == "e_RenderPriority_PreRendering")
+    }) {
+        let mesh = object.string("Mesh");
+        let record = mesh.and_then(|name| names.id(ao_formats::mesh::MESH_TYPE, name));
+        writeln!(report, "object{index}: name={} fxid={} mesh={mesh:?} record={record:?} texture={:?} sort={:?} visibility={:?} states={:?}",
+            object.name, object.fxid(), object.texture, object.field("Sorting"), object.field("Visibility"), object.states)?;
+        writeln!(report, "  authored fields={:?}", object.fields)?;
+    }
+    let mut off = Offscreen::new(&shot, (2090, 1083))?;
+    std::fs::create_dir_all(&out)?;
+    shot.scene = Some(scene.clone());
+    let list = off.frame(&mut shot, 0.0);
+    off.png(&shot, &list, &out.join("icc-retail-combined.png"))?;
+    // Keep instance indices and animation metadata intact. Empty world draw geometry rather
+    // than removing instances that movers/LOD reference.
+    let mut sky_only = scene.clone();
+    sky_only.liquids.clear();
+    sky_only.ground_detail.clear();
+    for (index, mesh) in sky_only.meshes.iter_mut().enumerate() {
+        if !scene.sky.iter().any(|instance| instance.mesh == index) {
+            mesh.submeshes.clear();
+        }
+    }
+    shot.scene = Some(sky_only.clone());
+    let list = off.frame(&mut shot, 0.0);
+    off.png(&shot, &list, &out.join("icc-retail-sky.png"))?;
+    for (ordinal, instance) in scene.sky.iter().enumerate() {
+        let mesh = &scene.meshes[instance.mesh];
+        let (lo, hi) = mesh.vertices.iter().fold(
+            (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
+            |(lo, hi), v| (lo.min(Vec3::from(v.pos)), hi.max(Vec3::from(v.pos))),
+        );
+        assert!(lo.is_finite() && hi.is_finite());
+        writeln!(report, "\nlayer{ordinal:02}: mesh={} vertices={} bounds={lo:?}..{hi:?} transform={:?}",
+            instance.mesh, mesh.vertices.len(), instance.transform)?;
+        let object_index = scene.sky_pose_objects.iter().find_map(|&(instance, object)| {
+            (instance == ordinal).then_some(object)
+        }).ok_or_else(|| anyhow::anyhow!("layer{ordinal:02} has no authored object mapping"))?;
+        let object = objects.get(object_index)
+            .ok_or_else(|| anyhow::anyhow!("layer{ordinal:02} object index {object_index} is out of range"))?;
+        let source_mesh = object.string("Mesh");
+        let record = source_mesh.and_then(|name| names.id(ao_formats::mesh::MESH_TYPE, name));
+        writeln!(report, "  authored object{object_index}: name={} fxid={} mesh={source_mesh:?} record={record:?} sorting={:?}",
+            object.name, object.fxid(), object.field("Sorting"))?;
+        writeln!(report, "  authored transform: Rotation={:?} Scale={:?} ScaleType={:?} Position={:?} PositionType={:?} MeshIndex={:?}",
+            object.field("Rotation"), object.field("Scale"), object.field("ScaleType"),
+            object.field("Position"), object.field("PositionType"), object.field("MeshIndex"))?;
+        writeln!(report, "  Geometry above is baked; authored formulas and factory-frame transforms are not the identity instance transform.")?;
+        for (material, submesh) in mesh.submeshes.iter().enumerate() {
+            writeln!(report, "  material{material}: texture={:?} blend={:?} base={:?} emissive={:?} sky_fog={} fog_color={:?} indices={}",
+                submesh.texture, submesh.blend, submesh.base_color, submesh.emissive,
+                submesh.sky_fog, submesh.sky_fog_color, submesh.indices.len())?;
+        }
+        let mut isolated = sky_only.clone();
+        for (index, other) in scene.sky.iter().enumerate() {
+            if index != ordinal {
+                anyhow::ensure!(other.mesh != instance.mesh, "shared sky mesh cannot be isolated by clearing submeshes");
+                isolated.meshes[other.mesh].submeshes.clear();
+            }
+        }
+        shot.scene = Some(isolated);
+        let list = off.frame(&mut shot, 0.0);
+        off.png(&shot, &list, &out.join(format!("icc-retail-layer{ordinal:02}.png")))?;
+    }
+    std::fs::write(out.join("icc-retail-objects.txt"), &report)?;
+    eprintln!("{report}");
+    Ok(())
+}
