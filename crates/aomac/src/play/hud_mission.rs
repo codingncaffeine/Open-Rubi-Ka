@@ -55,6 +55,8 @@ pub(super) struct HudMission {
     closed: Vec<WindowKind>,
     outbox: Vec<Frame>,
     urls: Vec<String>,
+    press: Option<i32>,
+    last_click: Option<(i32, f32)>,
     marker: Option<(u32, [f32; 2])>,
     /// The quest the open popup belongs to.
     popup: Option<i32>,
@@ -86,6 +88,8 @@ impl HudMission {
             closed: vec![],
             outbox: vec![],
             urls: vec![],
+            press: None,
+            last_click: None,
             marker: None,
             popup: None,
             built: None,
@@ -119,6 +123,30 @@ impl HudMission {
     /// The `itemid://` pages the user asked for (`InfoViewModule_c::ShowURL`).
     pub(super) fn take_urls(&mut self) -> Vec<String> {
         std::mem::take(&mut self.urls)
+    }
+
+    /// Native MultiListView release semantics apply to every cell, not just the name text.
+    pub(super) fn input(&mut self, gui: &Gui, ev: &ao_gui::InputEvent, mods: ao_gui::Modifiers) {
+        use ao_gui::{InputEvent, MouseButton};
+        let row = |x, y| self.win.as_ref().filter(|w| gui.pointer_owner(x, y) == Some(w.win))
+            .and_then(|w| w.view.row_at(gui, w.win, x, y, lv::ICON_32));
+        match *ev {
+            InputEvent::MouseDown { x, y, button: MouseButton::Left } => self.press = row(x, y),
+            InputEvent::MouseUp { x, y, button: MouseButton::Left } => {
+                let released = row(x, y);
+                let Some(key) = self.press.take().filter(|key| Some(*key) == released) else { return };
+                let double = self.last_click.is_some_and(|(old, at)| old == key && self.clock - at <= ao_gui::DOUBLE_CLICK_TIME);
+                self.last_click = (!mods.shift && !double).then_some((key, self.clock));
+                if let Some(w) = &mut self.win {
+                    w.view.selected = Some(key);
+                }
+                self.built = None;
+                if mods.shift || double {
+                    self.look(key);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The marker `Upload2Map` emitted (`GlobalSignals+0x158`): playfield and world X / Z.
@@ -196,6 +224,17 @@ impl HudMission {
         }
         self.dialogs.close_all(gui);
         self.built = None;
+        self.press = None;
+        self.last_click = None;
+    }
+
+    /// Quest removal actions update the canonical Zone list without a full-list packet.
+    pub(super) fn sync_removed(&mut self, zone: &Zone) {
+        let previous = self.quests.len();
+        self.quests.retain(|q| zone.quests.contains_key(&q.id));
+        if self.quests.len() != previous {
+            self.serial += 1;
+        }
     }
 
     fn icon(&mut self, gui: &mut Gui, id: i32) -> Option<(GfxId, u32, u32)> {
@@ -323,27 +362,52 @@ impl HudMission {
             }
             _ => {}
         }
-        let now = self.clock;
-        match win.view.event(gui, w, ev, now, lv::ICON_32) {
-            Some(Hit::Double(key)) => {
-                self.look(key);
-                true
-            }
-            Some(Hit::Click(_)) => {
-                self.built = None;
-                true
-            }
+        // Raw input above handles the complete row on release. Name TextButtons
+        // also emit Clicked: do not inspect twice or seed another double click.
+        if matches!(ev, Event::Clicked { .. } | Event::CanvasPress { .. }) {
+            return false;
+        }
+        match win.view.event(gui, w, ev, self.clock, lv::ICON_32) {
             Some(Hit::Context(key, at)) => {
                 self.popup(gui, key, at);
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 }
 
 #[cfg(test)]
 impl HudMission {
+    pub(super) fn set_quests(&mut self, quests: &[Quest]) {
+        self.quests = quests.to_vec();
+        self.serial += 1;
+    }
+
+    pub(super) fn row_point(&self, gui: &mut Gui, id: ao_net::msg::Identity, icon: bool) -> Option<(f32, f32)> {
+        self.quests.iter().find(|q| q.id == id)?;
+        let w = self.win.as_ref()?;
+        for name in gui.view_names(w.win).into_iter().filter(|n| n.starts_with("lv_row")) {
+            let r = gui.view_rect(w.win, &name)?;
+            let (x, y) = ((r.l + r.r) * 0.5, (r.t + r.b) * 0.5);
+            if w.view.row_at(gui, w.win, x, y, lv::ICON_32) != Some(id.instance) {
+                continue;
+            }
+            let name = if icon { name.replacen("lv_row", "lv_icon", 1) } else { name };
+            let r = gui.view_rect(w.win, &name)?;
+            let scroll = gui.view_rect(w.win, "lv_scroll")?;
+            let offset = gui.scroll_offset(w.win, "lv_scroll");
+            if r.t < scroll.t {
+                gui.set_scroll_offset(w.win, "lv_scroll", offset + r.t - scroll.t);
+            } else if r.b > scroll.b {
+                gui.set_scroll_offset(w.win, "lv_scroll", offset + r.b - scroll.b);
+            }
+            let r = gui.view_rect(w.win, &name)?;
+            return Some(((r.l + r.r) * 0.5, (r.t + r.b) * 0.5));
+        }
+        None
+    }
+
     pub(super) fn shown(&self) -> Vec<(i32, Vec<String>)> {
         self.win.as_ref().map(|w| w.view.rows().iter().map(|r| (r.key, r.cells.clone())).collect()).unwrap_or_default()
     }
@@ -435,6 +499,13 @@ mod tests {
         m.quests.push(quest(3, "Keep", 1 << 10, 0));
         m.remove(&zone, 3);
         assert!(m.take_outbox().is_empty());
+        // A removal action does not resend QuestFullUpdate: discard the stale row
+        // when the canonical Zone list no longer contains that quest.
+        let mut zone = Zone::new(7);
+        zone.quests.insert(m.quests[1].id, m.quests[1].clone());
+        m.sync_removed(&zone);
+        m.update(&mut gui, 0.0);
+        assert_eq!(m.shown(), vec![(2, vec!["Team Job".into(), "00:00:00".into()])]);
     }
 
     /// `MP_Quest_Icon`: `icon_at` finds a quest row and misses empty space (regression for the shift-to-inspect cursor).

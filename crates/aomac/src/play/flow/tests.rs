@@ -123,6 +123,81 @@ fn escape_info_mode_is_close_only_text_suppresses_and_dialogs_broadcast() {
     assert_eq!(r.p.zone.selected_target(), None);
     assert!(!r.p.chat.as_ref().unwrap().esc_closes());
 }
+#[test]
+fn mission_info_raw_row_shift_click_and_double_click_resolve_zone_quest_without_requests() {
+    use ao_net::{msg::Identity, n3::quest::{Quest, RewardBox, QUEST_KIND}};
+    let Some(mut r) = rig() else { return };
+    r.p.screen = Screen::InWorld;
+    r.p.gui.set_window_visible(r.p.login_w.unwrap(), false);
+    r.p.gui.clear_focus();
+    r.p.zone = zone::Zone::new(42);
+    r.p.chat = Some(super::super::chat::Chat::new(false));
+    r.p.hud = Some(super::super::hud::Hud::new(&mut r.p.gui, &r.p.dir, (1280, 800)).unwrap());
+    let quest = Quest {
+        id: Identity { kind: QUEST_KIND, instance: 71 },
+        name: "Mission input fixture".into(),
+        description: "Recover the sealed package.\\nReturn it to the mission contact.".into(),
+        reward: RewardBox { ints: [247, 593, 0, 0, 0, 0, 0], ..Default::default() },
+        ..Default::default()
+    };
+    let decoy = Quest { id: Identity { kind: QUEST_KIND, instance: 72 }, name: "Other mission".into(), description: "Not the requested mission.".into(), ..Default::default() };
+    for q in [&decoy, &quest] {
+        r.p.zone.quests.insert(q.id, q.clone());
+    }
+    let h = r.p.hud.as_mut().unwrap();
+    h.set_mission_quests(&[decoy.clone(), quest.clone()]);
+    h.open(&mut r.p.gui, super::super::hud::WindowKind::Mission);
+    r.p.frame(0.016, (1280, 800), &mut r.host);
+    assert!(r.p.chat.as_mut().unwrap().take_outbox().is_empty());
+    assert!(r.p.hud.as_mut().unwrap().take_outbox().is_empty());
+
+    let click = |r: &mut Rig, press_mods, release_mods, icon| {
+        let (x, y) = r.p.hud.as_ref().unwrap().mission_row_point(&mut r.p.gui, quest.id, icon).expect("real Missions row");
+        r.host.mods = press_mods;
+        r.p.input(InputEvent::MouseMove { x, y }, &mut r.host);
+        r.p.input(InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, &mut r.host);
+        r.host.mods = release_mods;
+        r.p.input(InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }, &mut r.host);
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+        r.host.mods = Default::default();
+    };
+    let check_page = |r: &mut Rig| {
+        assert!(r.p.chat.as_ref().unwrap().info_view_open());
+        let w = r.p.gui.window_ids().into_iter().find(|&w| r.p.gui.has_view(w, "BrowserView")).expect("existing InfoView");
+        let page = r.p.gui.text(w, "BrowserView");
+        assert!(page.contains(&quest.name), "{page}");
+        assert!(page.contains(&quest.description.replace("\\n", "<br>")), "{page}");
+        assert!(!page.contains(&decoy.description), "{page}");
+        for (key, amount) in [("NumCredits", 247), ("NumPoints", 593)] {
+            let expected = r.p.text.by_key(506, key).expect("retail quest reward text").replacen("%d", &amount.to_string(), 1);
+            assert!(page.contains(&expected), "{page}");
+        }
+        assert!(r.p.chat.as_mut().unwrap().take_outbox().is_empty(), "quest InfoView must resolve synchronously, not request character/item data");
+        assert!(r.p.hud.as_mut().unwrap().take_outbox().is_empty());
+    };
+
+    click(&mut r, Default::default(), Default::default(), false);
+    assert!(!r.p.chat.as_ref().unwrap().info_view_open(), "ordinary single click only selects");
+    r.p.frame(0.6, (1280, 800), &mut r.host); // Not the second half of a double click.
+    let ctrl = ao_gui::Modifiers { ctrl: true, ..Default::default() };
+    let shift = ao_gui::Modifiers { shift: true, ..Default::default() };
+    click(&mut r, ctrl, ctrl, false);
+    assert!(!r.p.chat.as_ref().unwrap().info_view_open(), "Ctrl single click must not inspect");
+    r.p.frame(0.6, (1280, 800), &mut r.host);
+    click(&mut r, shift, Default::default(), true);
+    assert!(!r.p.chat.as_ref().unwrap().info_view_open(), "Shift released before mouseup must not inspect");
+    r.p.frame(0.6, (1280, 800), &mut r.host);
+    click(&mut r, Default::default(), shift, true);
+    check_page(&mut r);
+    r.p.input(InputEvent::Key { key: Key::Escape, pressed: true, mods: Default::default() }, &mut r.host);
+    assert!(!r.p.chat.as_ref().unwrap().info_view_open());
+    r.p.frame(0.6, (1280, 800), &mut r.host);
+    click(&mut r, Default::default(), Default::default(), false);
+    assert!(!r.p.chat.as_ref().unwrap().info_view_open());
+    click(&mut r, Default::default(), Default::default(), false);
+    check_page(&mut r);
+}
+
 
 #[test]
 fn character_info_first_response_and_refresh_use_current_packet_stats() {

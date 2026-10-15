@@ -12,6 +12,8 @@
 //! `rightclickitem=<slot hex>` real right-click on the bag/wear cell currently showing `inv`'s slot (bug 10 equip/unequip/use).
 //! `ncurightclick` real right-click on the NCU window's first row (bug 21 cancel). `dragnano=<bar>:<slot>` drags the
 //! Programs window's first row onto a shortcut bar slot (bug 18); `nanopage=<index>` selects its school tab first. `barnames` prints bar 0's slot names, `clickslot=<bar>:<slot>` real-clicks one.
+//! `missioninfo=<mission name>` opens Missions and Shift+LMBs its real row, checks the existing InfoView against Zone quest data;
+//! logs only redacted quest metadata. Follow with `shot=name` for a frame of the resulting page.
 //! `nanos` prints learned program IDs; `buffs` prints running buffs and NCU usage.
 //! `down=KEY` / `up=KEY` hold across steps; `clickcorpse` / `rightcorpse` click a visible, GUI-unobscured corpse pick point.
 //! `focuslost` cancels held game input as the host's window-focus-loss event does.
@@ -922,6 +924,38 @@ fn live_walk() {
                 h.set_dvalue(&mut l.p.gui, d, state != "off");
                 l.tick();
             }
+            "missioninfo" => {
+                let mut matches = l.p.zone.quests.values().filter(|q| q.name == v);
+                let quest = matches.next().unwrap_or_else(|| panic!("missioninfo: requested mission not in Zone quests")).clone();
+                assert!(matches.next().is_none(), "missioninfo: mission name is ambiguous");
+                assert!(!quest.description.is_empty(), "missioninfo: live mission has no description");
+                // Close any previous page so an unrelated existing InfoView cannot satisfy the check.
+                if l.p.chat.as_ref().is_some_and(|c| c.info_view_open()) {
+                    l.p.input(ao_gui::InputEvent::Key { key: ao_gui::Key::Escape, pressed: true, mods: Default::default() }, &mut l.o.host);
+                }
+                l.p.hud.as_mut().expect("hud").open(&mut l.p.gui, super::super::hud::WindowKind::Mission);
+                l.tick();
+                let (x, y) = l.p.hud.as_ref().unwrap().mission_row_point(&mut l.p.gui, quest.id, true).expect("missioninfo: mission icon not shown");
+                let mods = l.o.host.mods;
+                l.o.host.mods = ao_gui::Modifiers { shift: true, ..Default::default() };
+                for ev in [
+                    ao_gui::InputEvent::MouseMove { x, y },
+                    ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left },
+                    ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left },
+                ] {
+                    l.p.input(ev, &mut l.o.host);
+                    l.tick();
+                }
+                l.o.host.mods = mods;
+                assert!(l.p.chat.as_ref().expect("chat").info_view_open(), "missioninfo: Shift+LMB did not open InfoView");
+                let w = l.p.gui.window_ids().into_iter().find(|&w| l.p.gui.has_view(w, "BrowserView")).expect("missioninfo: existing InfoView browser");
+                let page = l.p.gui.text(w, "BrowserView");
+                assert!(page.contains(&quest.name), "missioninfo: InfoView mission title mismatch");
+                assert!(page.contains(&quest.description.replace("\\n", "<br>")), "missioninfo: InfoView mission description mismatch");
+                eprintln!("missioninfo: kind={:#x} instance=[redacted] name={:?} description_bytes={} flags={:#x} cash={} xp={} reward_items={} single_reward={} actions={} InfoView=matched",
+                    quest.id.kind, quest.name, quest.description.len(), quest.value_a4, quest.reward.ints[0], quest.reward.ints[1],
+                    quest.reward.items.len(), quest.reward.item.low_id != 0 || quest.reward.item.high_id != 0 || quest.reward.item.level != 0, quest.actions.len());
+            }
             "tab" => {
                 l.p.input(ao_gui::InputEvent::Key { key: ao_gui::Key::Tab, pressed: true, mods: ao_gui::Modifiers::default() }, &mut l.o.host);
                 eprintln!("target {:?}", l.p.zone.target);
@@ -1593,7 +1627,7 @@ fn live_walk() {
                 l.wait(6.0);
             }
             // vending machine window (docs/zone/interact.md "Vending machines / shops"): `shop` prints it, `shopbuy=<i>` is the plain double click on stock item i
-            // (`MoveItemToInventory({0x6f, i})`), `shopadd=<i>` the Shift double click (`TradeAddItem`), `shoprm=<i>` removes bought item i, `shopaccept` / `shopdecline`
+            // (`MoveItemToInventory({0x6f, i})`), `shopadd=<i>` the Ctrl double click (`TradeAddItem`), `shoprm=<i>` removes bought item i, `shopaccept` / `shopdecline`
             "shop" => {
                 let p = &l.p;
                 eprintln!("{}", p.interact.as_ref().unwrap().shop_dump(&p.gui));

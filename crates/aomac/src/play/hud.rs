@@ -656,6 +656,16 @@ impl Hud {
     }
 
     #[cfg(test)]
+    pub(super) fn set_mission_quests(&mut self, quests: &[ao_net::n3::quest::Quest]) {
+        self.mission.set_quests(quests);
+    }
+
+    #[cfg(test)]
+    pub(super) fn mission_row_point(&self, gui: &mut Gui, id: ao_net::msg::Identity, icon: bool) -> Option<(f32, f32)> {
+        self.mission.row_point(gui, id, icon)
+    }
+
+    #[cfg(test)]
     pub(super) fn live_item_line(&mut self, gui: &mut Gui, low_id: i32) -> String {
         self.stats.live_item_line(gui, low_id)
     }
@@ -978,6 +988,7 @@ impl Hud {
         self.outbox.extend(self.nano.take_outbox());
         self.outbox.extend(self.ncu.take_outbox());
         self.system_lines.extend(self.ncu.take_lines());
+        self.mission.sync_removed(zone);
         self.mission.update(gui, _dt);
         self.outbox.extend(self.mission.take_outbox());
         if let Some(m) = self.mission.take_marker() {
@@ -1062,6 +1073,7 @@ impl Hud {
         self.actwin.input(gui, ev, &self.actions.list, mods, &mut self.shortcuts);
         self.uses.extend(self.actwin.take_uses());
         self.nano.input(gui, ev, mods);
+        self.mission.input(gui, ev, mods);
         self.start_nano_drag(gui);
         // item drag and drop between the wear window and the inventory (hud_stats/item_ui.rs)
         self.stats.input(gui, zone, ev, mods);

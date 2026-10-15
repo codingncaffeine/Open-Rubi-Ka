@@ -131,6 +131,7 @@ impl Play {
             if matches!(ev, InputEvent::MouseDown { button: MouseButton::Left, .. }) {
                 // GUI 10040a17 -> 100c9afc: information uses mask 3 (Shift).
                 i.use_ui.loot.info_click = host.mods.shift;
+                i.mission.info_click = host.mods.shift;
             }
             if let InputEvent::MouseMove { x, y } = ev {
                 i.trade.mouse = (*x, *y);

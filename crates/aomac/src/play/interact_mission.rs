@@ -24,6 +24,7 @@ pub(super) struct MissionUi {
     list: ListView,
     alternatives: Option<Alternatives>,
     grab: Option<(usize, f32)>,
+    pub(super) info_click: bool,
     urls: Vec<String>,
     marker: Option<(u32, [f32; 2])>,
     popup: Option<i32>,
@@ -35,7 +36,7 @@ pub(super) struct MissionUi {
 }
 impl Default for MissionUi {
     fn default() -> Self {
-        Self { win: None, values: [50, 0, 0, 0, 0, 0, 0], advanced: false, origin: Identity::default(), origin_type: 0, list: ListView::new(Mode::Grid, vec![], 3, 2, (0, false)), alternatives: None, grab: None, urls: vec![], marker: None, popup: None, dialogs: Dialogs::default(), screen: (0, 0), config_loaded: false, dirty: false, escape: true }
+        Self { win: None, values: [50, 0, 0, 0, 0, 0, 0], advanced: false, origin: Identity::default(), origin_type: 0, list: ListView::new(Mode::Grid, vec![], 3, 2, (0, false)), alternatives: None, grab: None, info_click: false, urls: vec![], marker: None, popup: None, dialogs: Dialogs::default(), screen: (0, 0), config_loaded: false, dirty: false, escape: true }
     }
 }
 fn escape(s: &str) -> String { s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;") }
@@ -143,6 +144,10 @@ impl MissionUi {
         gui.set_enabled(win, "accept", false);
         empty.then(|| "No missions available, please try again later!".into())
     }
+    pub(super) fn icon_hover_at(&self, gui: &Gui, x: f32, y: f32) -> bool {
+        self.win.filter(|w| gui.pointer_owner(x, y) == Some(*w))
+            .is_some_and(|w| self.list.row_at(gui, w, x, y, lv::ICON_32).is_some())
+    }
     fn enough_room(zone: &Zone) -> bool { (BAG_FIRST..BAG_FIRST + BAG_SLOTS).filter(|s| !zone.inventory.contains_key(s)).take(2).count() == 2 }
     fn refusal(&mut self, gui: &mut Gui, key: &str) {
         self.dialogs.go(gui, self.screen, (), &Self::text(key), &[Self::text("MsgBox_OK")]);
@@ -166,7 +171,10 @@ impl MissionUi {
             if let Some(q) = self.alternatives.as_ref().and_then(|a| a.missions.iter().find(|a| a.quest.id.instance == key)).map(|a| &a.quest) {
                 if let Some(p) = q.world_pos() { self.marker = Some((p.playfield.instance as u32, [p.x as f32, p.z as f32])); }
                 match hit {
+                    // GUI 100d0adf connects list+0x2e4 to 100cf975 (ShowURL).
+                    // Shared InventoryList handler 10040a17 emits info for qualifier mask 3 (Shift).
                     Hit::Double(_) => self.urls.push(format!("itemid://{}/{}", q.id.kind, q.id.instance)),
+                    Hit::Click(_) if self.info_click => self.urls.push(format!("itemid://{}/{}", q.id.kind, q.id.instance)),
                     Hit::Context(_, at) => {
                         let mut items = vec![MenuItem::entry(LOOK, &Self::text("Look@Mission"))];
                         if q.world_pos().is_some() { items.push(MenuItem::entry(MAP, &Self::text("Upload2Map"))); }
