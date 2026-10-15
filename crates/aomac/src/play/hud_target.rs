@@ -903,7 +903,7 @@ mod tests {
         DynelState { name: name.into(), pos: p, yaw: None, npc, side, level: 5, health: 30, max_health: 60 }
     }
 
-    fn captured_character() -> ao_net::n3::Message {
+    fn captured_character(npc: bool) -> ao_net::n3::Message {
         include_str!("../../../../docs/captures/zone_enter_ithaca.rec").lines().find_map(|line| {
             let mut fields = line.split_whitespace();
             let (_, direction, hex) = (fields.next()?, fields.next()?, fields.next()?);
@@ -911,12 +911,12 @@ mod tests {
             let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
             let (frame, _) = ao_net::frame::Frame::decode_with(&bytes, false).ok()??;
             let m = ao_net::n3::decode(&frame).ok()?;
-            matches!(&m.body, ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::SimpleCharFullUpdate(_))).then_some(m)
-        }).expect("captured full character")
+            matches!(&m.body, ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::SimpleCharFullUpdate(u)) if u.is_npc() == npc).then_some(m)
+        }).expect("captured full character of requested class")
     }
 
     fn prepare_cycle(z: &mut Zone) {
-        let mut m = captured_character();
+        let mut m = captured_character(true);
         let ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::SimpleCharFullUpdate(u)) = &mut m.body else { unreachable!() };
         u.flags |= ao_net::n3::dynel::flag::IN_PLAY;
         for &id in z.dynels.keys() {
@@ -943,7 +943,14 @@ mod tests {
         assert_eq!(cycle(&z, None, true, true), None);
         z.dynels.get_mut(&2).unwrap().pos = [0.0, 0.0, 100.0];
         assert_eq!(cycle(&z, None, true, true), Some(2));
-        let mut hidden = captured_character();
+        let mut not_in_play_npc = captured_character(true);
+        not_in_play_npc.header.target = Identity { kind: DYNEL_CHAR, instance: 2 };
+        let ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::SimpleCharFullUpdate(u)) = &mut not_in_play_npc.body else { unreachable!() };
+        u.flags &= !ao_net::n3::dynel::flag::IN_PLAY;
+        z.world.on_message(&not_in_play_npc);
+        assert!(z.world.character_visible(2), "native full-update visibility gate excludes NPCs, even with InPlay=0");
+        assert_eq!(cycle(&z, None, true, true), Some(2), "NPC visibility remains independent of the separately cached InPlay stat");
+        let mut hidden = captured_character(false);
         hidden.header.target = Identity { kind: DYNEL_CHAR, instance: 2 };
         let ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::SimpleCharFullUpdate(u)) = &mut hidden.body else { unreachable!() };
         u.flags &= !ao_net::n3::dynel::flag::IN_PLAY;
