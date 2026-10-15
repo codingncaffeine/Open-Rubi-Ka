@@ -8,9 +8,8 @@ use anyhow::{ensure, Result};
 use std::fmt::Write;
 
 fn text(texts: &TextDb, key: &str) -> String { texts.by_key(506, key).unwrap_or_default() }
-fn numbers(mut template: String, values: &[i32]) -> String {
-    for value in values { template = template.replacen("%d", &value.to_string(), 1); }
-    template
+fn numbers<const N: usize>(template: String, values: &[i32; N]) -> String {
+    super::super::log::ldb_format(&template, &values.map(super::super::log::Arg::N))
 }
 fn attribute(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('\n', "<br>").replace('"', "&quot;")
@@ -103,9 +102,9 @@ mod tests {
         let mut q = Quest { name:"Mission".into(), description:"first\\nsecond".into(), value_a4:1<<8, ..Quest::default() };
         q.reward.ints[0] = 25; q.reward.ints[1] = 50;
         q.reward.items.push(Acg { low_id:1, high_id:2, level:3, extra:0 });
-        let labels = |key:&str| match key { "DayHourMinute"=>"%d/%d/%d".into(), "NumCredits"|"NumPoints"|"IT_QuestSKReward"=>"%d".into(), _=>format!("[{key}]") };
+        let labels = |key:&str| match key { "DayHourMinute"=>"%d/%02d/%02d".into(), "NumCredits"|"NumPoints"|"IT_QuestSKReward"=>"%d".into(), _=>format!("[{key}]") };
         let out = render(&q,Some(90060),Some((50,false)),labels,|_|Ok(Some(("A<&\"".into(),42)))).unwrap();
-        assert!(out.contains("first<br>second")); assert!(out.contains("1/1/1"));
+        assert!(out.contains("first<br>second")); assert!(out.contains("1/01/01"));
         assert!(out.find("[Description]") < out.find("[RealtimeLeft]"));
         assert!(out.find("[TeamMissionRules]") < out.find("[Reward]"));
         assert!(out.contains("href=itemref://1/2/3 title=\"A&lt;&amp;&quot;\"><img src=rdb://42>"));
