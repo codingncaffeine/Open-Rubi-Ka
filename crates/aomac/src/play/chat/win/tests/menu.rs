@@ -2,7 +2,7 @@ use super::*;
 use super::super::menu::{OP_BEHIND, OP_ON_TOP, OP_OPEN_CHAT, OP_SEND_TELL, OP_SLIDER_ACTIVE, OP_SLIDER_INACTIVE};
 
 #[test]
-fn transparency_slider_events_preview_both_values_until_next_activation_edge() {
+fn transparency_slider_events_preview_then_restore_on_release_or_close() {
     let Some((mut gui, mut ch)) = rig((1280, 800)) else { return };
     let w = ch.frames[0].id;
     ch.test_pick(&mut gui, 0, OP_MODE, 2);
@@ -23,7 +23,7 @@ fn transparency_slider_events_preview_both_values_until_next_activation_edge() {
     ] {
         let events = gui.input(input);
         let value = events.iter().find_map(|event| match event {
-            Event::MenuSlider { id, value } if *id == OP_SLIDER_ACTIVE << 16 => Some(*value),
+            Event::MenuSlider { id, value, finished: false } if *id == OP_SLIDER_ACTIVE << 16 => Some(*value),
             _ => None,
         }).expect("the second slider must emit its active-alpha event");
         for event in &events {
@@ -34,28 +34,77 @@ fn transparency_slider_events_preview_both_values_until_next_activation_edge() {
         assert_eq!(ch.wins[0].cfg.alpha_active, value);
         assert!(!ch.wins[0].active);
     }
-    for event in gui.input(InputEvent::MouseUp { x: 75.0, y, button: ao_gui::MouseButton::Left }) {
-        ch.event(&mut gui, &event);
+    let preview = ch.wins[0].alpha;
+    let events = gui.input(InputEvent::MouseUp { x: 75.0, y, button: ao_gui::MouseButton::Left });
+    assert_eq!(events, [Event::MenuSlider { id: OP_SLIDER_ACTIVE << 16, value: preview, finished: true }]);
+    for event in &events {
+        ch.event(&mut gui, event);
     }
+    assert!(gui.menu_open());
+    assert!(ch.menu.is_some());
+    assert_eq!(ch.wins[0].target, ch.wins[0].cfg.alpha_inactive);
+    assert_eq!(ch.wins[0].rate, (ch.wins[0].target - preview).abs() / FADE_OUT);
+    ch.update(&mut gui, 1.0);
+    assert_eq!(gui.window_alpha(w), ch.wins[0].cfg.alpha_inactive, "release restores inactive alpha without closing");
     // Inactive window: even the second (active) slider previews its own value immediately.
     for (op, value) in [(OP_SLIDER_ACTIVE, 0.95), (OP_SLIDER_INACTIVE, 0.15), (OP_SLIDER_ACTIVE, 0.65)] {
-        ch.event(&mut gui, &Event::MenuSlider { id: op << 16, value });
+        ch.event(&mut gui, &Event::MenuSlider { id: op << 16, value, finished: false });
         assert_eq!(gui.window_alpha(w), value);
         ch.update(&mut gui, 0.016);
         assert_eq!(gui.window_alpha(w), value, "menu update must not restore the inactive alpha");
     }
     assert_eq!((ch.wins[0].cfg.alpha_inactive, ch.wins[0].cfg.alpha_active), (0.15, 0.65));
     gui.close_menu();
+    for event in gui.input(InputEvent::MouseMove { x: 0.0, y: 0.0 }) {
+        ch.event(&mut gui, &event);
+    }
     ch.update(&mut gui, 1.0);
-    assert_eq!(gui.window_alpha(w), 0.65, "closing the menu is not an activation edge");
+    assert_eq!(gui.window_alpha(w), 0.15, "closing the menu restores the inactive alpha");
     ch.focus_input(&mut gui);
     ch.update(&mut gui, 1.0);
     assert!(ch.wins[0].active);
     ch.event(&mut gui, &Event::ContextMenu { window: w, x: 10, y: 10, link: None });
-    ch.event(&mut gui, &Event::MenuSlider { id: OP_SLIDER_INACTIVE << 16, value: 0.25 });
+    let sliders = ch.window_menu(0)[1].sub.clone();
+    ch.menu_generation = Some(gui.open_menu((10, 10), (1280, 800), sliders));
+    let y = 12.0 + row * 0.5;
+    for input in [
+        InputEvent::MouseDown { x: 100.0, y, button: ao_gui::MouseButton::Left },
+        InputEvent::MouseMove { x: 75.0, y },
+    ] {
+        let events = gui.input(input);
+        let value = events.iter().find_map(|event| match event {
+            Event::MenuSlider { id, value, finished: false } if *id == OP_SLIDER_INACTIVE << 16 => Some(*value),
+            _ => None,
+        }).expect("the first slider must emit its inactive-alpha preview");
+        for event in &events {
+            ch.event(&mut gui, event);
+        }
+        ch.update(&mut gui, 0.016);
+        assert!(ch.wins[0].active);
+        assert_eq!(gui.window_alpha(w), value);
+        assert_eq!(ch.wins[0].cfg.alpha_inactive, value);
+    }
+    let preview = ch.wins[0].alpha;
+    let events = gui.input(InputEvent::MouseUp { x: 75.0, y, button: ao_gui::MouseButton::Left });
+    assert_eq!(events, [Event::MenuSlider { id: OP_SLIDER_INACTIVE << 16, value: preview, finished: true }]);
+    for event in &events {
+        ch.event(&mut gui, event);
+    }
+    assert!(gui.menu_open());
+    assert!(ch.menu.is_some());
+    assert_eq!(ch.wins[0].target, 0.65);
+    assert_eq!(ch.wins[0].rate, (0.65 - preview).abs() / FADE_IN);
+    ch.update(&mut gui, 1.0);
+    assert_eq!(gui.window_alpha(w), 0.65, "release restores active alpha without closing");
+    ch.event(&mut gui, &Event::MenuSlider { id: OP_SLIDER_INACTIVE << 16, value: 0.25, finished: false });
     ch.update(&mut gui, 1.0);
     assert_eq!(gui.window_alpha(w), 0.25, "inactive slider must also preview while active");
     gui.close_menu();
+    for event in gui.input(InputEvent::MouseMove { x: 0.0, y: 0.0 }) {
+        ch.event(&mut gui, &event);
+    }
+    ch.update(&mut gui, 1.0);
+    assert_eq!(gui.window_alpha(w), 0.65, "closing the menu restores the active alpha");
     gui.clear_focus();
     ch.update(&mut gui, 1.0);
     ch.focus_input(&mut gui);

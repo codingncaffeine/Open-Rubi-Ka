@@ -15,8 +15,7 @@
 use super::*;
 use std::collections::VecDeque;
 
-/// `FUN_10092f69`: `HTMLParser_c::SetFeatureFlags(0xa60)` = ENABLE_SHADOW | DISABLE_RC_MENU | WORD_WRAP | MULTILINE (the shadow is only rendered with
-/// the `ChatView` shadow flag, off in the shipped client).
+/// `FUN_10092f69`: base flags 0xa60; `FUN_10091fe5` toggles RENDER_SHADOW on every timed renderer with the regular output.
 const FLAGS: u32 = tvf::ENABLE_SHADOW | tvf::DISABLE_RC_MENU | tvf::WORD_WRAP | tvf::MULTILINE;
 
 struct FadeLine {
@@ -33,6 +32,7 @@ struct FadeLine {
 pub(super) struct TextFade {
     delay: f32,
     time: f32,
+    pub(super) shadow: bool,
     lines: VecDeque<FadeLine>,
 }
 
@@ -61,7 +61,7 @@ impl Gui {
                 }
             }
             Some((delay, time)) => {
-                let f = self.text_fades.entry(v).or_insert_with(|| TextFade { delay, time, lines: VecDeque::new() });
+                let f = self.text_fades.entry(v).or_insert_with(|| TextFade { delay, time, shadow: false, lines: VecDeque::new() });
                 (f.delay, f.time) = (delay, time);
                 if self.tree.views[v].visible {
                     self.tree.views[v].visible = false;
@@ -117,11 +117,12 @@ impl Gui {
         let tint = mul(parent_tint, self.map_color(color));
         let now = self.time;
         let Some(f) = self.text_fades.get(&id) else { return };
+        let flags = FLAGS | if f.shadow { tvf::RENDER_SHADOW } else { 0 };
         let lines: Vec<(String, i32, f32, f32)> = f.lines.iter().map(|l| (l.html.clone(), l.h, l.off, f.alpha(l, now))).collect();
         let outer = push_clip(out, [rect.l as i32, rect.t as i32, rect.r as i32 + 1, rect.b as i32 + 1]);
         for (html, h, off, alpha) in lines {
             let top = rect.b + 1.0 - off - h as f32;
-            let t = TextData { text: html, font: FontId::Chat, tvf: FLAGS, min_pref: Point::new(-1.0, -1.0), max_pref: Point::new(-1.0, -1.0), caret: 0, anchor: None, scroll_x: 0.0, hint: String::new() };
+            let t = TextData { text: html, font: FontId::Chat, tvf: flags, min_pref: Point::new(-1.0, -1.0), max_pref: Point::new(-1.0, -1.0), caret: 0, anchor: None, scroll_x: 0.0, hint: String::new() };
             self.draw_text_view(out, id, &t, Rect::new(rect.l, top, rect.r, top + h as f32 - 1.0), tint, alpha);
         }
         out.push(DrawCmd::Clip(outer));
@@ -138,7 +139,7 @@ mod tests {
 
     #[test]
     fn alpha_is_one_for_the_delay_then_falls_linearly_over_the_time() {
-        let f = TextFade { delay: 8.0, time: 0.3, lines: VecDeque::new() };
+        let f = TextFade { delay: 8.0, time: 0.3, shadow: false, lines: VecDeque::new() };
         let l = line(10.0);
         assert_eq!(f.alpha(&l, 10.0), 1.0);
         assert_eq!(f.alpha(&l, 18.0), 1.0); // age == delay: (0.3) / 0.3
@@ -148,7 +149,7 @@ mod tests {
 
     #[test]
     fn zero_time_never_divides_into_a_fade() {
-        let f = TextFade { delay: 2.0, time: 0.0, lines: VecDeque::new() };
+        let f = TextFade { delay: 2.0, time: 0.0, shadow: false, lines: VecDeque::new() };
         assert_eq!(f.alpha(&line(0.0), 1.0), 1.0); // +inf, not < 1
     }
 }

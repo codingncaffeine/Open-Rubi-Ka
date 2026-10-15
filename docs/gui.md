@@ -1322,8 +1322,10 @@ character without existing archives; an existing character's custom mode, groups
 positions take precedence. Retail `NewChar/Chat/Windows/Window1/Config.xml:57–64` sets visual mode
 2, inactive/active opacity 0.3/0.8 and an enabled input line; line 74 names it `Default Window`.
 Mode 0 is the framed, unfaded tabbed presentation (`FUN_10096ec5`); the shipped mode 2 is a
-borderless black-panel presentation. The original fades its text too (`Window::UpdateFadeLevel`
-0x10155653); see `docs/chat/gui.md` §2 for the complete evidence.
+borderless black-panel presentation. Window alpha reaches the background/chrome via
+`Window::UpdateFadeLevel` `10155653`, but chat output/editor/prompt renderers set view flag
+`0x80` (`100925ff`, `100919ab`), making `View::_CallRender` `1014d2e3` reset inherited alpha.
+The text does **not** fade with the window; the hint retains its own 0.6. See `docs/chat/gui.md` §2.
 For a fresh character the port deliberately selects mode 0 instead of the shipped mode-2 template,
 as requested to match the user's framed retail reference. Saved character modes are not overridden.
 

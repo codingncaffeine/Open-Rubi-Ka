@@ -112,8 +112,8 @@ pub enum Event {
     /// is delivered first; slider changes do not close the popup. Match the
     /// generation returned by `Gui::open_menu` before clearing owner context.
     MenuClosed { generation: u64 },
-    /// A slider item of the popup menu changed (`value` 0.0..=1.0); the menu stays open.
-    MenuSlider { id: u32, value: f32 },
+    /// A popup slider changed or was released (`finished`, `value` 0.0..=1.0); the menu stays open.
+    MenuSlider { id: u32, value: f32, finished: bool },
     /// The selection of a `DropdownMenu` changed (`DropdownMenu_c::SelectByIndex(.., true)`, signal `+0x128`): list index and item id.
     DropdownChanged { window: WindowId, view: String, index: usize, id: i64 },
     /// `ListViewBase_c::ItemSelected` (signal `+0x148`): item id and its new state. `view` = name of the `StringListView`.

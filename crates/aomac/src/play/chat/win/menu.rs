@@ -228,8 +228,8 @@ impl ChatWindows {
         vec![]
     }
 
-    /// A transparency slider moved (`FUN_10099801` / `FUN_100997be`): the value is the window's `window_transparency_*`; it applies at once.
-    pub(super) fn menu_slider(&mut self, gui: &mut Gui, mid: u32, value: f32) {
+    /// Retail slider callbacks persist every value, preview changes, and restore the activation fade on release.
+    pub(super) fn menu_slider(&mut self, gui: &mut Gui, mid: u32, value: f32, finished: bool) {
         let Some(ctx) = &self.menu else { return };
         let fi = ctx.frame;
         if fi >= self.frames.len() {
@@ -242,10 +242,16 @@ impl ChatWindows {
             OP_SLIDER_ACTIVE => w.cfg.alpha_active = value,
             _ => return,
         }
-        // Both retail slider callbacks pass false to their setter: FadeTo(value, 0), not the current activation's alpha.
-        w.alpha = value;
-        w.target = w.alpha;
-        gui.set_window_alpha(w.id, w.alpha);
+        // 10099801/100997be forward the slider's finished flag to 10096de4/10096db3.
+        if finished {
+            // 10096b23 restores the normal active/inactive target and fade rate.
+            w.target = alpha_of(&w.cfg, w.active);
+            w.rate = (w.target - w.alpha).abs() / if w.active { FADE_IN } else { FADE_OUT };
+        } else {
+            w.alpha = value;
+            w.target = w.alpha;
+            self.set_frame_alpha(gui, fi, value);
+        }
         self.dirty = true;
     }
 }

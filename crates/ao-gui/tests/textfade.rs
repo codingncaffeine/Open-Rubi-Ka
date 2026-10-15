@@ -35,6 +35,26 @@ fn lines_stay_opaque_for_the_delay_then_fade_and_vanish() {
 }
 
 #[test]
+fn view_flag_80_resets_inherited_alpha_but_preserves_local_and_timed_line_alpha() {
+    let Ok(mut g) = Gui::new(&ao_gui::client_dir(), None) else { return };
+    let xml = XML.replace("name=\"text\"", "name=\"text\" view_flags=\"0x80\"");
+    let w = g.open_window_xml("t", &xml, (10, 10), WindowSize::Fixed(300, 200)).unwrap();
+    g.set_view_alpha(w, "text", 0.4);
+    g.set_window_alpha(w, 0.05);
+    g.set_text(w, "text", "<div>regular</div>");
+    let normal = glyph_alphas(&mut g, 0.0);
+    assert!(!normal.is_empty() && normal.iter().all(|a| *a == 0.4), "{normal:?}");
+    g.set_text_fade(w, "scroll", Some((8.0, 0.3)), "<div>timed</div>");
+    let delay = glyph_alphas(&mut g, 7.9);
+    assert!(!delay.is_empty() && delay.iter().all(|a| *a == 1.0), "{delay:?}");
+    let fading = glyph_alphas(&mut g, 0.25);
+    assert!(!fading.is_empty() && fading.iter().all(|a| (*a - 0.5).abs() < 0.02), "{fading:?}");
+    g.set_text_fade(w, "scroll", None, "");
+    let restored = glyph_alphas(&mut g, 0.0);
+    assert!(!restored.is_empty() && restored.iter().all(|a| *a == 0.4), "{restored:?}");
+}
+
+#[test]
 fn newer_lines_push_older_ones_up_by_one_line_height() {
     let Ok(mut g) = Gui::new(&ao_gui::client_dir(), None) else { return };
     let w = g.open_window_xml("t", XML, (10, 10), WindowSize::Fixed(300, 200)).unwrap();

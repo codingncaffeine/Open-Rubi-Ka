@@ -33,13 +33,13 @@ Decompile dumps used (not committed): `ChatGUIModule_c::Initialize` 0x100872bd, 
   `SetBorder(false)`**; all three then call `FUN_1008e4f0(1)` (stores `+0x1b8`, forwards to the text view `FUN_100929ae`). `ChatView::SetBorder` (`FUN_1008daa0`, field `+0x1b9`, ctor default true) reconfigures
   the text area's `BorderView_c` (`+0x1a0`) **and** the input bar's (`+0x1a4`): `true` → `GFX_GUI_INSET_{TL,TR,BL,BR,LEFT,TOP,RIGHT,BOTTOM}` (0xf9,0xfb,0xf4,0xf6,0xf7,0xfa,0xf8,0xf5, bg 0), client margin 5
   (`_DAT_101a8b98`); `false` → **no border art, bg `GFX_GUI_WINDOW_BACKGROUND` (0x1bf, black), client margin 0**. So the shipped borderless windows are two black panels (text area, input bar)
-  that the window alpha (0.8 active / 0.3 inactive) fades together with the text; the port used to draw the inset outline without any fill there (the "transparent chat" of the live harness).
+  whose background opacity follows the window's active/inactive fade. Chat output, editor and prompt renderers explicitly ignore inherited alpha (`100925ff`, `100919ab`, view flag `0x80`); the earlier claim that text fades with these panels was incorrect.
 * Window alpha (modes ≠ 0): `FUN_10096b23`: the selected tab's window is *active* (`+0xda`) → `Window::FadeTo(window_transparency_active, 0.2 s)`
   else `FadeTo(window_transparency_inactive, 1 s)` (200000 / 1000000 µs). Defaults 0.8 / 0.3 (`_DAT_101b8a54` = 0.8, `_DAT_101ae0ec` = 0.3);
   the menu's two sliders write them (`FUN_10096db3` / `FUN_10096de4`).
-  *Port*: `Gui::set_window_alpha` multiplies everything drawn in the window; active = the window's input bar has the keyboard focus. Slider changes preview the selected alpha immediately, independent of that activation state (`100997be` / `10099801` → `10096db3` / `10096de4` → `Window::FadeTo`); the next activation transition restores the normal active/inactive fade. The fade scope is the *whole* window, text included:
-  `Window::FadeTo` 0x10155856 stores the target, `Window::UpdateFadeLevel` 0x10155653 interpolates and calls `View::SetAlpha(rootView, base × level)` on the window's root view (and the tab views),
-  so an inactive default window really is 30 % text on a 30 % black panel (checked, not a port artefact). Mode 0 calls `FadeTo(1.0)` (no fade).
+  *Port*: slider changes preview the selected non-text window alpha while dragging (`100997be` / `10099801` → `10096db3` / `10096de4` → `Window::FadeTo`). `Slider_c::MouseUp` `101443b3` emits `(value, true)` through `PopupMenuSliderItem_c::SlotSliderChanged` `10002c27`; that completion flag calls `10096b23` instead of previewing. Popup close (`1013c56f`, signal `+0x154`) also invokes `10096ceb` → `10096b23`, restoring the configured active/inactive fade.
+  `Window::FadeTo` `10155856` stores the target; `Window::UpdateFadeLevel` `10155653` interpolates and calls `View::SetAlpha` `1014a0b1` on the window root. Crucially, `View::_CallRender` `1014d2e3` resets incoming alpha to 1 when view flag `0x80` is present, before multiplying the renderer's own alpha. Regular output (`100925ff`) and both input renderers (`100919ab`) set this flag, not only timed fading lines.
+  Thus the window background/chrome fade, but output and editor text remain opaque and the hint keeps its own 0.6. Mode 0 calls `FadeTo(1.0)` (no window fade). The previous “30 % text on a 30 % panel” assertion omitted this consumer-side exception and was wrong.
 * `is_frontmost` / `is_backmost` (chat_window_config) set window flags 0x100 / 0x200 (`FUN_10097ae3`): ported as `Gui::set_window_layer` (1 / -1), toggled by the menu entries *AlwaysOnTop* / *AlwaysBehind* (§12) and persisted.
 * Mode 0 (framed "Normal") is ported: a style-0 `ao_gui` window with the tab strip (docs/gui.md §6.1), movable / resizable by its frame, one tab per chat window (§10, §11). The Window menu's *Normal* entry switches to it.
 
@@ -137,8 +137,8 @@ Arguments: group node, sender name, text, kind (1 whisper, 2 shout, 3 emote), co
   `<a>` runs use the link colour when their attribute word has bit 4 (`_RenderLine` 0x10161112: `attrib & 4 → +0x1c0`); `HTMLParser_c::_ParseTag` 0x1015c9ad sets that word to 6 (underline + link colour) only when the
   `style` attribute is absent or not `text-decoration:none`, so names / group names written as `<a style="text-decoration:none" href=..>` keep the line's font colour (corrected: they were blue before;
   `ao-gui` `layout_text` now follows this, docs/zone/interact.md §2).
-  Shadow = a clone of the text surface with colour 0 (black), alpha 1, behind the text (`_AllocateBitmap` 0x1016095b, only with flag 0x1000 = `ChatView::shadow`, `+0x1ba`, default **off**,
-  setter `FUN_1008e04f`; offset from pref `ChatTextShadowOffset`: 0 → 0, 1 → 1, 2 → 2, else 1; shipped value 1).
+  Shadow = a clone of the text surface with colour 0 (black), alpha 1, behind the text (`_AllocateBitmap` `1016095b`, flag `0x1000`). `ChatView::shadow` (`+0x1ba`) defaults off but is **enabled dynamically** below window opacity 0.4: `10096e15` → `10096b83` → `1008e04f` / `10091fe5`, including existing timed lines. The former assertion that retail never enables it was wrong.
+  Its offset follows `ChatTextShadowOffset`: 0 → 0, 1 → 1, 2 → 2, else 1; shipped value 1 (`1008d673`).
 * The `<div indent=wrapped>` hanging indent of wrapped lines (10 px, `_AddLineDesc` 0x10161b44) is ported (docs/zone/interact.md §2). Text selection/copy, right-click menus, window drag/resize and tabs: §10-§13.
 
 ### 5.1 Message fading (`is_message_fading_enabled`, `ChatTextFadeDelay` 8.0 s, `ChatTextFadeTime` 0.3 s) — ported, `ao-gui` `gui/textfade.rs`
@@ -153,8 +153,7 @@ The chat text area (`FUN_100925ff`, 0x170 bytes, around the `TextView` at `+0x12
 * **Per frame** (`FUN_10092241`, timer handler registered in `FUN_100925ff`): front lines with `now > born + delay + time` are deleted; every line gets `View::SetAlpha((born + delay - now + time) / time)` while that is
   < 1 → opaque for 8 s, then a linear 0.3 s fade. View flag `0x80` makes `View::_CallRender` reset the inherited alpha to 1.0, so the window transparency (0.3 inactive) does **not** dim the lines: this is what makes the
   option useful with transparent windows. Port: `Gui::tick_text_fades` / `draw_fade_lines`, lines are drawn with their own alpha only.
-* Shipped default: off (`is_message_fading_enabled` false); menu *Style_FadeMessages* toggles it. Not ported: the `ChatView` shadow flag (`this[0x16c]` → `RENDER_SHADOW` on the lines; the shipped client never sets it, §5), the
-  timer period (we tick every frame; `StartFrameTimer`). Tests: `cargo test --release -p ao-gui --test textfade`, `cargo test --release -p aomac chat::win::tests::message_fading`.
+* Shipped default: off (`is_message_fading_enabled` false); menu *Style_FadeMessages* toggles it. The readability shadow follows actual window opacity (§5) independently of message aging. The native timer is frame-based (`StartFrameTimer`); the port ticks each frame. Tests: `cargo test --release -p ao-gui --test textfade`, `cargo test --release -p aomac chat::win::tests::message_fading`.
 
 ## 6. Input bar, links, activation
 
@@ -307,7 +306,7 @@ Defects found and fixed (all verified against the decompiles above):
 **Live settings.** `ChatShowOGrpInTitleBar`, `ChatShowOGrpInInputBar`, `ChatFontName`, `ChatFontStyle`, `ChatFontSize` (tenths of a point; `lfHeight = size / 10`, default 140 = 14 px) are read from the HUD's
 `DValues` every frame (`WinPrefs::from_dvalues`, `flow.rs` → `Chat::set_prefs` → `ChatWindows::set_prefs`); a change re-titles the tabs / shows or hides the prompt next frame, a font change rebuilds the windows
 (input bar height = line height + margins). Defaults equal the client's (tested against the shipped templates). `window_transparency_active/inactive`, `show_timestamps` and `visual_mode` are per-window document settings
-(Config.xml, the Window menu) and apply immediately (`alpha_of`, `deliver`). `ChatTextShadowOffset` now follows the character DValue through `WinPrefs`, including frame rebuilds; `FUN_1008d673` maps 0/1/2 to those pixel offsets and other values to 1. The shadow remains off unless the window enables it (`ChatView::shadow` false by default, §5). `ChatTextFadeDelay` / `ChatTextFadeTime` are read from the DValues every frame for windows with `is_message_fading_enabled` (§5.1).
+(Config.xml, the Window menu) and apply immediately (`alpha_of`, `deliver`). `ChatTextShadowOffset` follows the character DValue through `WinPrefs`, including frame rebuilds; `1008d673` maps 0/1/2 to those pixel offsets and other values to 1. The shadow enables while actual window opacity is below 0.4 (§5), not via a separately persisted shadow preference. `ChatTextFadeDelay` / `ChatTextFadeTime` are read from the DValues every frame for windows with `is_message_fading_enabled` (§5.1).
 
 **Verification.** `cargo test --release -p ao-gui --test frame` (tab title width, chat font, hint) and `cargo test --release -p aomac chat::win` (titles, mode XML, prompt, alpha rules, prefs defaults).
 Shots with a world-like backdrop (sky gradient over mottled pavement): `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac -- chat_win_shot chat_frame_shot` → `chat-inactive.png` / `chat-active.png`
@@ -332,7 +331,7 @@ Regression checks added (not run by the worker): `message_archive_appends_withou
 
 ## 17. Right-click configuration audit (2026-10-15)
 
-The supplied retail menu crop confirms the two unlabeled transparency rows: **inactive first, active second**. `GUI.dll 100998bc` reads document offsets `+0x174` and `+0x170`, associates the respective `…InactiveToolTip`/`…ActiveToolTip` keys, and connects `10099801`/`100997be`. Those callbacks store the setting and immediately preview its value in the existing window through `10096de4`/`10096db3`; selecting the active slider while the input is inactive must therefore still visibly change the window. Normal mode intentionally has no transparency submenu (`100998bc`) and remains alpha 1 (`10096ec5`).
+The supplied menu crop shows two unlabeled transparency rows; their semantic identity comes from the native code, not from the crop: **inactive first, active second**. `GUI.dll 100998bc` reads document offsets `+0x174` and `+0x170`, associates the respective `…InactiveToolTip`/`…ActiveToolTip` keys, and connects `10099801`/`100997be`. Those callbacks store the setting and immediately preview its value in the existing window through `10096de4`/`10096db3`; selecting the active slider while the input is inactive must therefore still visibly change the non-text window. Normal mode intentionally has no transparency submenu (`100998bc`) and remains alpha 1 (`10096ec5`). Neither slider writes a separate text-opacity setting; see the corrected render consumer trace in §2.
 
 | Entry | Native effect / persistence contract |
 |---|---|
@@ -342,7 +341,7 @@ The supplied retail menu crop confirms the two unlabeled transparency rows: **in
 | ChatConfiguration | `100aa966` toggles `chat_group_window`; `100ad888` constructs GroupControlWindow with its ChatConfig tab, `100ad160` the Chat Windows list beside the selected document's options. Document operations are shared with the menu (§16), not independent settings copies. |
 | Rename / Delete / New Window | Native dialogs, duplicate-name rejection, startup deletion protection and archive handling in §16. Names and document identity persist in each Config.xml. |
 | Visual > Mode | `visual_mode`, 0 Normal / 2 Borderless; `10096ec5` changes the frame style and preserves its outer rectangle. |
-| Visual > Transparency | `window_transparency_inactive` / `window_transparency_active`; each row immediately previews its own value, then activation transitions use the saved pair. |
+| Visual > Transparency | `window_transparency_inactive` / `window_transparency_active`; each row immediately previews its own non-text window opacity, then popup closure and activation transitions use the saved pair. |
 | Show timestamps | `show_timestamps`, used when formatting delivered messages. |
 | Disable text input | Inverse of `is_textinput_enabled`; rebuilds the input layout and disables the Autohide menu entry. |
 | Autohide inputbar | `hide_input_when_inactive`; input visibility follows document activation. |
@@ -360,3 +359,18 @@ The configuration panel now retains the selected document in its archive after c
 Regression coverage includes pointer-driven second-slider dragging, both layer transitions, channel menu eligibility/category boundaries, saved/offline subscription retention, SendTell versus OpenChat, disabled docked mode changes, all three chat popup contexts dismissed/replaced before unrelated menu picks, nested-key precedence, saved channel/name/output/layer/pin reload, rebuilt hints/input visibility, configuration archive restoration and shutdown flush. No real window, desktop input or live session was used for this audit.
 
 Verification (headless, 2026-10-15): `CARGO_TARGET_DIR=/tmp/Chat7/target cargo test --release --workspace -j 2` passed **1857 tests, 39 suites, 60 ignored**; `cargo clippy --release --workspace --all-targets -j 2 -- -D warnings` passed. These exercise offscreen GUI events and persistence, not a real-window acceptance run.
+
+### Transparency consumer re-audit
+
+The user's recollection of separate text/background sliders prompted an independent re-trace. The exact key and draw-consumer chain confirms two **activation-state targets for non-text window opacity**, not one text setting and one background setting:
+
+| Row | Document write | Config.xml key | Window target |
+|---|---|---|---|
+| Top | `1009981e`: `[doc+0x174]`, then `1009983b` calls `10096de4` | `window_transparency_inactive` (read `1009e019`, write `1009a8b8`) | `ChatWindow+0x78` |
+| Bottom | `100997db`: `[doc+0x170]`, then `100997f8` calls `10096db3` | `window_transparency_active` (read `1009e003`, write `1009a8a7`) | `ChatWindow+0x74` |
+
+`10096b23` chooses between these same fields using the selected document's `+0xda` activation state; the setter `10098933` writes that byte and emits document signal `+0x24`, consumed by `10096ccb` → `10096b23`. Both targets feed `Window::FadeTo` and the same root-alpha render path. No text-opacity DValue or separate text-alpha write was found in either callback.
+
+The actual port defect was downstream: it omitted the chat TextRenderer flag `0x80` inheritance reset, so unlike retail its text dimmed with the window. Output/editor now retain their own opacity and the hint its own 0.6, while panel/chrome opacity still uses the original persisted pair and focus-fade timings. Readability shadows follow the native actual-opacity threshold 0.4. The provided screenshot does not establish either slider's semantic identity by itself; the function/field trace above does.
+
+Re-audit verification (headless): workspace release tests passed **1909 tests, 40 suites, 61 ignored**; strict release workspace/all-target clippy passed (`-j 2`). `chat_low_window_alpha_preserves_rendered_text_pixels` renders real offscreen images at window alpha 0.05 and 1.0, checks actual pixels against independent opaque output/editor (hint 0.6), proves fully covered white output strokes remain unchanged, and proves background pixels still change. Draw-command regressions cover both sliders, focus transitions, frame rebuilds, release completion and the 0.4 shadow threshold, including timed-line local fading. No real window or desktop capture was used.

@@ -152,7 +152,9 @@ impl ChatWindows {
     /// * 0: the group view has no art and a 3 px client border; the `ChatView` borders (`FUN_1008daa0(true)`) are the `GFX_GUI_INSET_*` set with a 5 px client margin;
     /// * 1: the group view is a `GFX_GUI_WINDOW3_BORDER_*` + `GFX_GUI_WINDOW_BACKGROUND` frame at local alpha 0.4 (`_DAT_101b9e78`), 3 px border, inset `ChatView`;
     /// * 2 (shipped default): no group border (client 0) and `FUN_1008daa0(false)`: both `ChatView` borders are *only* `GFX_GUI_WINDOW_BACKGROUND` (0x1bf) with
-    ///   no client margin, so the text area and the input bar are black panels (the window alpha 0.8 / 0.3 of `FUN_10096b23` fades them with the text).
+    ///   no client margin, so the text area and the input bar are black panels faded by the window alpha 0.8 / 0.3 of `FUN_10096b23`.
+    ///
+    /// `ChatTextView_c` 0x100925ff and `InputBar_c` 0x100919ab set renderer flag 0x80: output, editor and prompt ignore window alpha (prompt keeps 0.6).
     ///
     /// `none` names no art (the XML parser keeps the INSET default for an *empty* attribute).
     pub(super) fn doc_xml(&self, d: usize, line_h: u32) -> String {
@@ -168,7 +170,7 @@ impl ChatWindows {
         let input = if w.cfg.textinput {
             format!(
                 r#"<BorderView name="input_border_{n}" {art} layout_borders="Rect(0,5,0,0)" min_size="Point(-1,{ih})" max_size="Point(16000,{ih})">
-                     <TextView name="input_{n}" max_size="Point(16000,-1)" layout_borders="Rect({margin},{margin},{margin},{margin})" font="CHAT" feature_flags="{INPUT_FLAGS}"/>
+                     <TextView name="input_{n}" view_flags="0x80" max_size="Point(16000,-1)" layout_borders="Rect({margin},{margin},{margin},{margin})" font="CHAT" feature_flags="{INPUT_FLAGS}"/>
                    </BorderView>"#
             )
         } else {
@@ -179,7 +181,7 @@ impl ChatWindows {
             r#"<BorderView name="text_border_{n}" {art} max_size="Point(16000,16000)">
                    <ScrollView name="scroll_{n}" v_scrollbar_mode="always" layout_borders="{m}" max_size="Point(16000,16000)">
                      <ScrollViewChild view_layout="vertical" max_size="Point(16000,16000)">
-                       <TextView name="text_{n}" max_size="Point(16000,-1)" font="CHAT" feature_flags="{TEXT_FLAGS}"/>
+                       <TextView name="text_{n}" view_flags="0x80" max_size="Point(16000,-1)" font="CHAT" feature_flags="{TEXT_FLAGS}"/>
                      </ScrollViewChild>
                    </ScrollView>
                  </BorderView>
@@ -241,6 +243,7 @@ impl ChatWindows {
         // `is_backmost` / `is_frontmost` -> window flags 0x200 / 0x100 (`FUN_10097ae3`); default: normal stacking. **GUESS**: frontmost wins if both are set.
         gui.set_window_layer(id, if s.cfg.frontmost { 1 } else if s.cfg.backmost { -1 } else { 0 });
         gui.set_window_visible(id, docs.iter().any(|&d| self.wins[d].cfg.open));
+        self.sync_frame_shadow(gui, docs, id, a);
         Ok(id)
     }
 
@@ -412,7 +415,16 @@ impl ChatWindows {
         if let Event::MenuClosed { generation } = ev {
             if self.menu_generation == Some(*generation) {
                 self.menu_generation = None;
-                self.menu = None;
+                if let Some(ctx) = self.menu.take() {
+                    if ctx.frame < self.frames.len() {
+                        let d = self.sel_doc(ctx.frame);
+                        let w = &mut self.wins[d];
+                        // GUI 1013c56f emits close -> 10096ceb -> 10096b23:
+                        // slider preview ends when the popup closes.
+                        w.target = alpha_of(&w.cfg, w.active);
+                        w.rate = (w.target - w.alpha).abs() / if w.active { FADE_IN } else { FADE_OUT };
+                    }
+                }
                 self.config_clear_menu();
             }
             return vec![];
@@ -495,7 +507,7 @@ impl ChatWindows {
             Event::FrameIcon { window, x, y } => self.open_menu(gui, *window, (*x, *y), None),
             Event::ContextMenu { window, x, y, link } => self.open_menu(gui, *window, (*x, *y), link.as_deref()),
             Event::MenuPicked { id } => out.extend(self.menu_picked(gui, *id)),
-            Event::MenuSlider { id, value } => self.menu_slider(gui, *id, *value),
+            Event::MenuSlider { id, value, finished } => self.menu_slider(gui, *id, *value, *finished),
             _ => {}
         }
         out
@@ -521,6 +533,24 @@ impl ChatWindows {
         }
     }
 
+    /// `Window::UpdateFadeLevel` 0x10155653 -> 0x10096e15 -> 0x10096b83:
+    /// all tab views use a readability shadow below the current rendered level 0.4, not either configured target.
+    fn sync_frame_shadow(&self, gui: &mut Gui, docs: &[usize], id: WindowId, alpha: f32) {
+        let shadow = alpha < 0.4;
+        for &d in docs {
+            let w = &self.wins[d];
+            gui.set_text_shadow(id, &format!("text_{}", w.n), shadow);
+            gui.set_text_shadow(id, &w.input(), shadow);
+            gui.set_text_shadow(id, &w.scroll(), shadow);
+        }
+    }
+
+    pub(super) fn set_frame_alpha(&self, gui: &mut Gui, fi: usize, alpha: f32) {
+        let f = &self.frames[fi];
+        gui.set_window_alpha(f.id, alpha);
+        self.sync_frame_shadow(gui, &f.docs, f.id, gui.window_alpha(f.id));
+    }
+
     /// A tab was pressed (`TabView` selection, `Window::SetTabSelection`): its view shows, the others collapse; the window alpha follows the selected tab
     /// (`FUN_10096b23`).
     pub(super) fn select_tab(&mut self, gui: &mut Gui, fi: usize, index: usize) {
@@ -530,7 +560,7 @@ impl ChatWindows {
         for (i, &d) in docs.iter().enumerate() {
             gui.show_collapsing(id, &self.wins[d].chat(), i == sel);
         }
-        gui.set_window_alpha(id, self.wins[docs[sel]].alpha);
+        self.set_frame_alpha(gui, fi, self.wins[docs[sel]].alpha);
         self.wins[docs[sel]].unread = false; // `FUN_100aac81(true)`: the tab became visible
         gui.clear_focus();
         self.dirty = true;
@@ -660,6 +690,7 @@ impl ChatWindows {
                 w.fade = fade;
                 let all = w.lines.iter().map(String::as_str).collect::<Vec<_>>().join("<br>");
                 gui.set_text_fade(w.id, &w.scroll(), fade, &all);
+                gui.set_text_shadow(w.id, &w.scroll(), gui.window_alpha(w.id) < 0.4);
                 if fade.is_none() {
                     gui.scroll_to_bottom(w.id, &w.scroll());
                 }
@@ -680,7 +711,8 @@ impl ChatWindows {
                 let step = w.rate * dt;
                 w.alpha = if (w.target - w.alpha).abs() <= step { w.target } else { w.alpha + step * (w.target - w.alpha).signum() };
                 if selected {
-                    gui.set_window_alpha(w.id, w.alpha);
+                    let (fi, alpha) = (w.frame, w.alpha);
+                    self.set_frame_alpha(gui, fi, alpha);
                 }
             }
         }

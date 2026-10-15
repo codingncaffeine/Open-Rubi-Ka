@@ -957,7 +957,7 @@ impl Gui {
     pub fn clear_focus(&mut self) {
         self.focus = None;
     }
-    /// `Window::FadeTo` end value (0..1): multiplies the alpha of everything in the window.
+    /// `Window::FadeTo` end value (0..1), inherited by views unless native flag `0x80` resets it.
     pub fn set_window_alpha(&mut self, w: WindowId, alpha: f32) {
         if let Some(Some(win)) = self.windows.get_mut(w) {
             win.alpha = alpha.clamp(0.0, 1.0);
@@ -985,6 +985,18 @@ impl Gui {
     }
     pub fn window_alpha(&self, w: WindowId) -> f32 {
         self.windows.get(w).and_then(|w| w.as_ref()).map_or(1.0, |w| w.alpha)
+    }
+    /// Toggles `TextRenderer_c` RENDER_SHADOW for text/editor (including its prompt), or a timed-line ScrollView (`0x10091fe5`).
+    pub fn set_text_shadow(&mut self, w: WindowId, name: &str, enabled: bool) {
+        let Some(v) = self.find(w, name) else { return };
+        if let Some(f) = self.text_fades.get_mut(&v) {
+            f.shadow = enabled;
+        }
+        if let Some(e) = self.editor_of(v) {
+            if let Kind::Text(t) = &mut self.tree.views[e].kind {
+                if enabled { t.tvf |= tvf::RENDER_SHADOW; } else { t.tvf &= !tvf::RENDER_SHADOW; }
+            }
+        }
     }
     /// `TextRenderer_c::SetShadowOffset` (applies to every view drawn with `tvf::RENDER_SHADOW`).
     pub fn set_text_shadow_offset(&mut self, dx: i32, dy: i32) {
@@ -1258,6 +1270,8 @@ impl Gui {
             None
         };
         let tint = mul(parent_tint, self.map_color(v.color));
+        // View::_CallRender 0x1014d2e3: flag 0x80 resets inherited alpha before applying the view's own alpha.
+        let parent_alpha = if v.flags & 0x80 != 0 { 1.0 } else { parent_alpha };
         let alpha = parent_alpha * v.alpha;
         if v.backdrop > 0.0 {
             out.push(DrawCmd::Solid { dst: [rect.l, rect.t, rect.r + 1.0, rect.b + 1.0], color: [0; 3], alpha: alpha * v.backdrop });
@@ -1526,10 +1540,13 @@ impl Gui {
         // `InputBar_c` prompt overlay (`FUN_10090f0b`): visible while the editor is empty, moved right by `_DAT_101b0840` = 4 px while the editor has the focus.
         if editable && t.text.is_empty() && !t.hint.is_empty() {
             let hint = text::layout_text(&mut self.fonts, &self.colors, t.font, &t.hint, 0, None);
-            let mut pen = origin_x + if focused { 4 } else { 0 };
-            for run in hint.lines.iter().flat_map(|l| &l.runs) {
-                let c = run.color.map_or(tint, |c| mul(tint, rgb(c)));
-                pen += self.draw_string(out, t.font, &run.text, pen, r.t as i32, c, alpha * 0.6, false);
+            for &is_shadow in passes {
+                let (dx, dy) = if is_shadow { shadow.unwrap_or((0, 0)) } else { (0, 0) };
+                let mut pen = origin_x + if focused { 4 } else { 0 };
+                for run in hint.lines.iter().flat_map(|l| &l.runs) {
+                    let c = if is_shadow { [0; 3] } else { run.color.map_or(tint, |c| mul(tint, rgb(c))) };
+                    pen += self.draw_string(out, t.font, &run.text, pen + dx, r.t as i32 + dy, c, alpha * 0.6, false);
+                }
             }
         }
         if editable && focused {

@@ -5,6 +5,8 @@ use ao_gui::{InputEvent, Key};
 
 mod menu;
 mod dismissal;
+mod opacity;
+mod shadow;
 
 fn msg(group: u64, name: &str, from: &str, text: &str, kind: u8) -> ChatMsg {
     ChatMsg { group, group_name: name.into(), from_name: from.into(), text: text.into(), kind, ..Default::default() }

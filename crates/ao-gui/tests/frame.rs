@@ -222,12 +222,14 @@ fn popup_slider_item_reports_values_and_stays_open() {
     // press in the middle of the slider row, drag to the far right, release: values 0..1, menu still open
     let evs = g.input(InputEvent::MouseDown { x: 110.0, y: 58.0, button: MouseButton::Left });
     let v = match evs.as_slice() {
-        [Event::MenuSlider { id: 7, value }] => *value,
+        [Event::MenuSlider { id: 7, value, finished: false }] => *value,
         other => panic!("{other:?}"),
     };
     assert!((0.3..0.7).contains(&v), "{v}");
     let evs = g.input(InputEvent::MouseMove { x: 400.0, y: 58.0 });
-    assert_eq!(evs, vec![Event::MenuSlider { id: 7, value: 1.0 }]);
+    assert_eq!(evs, vec![Event::MenuSlider { id: 7, value: 1.0, finished: false }]);
+    assert_eq!(g.input(InputEvent::MouseUp { x: 400.0, y: 58.0, button: MouseButton::Left }),
+        vec![Event::MenuSlider { id: 7, value: 1.0, finished: true }]);
     assert!(g.input(InputEvent::MouseUp { x: 400.0, y: 58.0, button: MouseButton::Left }).is_empty());
     assert!(g.menu_open());
 }

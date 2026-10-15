@@ -205,13 +205,18 @@ impl Gui {
         if it.slider != Some(v) {
             it.slider = Some(v);
             let id = it.id;
-            self.events.push(Event::MenuSlider { id, value: v });
+            self.events.push(Event::MenuSlider { id, value: v, finished: false });
         }
     }
 
+    /// `Slider_c::MouseUp` (101443b3) emits the current value with finished=true, without closing the popup.
     pub(super) fn menu_mouse_up(&mut self) {
         if let Some(m) = &mut self.ix.menu {
-            m.drag = None;
+            let Some((lv, i)) = m.drag.take() else { return };
+            let Some(it) = menu_item_mut(m, lv, i) else { return };
+            if let Some(value) = it.slider {
+                self.events.push(Event::MenuSlider { id: it.id, value, finished: true });
+            }
         }
     }
 
