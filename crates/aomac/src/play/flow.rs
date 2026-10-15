@@ -896,6 +896,14 @@ impl Play {
                     if let Some(m) = self.fight.as_mut() {
                         m.on_frame(&f);
                     }
+                    // CharacterAction 0x7a posts CancelCampMessage (GC 0x1005dae8 -> event 0x2a -> AFCM 10:0x20).
+                    if let Ok(message) = ao_net::n3::decode(&f) {
+                        if message.header.target.kind == 50000 && message.header.target.instance == self.zone.char_id as i32
+                            && matches!(message.body, ao_net::n3::N3::World(ao_net::n3::world::World::CharacterAction(a)) if a.action == 0x7a)
+                        {
+                            self.cancel_camp();
+                        }
+                    }
                     self.interact_zone_frame(&f);
                     if hud::Hud::wants_zone_frame(&f) {
                         match self.hud.as_mut() {
@@ -961,22 +969,26 @@ impl Play {
                         self.begin_zone_change(host);
                     }
                 }
-                LoginEvent::Disconnected(why) if self.screen != Screen::InWorld => {
-                    // [INFERENCE] AnarchyLauncher.url code 3 = "Server Lost"; the call site was not located in the DLL
-                    eprintln!("login connection lost: {why}");
-                    self.show_login(host);
-                    self.show_error(3, 0);
+                LoginEvent::Disconnected(why) => {
+                    // ServerLostMessage [GUI 0x10028d50] -> ActivateGameClosing [0x10028194]:
+                    // an active timed logout selects its destination; otherwise this is status 3, server lost.
+                    eprintln!("connection lost: {why}");
+                    self.session = None;
+                    self.camp = None;
+                    self.camp_bar_close();
+                    match self.logout.expired() {
+                        Some(super::logout::Closing::System) => host.quit = true,
+                        Some(super::logout::Closing::Login) => self.show_login(host),
+                        None if !host.quit => {
+                            self.logout.cancel();
+                            self.show_login(host);
+                            self.show_error(3, 0);
+                        }
+                        None => {}
+                    }
                 }
-                other => self.on_zone_event(other),
+                other => eprintln!("unhandled session event: {other:?}"),
             }
-        }
-    }
-
-    /// M3 seam: every session event once the world is shown. Zone message decoding/handling plugs in here.
-    fn on_zone_event(&mut self, ev: LoginEvent) {
-        match ev {
-            LoginEvent::Disconnected(why) => self.in_world_msg = format!("Zone connection closed: {why}"),
-            other => eprintln!("zone event (unhandled until M3): {other:?}"),
         }
     }
 

@@ -236,7 +236,6 @@ struct Play {
     zone: zone::Zone,
     /// Frames drawn since the world appeared; `CharInPlay` is sent after [`flow::IN_PLAY_FRAMES`].
     world_frames: u32,
-    in_world_msg: String,
     fake: bool,
     /// `--fake-charlist`: the replies an in-process fake login server would send (random name, created, hand-off, …).
     fake_events: std::collections::VecDeque<LoginEvent>,
@@ -376,7 +375,6 @@ impl Play {
             world_audio: None,
             zone: zone::Zone::default(),
             world_frames: 0,
-            in_world_msg: String::new(),
             fake: fake_charlist.is_some(),
             fake_events: Default::default(),
             under_dialog: None,

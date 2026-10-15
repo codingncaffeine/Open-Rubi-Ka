@@ -17,6 +17,8 @@
 //! `focuslost` cancels held game input as the host's window-focus-loss event does.
 //! Named GUI keys are delivered before physical game keys, as in the viewer; letters stay physical (no invented layout/IME text).
 //! `inputstate` prints target, Wear, text focus, host look, movement mode and camp state; `inputstate=clear` also asserts no target.
+//! `exit` real-clicks Actions > Normal Actions > EXIT; `campcheck=active|cancelled` asserts the in-world camp/session state,
+//! and cancelled also requires the localized `TimedLogoutAborted` line in a visible GUI text view.
 //! Frame captures require `AOMAC_LIVE_SHOTS`: `arm=attack:1:note,down=Q,capturewait=30,up=Q` records the frame
 //! processing the next own attack note. `arm=burst:1:special,M=0.1,capturewait=30` selects SpecialAttack instead.
 //! (60 PNGs for one second, `attack-0000.png` onward). No event queue polling; the processing hook counts events.
@@ -732,10 +734,10 @@ fn live_walk() {
                 assert!(error.abs() <= tolerance, "fight facing error {error} exceeds {tolerance}");
             }
             "inputstate" => {
-                eprintln!("inputstate: target={:?} wear_open={} text_focus={} host_look={} mode={:?} camp={:?} logout={:?} world_message={:?}",
+                eprintln!("inputstate: target={:?} wear_open={} text_focus={} host_look={} mode={:?} camp={:?} logout={:?}",
                     l.p.zone.selected_target(), l.p.hud.as_ref().is_some_and(|h| h.is_open(super::super::hud::WindowKind::Character)),
                     l.p.gui.text_focused(), l.o.host.look, l.p.player.as_ref().map(|p| p.mode()),
-                    l.p.camp, l.p.logout.state, l.p.in_world_msg);
+                    l.p.camp, l.p.logout.state);
                 if let Some(h) = &l.p.hud {
                     let wear = super::super::options::keys::provider_hash("WINDOW_WEAR");
                     let inputs: Vec<_> = h.key_tables().0.pairs().filter_map(|(input, provider)| (provider == wear).then_some(input)).collect();
@@ -745,6 +747,60 @@ fn live_walk() {
                     "" => {}
                     "clear" => assert!(l.p.zone.selected_target().is_none(), "inputstate expected the target to be cleared"),
                     _ => panic!("inputstate accepts only clear or no value"),
+                }
+            }
+            "campcheck" => {
+                let active = match v {
+                    "active" => true,
+                    "cancelled" => false,
+                    _ => panic!("campcheck accepts only active or cancelled"),
+                };
+                eprintln!("campcheck={v}: in_world={} camp={:?} camp_bar={:?} logout={:?} session={}",
+                    l.p.screen == Screen::InWorld, l.p.camp, l.p.camp_bar, l.p.logout.state, l.p.session.is_some());
+                assert!(l.p.screen == Screen::InWorld, "campcheck requires InWorld");
+                assert_eq!(l.p.camp.is_some(), active, "campcheck camp timer");
+                assert_eq!(l.p.camp_bar.is_some(), active, "campcheck camp bar");
+                assert_eq!(l.p.logout.state != super::super::logout::State::None, active, "campcheck logout state");
+                assert!(l.p.session.is_some(), "campcheck requires a live session");
+                if !active {
+                    let expected = l.p.text.by_key(200, "TimedLogoutAborted").expect("TimedLogoutAborted text");
+                    assert!(!expected.is_empty(), "TimedLogoutAborted text must not be empty");
+                    let mut found = false;
+                    for w in l.p.gui.window_ids() {
+                        if !l.p.gui.window_visible(w) { continue; }
+                        for name in l.p.gui.view_names(w) {
+                            if !l.p.gui.is_visible(w, &name) { continue; }
+                            let text = l.p.gui.text(w, &name);
+                            if text.contains(&expected) {
+                                eprintln!("campcheck=cancelled: TimedLogoutAborted={expected:?} window={w:?} view={name:?} visible_text={text:?}");
+                                found = true;
+                            }
+                        }
+                    }
+                    assert!(found, "TimedLogoutAborted {expected:?} missing from visible GUI text views");
+                }
+                eprintln!("campcheck={v}: PASS");
+            }
+            "exit" => {
+                // LeftMenu.xml -> CommandMenu.xml normal category -> suspended animation (#Quit / EXIT).
+                let template = super::super::hud_special::template_of(0x51).expect("camp action template");
+                let exit_suffix = format!("_sa_{template}");
+                for view in ["command_menu", "__menu_0_0_3", &exit_suffix] {
+                    let (w, name) = l.p.gui.window_ids().into_iter().filter(|&w| l.p.gui.window_visible(w))
+                        .find_map(|w| l.p.gui.view_names(w).into_iter()
+                            .find(|name| (name == view || (view == exit_suffix && name.ends_with(view))) && l.p.gui.is_visible(w, name))
+                            .map(|name| (w, name)))
+                        .unwrap_or_else(|| panic!("EXIT HUD route missing visible view {view}"));
+                    let r = l.p.gui.view_rect(w, &name).expect("EXIT HUD view rect");
+                    assert!(r.width() > 0.0 && r.height() > 0.0, "EXIT HUD view must have a clickable rect");
+                    let (x, y) = (r.l + r.width() / 2.0, r.t + r.height() / 2.0);
+                    eprintln!("exit: real-click window={w:?} view={name:?} rect={r:?} at {x},{y}");
+                    for ev in [ao_gui::InputEvent::MouseMove { x, y },
+                        ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left },
+                        ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }] {
+                        l.p.input(ev, &mut l.o.host);
+                    }
+                    l.tick();
                 }
             }
             "audio" => eprintln!("audio: {} combat={:?} layer={:?} music={:?}", l.p.audio.as_ref().map_or("off".into(), |a| a.status()), l.p.audio.as_ref().map(|a| a.combat_state()), l.p.audio.as_ref().and_then(|a| a.music_layer()), l.p.audio.as_ref().and_then(|a| a.now_playing())),
@@ -830,11 +886,11 @@ fn live_walk() {
                 let start = Instant::now();
                 while l.p.screen != Screen::Login {
                     assert!(start.elapsed().as_secs() < 120,
-                        "camp did not return to login: camp={:?} logout={:?} world_message={:?} text_focus={} host_look={}",
-                        l.p.camp, l.p.logout.state, l.p.in_world_msg, l.p.gui.text_focused(), l.o.host.look);
+                        "camp did not return to login: camp={:?} logout={:?} text_focus={} host_look={}",
+                        l.p.camp, l.p.logout.state, l.p.gui.text_focused(), l.o.host.look);
                     l.tick();
                 }
-                eprintln!("camp returned to login: logout={:?} world_message={:?}", l.p.logout.state, l.p.in_world_msg);
+                eprintln!("camp returned to login: logout={:?}", l.p.logout.state);
                 l.wait(1.0);
                 eprintln!("login screen: {} gui windows, chat layer {}, session {}", l.p.gui.window_ids().len(), l.p.chat.is_some(), l.p.session.is_some());
             }

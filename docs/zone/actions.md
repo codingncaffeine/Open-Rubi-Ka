@@ -105,7 +105,7 @@ IDs use the existing `ao_audio::sbf::sound_id` (`CreateSoundID`, SandyInterface 
 | `0x77` |  | 0x24 @ 0x1005da11 | recv text `Feedback_TeamMemberLinkdead` / `...WentLinkDead` |
 | `0x78` | StartCamping | default (ignored) | StartCamping (client) |
 | `0x79` | StopCamping | default (ignored) | StopCamping (client) |
-| `0x7a` |  | 0x25 @ 0x1005dae8 |  |
+| `0x7a` | Camp cancelled (server) | 0x25 @ 0x1005dae8 | own-character action availability 0x52; `FUN_10012ab3` posts event 0x2a -> AFCM(10,0x20) `CancelCampMessage`: timer deleted, logout state/time cleared, `TimedLogoutAborted` chat (docs/zone/movement.md §10) |
 | `0x7b` |  | 0x26 @ 0x1005db15 | recv `Combat_PvPTargetLvl` / `...Team`; clears `controller+0x79` |
 | `0x7f` | text cmd (?) | default (ignored) |  |
 | `0x80` | FUN_10065bc5 | default (ignored) |  |

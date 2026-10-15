@@ -367,9 +367,8 @@ impl Play {
                 c.feedback(&mut self.gui, key, &self.text);
             }
         }
-        let out = m.take_outbox();
         if let Some(s) = &self.session {
-            for f in out {
+            for f in m.take_outbox() {
                 s.send_zone(f);
             }
         }

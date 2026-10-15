@@ -506,6 +506,65 @@ fn camp_queues_sit_movement_before_start_camping_without_next_frame_duplicate() 
     )));
 }
 
+#[test]
+fn camp_keyboard_stand_waits_for_own_server_cancel_action() {
+    use ao_net::{msg::Identity, n3::{action::{self, id}, outgoing::n3_frame, world::World, N3}};
+    use super::super::logout::State;
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    r.enter();
+    for _ in 0..IN_PLAY_FRAMES + 2 {
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+    }
+    assert!(r.p.game_input_open() && !r.p.gui.text_focused());
+    r.p.chat.as_mut().unwrap().run_line(&mut r.p.gui, "/camp", &r.p.zone, &r.p.text);
+    r.p.frame(0.016, (1280, 800), &mut r.host);
+    r.p.frame(5.0, (1280, 800), &mut r.host);
+    assert!(r.p.camp.is_some() && r.p.camp_bar.is_some());
+    assert_eq!(r.p.logout.state, State::Login);
+    r.p.fight.as_mut().unwrap().take_outbox();
+    for pressed in [true, false] {
+        r.p.game_input(ao_render::GameInput::Key { code: ao_render::KeyCode::KeyX, pressed, repeat: false }, &mut r.host);
+    }
+    r.p.frame(0.016, (1280, 800), &mut r.host);
+    let sent = r.p.fight.as_mut().unwrap().take_outbox();
+    let actions = sent.iter().filter_map(|f| match ao_net::n3::decode(f).unwrap().body {
+        N3::World(World::CharacterAction(a)) => Some(a.action),
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert!(actions.contains(&id::STAND_UP), "{actions:?}");
+    assert!(!actions.contains(&id::STOP_CAMPING), "{actions:?}");
+    assert!(r.p.camp.is_some() && r.p.camp_bar.is_some(), "X waits for the server cancellation");
+    assert_eq!(r.p.logout.state, State::Login);
+    let own = Identity { kind: 50000, instance: r.p.zone.char_id as i32 };
+    let cancel = action::simple(0x7a, Identity::default(), Identity::default());
+    let stop = |who| LoginEvent::ZoneFrame(n3_frame(0, own.instance as u32, action::character_action_for(who, &cancel)));
+    r.event(stop(Identity { instance: own.instance + 1, ..own }));
+    assert!(r.p.camp.is_some() && r.p.camp_bar.is_some(), "another character cannot cancel our logout");
+    assert_eq!(r.p.logout.state, State::Login);
+    let stand = action::simple(id::STAND_UP, Identity::default(), Identity::default());
+    r.event(LoginEvent::ZoneFrame(n3_frame(0, own.instance as u32, action::character_action_for(own, &stand))));
+    r.p.frame(0.016, (1280, 800), &mut r.host);
+    assert!(matches!(r.p.player.as_ref().unwrap().mode(), 2 | 3), "server stand restores an upright mode");
+    assert!(r.p.camp.is_some() && r.p.camp_bar.is_some(), "stand echo alone does not cancel the countdown");
+    r.event(stop(own));
+    r.p.frame(0.016, (1280, 800), &mut r.host);
+    assert!(r.p.camp.is_none() && r.p.camp_bar.is_none());
+    assert_eq!(r.p.logout.state, State::None);
+    let expected = r.p.text.by_key(200, "TimedLogoutAborted").expect("localized cancellation text");
+    assert!(!expected.is_empty());
+    assert!(r.p.gui.window_ids().into_iter().filter(|&w| r.p.gui.window_visible(w)).any(|w|
+        r.p.gui.view_names(w).into_iter().any(|name|
+            r.p.gui.is_visible(w, &name) && r.p.gui.text(w, &name).contains(&expected)
+        )
+    ), "localized cancellation line missing from visible chat: {expected:?}");
+    for _ in 0..41 {
+        r.p.frame(1.0, (1280, 800), &mut r.host);
+    }
+    assert!(r.p.screen == Screen::InWorld && !r.host.quit, "cancelled camp must neither log out nor quit later");
+}
+
 /// The own character on the captured Arrival Hall start: the avatar is built, the login window's focus is gone (it blocked every key),
 /// holding W walks it along its heading at about the client's run speed, and the position is the movement state's, not the server's.
 #[test]
@@ -887,4 +946,49 @@ fn dropping_play_without_explicit_shutdown_still_saves_the_viewer_cache() {
     let cache = ao_formats::character::ViewerCache::load(&scratch);
     let saved = cache.0.get(&(CHAR_ID as i32)).expect("Play::drop must have saved the viewer cache entry");
     assert_eq!(saved.head_mesh() as i32, u.head_mesh.unwrap_or(saved.head_mesh() as i32), "the saved entry must reflect the live update's appearance");
+}
+
+/// ServerLostMessage (GUI 0x10028d50) chooses the timed-logout destination, not the displayed timer's expiry.
+#[test]
+fn server_eof_completes_camp_or_reports_unexpected_loss() {
+    use super::super::logout::State;
+    for destination in [State::Login, State::System, State::None] {
+        let Some(mut r) = rig() else { return };
+        r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+        r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+        r.enter();
+        let bar = if destination != State::None {
+            r.p.camp();
+            assert_eq!(r.p.logout.state, State::Login);
+            assert_eq!(r.p.camp, Some(0.0));
+            let bar = r.p.camp_bar.expect("camp timer opened");
+            if destination == State::System {
+                r.p.quit_cmd(&mut r.host);
+                assert_eq!(r.p.logout.state, State::System);
+            }
+            Some(bar)
+        } else {
+            None
+        };
+        r.p.session = Some(r.session());
+        r.event(LoginEvent::Disconnected("server EOF before countdown expiry".into()));
+        assert!(r.p.session.is_none(), "the dead session must be dropped");
+        assert!(r.p.camp.is_none() && r.p.camp_bar.is_none());
+        assert!(bar.is_none_or(|w| !r.p.gui.window_ids().contains(&w)), "the camp timer window must close");
+        assert_eq!(r.p.logout.state, State::None);
+        assert_eq!(r.host.quit, destination == State::System);
+        if destination == State::System {
+            assert!(r.p.screen == Screen::InWorld, "system logout must not reopen login");
+        } else {
+            assert!(r.p.screen == Screen::Login && r.login_visible());
+            assert!(r.p.hud.is_none() && r.p.chat.is_none() && r.p.interact.is_none());
+            assert_eq!(r.p.gui.window_ids(), vec![r.p.login_w.unwrap()]);
+        }
+        if destination == State::None {
+            assert_eq!(r.p.opened_urls.len(), 1);
+            assert!(r.p.opened_urls[0].ends_with("/3.html"));
+        } else {
+            assert!(r.p.opened_urls.is_empty(), "intentional camp EOF is not a connection-loss error");
+        }
+    }
 }

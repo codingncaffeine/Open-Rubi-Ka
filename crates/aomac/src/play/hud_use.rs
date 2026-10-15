@@ -63,7 +63,6 @@ impl Play {
                 self.start_camping();
             }
             0x52 => {
-                self.cancel_camp();
                 self.send_outgoing(vec![action::stop_camping()]);
             }
             // Use / Pick-Up on the selected target (`FUN_1004256c`: identity = the targeting object's `+0x5c`, `Zone::target`)
@@ -171,7 +170,7 @@ impl Play {
 
     /// `CancelCampMessage` [GUI 0x10029c26]: the timer bar is deleted (`TimerSystemModule_t::DeleteTimer`), text `TimedLogoutAborted`
     /// (code 12), state 0, quit time 0.
-    fn cancel_camp(&mut self) {
+    pub(in crate::play) fn cancel_camp(&mut self) {
         self.camp_bar_close();
         self.camp = None;
         self.logout.cancel();
@@ -198,7 +197,7 @@ impl Play {
         }
     }
 
-    fn camp_bar_close(&mut self) {
+    pub(in crate::play) fn camp_bar_close(&mut self) {
         if let Some(w) = self.camp_bar.take() {
             self.gui.close_window(w);
         }
