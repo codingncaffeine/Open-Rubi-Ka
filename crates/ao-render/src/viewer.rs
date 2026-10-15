@@ -42,9 +42,9 @@ pub struct Host {
     /// downward-clamped to what the adapter supports by [`Renderer::set_msaa_samples`].
     pub msaa_samples: Option<u32>,
     /// Interface scale (aomac Enhanced option, audit item 2): `None`/`Some(0)` = Auto (today's whole backing-scale
-    /// rounding), `Some(1..=3)` = a fixed GUI-pixel scale, reduced (never below 1x) to whatever keeps the window at
-    /// least 1024x768 logical pixels ([`gui_scale`]). Drained every frame by the viewer; the very first frame (before
-    /// the window exists) reads [`Frontend::interface_scale`] instead, so the login screen is never a frame late.
+    /// rounding), `Some(1..=3)` = a fixed GUI-pixel scale, honoured regardless of window size ([`gui_scale`]).
+    /// Drained every frame by the viewer; the very first frame (before the window exists) reads
+    /// [`Frontend::interface_scale`] instead, so the login screen is never a frame late.
     pub interface_scale: Option<u8>,
     /// Skip the Spaces fullscreen animation and hide the menu bar/dock on fullscreen entry (aomac Enhanced option,
     /// audit item 6; winit `WindowExtMacOS::set_borderless_game`). Not drained: read whenever fullscreen is toggled.
@@ -322,19 +322,12 @@ struct Gui {
 }
 
 /// Physical pixels per GUI pixel. `requested` is [`Host::interface_scale`] (`None`/`Some(0)` = Auto, today's whole
-/// backing-scale rounding); an explicit 1x/2x/3x is reduced (never below 1x) to whatever keeps `physical` at least
-/// 1024x768 logical pixels (audit item 2: "block scales that would make the interface smaller than 1024x768 logical").
-fn gui_scale(scale_factor: f64, requested: Option<u8>, physical: (u32, u32)) -> u32 {
+/// backing-scale rounding); explicit scales are honoured even when they reduce the logical viewport below 1024x768.
+fn gui_scale(scale_factor: f64, requested: Option<u8>, _physical: (u32, u32)) -> u32 {
     let auto = (scale_factor.round() as u32).max(1);
     match requested {
         None | Some(0) => auto,
-        Some(n) => {
-            let mut s = u32::from(n).max(1);
-            while s > 1 && (physical.0 / s < 1024 || physical.1 / s < 768) {
-                s -= 1;
-            }
-            s
-        }
+        Some(n) => u32::from(n).max(1),
     }
 }
 
@@ -1244,15 +1237,15 @@ mod tests {
         assert_eq!(gui_scale(f64::NAN, None, (1920, 1080)), 1);
     }
 
-    /// Audit item 2: an explicit scale is used as-is when it still leaves at least 1024x768 logical pixels, but is
-    /// reduced (never below 1x) when it would not; `Auto`/`0` is untouched (today's behaviour, unblocked).
     #[test]
-    fn gui_scale_explicit_request_is_blocked_below_1024x768_logical() {
-        assert_eq!(gui_scale(2.0, Some(0), (1200, 800)), 2, "Auto is never blocked");
-        assert_eq!(gui_scale(2.0, Some(2), (2560, 1600)), 2, "2x of a large window fits, used as requested");
-        assert_eq!(gui_scale(2.0, Some(2), (1600, 1200)), 1, "2x of 1600x1200 would be 800x600 logical: falls back to 1x");
-        assert_eq!(gui_scale(2.0, Some(3), (2560, 1600)), 2, "3x of 2560x1600 would be 853x533: falls back until it fits");
-        assert_eq!(gui_scale(2.0, Some(1), (200, 200)), 1, "a window too small for even 1x stays at 1x (best available)");
+    fn gui_scale_honours_explicit_requests_regardless_of_viewport() {
+        assert_eq!(gui_scale(2.0, Some(0), (1200, 800)), 2);
+        for scale in [1, 2, 3] {
+            assert_eq!(gui_scale(2.0, Some(scale), (5120, 1440)), u32::from(scale));
+        }
+        assert_eq!(gui_scale(2.0, Some(2), (1600, 1200)), 2);
+        assert_eq!(gui_scale(2.0, Some(3), (2560, 1600)), 3);
+        assert_eq!(gui_scale(2.0, Some(1), (200, 200)), 1);
     }
 
     /// Trackpad fix: a gesture sent as many small `PixelDelta` events (each well under one 40 px notch) must still

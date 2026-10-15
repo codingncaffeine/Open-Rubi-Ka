@@ -40,7 +40,7 @@ pub struct DrawList {
     pub cmds: Vec<DrawCmd>,
 }
 
-/// Single-page 8-bit coverage atlas for rasterised glyphs (grown on demand by the engine).
+/// Single-page 8-bit coverage atlas for rasterised glyphs.
 pub struct GlyphAtlas {
     pub width: u32,
     pub height: u32,
@@ -56,6 +56,14 @@ impl GlyphAtlas {
     pub fn new() -> Self {
         let (w, h) = (1024, 1024);
         Self { width: w, height: h, data: vec![0; (w * h) as usize], version: 1, x: 1, y: 1, row_h: 0 }
+    }
+    /// Reclaims rasterization-mode-specific glyphs without reallocating the GPU-sized page.
+    pub fn clear(&mut self) {
+        self.data.fill(0);
+        self.x = 1;
+        self.y = 1;
+        self.row_h = 0;
+        self.version += 1;
     }
     /// Stores a `w × h` coverage bitmap and returns its origin; `None` when the page is full.
     pub fn alloc(&mut self, w: u32, h: u32, bits: &[u8]) -> Option<(u32, u32)> {

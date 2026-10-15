@@ -145,10 +145,10 @@ pub struct Gui {
     /// aomac Enhanced "Anti-aliased Text" cache (not retail, audit item 13): keyed by `text_scale` too, since a
     /// changed backing scale needs its glyphs re-rasterized ([`Font::glyph_scaled`]) and re-atlased.
     glyph_map: HashMap<(FontId, char, u8), GlyphSrc>,
-    /// Backing-scale multiplier TrueType glyphs are rasterized at for anti-aliasing (aomac Enhanced option, not
-    /// retail, audit item 13); 1 = retail's hinted 1-bit bitmap, matching every default. Set by the frontend
-    /// through [`Gui::set_text_scale`] from the window's current physical-pixels-per-GUI-pixel ratio.
+    /// Physical pixels per GUI pixel for TrueType rasterization; AA is selected independently so it also
+    /// works at 1x. Bitmap fonts always retain retail rasterization.
     text_scale: u8,
+    text_smooth: bool,
     localize: Localize,
     mouse: Point,
     hover: Option<ViewId>,
@@ -236,6 +236,7 @@ impl Gui {
             glyphs: GlyphAtlas::new(),
             glyph_map: HashMap::new(),
             text_scale: 1,
+            text_smooth: false,
             localize: localize.unwrap_or_else(|| Box::new(|_| None)),
             mouse: Point::default(),
             hover: None,
@@ -278,12 +279,16 @@ impl Gui {
     pub fn glyph_atlas(&self) -> &GlyphAtlas {
         &self.glyphs
     }
-    /// aomac Enhanced "Anti-aliased Text" (not retail, audit item 13, opt-in): `scale` is the window's current
-    /// physical-pixels-per-GUI-pixel ratio TrueType glyphs will be rasterized at ([`Font::glyph_scaled`]); the
-    /// frontend calls this once per frame from the Enhanced option and the live backing scale. 1 = retail's
-    /// hinted 1-bit bitmap (the default, matching every unset option); bitmap fonts are never affected.
-    pub fn set_text_scale(&mut self, scale: u8) {
-        self.text_scale = scale.max(1);
+    /// Enhanced AA text: rasterize at the physical-pixels-per-GUI-pixel `scale`, even at 1x.
+    /// With `smooth` off, retain retail 1-bit glyphs. Bitmap fonts are never affected.
+    pub fn set_text_scale(&mut self, scale: u8, smooth: bool) {
+        let scale = if smooth { scale.max(1) } else { 1 };
+        if self.text_scale != scale || self.text_smooth != smooth {
+            self.text_scale = scale;
+            self.text_smooth = smooth;
+            self.glyph_map.clear();
+            self.glyphs.clear();
+        }
     }
     pub fn fonts(&mut self) -> &mut FontSystem {
         &mut self.fonts
@@ -1181,12 +1186,12 @@ impl Gui {
 
     /// Returns the atlas region and the effective rasterization scale ([`Font::glyph_scaled`]) a renderer needs to
     /// divide the atlas region back down by to get the logical destination box (aomac Enhanced "Anti-aliased
-    /// Text", audit item 13; `self.text_scale` 1 is always 1 here too, byte-identical to the pre-item-13 cache).
+    /// Text", opt-in; AA off remains byte-identical to the retail cache).
     fn glyph_src(&mut self, font: FontId, ch: char) -> Option<([u16; 4], u8)> {
         if let Some(c) = self.glyph_map.get(&(font, ch, self.text_scale)) {
             return *c;
         }
-        let (g, scale) = self.fonts.font(font).glyph_scaled(ch, self.text_scale);
+        let (g, scale) = self.fonts.font(font).glyph_scaled(ch, self.text_scale, self.text_smooth);
         let g = g.clone();
         let src = if g.width > 0 && g.height > 0 && g.bits.iter().any(|b| *b != 0) {
             let cov: Vec<u8> = g.bits.iter().map(|b| if *b > 1 { *b } else if *b == 1 { 255 } else { 0 }).collect();
@@ -2492,6 +2497,31 @@ fn delete_selection(t: &mut TextData) -> bool {
 #[cfg(test)]
 mod clip_tests {
     use super::*;
+
+    #[test]
+    fn anti_aliased_text_at_one_x_reclaims_the_atlas_on_live_changes() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let advance = gui.text_width(FontId::Normal, "A");
+        gui.glyph_src(FontId::Normal, 'A').unwrap();
+        assert!(gui.glyphs.data.iter().all(|&b| b == 0 || b == 255));
+        for (scale, smooth) in [(1, true), (2, true), (3, true), (1, false), (1, true)] {
+            let version = gui.glyphs.version;
+            gui.set_text_scale(scale, smooth);
+            assert!(gui.glyph_map.is_empty());
+            assert!(gui.glyphs.data.iter().all(|&b| b == 0));
+            assert!(gui.glyphs.version > version, "clearing must trigger a GPU upload");
+            let (_, effective) = gui.glyph_src(FontId::Normal, 'A').unwrap();
+            assert_eq!(effective, scale);
+            assert_eq!(gui.text_width(FontId::Normal, "A"), advance);
+            assert_eq!(gui.glyphs.data.iter().any(|&b| b > 0 && b < 255), smooth);
+            assert_eq!(gui.glyph_src(FontId::Shell, 'A').unwrap().1, 1);
+            let version = gui.glyphs.version;
+            gui.set_text_scale(scale, smooth);
+            assert_eq!(gui.glyphs.version, version, "unchanged frames must retain the atlas");
+        }
+    }
 
     #[test]
     fn nested_clips_intersect_and_restore_empty_intersections() {

@@ -1238,11 +1238,7 @@ impl Frontend for Play {
             self.interface_scale = hud.dvalues.get_i64("AomacInterfaceScale").unwrap_or(0).clamp(0, 3) as u8;
             host.borderless_game = hud.dvalues.flag("AomacBorderlessFullscreen");
             host.pinch_zoom = hud.dvalues.flag("AomacPinchZoom");
-            // Audit item 13, not retail, opt-in: rasterize TrueType glyphs at the real window backing scale with
-            // real coverage antialiasing instead of retail's hinted 1-bit bitmap; bitmap fonts are unaffected
-            // regardless (`Font::glyph_scaled`). Off (1) reproduces retail exactly.
-            let smooth_text = hud.dvalues.flag("AomacSmoothText");
-            self.gui.set_text_scale(if smooth_text { host.window_scale.clamp(1, 8) as u8 } else { 1 });
+            self.smooth_text = hud.dvalues.flag("AomacSmoothText");
             // Audit item 11, not retail, opt-in: relights every pixel with the same D3D7 light-accumulation formula
             // the vertex shader already uses (`shader.wgsl`'s `shade`/`light_vertex_sun`). Off (default) reproduces
             // retail's per-vertex lighting exactly.
@@ -1250,6 +1246,8 @@ impl Frontend for Play {
         }
         // audit item 2: every screen, including the login screen before any HUD exists.
         host.interface_scale = Some(self.interface_scale);
+        // Apply saved text preferences to login/character screens too; AA is independent of GUI scale.
+        self.gui.set_text_scale(host.window_scale.clamp(1, 8) as u8, self.smooth_text);
         if let Some((life, models)) = &mut self.world_life {
             life.set_enabled(self.wildlife_enabled);
             if !self.wildlife_enabled { models.clear(); }

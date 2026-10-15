@@ -13,6 +13,19 @@ fn nano_audio_logs_oneshots_and_refusals_not_successful_rearms() {
 }
 
 #[test]
+fn anti_aliased_text_applies_on_login_without_a_hud() {
+    let Some(mut r) = rig() else { return };
+    assert!(r.p.hud.is_none());
+    r.host.window_scale = 1;
+    r.p.smooth_text = true;
+    r.p.frame(0.016, (1280, 800), &mut r.host);
+    assert!(r.p.gui.glyph_atlas().data.iter().any(|&b| b > 0 && b < 255));
+    r.p.smooth_text = false;
+    r.p.frame(0.016, (1280, 800), &mut r.host);
+    assert!(r.p.gui.glyph_atlas().data.iter().all(|&b| b == 0 || b == 255));
+}
+
+#[test]
 fn ground_texture_refresh_discards_superseded_worker_results() {
     let Some(mut r) = rig() else { return };
     r.p.screen = Screen::InWorld;

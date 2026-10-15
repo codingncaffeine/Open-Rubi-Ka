@@ -112,27 +112,27 @@ impl Font {
         if !self.cache.contains_key(&ch) {
             let g = match &self.kind {
                 Kind::Bitmap(b) => b.glyph(ch),
-                Kind::Tt(t) => t.glyph(ch, 1),
+                Kind::Tt(t) => t.glyph(ch, 1, false),
             };
             self.cache.insert(ch, g);
         }
         &self.cache[&ch]
     }
-    /// aomac Enhanced "Anti-aliased Text" (not retail, audit item 13, opt-in): the glyph rasterized `scale`x
-    /// bigger with real coverage antialiasing instead of 1-bit hinting ([`TtFont::glyph`]'s `scale` parameter).
-    /// Bitmap fonts (tooltips, shell, chat, name tags) always stay pixel art at scale 1 regardless of the
-    /// option, since only `Kind::Tt` honours `scale` > 1. Returns the *effective* scale used, so the caller
+    /// aomac Enhanced "Anti-aliased Text" (not retail, opt-in): when `smooth`, rasterize real coverage at
+    /// `scale` physical pixels per GUI pixel, including at 1x.
+    /// Bitmap fonts (tooltips, shell and clock) always stay pixel art at scale 1 regardless of the
+    /// option. Returns the *effective* scale used, so the caller
     /// can size the destination box back down from the bigger atlas bitmap (physical source, logical
     /// destination) -- the retail-hinted advance (`Font::advance`) never depends on `scale`, so text layout
     /// is unchanged.
-    pub fn glyph_scaled(&mut self, ch: char, scale: u8) -> (&Glyph, u8) {
-        let scale = match &self.kind { Kind::Bitmap(_) => 1, Kind::Tt(_) => scale.max(1) };
-        if scale <= 1 {
+    pub fn glyph_scaled(&mut self, ch: char, scale: u8, smooth: bool) -> (&Glyph, u8) {
+        if !smooth || matches!(&self.kind, Kind::Bitmap(_)) {
             return (self.glyph(ch), 1);
         }
+        let scale = scale.max(1);
         if !self.aa_cache.contains_key(&(ch, scale)) {
-            let Kind::Tt(t) = &self.kind else { unreachable!("scale > 1 is forced to 1 for Kind::Bitmap above") };
-            let g = t.glyph(ch, scale);
+            let Kind::Tt(t) = &self.kind else { unreachable!("bitmap fonts return above") };
+            let g = t.glyph(ch, scale, true);
             self.aa_cache.insert((ch, scale), g);
         }
         (&self.aa_cache[&(ch, scale)], scale)
@@ -316,14 +316,10 @@ impl TtFont {
         Ok(Self { data, ppem: ppem as f32, hint, ascent, descent, cell_height: ascent + descent, hdmx })
     }
 
-    /// `scale` 1 reproduces the retail 1-bit hinted bitmap exactly (same `self.hint` instance, same `Flatten::fill`,
-    /// byte-identical to the pre-item-13 implementation). `scale` > 1 is the aomac Enhanced "Anti-aliased Text"
-    /// option (not retail, audit item 13, opt-in): a *bigger* bitmap (physical atlas source) rasterized with real
-    /// coverage antialiasing ([`Flatten::fill_aa`]) at a fresh hinting instance for `ppem * scale`, same interpreter
-    /// engine as retail, just more detail. `advance`/`cell_height`/`ascent` stay the retail-hinted LOGICAL values
-    /// (never multiplied by `scale`): callers divide the bigger bitmap's width/height back down by `scale` to get
-    /// the logical destination box, so text layout is unaffected either way.
-    fn glyph(&self, ch: char, scale: u8) -> Glyph {
+    /// Without `smooth`, reproduces the retail 1-bit hinted bitmap exactly. The opt-in Enhanced AA path
+    /// uses real coverage even at scale 1, while retaining retail logical advances and cell dimensions.
+    /// Callers divide the physical bitmap dimensions by `scale`, so layout is unaffected.
+    fn glyph(&self, ch: char, scale: u8, smooth: bool) -> Glyph {
         let font = FontRef::new(&self.data).expect("validated in new");
         let ch = if ch == '\t' { ' ' } else { ch };
         let gid = font.charmap().map(ch).unwrap_or_default();
@@ -336,7 +332,7 @@ impl TtFont {
             font.glyph_metrics(Size::new(self.ppem), LocationRef::default()).advance_width(gid).unwrap_or(0.0).round() as i32
         });
         let outlines = font.outline_glyphs();
-        if scale <= 1 {
+        if !smooth {
             let mut pen = Flatten::default();
             if let Some(g) = outlines.get(gid) {
                 let _ = g.draw(DrawSettings::hinted(&self.hint, false), &mut pen);
@@ -526,24 +522,23 @@ mod tests {
         // Windows: Verdana at lfHeight 13 is the classic 8pt (11 ppem) face, tmHeight 13.
         assert_eq!(f.ppem as i32, 11);
         assert_eq!(f.cell_height, 13);
-        let g = f.glyph('L', 1);
+        let g = f.glyph('L', 1, false);
         println!("{}\nadv {}", dump(&g), g.advance);
         assert!(g.bits.iter().any(|b| *b != 0));
-        let l = f.glyph('l', 1);
+        let l = f.glyph('l', 1, false);
         println!("{}", dump(&l));
     }
 
     #[test]
     fn anti_aliased_text_scales_the_bitmap_not_the_advance() {
-        // audit item 13: `scale` 1 must be exactly today's retail hinted 1-bit bitmap; `scale` > 1 (the aomac
-        // Enhanced "Anti-aliased Text" option) must rasterize a bigger bitmap with real (non-binary) coverage,
-        // while the retail-hinted advance/cell height -- what drives text layout -- never changes with scale.
+        // AA is independent of GUI scale; all modes preserve the retail layout.
         let Some(dir) = find_verdana_dir() else { return };
-        let f = TtFont::new(&dir, "Verdana", 13, false, false).unwrap();
-        let retail = f.glyph('A', 1);
-        assert!(retail.bits.iter().all(|&b| b == 0 || b == 1), "scale 1 must stay the retail 1-bit bitmap");
-        for scale in [2u8, 3] {
-            let aa = f.glyph('A', scale);
+        let mut font = Font { kind: Kind::Tt(TtFont::new(&dir, "Verdana", 13, false, false).unwrap()), cache: HashMap::new(), aa_cache: HashMap::new(), height: 13, space: 0 };
+        let retail = font.glyph_scaled('A', 1, false).0.clone();
+        assert!(retail.bits.iter().all(|&b| b == 0 || b == 1), "AA off must stay the retail 1-bit bitmap");
+        for scale in [1u8, 2, 3] {
+            let (aa, effective) = font.glyph_scaled('A', scale, true);
+            assert_eq!(effective, scale);
             assert_eq!(aa.advance, retail.advance, "scale must never change the retail-hinted advance (layout)");
             assert_eq!(aa.height, retail.height * i32::from(scale), "the AA bitmap must be `scale`x the logical cell height");
             assert!(aa.width >= retail.width * i32::from(scale) - i32::from(scale), "the AA bitmap must be about `scale`x the logical width");
