@@ -145,7 +145,11 @@ fn icc_sky_layer_screenshots() -> anyhow::Result<()> {
 /// One landmark-inferred view of the user's current-client screenshot, not retail visual proof.
 /// `AOMAC_SHOT_DIR=/tmp/icc-retail cargo test --release -p aomac icc_retail_sky_screenshots -- --nocapture`
 /// Optional scene-space calibration: AOMAC_SKY_EYE=x,y,z; AOMAC_SKY_YAW/PITCH (radians);
-/// AOMAC_SKY_TIME (game seconds), AOMAC_SKY_WIDE=0|1. Reuse identical values before/after.
+/// AOMAC_SKY_TIME (game seconds), AOMAC_SKY_WIDE=0|1, AOMAC_SKY_SIZE=widthxheight, AOMAC_SKY_FAR (metres);
+/// AOMAC_SKY_SHOTS=all|combined|world|dry|sky|layers|layerNN|omitNN|throughNN.
+/// `omitNN` removes one layer from combined; `throughNN` draws sky layers 0..=NN.
+/// AOMAC_SKY_PIXELS=x,y;x,y probes SingleCloud layer17 in combined/through17 captures.
+/// AOMAC_SKY_PROBE_FAR overrides only the diagnostic projection, retaining rendered GPU geometry.
 #[test]
 fn icc_retail_sky_screenshots() -> anyhow::Result<()> {
     use std::fmt::Write;
@@ -173,11 +177,44 @@ fn icc_retail_sky_screenshots() -> anyhow::Result<()> {
     anyhow::ensure!((0.0..6480.0).contains(&time), "AOMAC_SKY_TIME must be in 0..6480");
     let wide = scalar("AOMAC_SKY_WIDE", 0.0)?;
     anyhow::ensure!(wide == 0.0 || wide == 1.0, "AOMAC_SKY_WIDE must be 0 or 1");
+    let size = std::env::var("AOMAC_SKY_SIZE").unwrap_or_else(|_| "2090x1083".into());
+    let (width, height) = size.split_once('x')
+        .ok_or_else(|| anyhow::anyhow!("AOMAC_SKY_SIZE must be widthxheight"))?;
+    let size = (width.parse::<u32>()?, height.parse::<u32>()?);
+    anyhow::ensure!(size.0 > 0 && size.1 > 0, "AOMAC_SKY_SIZE dimensions must be positive");
+    let shots = std::env::var("AOMAC_SKY_SHOTS").unwrap_or_else(|_| "all".into());
+    let mut pixels = Vec::new();
+    if let Ok(value) = std::env::var("AOMAC_SKY_PIXELS") {
+        anyhow::ensure!(matches!(shots.as_str(), "combined" | "through17"),
+            "AOMAC_SKY_PIXELS requires AOMAC_SKY_SHOTS=combined or through17");
+        for pixel in value.split(';') {
+            let (x, y) = pixel.split_once(',')
+                .ok_or_else(|| anyhow::anyhow!("AOMAC_SKY_PIXELS must be x,y;x,y"))?;
+            let pixel = (x.parse::<u32>()?, y.parse::<u32>()?);
+            anyhow::ensure!(pixel.0 < size.0 && pixel.1 < size.1, "AOMAC_SKY_PIXELS must be inside the capture");
+            pixels.push(pixel);
+        }
+    }
+    let probe_far = if std::env::var_os("AOMAC_SKY_PROBE_FAR").is_some() {
+        anyhow::ensure!(!pixels.is_empty(), "AOMAC_SKY_PROBE_FAR requires AOMAC_SKY_PIXELS");
+        Some(scalar("AOMAC_SKY_PROBE_FAR", 0.0)?)
+    } else {
+        None
+    };
     let store = ao_rdb::RecordStore::open(&dir)?;
     let scene = ao_formats::playfield::load_playfield_at(&store, &dir, 4582, time)?;
     assert!(!scene.sky.is_empty(), "ICC must supply authored sky layers");
+    anyhow::ensure!(
+        matches!(shots.as_str(), "all" | "combined" | "world" | "dry" | "sky" | "layers")
+            || (0..scene.sky.len()).any(|i| {
+                ["layer", "omit", "through"].iter().any(|prefix| shots == format!("{prefix}{i:02}"))
+            }),
+        "AOMAC_SKY_SHOTS must be all, combined, world, dry, sky, layers, or existing layerNN/omitNN/throughNN",
+    );
     let mut lens = camera::lens(scene.lens.unwrap_or_default(), wide == 1.0);
-    lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
+    let far = scalar("AOMAC_SKY_FAR", camera::far_plane(camera::VIEW_DISTANCE))?;
+    anyhow::ensure!(far > lens.near, "AOMAC_SKY_FAR must be greater than the near plane");
+    lens.far = Some(far);
     let mut shot = Shot {
         gui: Gui::new(&dir, None)?,
         scene: None,
@@ -185,25 +222,26 @@ fn icc_retail_sky_screenshots() -> anyhow::Result<()> {
         lens,
     };
     let mut report = format!(
-        "reference=user current-client Screenshot 2026-10-15 at 16.50.21.png (NOT retail visual proof)\nsize=2090x1083\ncamera=INFERRED, not recovered from screenshot\n\
+        "reference=user current-client screenshot (NOT retail visual proof)\nsize={}x{}\ncamera=INFERRED, not recovered from screenshot\n\
          eye={eye:?} yaw={yaw} pitch={pitch} direction={:?} lens={lens:?}\n\
          time={time} (game seconds, NOT screenshot/chat wall time)\n\
          default_camera_source=offscreen landmark calibration camera-view-i; initial area located from docs/zone/camera.md ICC idle capture\n\
          default_camera_residuals_approx_pixels= wreck_mast(-3,+3), shuttle_antenna(-5,0), overhang_right_edge(+7,0)\n\
          default_camera_limit=foreground grass/shoreline differs; no exact camera or saved preferences recovered\n\
-         screenshot_landmarks=left sea wreck; raised shuttle right; grass beach; overhang upper-left\n\
+         default_camera_landmarks=left sea wreck; raised shuttle right; grass beach; overhang upper-left\n\
          native_ICC_game_time=2648.69, authored FrozenTime override via FXS duplicate-object replacement; independent of wall16:50\n\
          scene_environment={:?}\n\
          Combined frame contains installed static playfield and sky, not captured avatar/NPCs/HUD.\n",
-        shot.camera.forward(), scene.environment,
+        size.0, size.1, shot.camera.forward(), scene.environment,
     );
     let names = ao_formats::character::NameTable::load(&store)?;
     let tweaks = ao_formats::playfield::Tweaks::load(&dir, 4582, true)
         .ok_or_else(|| anyhow::anyhow!("missing ICC tweaks"))?;
     let objects = tweaks.objects();
-    writeln!(report, "\nAuthored pre-render objects (including objects hidden at this game time):")?;
+    writeln!(report, "\nAuthored pre-render and mesh objects (including objects hidden at this game time):")?;
     for (index, object) in objects.iter().enumerate().filter(|(_, o)| {
         o.field("Priority").is_some_and(|p| p.trim() == "e_RenderPriority_PreRendering")
+            || o.string("Mesh").is_some()
     }) {
         let mesh = object.string("Mesh");
         let record = mesh.and_then(|name| names.id(ao_formats::mesh::MESH_TYPE, name));
@@ -211,11 +249,46 @@ fn icc_retail_sky_screenshots() -> anyhow::Result<()> {
             object.name, object.fxid(), object.texture, object.field("Sorting"), object.field("Visibility"), object.states)?;
         writeln!(report, "  authored fields={:?}", object.fields)?;
     }
-    let mut off = Offscreen::new(&shot, (2090, 1083))?;
+    writeln!(report, "\nNative liquid surfaces: count={}", scene.liquids.len())?;
+    for (index, surface) in scene.liquids.iter().enumerate() {
+        let mesh = &scene.meshes[surface.mesh];
+        writeln!(report, "liquid{index}: mesh={} style={} vertices={}",
+            surface.mesh, surface.style, mesh.vertices.len())?;
+        for (material, submesh) in mesh.submeshes.iter().enumerate() {
+            writeln!(report, "  material{material}: liquid={} texture={:?} indices={}",
+                submesh.liquid, submesh.texture, submesh.indices.len())?;
+        }
+    }
+    let mut off = Offscreen::new(&shot, size)?;
     std::fs::create_dir_all(&out)?;
-    shot.scene = Some(scene.clone());
-    let list = off.frame(&mut shot, 0.0);
-    off.png(&shot, &list, &out.join("icc-retail-combined.png"))?;
+    if matches!(shots.as_str(), "all" | "combined") {
+        shot.scene = Some(scene.clone());
+        let list = off.frame(&mut shot, 0.0);
+        off.png(&shot, &list, &out.join("icc-retail-combined.png"))?;
+    }
+    if matches!(shots.as_str(), "all" | "world") {
+        let mut world_only = scene.clone();
+        for instance in &scene.sky {
+            world_only.meshes[instance.mesh].submeshes.clear();
+        }
+        shot.scene = Some(world_only);
+        let list = off.frame(&mut shot, 0.0);
+        off.png(&shot, &list, &out.join("icc-retail-world.png"))?;
+    }
+    if matches!(shots.as_str(), "all" | "dry") {
+        let mut dry = scene.clone();
+        dry.liquids.clear();
+        for mesh in &mut dry.meshes {
+            for submesh in &mut mesh.submeshes {
+                if submesh.liquid {
+                    submesh.indices.clear();
+                }
+            }
+        }
+        shot.scene = Some(dry);
+        let list = off.frame(&mut shot, 0.0);
+        off.png(&shot, &list, &out.join("icc-retail-dry.png"))?;
+    }
     // Keep instance indices and animation metadata intact. Empty world draw geometry rather
     // than removing instances that movers/LOD reference.
     let mut sky_only = scene.clone();
@@ -226,9 +299,26 @@ fn icc_retail_sky_screenshots() -> anyhow::Result<()> {
             mesh.submeshes.clear();
         }
     }
-    shot.scene = Some(sky_only.clone());
-    let list = off.frame(&mut shot, 0.0);
-    off.png(&shot, &list, &out.join("icc-retail-sky.png"))?;
+    if matches!(shots.as_str(), "all" | "sky") {
+        shot.scene = Some(sky_only.clone());
+        let list = off.frame(&mut shot, 0.0);
+        off.png(&shot, &list, &out.join("icc-retail-sky.png"))?;
+    }
+    for (prefix, cumulative) in [("omit", false), ("through", true)] {
+        if let Some(ordinal) = shots.strip_prefix(prefix) {
+            let ordinal = ordinal.parse::<usize>()?;
+            let mut probe = if cumulative { sky_only.clone() } else { scene.clone() };
+            for (index, instance) in scene.sky.iter().enumerate() {
+                let remove = if cumulative { index > ordinal } else { index == ordinal };
+                if remove {
+                    probe.meshes[instance.mesh].submeshes.clear();
+                }
+            }
+            shot.scene = Some(probe);
+            let list = off.frame(&mut shot, 0.0);
+            off.png(&shot, &list, &out.join(format!("icc-retail-{shots}.png")))?;
+        }
+    }
     for (ordinal, instance) in scene.sky.iter().enumerate() {
         let mesh = &scene.meshes[instance.mesh];
         let (lo, hi) = mesh.vertices.iter().fold(
@@ -256,6 +346,9 @@ fn icc_retail_sky_screenshots() -> anyhow::Result<()> {
                 submesh.texture, submesh.blend, submesh.base_color, submesh.emissive,
                 submesh.sky_fog, submesh.sky_fog_color, submesh.indices.len())?;
         }
+        if !matches!(shots.as_str(), "all" | "layers") && shots != format!("layer{ordinal:02}") {
+            continue;
+        }
         let mut isolated = sky_only.clone();
         for (index, other) in scene.sky.iter().enumerate() {
             if index != ordinal {
@@ -266,6 +359,9 @@ fn icc_retail_sky_screenshots() -> anyhow::Result<()> {
         shot.scene = Some(isolated);
         let list = off.frame(&mut shot, 0.0);
         off.png(&shot, &list, &out.join(format!("icc-retail-layer{ordinal:02}.png")))?;
+    }
+    if !pixels.is_empty() {
+        writeln!(report, "\n{}", off.sky_pixel_probe(17, &pixels, &scene, probe_far)?)?;
     }
     std::fs::write(out.join("icc-retail-objects.txt"), &report)?;
     eprintln!("{report}");

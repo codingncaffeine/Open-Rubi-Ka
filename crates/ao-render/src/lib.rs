@@ -11,6 +11,7 @@ mod native_ground;
 mod native_texture;
 mod native_liquid;
 mod gpu_stats;
+mod sky_probe;
 use gpu_stats::{GpuStatsExt, TextureViewStatsExt};
 pub use native_ground::GroundPath;
 

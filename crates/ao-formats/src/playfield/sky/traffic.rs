@@ -125,7 +125,7 @@ pub fn emit(objs: &[Obj], o: &Obj, store: &RecordStore, names: &NameTable, scene
         None => {
             let mut tmp = Scene::default();
             let Some(id) = names.id(MESH_TYPE, name) else { return };
-            if !matches!(decode_generic_mesh(store, id, index, false, &mut tmp), Ok(Some(_))) {
+            if !matches!(decode_generic_mesh(store, id, index, false, &super::layers::mesh_states(o), &mut tmp), Ok(Some(_))) {
                 return;
             }
             let Some(m) = tmp.meshes.pop() else { return };

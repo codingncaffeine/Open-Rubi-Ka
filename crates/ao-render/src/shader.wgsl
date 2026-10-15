@@ -335,12 +335,17 @@ fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
     return vec4<f32>(rgb, a);
 }
 
-// Sky: prelit vertex colour; optional source fog precedes the native blend equation.
-fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
+// Shared by the opt-in GPU pixel probe: never reconstruct cloud UVs on the CPU.
+fn sky_uv(i: VOut) -> vec2<f32> {
     let wu = u32(mat.wave.x);
     let wv = u32(mat.wave.z);
     let wobble = vec2<f32>(mat.wave.y * g.wave[wu >> 2u][wu & 3u], mat.wave.w * g.wave[wv >> 2u][wv & 3u]);
-    let t = sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z + wobble);
+    return i.uv + mat.scroll.xy * g.fog.z + wobble;
+}
+
+// Sky: prelit vertex colour; optional source fog precedes the native blend equation.
+fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
+    let t = sample_clamped(tex, sky_uv(i));
     let alpha = t.a * i.color.a * mat.color.a;
     let a2c = g.fog.w > 0.5; // audit item 4, see `shade`
     if mode == 1u && !a2c && alpha < 0.5 {

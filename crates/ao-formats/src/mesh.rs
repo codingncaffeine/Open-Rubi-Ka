@@ -71,6 +71,7 @@ pub fn load_animated_mesh(store: &RecordStore, id: u32) -> Result<Option<(Scene,
                 ar, mesh: Mesh::default(), groups: HashMap::new(), have_texture: &mut textures,
                 visited: vec![], object_space: true, overrides: &[], slot: 0, last_tex: None,
                 generic_materials: &[],
+                object_states: &[],
             };
             let state = node.ref1("delta_state").and_then(|i| ar.objects.get(i));
             for mesh in ar.objects[data].refs("mesh") {
@@ -126,7 +127,7 @@ pub fn decode_statel_mesh(store: &RecordStore, rdb_type: u32, id: u32, overrides
 /// DisplaySystem's case-4 visual starts as `rock01.abiff` (1010001/36067).
 /// `SetTriMeshData` retains that visual's animation frame; `Init` with `MeshIndex`
 /// instead installs the selected data's frame (10063188, 100616e4, 1005e716).
-pub(crate) fn decode_generic_mesh(store: &RecordStore, id: u32, index: Option<usize>, camera_locked: bool, scene: &mut Scene) -> Result<Option<usize>> {
+pub(crate) fn decode_generic_mesh(store: &RecordStore, id: u32, index: Option<usize>, camera_locked: bool, object_states: &[(i32, i32)], scene: &mut Scene) -> Result<Option<usize>> {
     let Some(bytes) = store.get(MESH_TYPE, id)? else { return Ok(None) };
     let ar = Archive::parse(&bytes)?;
     let root = store.get(MESH_TYPE, 36067)?.context("missing GenericMeshObject factory mesh 1010001/36067")?;
@@ -140,7 +141,7 @@ pub(crate) fn decode_generic_mesh(store: &RecordStore, id: u32, index: Option<us
         }
         scene.textures.contains_key(&key)
     };
-    let mesh = generic_mesh_archive(&ar, default, index, camera_locked, &mut textures)?;
+    let mesh = generic_mesh_archive(&ar, default, index, camera_locked, object_states, &mut textures)?;
     scene.meshes.push(mesh);
     Ok(Some(scene.meshes.len() - 1))
 }
@@ -152,7 +153,7 @@ fn mesh_animation_matrix(data: &Object) -> Result<Mat> {
     Ok(frame_matrix(rotation, position, 1.0))
 }
 
-fn generic_mesh_archive(ar: &Archive, default: &Object, index: Option<usize>, camera_locked: bool, have_texture: &mut dyn FnMut(TextureKey) -> bool) -> Result<Mesh> {
+fn generic_mesh_archive(ar: &Archive, default: &Object, index: Option<usize>, camera_locked: bool, object_states: &[(i32, i32)], have_texture: &mut dyn FnMut(TextureKey) -> bool) -> Result<Mesh> {
     let mut nodes = Vec::new();
     fn collect(ar: &Archive, i: usize, nodes: &mut Vec<usize>, visited: &mut [bool], depth: usize) -> Result<()> {
         ensure!(depth < MAX_DEPTH, "frame tree too deep");
@@ -182,6 +183,7 @@ fn generic_mesh_archive(ar: &Archive, default: &Object, index: Option<usize>, ca
         ar, mesh: Mesh::default(), groups: HashMap::new(), have_texture,
         visited: vec![], object_space: true, overrides: &[], slot: 0, last_tex: None,
         generic_materials: &generic_materials,
+        object_states,
     };
     for &i in selected {
         let node = &ar.objects[i];
@@ -344,6 +346,8 @@ struct Builder<'a, 'b> {
     last_tex: Option<TextureKey>,
     /// Material identities reset by DisplaySystem's generic resource loader10061505.
     generic_materials: &'b [usize],
+    /// StateBlob is installed before node/material deltas (DS1005c334, Randy1004b199).
+    object_states: &'b [(i32, i32)],
 }
 
 fn decode_archive(bytes: &[u8], object_space: bool, have_texture: impl FnMut(TextureKey) -> bool) -> Result<Mesh> {
@@ -363,6 +367,7 @@ fn decode_archive_with(bytes: &[u8], object_space: bool, overrides: &[(u32, u32)
         slot: 0,
         last_tex: inherited,
         generic_materials: &[],
+        object_states: &[],
     };
     b.node(ar.root, &IDENTITY, 0)?;
     b.mesh.submeshes.retain(|s| !s.indices.is_empty());
@@ -402,7 +407,10 @@ impl Builder<'_, '_> {
         let generic = sm.ref1("material").is_some_and(|i| self.generic_materials.contains(&i));
         let mat_ds = mat.and_then(|m| m.ref1("delta_state")).and_then(|d| objs.get(d));
         let state = |ty: i32| {
-            [mat_ds, node_ds].into_iter().flatten().find_map(|ds| ds.all("rst_type").zip(ds.all("rst_value")).filter(|&(t, _)| le(t) == Some(ty)).last().and_then(|(_, v)| le(v)))
+            [mat_ds, node_ds].into_iter().flatten().find_map(|ds| {
+                ds.all("rst_type").flat_map(|v| v.as_chunks::<4>().0.iter()).zip(ds.all("rst_value").flat_map(|v| v.as_chunks::<4>().0.iter()))
+                    .filter(|&(t, _)| le(t) == Some(ty)).last().and_then(|(_, v)| le(v))
+            }).or_else(|| self.object_states.iter().rev().find(|&&(t, _)| t == ty).map(|&(_, v)| v))
         };
         let mut tex = None;
         for ds in [node_ds, mat_ds].into_iter().flatten() {
@@ -429,10 +437,13 @@ impl Builder<'_, '_> {
             Blend::AlphaTest
         } else if state(D3DRS_ALPHABLENDENABLE) == Some(1) {
             let src = state(D3DRS_SRCBLEND);
-            if state(D3DRS_DESTBLEND) == Some(D3DBLEND_ONE) && matches!(src, Some(D3DBLEND_ONE | D3DBLEND_SRCALPHA)) {
-                Blend::Additive
-            } else {
-                Blend::AlphaBlend
+            match (src.unwrap_or(D3DBLEND_SRCALPHA), state(D3DRS_DESTBLEND).unwrap_or(6)) {
+                (3, 2) => Blend::SourceColorOne,
+                (D3DBLEND_ONE | D3DBLEND_SRCALPHA, D3DBLEND_ONE) => Blend::Additive,
+                (1, 3) => Blend::ZeroSourceColor,
+                (9, 3) => Blend::DestinationColorSourceColor,
+                (D3DBLEND_ONE, 6) => Blend::PremultipliedAlpha,
+                _ => Blend::AlphaBlend,
             }
         } else {
             Blend::Opaque
@@ -647,9 +658,9 @@ mod tests {
             let data = ar.objects[ar.root].ref1("data").expect("single mesh root");
             let native = mesh_animation_matrix(&ar.objects[data]).unwrap();
             let raw = decode_archive(&bytes, true, |_| false).unwrap();
-            let world = generic_mesh_archive(&ar, default, None, false, &mut |_| false).unwrap();
-            let locked = generic_mesh_archive(&ar, default, None, true, &mut |_| false).unwrap();
-            let selected = generic_mesh_archive(&ar, default, Some(0), false, &mut |_| false).unwrap();
+            let world = generic_mesh_archive(&ar, default, None, false, &[], &mut |_| false).unwrap();
+            let locked = generic_mesh_archive(&ar, default, None, true, &[], &mut |_| false).unwrap();
+            let selected = generic_mesh_archive(&ar, default, Some(0), false, &[], &mut |_| false).unwrap();
             assert_eq!(raw.vertices.len(), world.vertices.len());
             assert_eq!(world.submeshes[0].indices, raw.submeshes[0].indices);
             for (i, v) in raw.vertices.iter().enumerate() {
@@ -668,7 +679,7 @@ mod tests {
                 normal.iter_mut().for_each(|v| *v /= length);
                 close(locked.vertices[i].normal, normal);
             }
-            assert!(generic_mesh_archive(&ar, default, Some(usize::MAX), false, &mut |_| false).is_err());
+            assert!(generic_mesh_archive(&ar, default, Some(usize::MAX), false, &[], &mut |_| false).is_err());
         }
     }
 
@@ -682,7 +693,7 @@ mod tests {
             let raw = decode_archive(&bytes, true, |_| false).unwrap();
             assert_eq!(raw.submeshes[0].emissive, [1.0; 3], "raw archive {id} really authors emissive1");
             let mut scene = Scene::default();
-            let decoded = decode_generic_mesh(&store, id, None, true, &mut scene).unwrap().unwrap();
+            let decoded = decode_generic_mesh(&store, id, None, true, &[], &mut scene).unwrap().unwrap();
             for sub in &scene.meshes[decoded].submeshes {
                 assert_eq!(sub.emissive, [0.0; 3], "10061505 clears first material emission");
                 assert_eq!(sub.specular, [0.0; 3]);
@@ -712,7 +723,7 @@ mod tests {
         ] };
         let mut textures = |_| false;
         let mut builder = Builder { ar: &ar, mesh: Mesh::default(), groups: HashMap::new(), have_texture: &mut textures,
-            visited: vec![], object_space: true, overrides: &[], slot: 0, last_tex: None, generic_materials: &[1] };
+            visited: vec![], object_space: true, overrides: &[], slot: 0, last_tex: None, generic_materials: &[1], object_states: &[] };
         for i in [0, 4] {
             let material = builder.material(None, &ar.objects[i]);
             assert_eq!(material.emissive, [0.0; 3]);
@@ -721,6 +732,33 @@ mod tests {
         let other = builder.material(None, &ar.objects[2]);
         assert_eq!(other.emissive, [0.5f32.powf(2.2); 3], "another material identity must retain its authored properties");
         assert_eq!(other.specular, [0.5f32.powf(2.2); 3]);
+    }
+
+    #[test]
+    fn packed_material_states_override_node_and_object_before_batching() {
+        use crate::archive::Member;
+        let material = 1u32.to_le_bytes();
+        let state = 2u32.to_le_bytes();
+        let types: Vec<u8> = [D3DRS_ALPHABLENDENABLE, D3DRS_CULLMODE].into_iter().flat_map(i32::to_le_bytes).collect();
+        let values: Vec<u8> = [1i32, D3DCULL_NONE].into_iter().flat_map(i32::to_le_bytes).collect();
+        let disabled = 0i32.to_le_bytes();
+        let alpha = D3DRS_ALPHABLENDENABLE.to_le_bytes();
+        let node = Object { members: vec![Member { name: "rst_type", data: &alpha }, Member { name: "rst_value", data: &disabled }] };
+        let ar = Archive { root: 0, animation_ranges: vec![], objects: vec![
+            Object { members: vec![Member { name: "material", data: &material }] },
+            Object { members: vec![Member { name: "delta_state", data: &state }] },
+            Object { members: vec![Member { name: "rst_type", data: &types }, Member { name: "rst_value", data: &values }] },
+        ] };
+        let mut textures = |_| false;
+        let mut builder = Builder { ar: &ar, mesh: Mesh::default(), groups: HashMap::new(), have_texture: &mut textures,
+            visited: vec![], object_space: true, overrides: &[], slot: 0, last_tex: None, generic_materials: &[],
+            object_states: &[(D3DRS_ALPHABLENDENABLE, 0), (D3DRS_CULLMODE, 2), (D3DRS_SRCBLEND, 3), (D3DRS_DESTBLEND, 2)] };
+        let effective = builder.material(Some(&node), &ar.objects[0]);
+        assert_eq!(effective.blend, Blend::SourceColorOne, "material enables blending but inherits object blend factors");
+        assert!(effective.two_sided, "second packed material state overrides object culling");
+        let without_material = Object { members: vec![] };
+        builder.object_states = &[(D3DRS_ALPHABLENDENABLE, 1)];
+        assert_eq!(builder.material(Some(&node), &without_material).blend, Blend::Opaque, "node overrides the object");
     }
 
     #[test]

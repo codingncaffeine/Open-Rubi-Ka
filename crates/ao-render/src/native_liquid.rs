@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn native_water_passes_alpha_blend_over_a_red_floor() {
+    fn native_water_passes_blend_over_sky_write_depth_and_redraw_coplanar() {
         use ao_scene::{liquid::SourceTriangle, Instance, Mesh, Scene, Submesh, IDENTITY};
         let vertices: Vec<_> = [[-20.0, 0.0, -20.0], [20.0, 0.0, -20.0], [20.0, 0.0, 20.0], [-20.0, 0.0, 20.0]]
             .map(|pos| Vertex { pos, normal: [0.0, 1.0, 0.0], ..Default::default() }).into();
@@ -196,16 +196,35 @@ mod tests {
             instances: vec![Instance { mesh: 0, transform: IDENTITY }, Instance { mesh: 1, transform: IDENTITY }],
             liquids: vec![source], ..Default::default()
         };
-        let path = std::env::temp_dir().join(format!("aomac-native-water-{}.png", std::process::id()));
-        super::super::render_to_png(&scene, [0.0, 10.0, 0.0], [0.0, 0.0, -0.1], 64, 64, &path).unwrap();
-        let mut decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap())).read_info().unwrap();
-        let mut pixels = vec![0; decoder.output_buffer_size()];
-        decoder.next_frame(&mut pixels).unwrap();
-        std::fs::remove_file(path).unwrap();
+        let shot = |scene: &Scene| {
+            let path = std::env::temp_dir().join(format!("aomac-native-water-{}.png", std::process::id()));
+            super::super::render_to_png(scene, [0.0, 10.0, 0.0], [0.0, 0.0, -0.1], 64, 64, &path).unwrap();
+            let mut decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap())).read_info().unwrap();
+            let mut pixels = vec![0; decoder.output_buffer_size()];
+            decoder.next_frame(&mut pixels).unwrap();
+            std::fs::remove_file(path).unwrap();
+            pixels
+        };
+        let pixels = shot(&scene);
         let pixel = &pixels[(32 * 64 + 32) * 4..][..3];
         // Two half-alpha passes: red -> (128,0,128) -> (64,0,192), in D3D7 gamma bytes.
         // The stale slot uses SRCCOLOR/ONE, leaving red at 255 instead.
         assert!((55..75).contains(&pixel[0]) && pixel[1] < 5 && (180..205).contains(&pixel[2]), "{pixel:?}");
+        // The second blue pass is coplanar: the 192 blue above also proves LESSEQUAL,
+        // rather than LESS rejecting it after the first pass writes depth.
+        let mut sky = scene.clone();
+        sky.instances.pop();
+        sky.sky.push(Instance { mesh: 1, transform: IDENTITY });
+        assert_eq!(&shot(&sky)[(32 * 64 + 32) * 4..][..3], pixel, "water must blend over the earlier sky without sky depth occlusion");
+        let mut behind = scene.clone();
+        let mut overlay = behind.meshes[1].clone();
+        overlay.submeshes[0].blend = ao_scene::Blend::AlphaBlend;
+        overlay.submeshes[0].base_color = [0.0, 1.0, 0.0, 1.0];
+        behind.meshes.push(overlay);
+        behind.instances.push(Instance { mesh: 2, transform: IDENTITY });
+        assert_eq!(shot(&behind), pixels, "native water writes depth even while blending, occluding later below-water blends");
+        for vertex in &mut behind.meshes[2].vertices { vertex.pos[1] = 1.0; }
+        assert_ne!(shot(&behind), pixels, "the same later blend above water must remain visible");
     }
 
     #[test]

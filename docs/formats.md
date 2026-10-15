@@ -287,7 +287,7 @@ The client has **no sky data in the playfield records**: the sky is a set of FXS
 * **Generic mesh visual frames / static rotations [CODE]**: the earlier object-space-only inference was wrong. DisplaySystem factory `10063188` case4 uses VisualEnvFX mesh slot+0x10, loaded by `100616e4` case4 from **rock01.abiff1010001/36067**. Constructor `10064ff9`→`100184a3`→Randy `RTriMesh100490e3`→`Init1004905c` builds animation from data `anim_pos/anim_rot`. In `1005e716`, single Mesh/absent MeshIndex calls `SetTriMeshData10049017`, replacing geometry but retaining that factory frame. `decode_generic_mesh` reads it from the asset, not a fitted constant (data object2: position at0x58f `(0.008812099695,0.028321990743,−0.043792810291)`, quaternion at0x5a8 `(0.7071070075035,0,−0.7071070075035,−0)`). Explicit MeshIndex calls Init with the selected data frame. Multiple meshes become Child_Mesh_Misc with explicit indices; `10061505`/`10003e7a` enumerate Randy `NextNode10045289` depth-first preorder filtered to mesh nodes, without ancestor/local frames. `UpdateWorldMatrix10044fa2` is row-vector `anim * local(tweak) * parent` (column `parent * tweak * anim`); this applies to sky, moons, horizon, skylines and traffic, including lighting normals. Camera lock `1005c334` replaces world translation, omitting inherited anim_pos; InitDirection affects only type2 scale. `generic_visual_uses_factory_frame_or_selected_mesh_frame` covers inherited/selected frame geometry and normals.
   * **Quaternion operator order, now proven rather than fitted**: FXS parser `10008a11` consumes values/operators in source order and appends via `10004781`→`10004530` (new node before sentinel tail). `10008914` starts at sentinel.next and evaluates forward; quaternion runtime `10009a76` invokes this traversal. Evaluator `10005600` ROT branch `10008020` supplies accumulator as this and RHS as param to `10004f91`, which computes **RHS * accumulator**. Therefore `a [ROT] b` applies **a then b**; old b-first inference was invalid because it omitted the inherited factory frame. Shared parser now folds `total.then(term)`, and the manual traffic mover folds `quat_mul(term,total)`; primitives remain unchanged. With the actual factory frame, `Rz90 [ROT] Ry90` keeps the horizon dish horizontal instead of vertical. `rot_operator_applies_left_operand_first`, `script_rotation_terms_compose_in_source_order`, and the real horizon-cloud regression's dish bounds cover both paths.
 * **Normalized locked scale and position [CODE]** (`1005c334`): type 1 is `Scale*far/1000`; type 2 multiplies this by `0.1 + 0.9*(h <= 0 ? 1 : 1-h)`, where `h=(Rotation*InitDirection).y` (constants `1008c078`=0.899999976, `10089e20`=0.1000000015). The factory animation frame does not rotate `InitDirection`. Camera-relative generic-mesh `Position` also uses **far/1000**, replacing world translation with `camera + Position*(far/1000)`; `1005c334` divides camera far (`camera+0xb8`) by double `1008aa78`=1000.0, calls `1000464b` to scale Position, `10004734` to add camera translation, and `10004772` to replace it. Sky geometry uses normalized far=1000, so baked offsets and rotation pivots retain authored `Position` unchanged. The earlier far/100 / Position*10 reading was incorrect and is removed. `native_locked_scale_and_position_use_projection_relative_units` checks below/on/above-horizon sizes, type 1, and locked/world offsets. The installed world-space scenery/traffic callers use type 3; no new world type-1/2 runtime metadata was introduced.
-* **Generic sky culling [CODE/DATA]**: Randy default `10041ede` sets CULL_CW=2 (`10041f8a` pushes2, `10041f8b` pushes state22, `10041f8d` calls `1002397c`→SetRenderState). GenericMesh `1005c334` does not force no-cull; `Rasterize1004d84a` overrides fill/lighting, while `1004d2d8`→`1004b199`→`10040aa0` applies material state. Construction now preserves asset culling, with explicit script CULL_NONE/CW overrides, and renderer routes the corresponding culled/two-sided variants (pipeline slots documented under bug11). Base227651 only sets material ALPHABLENDENABLE and has camera-facing normals; rim227745 has opposite normals and explicit CULL_NONE(state22=1). The real horizon regression asserts both material defaults and script overrides. Renderer tests and visual gates remain parent-owned.
+* **Generic sky effective states [CODE/DATA, material-last]**: Randy default `10041ede` sets CULL_CW=2. DS `1005c334` applies the outer object StateBlob before `Rasterize1004d84a`; each SimpleMesh then calls `RenderWithTransparency1004d2d8` → `SetMaterial1004b199` → `10040aa0`, applying the node/material delta last. DeviceState `1001bbc1` ignores priority arguments: last write wins. SetMaterial applies the delta unconditionally, before the numerical material-cache comparison, and `ResetMaterial1004b724` → `10040ac9` → `1002f042` restores it after each draw; DS then restores the outer script. Decode therefore resolves **object → node → material before batching**, including packed `rst_type`/`rst_value` arrays, rather than overwriting the decoded material with script states afterward. Moon3161/17303/17304 material27=1 overrides script ALPHABLENDENABLE FALSE; texture16807 has meaningful alpha, so these background moons must alpha blend. Rim227745 material22=1 wins over an object CULL_CW request; its script SRCCOLOR/ONE remains because the material does not overwrite factors. Regressions: `packed_material_states_override_node_and_object_before_batching`, `real_sky_materials_preserve_native_fog_emissive_blend_and_alpha`. Native state proof is retained with the clipping follow-up evidence.
 * **Sun rays** (`e_SunRays`, `FUN_1005a3a9` @0x1005a3a9): one triangle fan per `Sun1`, `Sun1_Body`, `Sun2`, `Sun2_Body` (blue/orange pairs, additive `newsun_frame01.png`): `FUN_1005a7f6` (DisplaySystem) builds `Vertices` (33) points, rim `i` of `Vertices−1` at local `(Size·9·sin a, Size·9·cos a, −100)`, `a = i/(Vertices−1)·360·3.14/180`, uv `0.5 + UVSize·0.5·(sin a, cos a)` (`UVSize` default 0.8, `Size` default 6, colour default (255,155,55)): a disc of radius 9·Size at distance 100 (Size 6 → 28° half angle), exact. The **rim alpha** is `(255 − table[i&7]) · A / 255` (`A` = the alpha below, centre vertex `A`; integer maths, `FUN_1005a3a9` @0x1005a7a2): `table` is `int[16]` at `+0x50` of the shared `VisualEnvFX` struct (`*(VisualEnvFX+0x7e8)`, size 0x1138), selector `+0x32c & 1` is only ever initialised to 0 (`FUN_10059f44`, no other write in the class), so entries 0..7 are read. **The writer** is Gamecode `FUN_100b005c` @0x100b005c (every frame from `FUN_100b19e4`, argument = the frame time): `s = fmod(s + dt·50, 360)` (double 50.0 @0x10155a68, 360.0 @0x10167468, `FUN_1013ed9c`) and `GameWaveCurve_k = 0.5 + 0.5·cos((s + phase_k)·3.14/180)` (3.14 @0x10167458, 180 @0x10163a40, 0.5 @0x10155f00; phases 90, 180, 0, 270, 45, 135, 350, 50, 100, 0, 45, 270, 36, 112, 350, 50 for k = 0..15) stored as floats at struct `+0x90 + 4k`, then `table[k] = trunc(255 · curve_k)` (255.0 @0x10166f60, `FUN_1013ecf0` = float→int truncation) at `+0x50 + 4k`: a 7.2 s period, no random source, no real-time clock (only the frame time). `ao_scene::wave` (`wave_curves`, `sun_flicker_table`; tests) holds the formulas; the initial `s` (a member of the object `FUN_100b005c` runs on, ctor not located) is taken as 0 and the frame time is taken as seconds [INFERENCE]. Emission: the rim vertices carry their index in `normal.z` (centre −1) and `Submesh::sun_flicker` makes the sky vertex shader (`vs_sky`) scale the vertex alpha by `1 − trunc(255 · curve[i&7]) / 255` from `Globals::wave` (`Renderer::time`), so the fan's rim breathes like the client's (verified: pf 566 looking at the sun at `--anim-time` 0 vs 3.6 differ). Alpha `(100·y)^4` below elevation 0.01, 0 below the horizon (constants 100.0 @0x10089e48, 0.01 @0x1008ae90 read from the DLL). Shadowlands: `Sun1_Static` (`shadowsun1_256_red_eclipse.png`), `SkyVortex`/`SkyVortexTop`/`VortexHorizon` meshes (`shadowlands_vortex*.abiff`), `FlareInTheVortex*`, `HorizonClouds` (`shadowlands_cloudlayers_fake-perspective*.abiff`). **Aurora `e_GloomySky`** (`Tweak_Shadowlands_Aurora_{Soft,Fire,Crazy,...}.txt`; Soft in Jobe/Nascense/Adonis/Elysium/Penumbra/Scheol, Fire in Inferno, Crazy in Pandemonium) is emitted: `sky/aurora.rs` reads the variable table bound by `FUN_1004412e` (DisplaySystem @0x1004412e, 265 `GetVariablePointer` names) and builds the dome of `FUN_10046ccc` (@0x10046ccc; `FUN_10043aaf` is only the constructor that zeroes the members): vertex `(a, b)` of the `W x H` grid (default 40 x 80) sits at azimuth `2b·3.14/H + VortexRotation·s`, `t = 1 − a·(MeshBelowHorizon+1)/W`, `s = 1 − VortexHoleSize·t^(2^MeshBodyCurve)` (`t ≥ 0`) or `1 + t/MeshBelowHorizon`, position `R·(s sin, MeshHeight·t, s cos)` with `R = MeshXZRadius`, uv `(a/W·0.5, 0.5)`, quads alternate their diagonal, `MeshTopToBottomFill` wraps the last column. The per-frame colour map is `ao_scene::aurora::GloomySky` (`FUN_10047300` @0x10047300, plot `FUN_10045a24` @0x10045a24, constants 255.0 @0x10089ef8, π/2 factors @0x10089d28/d20): curves `y = H/2 + H/2·Σ cos(Repeats·(x/W·π/2) + AnimSpeed·t·Speed + Displacement)/Size`, splat of 4 texels with alpha `ftol(Intensity·255·max(wx, wy))` OR-ed into the ARGB map, then StopFeedback / Drag1-3 / Blur1-2 / Drag4-6 / Div2Fade1, vertex copy, ClearUpper (second vertex indexed with the map *height*, as in the client), Div2Fade2 and SubtractFade for the next frame; `rand()` is the MSVCRT LCG seeded 1. The renderer advances it (`Scene::sky_colors`) and rewrites the vertex buffer each frame; blend `DESTBLEND ONE` = additive, `MODULATE2X/4X` gain is applied to the colour, `COLORARG1 ... COMPLEMENT` (Crazy) inverts the texture. `GAME.CurrentNightIntensity` (`NightIntensity` track) is now evaluated (it scaled the Shadowlands sun flares and the Soft/Hard aurora intensity and was 0 before). **[UNRESOLVED]**: the client's frame rate (the feedback is per frame: `ao_scene::aurora::STEP` = 1/30 s assumed); stage-0 alpha default (alpha = tex·diffuse assumed); `Aurora_Boss` (PostRendering, world positioned) and `GloomySky` itself are not included by any playfield tweak and not emitted. `BrinkRocks` (empty script), `Debris`/`VeinFX`, `HorizonLight_*` directional lights, wave-curve driven objects other than `Sun*_Moving` / `VortexHorizon` (`Debris`, `VeinFX`: not emitted). **`GameWaveCurve0..15`** = the sin/cos waves of `FUN_100b005c` (see *Sun rays*; DisplaySystem `FUN_1005cdcf` @0x1005cdcf copies struct `+0x90..+0xcc` into the `GAME.GameWaveCurve*` variables every frame). Applied: `Scene::sky_wave_spin` (`SkyWaveSpin`: `Sun1_Moving` / `Sun2_Moving` `RotMove = v(0,0,1), GameWaveCurve0 * 4 − 2` (±2° about the view axis) is baked at curve 0 and the renderer turns it by `4° · curve(t)`; the expression is affine in the angle, derived by evaluating the rotation with the curve at 1) and `Submesh::uv_wave` (`VortexHorizon` `ScrollMatrix` translation `GameWaveCurve0/1 − 0.5 · 0.005`, shader uv offset `0.005 · curve(t)` on the baked −0.0025). **Spaceships / city skylines** (`Tweak_Spaceship_*`, `Template_Spaceship_*`): `Priority e_RenderPriority_Normal` world-space `e_GenericMeshObject`s (`PositionType e_World`, `Visibility GAME.GameShowSpaceship`, position `RKPP.<pf> − PlayfieldData.UniversePosition + waypoint`), the static city meshes (`simplecity_oldathen.abiff`, ...) are plain placed objects; the traffic ships are `Scene::movers` (below). These are scene objects, not sky layers.
 
 #### ICC screenshot audit, 2026-10-15
@@ -324,9 +324,9 @@ capture report.
 |---|---|---:|---|---|---|
 | Universe |204162, `nebulas_sphere`; texture204188|2|Opaque; F|factory, Rz90, scale10|**Mismatch→fixed:** invented below-horizon alpha fade, disabled inherited fog and emissive multiplication removed; tweak opaque state, archive0x2c09/0x2cbc, DS1005c334.|
 | DotStars |`DotStarsMesh` blueprint,500 points; texture6323|3|ONE/ONE; black|authored surface point×Size990, scale1|**Mismatch→fixed:** angular quads, normalized positions, random distribution and time-based omission replaced with native one-pixel points, FXS per-frame Counter+.01; FXS1000e863/1000e500, Randy100227b6. Process-global random history remains unrecoverable.|
-| Moon1 |3161|4|Opaque; F|factory, Ry(−t/6480×360−90), type2 scale11|**Mismatch→fixed:** frozen interface, inherited fog, native material and per-frame pose; TWK Moon1, DS1005c334, FXS1000132f.|
-| Moon2 |17304|5|Opaque; F|factory, R(0,1,1;t/3240×360+90), type2 scale11|**Mismatch→fixed:** same shared clock/fog/material paths; TWK Moon2.|
-| Moon3 |17303|6|Opaque; F|factory, R(0,1,−1;t/2160×360+60), type2 scale11|**Mismatch→fixed:** same shared clock/fog/material paths; TWK Moon3.|
+| Moon1 |3161|4|SRCALPHA/INVSRCALPHA; F|factory, Ry(−t/6480×360−90), type2 scale11|**Mismatch→fixed:** frozen interface, inherited fog, per-frame pose and material-last alpha state; material27=1 overrides script false; texture16807 alpha0..255.|
+| Moon2 |17304|5|SRCALPHA/INVSRCALPHA; F|factory, R(0,1,1;t/3240×360+90), type2 scale11|**Mismatch→fixed:** same corrected clock/fog/material precedence paths; TWK Moon2.|
+| Moon3 |17303|6|SRCALPHA/INVSRCALPHA; F|factory, R(0,1,−1;t/2160×360+60), type2 scale11|**Mismatch→fixed:** same corrected clock/fog/material precedence paths; TWK Moon3.|
 | Atmosphere |`AtmosphereMesh` blueprint; texture6330|7|SRCALPHA/INVSRCALPHA; F|native6-vertex strip, camera yaw only, scale1|**Mismatch→fixed:** invented elevation dome and below-horizon ring removed; TWK six positions, DS1005c917, native eye-depth vertex fog.|
 | Moon1_Close |3161|9|SRCALPHA/ONE, MODULATE2X; black|Moon1 rotation, type2 scale1|**Mismatch→fixed:** inherited fog was incorrectly off; exact interface/pose and stage gain preserved.|
 | Moon2_Close |17304|10|SRCALPHA/ONE, MODULATE2X; black|Moon2 rotation, type2 scale1|**Mismatch→fixed:** same corrected paths.|
@@ -384,6 +384,128 @@ through three delayed worker snapshot replacements; maximum linear-trajectory
 `abs(delta−dt)` was4.071e−6. Both regressions passed. Native frozen ICC remains
 stationary; continuous movement applies to non-frozen scripts. All evidence is
 headless/offscreen; no real-window or retail-binary visual PASS is claimed.
+
+**North-platform overlap follow-up (2026-10-15, native code/data plus offscreen isolation):**
+The separate north-facing capture uses an inferred eye `(925,50,-927.5)`,
+yaw `0.25`, pitch `-0.207`, horizontal FOV90°, far800 and2094×1096 pixels.
+It is not the earlier south-facing beach view or a recovered retail capture.
+
+* **Cloud bank versus sea:** removing only the native liquid restores the
+  cloud bank beginning at original row372, with projection and all sky draws
+  unchanged. At `(800,372)`, sky/dry RGB is `(104,133,185)` versus water-covered
+  `(29,97,168)`; row371 is identical. Liquid0 is scene mesh88, style0,
+  texture1010004:6329, two2568-index source submeshes. The dry view restores
+  rows372–394; regular-world geometry covers it from395. Thus this cloud-bank
+  cutoff is ocean overdraw, not clipping of those cloud triangles.
+* **Pre-fix moon strip attribution:** cumulative and omission captures identify
+  `Moon1_Close` (mesh3161, texture16807, sort9), then `SingleCloud` (sort250)
+  forming its upper mask, and opaque `Horizon` (204393/204394, sort428)
+  forming its lower mask. The left edge is the curved lunar limb.
+  Moon1_Close's captured AABB bounds its entire normalized view-depth to
+  `54.841..91.985`, strictly between the normalized near/far planes
+  `0.25..1000`; the lunar mesh itself is not near/far-clipped.
+* **Cloud alpha/depth/order [CODE]:** `10054e07` submits raw XYZ lit/unlit
+  vertices (FVF0x152/0x142), not pretransformed XYZRHW vertices. Native default
+  CLIPPING136=true is explicit at Randy`10042090..96`. The cloud material
+  constructed through DisplaySystem`100601dc`→Randy`10041043` installs only
+  texture0, CULL_NONE22=1 and ALPHABLENDENABLE27=1; no alpha-stage, clipping,
+  fog, depth-write or alpha-test override. Cloud StateBlobs explicitly set
+  ZWRITE14=false. Default SRCALPHA5/INVSRCALPHA6 and stage0
+  ALPHAOP=MODULATE, ALPHAARG1=TEXTURE, ALPHAARG2=DIFFUSE
+  (`10042199..100421bc`) therefore apply. ALPHATEST15=false (`10041f50..53`),
+  ALPHAREF24=0 (`10041fa7..aa`), ALPHAFUNC25=GREATEREQUAL7
+  (`10041fb5..b9`; immaterial while disabled). The moon precedes the cloud,
+  so a later moon cannot be rejected by a transparent cloud depth write.
+* **Cloud diffuse alpha [CODE]:** `1005485a` computes sheet opacity
+  `1 − storm²` (`10054cc7..10054cdf`); raster`10054e07` converts it to
+  `trunc(255×opacity)` (`10054f38..10054f64`) and writes that same byte
+  to every lit vertex (`10055286`, stride36) or unlit vertex (`100552c3`,
+  stride24). Only A=0 skips the sheet. There is no distance, card-edge,
+  sun-height or near/far-plane fade to multiply into texture alpha.
+* **Far-plane comparison [CODE + read-only saved preferences]:**
+  `~/Library/Application Support/aomac/reiserfs/Login.cfg:69` saves
+  `ViewDistance 0.800000`, also retail's default (`GUI10124b33`, float
+  `101b8a54=.8`, bounds0..1); FogMode3 is saved at line10.
+  Enhanced `AomacSceneryDistance` is absent and defaults to1.0 (only1..2
+  extends the distance); Enhanced widescreen is absent/defaultfalse.
+  Native `N3/1001fc91` and the port both compute
+  `far=max(ViewDistance*1000,near+50)`, hence800m at near0.2, cloud scale0.8.
+  Activation`1006afcc→100789e6→1004b997` installs one RCamera at viewport+0c.
+  Projection`1004b183→1002ab22` reads that camera's+b8; cloud
+  `10054e7e..10054e8a` reads the same+b8 and divides by double1000
+  (`1008aa78`). Lists0..2 do not substitute a larger sky far, a max-radius
+  distance or another camera. Fog end561.56 at D0.3 is separate and never
+  modifies far. The port selects one lens far before projection/fog/cloud
+  update and gives cloud instances scale1 because vertices already include
+  far/1000. No far, clipping or scale-ratio adjustment is warranted.
+* **Proven cloud tilt mismatch:** the pre-fix GPU edge belonged only to
+  sheet8, texture121211 (PNG RGBA256²→RGBA8, no colour key/DXT1 conversion).
+  At `(1200,278)`, `(1250,280)`, `(1300,283)`, sampled/base alpha was
+  `.546324`, `.647794`, `.440931`, diffuse alpha1 and LOD0; their next
+  sampled rows had no geometry. Interior UVs and triangle view-depths
+  crossing800 prove a far-plane cut, not lost texture alpha.
+  However, the earlier geometry-parity conclusion missed the axis-angle
+  helper's internal half-angle conversion: native full tilt is`.25*d²`,
+  not the port's`.5*d²`. This is corrected, with independent native
+  quaternion regression
+  `native_bend_matches_quaternion_quarter_radian_at_clamped_radius`.
+  Native centres may range beyond normalized1000 (respawn bounds±1600,
+  bend radius1500); far/1000 does not promise frustum containment.
+  The old sheet8 depth numbers are pre-fix port measurements, not native
+  observations; changing far alone would scale depths and far equally.
+* **Controlled far-only proof:** normal far800/1000/1600 captures scale
+  both geometry and projection; zero coverage differences in that experiment
+  do **not** rule out clipping. The decisive control holds the actual
+  uploaded geometry, camera, instance matrices, viewport, textures/materials
+  and rendered lens at800, changing only the diagnostic clip-Z projection
+  to1000. Six full runtime vertex dumps remain identical; formerly missing
+  pixels `(1200,299)`, `(1250,300)`, `(1300,301)` recover sheet8 triangles
+  with source alpha`.418873`, `.597549`, `.517647`. This proves missing
+  fragments are far-clipped, not an outer mesh/UV edge. Probe controls:
+  `AOMAC_SKY_FAR=800 AOMAC_SKY_PROBE_FAR=1000 AOMAC_SKY_PIXELS=...`;
+  only the opt-in diagnostic changes projection, never normal rendering.
+  Regression `sky_pixel_probe_projection_far_recovers_fixed_straddling_geometry`
+  recovers the same fixed uploaded quad by extending only projection and
+  restores original coverage when the override is removed.
+* **UV and retail-equation disposition [CODE]:** `10053681` writes
+  `U=.005+.99*x/(n−1)`, `V=.005+.99*y/(n−1)`, matching the port.
+  Lit FVF0x152 has one UV set at offsets0x1c/0x20, stride36; unlit0x142
+  uses0x10/0x14, stride24. Warping/bending transforms positions/normals,
+  not UVs. Default TEXCOORDINDEX0 (`1004220b..0f`) and disabled
+  TEXTURETRANSFORMFLAGS (`10042335..39`) apply; cloud raster sets WORLD
+  matrix only. The preceding ThickClouds texture transform is scoped:
+  `10025032/10024d1e` restore texture-stage values and identity matrices.
+  Material loading`100601dc` uses four full separate PNGs, no atlas.
+  These seam vertices are interior grid33/43/34, not the authored border.
+  No invented UV remap or alpha fade is added.
+  **Retail would clip identically under the same far and cloud state**:
+  projection and cloud scale read the same camera+b8
+  (`1004b183→1002ab22`, `10054e7e..8a`), CLIPPING136 is true, and
+  `10054e07` draws raw XYZ with flags0. Final native ZENABLE is1 or2,
+  never0 (`10042555..65`, `EnableWBuffer1004170c`); GUI batch
+  `10152a91/10150be6` scopes/restores that value, not a sky-only disable.
+  Corrected triangle60 depths`758.7085/835.5803/776.6833` and triangle62
+  `776.6833/849.6255/798.2286` straddle800. This is the retail-equation
+  result for the reproduced cloud state, **not an observed retail frame**:
+  process-global retail cloud RNG/history is unknown.
+  At saved ViewDistance0.8, native and port far are800; increasing
+  ViewDistance scales the sky and clipping range together. Corrected
+  tilt moves the cut16.38–18.73 pixels down; the straight band remains.
+* **Exercised follow-up verification:** release workspace1908 passed,
+  0 failed,61 ignored across39 suite summaries; strict release
+  workspace/all-target Clippy with `-D warnings` passed. Headless matched
+  before/after frames, layer/cumulative/omit/dry captures, three ordinary
+  far settings and the fixed-geometry projection-only GPU proof are retained
+  outside Git under `~/aomac-handoff/sky7/clipping/`. No real window,
+  input, retail-binary render or aesthetic acceptance is claimed.
+* **Native water depth [CODE]:** both passes inherit ZWRITE=true and
+  ZFUNC=LESSEQUAL (`10041f42..45`, `10041f98..9c`); the pass blobs in
+  `1003db41`, material construction and raster`1003b5e9` do not change them.
+  Pass1 blends SRCALPHA/INVSRCALPHA; pass2 reverses those factors and must
+  redraw at equal depth. The existing renderer already matches this.
+  Regression `native_water_passes_blend_over_sky_write_depth_and_redraw_coplanar`
+  covers sky compositing, the coplanar second pass, later below-water
+  blending being occluded and above-water blending remaining visible.
 
 
 **Traffic ships** (`sky/traffic.rs`, `ao_scene::mover`; RE FXS.dll): every `Template_Spaceship_*` ship (10 freighters + transporters / cruisers / VIP shuttles; 46 playfields, e.g. 566 has 11) follows `UniversePosition[Counter]` with `Counter = frac(DayTimeFactor·k + c)` (`GAME.DayTimeFactor·120 % 1` = a 54 s loop for the Newland transporter, `GAME.DayTimeFactor` = one loop per game day for freighters, `Other.Counter + 0.2 % 1` offsets; `%` applies to the whole left to right sum). Decoded semantics:

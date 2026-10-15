@@ -244,7 +244,7 @@ pub fn emit_distant(objs: &[Obj], store: &RecordStore, scene: &mut Scene, day_ti
         }
         let (Some(pos), Some(id)) = (o.field("Position").and_then(|e| position_expr(objs, o, e)), o.string("Mesh").and_then(|m| names.id(MESH_TYPE, m))) else { continue };
         let mut tmp = Scene::default();
-        if !matches!(decode_generic_mesh(store, id, mesh_index(o, &ctx), false, &mut tmp), Ok(Some(_))) {
+        if !matches!(decode_generic_mesh(store, id, mesh_index(o, &ctx), false, &mesh_states(o), &mut tmp), Ok(Some(_))) {
             continue;
         }
         let Some(mut mesh) = tmp.meshes.pop() else { continue };
@@ -390,7 +390,7 @@ impl Builder<'_> {
         let id = self.names.id(MESH_TYPE, o.string("Mesh")?)?;
         let mut tmp = Scene::default();
         let camera_locked = o.field("PositionType").is_some_and(|p| p.trim() == "e_LockToCamera");
-        decode_generic_mesh(self.store, id, mesh_index(o, &self.ctx), camera_locked, &mut tmp).ok()??;
+        decode_generic_mesh(self.store, id, mesh_index(o, &self.ctx), camera_locked, &mesh_states(o), &mut tmp).ok()??;
         let mut mesh = tmp.meshes.pop()?;
         self.scene.textures.extend(tmp.textures);
         let q = o.field("Rotation").and_then(|e| script::rotation(o, &self.ctx, e, 0)).unwrap_or(Quat::IDENTITY);
@@ -438,12 +438,6 @@ impl Builder<'_> {
             s.uv_scroll = uv_scroll;
             s.uv_wave = uv_wave;
             s.uv_camera = uv_camera;
-            s.blend = object_blend(o, s.blend);
-            match o.states.get("CULLMODE").map(String::as_str) {
-                Some("e_D3DCULL_NONE") => s.two_sided = true,
-                Some("e_D3DCULL_CW") => s.two_sided = false,
-                _ => {}
-            }
             if !lit {
                 s.emissive = [0.0; 3];
             }
@@ -572,20 +566,33 @@ impl Builder<'_> {
     }
 }
 
-/// The submesh blend a `StateBlob` selects, keyed off its own `ALPHABLENDENABLE`/`SRCBLEND`/`DESTBLEND`: `prev` (the mesh's
-/// own baked blend) is kept when the object sets no `ALPHABLENDENABLE` at all (never observed for a sky `StateBlob`, kept
-/// for parity with every other caller of this match). `SRCBLEND SRCCOLOR` self-modulates by the (already `MODULATE2X`-
-/// doubled) source colour before adding: a soft glow that fades out in dark texture regions, unlike a flat `SRCALPHA`
-/// additive wash when alpha is just 1.0 (`Tweak_Rubi-Ka_HorizonClouds.txt` `HorizonCloudsRim`: `jobe_cloudlayers_regular_rim.abiff`
-/// is fully opaque, alpha 255 everywhere, so only the colour-weighted blend fades its silhouette).
-fn object_blend(o: &Obj, prev: Blend) -> Blend {
-    match (o.flag("ALPHABLENDENABLE"), o.states.get("SRCBLEND").map(String::as_str), o.states.get("DESTBLEND").map(String::as_str)) {
-        (Some(true), Some("e_D3DBLEND_SRCCOLOR"), Some("e_D3DBLEND_ONE")) => Blend::SourceColorOne,
-        (Some(true), _, Some("e_D3DBLEND_ONE")) => Blend::Additive,
-        (Some(true), _, _) => Blend::AlphaBlend,
-        (Some(false), _, _) => Blend::Opaque,
-        (None, _, _) => prev,
-    }
+/// Object StateBlob precedes node/material deltas; pass its states into decoding
+/// instead of overwriting the final material blend/culling after batching.
+pub(super) fn mesh_states(o: &Obj) -> [(i32, i32); 5] {
+    let blend = |name: &str| match o.states.get(name).map(String::as_str) {
+        Some("e_D3DBLEND_ZERO") => Some(1),
+        Some("e_D3DBLEND_ONE") => Some(2),
+        Some("e_D3DBLEND_SRCCOLOR") => Some(3),
+        Some("e_D3DBLEND_INVSRCCOLOR") => Some(4),
+        Some("e_D3DBLEND_SRCALPHA") => Some(5),
+        Some("e_D3DBLEND_INVSRCALPHA") => Some(6),
+        Some("e_D3DBLEND_DESTALPHA") => Some(7),
+        Some("e_D3DBLEND_INVDESTALPHA") => Some(8),
+        Some("e_D3DBLEND_DESTCOLOR") => Some(9),
+        Some("e_D3DBLEND_INVDESTCOLOR") => Some(10),
+        _ => None,
+    };
+    [
+        (15, o.flag("ALPHATESTENABLE").map(i32::from)),
+        (27, o.flag("ALPHABLENDENABLE").map(i32::from)),
+        (19, blend("SRCBLEND")),
+        (20, blend("DESTBLEND")),
+        (22, match o.states.get("CULLMODE").map(String::as_str) {
+            Some("e_D3DCULL_NONE") => Some(1),
+            Some("e_D3DCULL_CW") => Some(2),
+            _ => None,
+        }),
+    ].map(|(ty, value)| value.map_or((-1, 0), |value| (ty, value)))
 }
 
 
@@ -947,8 +954,9 @@ Object VortexHorizon
         assert_eq!(clouds.states.get("SRCBLEND"), None);
         assert_eq!(rim.states.get("SRCBLEND").map(String::as_str), Some("e_D3DBLEND_SRCCOLOR"));
         assert_eq!(rim.states.get("DESTBLEND").map(String::as_str), Some("e_D3DBLEND_ONE"));
-        assert_eq!(object_blend(clouds, Blend::Opaque), Blend::AlphaBlend);
-        assert_eq!(object_blend(rim, Blend::Opaque), Blend::SourceColorOne);
+        assert!(mesh_states(clouds).contains(&(27, 1)));
+        assert!(mesh_states(rim).contains(&(19, 3)));
+        assert!(mesh_states(rim).contains(&(20, 2)));
     }
 
     /// Native frame fog survives per-object Set/Reset; GenericMesh resource loading
@@ -1011,11 +1019,20 @@ Object VortexHorizon
         let rim = objs.iter().find(|o| o.name == "HorizonCloudsRim").expect("HorizonCloudsRim");
         let rim_mesh = b.mesh_object(rim).expect("HorizonCloudsRim mesh");
         assert!(rim_mesh.submeshes.iter().all(|s| s.two_sided), "rim material explicitly sets CULL_NONE");
+        assert!(rim_mesh.submeshes.iter().all(|s| s.blend == Blend::SourceColorOne));
+        for name in ["Moon1", "Moon2", "Moon3"] {
+            let moon = objs.iter().find(|o| o.name == name).expect(name);
+            assert_eq!(moon.flag("ALPHABLENDENABLE"), Some(false));
+            assert!(b.mesh_object(moon).unwrap().submeshes.iter().all(|s| s.blend == Blend::AlphaBlend), "moon material enables blending after the script disables it");
+        }
+        let moon_texture = b.scene.textures.get(&TextureKey { rdb_type: TEXTURES, id: 16807 }).expect("moon texture");
+        assert!(moon_texture.rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 0), "moon texture has a real transparent mask: opaque blending is not equivalent");
+        assert!(moon_texture.rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 255));
         assert!(rim_mesh.submeshes.iter().all(|s| s.emissive == [0.0; 3] && s.base_color[..3] == [srgb_to_linear(2.0); 3]), "native reset precedes lighting; MODULATE2X follows saturation");
         let original_vertices = rim_mesh.vertices.clone();
         let mut culled = rim.clone();
         culled.states.insert("CULLMODE".into(), "e_D3DCULL_CW".into());
-        assert!(b.mesh_object(&culled).unwrap().submeshes.iter().all(|s| !s.two_sided));
+        assert!(b.mesh_object(&culled).unwrap().submeshes.iter().all(|s| s.two_sided), "material CULL_NONE applies after the object's CULL_CW");
         let original_indices = rim_mesh.submeshes[0].indices.clone();
         let original_texture = rim_mesh.submeshes[0].texture;
         let fogged = b.fogged(rim, rim_mesh);

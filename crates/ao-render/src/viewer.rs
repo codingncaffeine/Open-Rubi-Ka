@@ -1144,6 +1144,12 @@ impl Offscreen {
         let _ = self.r.device.poll(wgpu::PollType::Poll);
         list
     }
+    /// Reads actual last-render sky fragments without advancing the simulation.
+    /// `projection_far` changes only diagnostic clip Z, never uploaded sky geometry.
+    pub fn sky_pixel_probe(&self, layer: usize, pixels: &[(u32, u32)], scene: &Scene, projection_far: Option<f32>) -> Result<String> {
+        self.r.sky_pixel_probe(layer, pixels, self.size, &scene.textures, projection_far)
+    }
+
 
     /// Renders the current scene with the host camera, draws `list` over it and writes the PNG.
     pub fn png(&mut self, fe: &dyn Frontend, list: &ao_gui::DrawList, path: &std::path::Path) -> Result<()> {
