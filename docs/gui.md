@@ -983,9 +983,23 @@ Flag `0x1` applies the floored intersection through `RViewPort_t::SetViewRect` w
 Nested canvas, scroll, editable-text, tab, list-header and fading-text clips
 intersect and restore the window viewport; clipped-away points do not receive mouse hits, tooltips or fade hover.
 Fully outside pages are culled against the area, not the whole screen; free windows and post-window overlays remain unclipped.
+
+Full-height page regression: commit `f78c6e5`, `play/hud_rollup.rs:196`, replaced the stacked `body` View
+(content beside a fixed-size `body_bg` sibling) with a vertical `body` CanvasView. Child elastic maxima then propagated
+into the page's preferred height: `ao-gui/src/layout.rs::pref_plain` computes `max(child_preferred, min_size, max_size)`
+before clamping to `max_limit`, so `max_size` is a preferred-size floor, not a ceiling.
+Source-history bisection on wrapper shape identifies `f78c6e5`; a frozen old/new-wrapper regression isolates this transition.
+The rollup controller must impose the configured body height as a hard ceiling while docked, and release that ceiling
+for a free DockWindow; clipping alone hides the overflow but does not restore the following pages' positions.
+
 Screenshot regression: `AOMAC_SHOT_DIR=/tmp/rollup-shot cargo test --release -p aomac scrolled_appended_page_offscreen_clip`
 renders a scrolled appended shop-like page with nested ScrollView/CanvasView to `rollup-clipped.png`, asserting visible green content
 inside the area and no green pixels above y=20. The screenshot test requires the client install and `AOMAC_SHOT_DIR`.
+`stacked_programs_wear_actions_respect_page_heights` additionally writes `rollup-stacked.png` through the same offscreen
+`AOMAC_SHOT_DIR` pattern: fully expanded real Programs/Wear/Actions pages at 1280×1024 with template/natural heights,
+checking body/header heights, stacking, visibility, restore and free/redock transitions. At 1280×800 it retains those
+heights and checks overflow scrolling (`rollup-stacked-800.png`), rather than shrinking or collapsing pages to fit.
+Its optional `rollup-before.png` recreates the missing-hard-ceiling behavior with the same real owners at 1280×800.
 
 ## Options window (`play/options.rs`, `options/{model,live}.rs`)
 

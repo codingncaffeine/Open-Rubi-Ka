@@ -193,7 +193,7 @@ impl Rollup {
             "<root><View view_layout=\"vertical\" h_alignment=\"left\">\
              <View name=\"rollup_header\" view_layout=\"stacked\" min_size=\"Point({w},{header})\" max_size=\"Point({w},{header})\"><CanvasView name=\"header_bg\" min_size=\"Point({w},{header})\" max_size=\"Point({w},{header})\"/>\
              <View view_layout=\"horizontal\" v_alignment=\"top\">{}<TextView name=\"title\" value=\"{}\" layout_borders=\"Rect(8,2,0,2)\"/><HLayoutSpacer/>{}{}</View></View>\
-             <CanvasView name=\"body\" view_layout=\"vertical\" h_alignment=\"left\" min_size=\"Point({w},{bh})\" max_size=\"Point({w},{bh})\">{view_xml_inner}</CanvasView>\
+             <CanvasView name=\"body\" view_layout=\"vertical\" h_alignment=\"left\" min_size=\"Point({w},{bh})\" max_size=\"Point({w},{bh})\" max_size_limit=\"Point({w},{bh})\">{view_xml_inner}</CanvasView>\
              </View></root>",
             canvas("icon", icon, "2,2,0,2"),
             esc(title),
@@ -269,7 +269,21 @@ impl Rollup {
     /// Size an owner wrapper from its page height, not its free-resize ceiling.
     fn resize_page(&self, gui: &mut Gui, page: &Page) {
         let width = if page.docked { AREA_W } else { gui.window_size(page.window).0 };
-        if page.wrapped {
+        if !page.docked {
+            let size = if page.wrapped && !self.config.iter().any(|c| c.key == page.key) {
+                WindowSize::Fixed(width, gui.window_size(page.window).1)
+            } else {
+                WindowSize::Preferred
+            };
+            // Release only the page's constraints; the owner's size limits still apply.
+            gui.set_view_max_size_limit(page.window, "body", (16000.0, 16000.0));
+            gui.set_view_pref_size(page.window, "body", (-1.0, -1.0), (-1.0, -1.0));
+            gui.resize_window(page.window, size);
+            if page.wrapped {
+                // Restore the wrapper's elastic range only after choosing its preferred height.
+                gui.set_view_pref_size(page.window, "body", (-1.0, -1.0), (16000.0, 16000.0));
+            }
+        } else if page.wrapped {
             let Some(config) = self.config.iter().find(|c| c.key == page.key) else {
                 // No saved page height: retain the current content size, rather than
                 // deriving a new preferred height from the wrapper's elastic body.
@@ -278,18 +292,14 @@ impl Rollup {
                 return;
             };
             let height = config.height;
+            gui.set_view_max_size_limit(page.window, "body", (16000.0, height));
             gui.set_view_pref_size(page.window, "body", (0.0, height), (16000.0, height));
             gui.resize_window(page.window, WindowSize::Preferred);
-            gui.set_view_pref_size(page.window, "body", (0.0, height), (16000.0, 16000.0));
         } else {
-            if page.docked {
-                if let Some(config) = self.config.iter().find(|c| c.key == page.key) {
-                    let height = config.height + (BODY_TOP + BODY_BOTTOM) as f32;
-                    gui.set_view_pref_size(page.window, "body", (AREA_W as f32, height), (AREA_W as f32, height));
-                }
-            } else {
-                // RollupPage's saved height/column width do not constrain a free DockWindow.
-                gui.set_view_pref_size(page.window, "body", (-1.0, -1.0), (-1.0, -1.0));
+            if let Some(config) = self.config.iter().find(|c| c.key == page.key) {
+                let height = config.height + (BODY_TOP + BODY_BOTTOM) as f32;
+                gui.set_view_max_size_limit(page.window, "body", (AREA_W as f32, height));
+                gui.set_view_pref_size(page.window, "body", (AREA_W as f32, height), (AREA_W as f32, height));
             }
             gui.resize_window(page.window, WindowSize::Preferred);
         }
@@ -461,6 +471,155 @@ mod tests {
                 assert_eq!(dock.t, without_toolbar_top, "hidden toolbar consumes no layout height");
             }
         }
+    }
+
+    #[test]
+    fn stacked_programs_wear_actions_respect_page_heights() {
+        use crate::play::{hud::WindowKind, hud_actionwin::HudActionWin, hud_nano::HudNano, hud_stats::HudStats, zone::Zone};
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() || !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() {
+            eprintln!("skipping: no client");
+            return;
+        }
+        let size = (1280, 1024);
+        let mut gui = Gui::new(&dir, None).unwrap();
+        gui.set_screen_size(size.0, size.1);
+        let mut rollup = Rollup::new(&dir, size);
+        // Preserve the original saved/natural heights: all three expanded pages
+        // fit this taller viewport; a shorter viewport must scroll, not stretch.
+        rollup.config = vec![
+            PageConfig { key: "nano_window".into(), height: 205.0, expanded: true },
+            PageConfig { key: "wear_window".into(), height: 317.0, expanded: true },
+        ];
+        let mut programs = HudNano::new(&dir, size).unwrap();
+        let mut wear = HudStats::new(&dir, size).unwrap();
+        let mut actions = HudActionWin::new(&dir, size);
+        programs.open(&mut gui, &mut rollup);
+        wear.open(&mut gui, &mut rollup, WindowKind::Character);
+        actions.open(&mut gui, &mut rollup);
+        let mut zone = Zone::new(7);
+        // The same real Shadow Touch record/school fixture as hud_nano's tests.
+        zone.nanos.programs = vec![163449];
+        zone.nanos.serial += 1;
+        programs.set_page(4);
+        programs.update(&mut gui, &zone, 0.016);
+        let mut shot = ClipShot { gui };
+        // Render before geometry assertions so a historical failure still leaves
+        // an actual before-frame. Without this env no GPU is needed.
+        if let Some(out) = std::env::var_os("AOMAC_SHOT_DIR") {
+            // Reproduce f78c6e5's missing ceiling with these same real owners.
+            let saved = rollup.dock_states(&shot.gui);
+            rollup.set_screen(&mut shot.gui, (1280, 800));
+            shot.gui.set_screen_size(1280, 800);
+            for page in &rollup.pages {
+                shot.gui.set_view_max_size_limit(page.window, "body", (16000.0, 16000.0));
+                shot.gui.resize_window(page.window, WindowSize::Preferred);
+                rollup.paint_body_background(&mut shot.gui, page.window, "body");
+            }
+            rollup.layout(&mut shot.gui);
+            let mut before = ao_render::Offscreen::new(&shot, (1280, 800)).unwrap();
+            let list = before.frame(&mut shot, 0.016);
+            std::fs::create_dir_all(&out).unwrap();
+            before.png(&shot, &list, &Path::new(&out).join("rollup-before.png")).unwrap();
+            rollup.set_screen(&mut shot.gui, size);
+            shot.gui.set_screen_size(size.0, size.1);
+            rollup.restore_docks(&mut shot.gui, &saved);
+            let mut off = ao_render::Offscreen::new(&shot, size).unwrap();
+            let list = off.frame(&mut shot, 0.016);
+            std::fs::create_dir_all(&out).unwrap();
+            off.png(&shot, &list, &Path::new(&out).join("rollup-stacked.png")).unwrap();
+        } else {
+            shot.gui.frame(0.016);
+        }
+        let gui = &mut shot.gui;
+        let assert_stack = |rollup: &Rollup, gui: &Gui, all_fit: bool| {
+            assert_eq!(rollup.pages.len(), 3, "all real owners opened successfully");
+            let (left, top, bottom) = rollup.area();
+            let mut y = top - rollup.scroll as i32;
+            for (page, (key, height)) in rollup.pages.iter().zip([
+                ("nano_window", 205), ("wear_window", 317), ("specialaction_window", 167),
+            ]) {
+                assert_eq!(page.key, key);
+                assert!(page.docked && page.expanded);
+                let header = gui.view_rect(page.window, "rollup_header").unwrap();
+                let body = gui.view_rect(page.window, "body").unwrap();
+                let expected = height + BODY_TOP + BODY_BOTTOM + 1;
+                assert_eq!(body.height() + 1.0, expected as f32, "{key} respects its page height");
+                let (x, actual_y, width, h) = gui.window_outer_frame(page.window).unwrap();
+                assert_eq!((x, actual_y), (left, y), "{key} stacks directly below its predecessor");
+                assert!((AREA_W..=AREA_W + 1).contains(&width), "{key} retains the inclusive dock width");
+                assert_eq!(h, expected + (header.height() + 1.0) as u32);
+                if all_fit {
+                    assert!(gui.window_visible(page.window), "{key} remains visible");
+                    assert!(actual_y >= top && actual_y + h as i32 <= bottom + 1, "{key} fits inside the visible column");
+                }
+                y += h as i32 + GAP;
+            }
+            if all_fit {
+                assert_eq!(rollup.scroll, 0.0, "the complete stack needs no scrolling");
+            }
+        };
+        assert_eq!(programs.shown(), [163449]);
+        assert_stack(&rollup, gui, true);
+        let saved = rollup.dock_states(gui);
+        rollup.restore_docks(gui, &saved);
+        assert_stack(&rollup, gui, true);
+        // Use the real header drag path to free Programs, then its public tab
+        // drop event to redock it. Owner content must survive both transitions.
+        let window = rollup.pages[0].window;
+        let header = gui.view_rect(window, "rollup_header").unwrap();
+        let (x, y) = (header.l + 80.0, header.t + 5.0);
+        for ev in [
+            InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left },
+            InputEvent::MouseMove { x: 300.0, y: 200.0 },
+            InputEvent::MouseUp { x: 300.0, y: 200.0, button: ao_gui::MouseButton::Left },
+        ] {
+            rollup.input(gui, &ev, 0);
+        }
+        assert!(!rollup.pages.iter().find(|p| p.window == window).unwrap().docked);
+        assert!(gui.view_rect(window, "body").unwrap().height() + 1.0 > 214.0, "free Programs releases the saved dock height");
+        let (left, top, _) = rollup.area();
+        assert!(rollup.dock_event(gui, &Event::TabDropped { window, tab: 0, x: left + 80, y: top, target: None }));
+        assert_stack(&rollup, gui, true);
+        rollup.restore_docks(gui, &saved);
+        programs.update(gui, &zone, 0.016);
+        assert_eq!(programs.shown(), [163449], "real content survives restore/free/redock");
+        assert_stack(&rollup, gui, true);
+        rollup.set_screen(gui, (1280, 800));
+        gui.set_screen_size(1280, 800);
+        assert_stack(&rollup, gui, false);
+        rollup.scroll = 10000.0;
+        rollup.layout(gui);
+        assert!(rollup.scroll > 0.0, "natural pages scroll in a shorter viewport instead of stretching");
+        assert_stack(&rollup, gui, false);
+        let last = rollup.pages.last().unwrap().window;
+        let (_, y, _, h) = gui.window_outer_frame(last).unwrap();
+        assert!(gui.window_visible(last) && y + h as i32 <= rollup.area().2 + 1);
+        if let Some(out) = std::env::var_os("AOMAC_SHOT_DIR") {
+            let mut off = ao_render::Offscreen::new(&shot, (1280, 800)).unwrap();
+            let list = off.frame(&mut shot, 0.016);
+            off.png(&shot, &list, &Path::new(&out).join("rollup-stacked-800.png")).unwrap();
+        }
+        rollup.set_screen(&mut shot.gui, size);
+        shot.gui.set_screen_size(size.0, size.1);
+        rollup.restore_docks(&mut shot.gui, &saved);
+        assert_stack(&rollup, &shot.gui, true);
+    }
+
+    #[test]
+    fn historical_rollup_body_layout_regression() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        // Freeze both sides of f78c6e5's XML-only body change. A Programs-shaped
+        // scroll child contributes an elastic maximum, not a hard size.
+        let content = r#"<View view_layout="vertical"><ScrollView min_size="Point(167,96)" max_size="Point(16000,16000)"><ScrollViewChild view_layout="vertical" max_size="Point(16000,16000)"><CanvasView min_size="Point(167,96)" max_size="Point(16000,16000)"/></ScrollViewChild></ScrollView></View>"#;
+        let before = format!(r#"<root><View view_layout="stacked" name="body" min_size="Point(192,213)" max_size="Point(192,213)"><CanvasView name="body_bg" min_size="Point(192,213)" max_size="Point(192,213)"/>{content}</View></root>"#);
+        let after = format!(r#"<root><CanvasView view_layout="vertical" name="body" min_size="Point(192,213)" max_size="Point(192,213)">{content}</CanvasView></root>"#);
+        let old = gui.open_window_xml("HistoricalStackedRollup", &before, (0, 0), WindowSize::Preferred).unwrap();
+        let new = gui.open_window_xml("HistoricalVerticalRollup", &after, (0, 0), WindowSize::Preferred).unwrap();
+        assert!(gui.window_size(old).1 <= 240, "the fixed background sibling bounds stacked preferred height");
+        assert!(gui.window_size(new).1 >= 16000, "the vertical Canvas leaks the elastic child maximum");
     }
 
     struct ClipShot { gui: Gui }

@@ -37,6 +37,14 @@ impl Gui {
         }
     }
 
+    /// Updates the hard preferred-size ceiling without changing preferred-size floors.
+    pub fn set_view_max_size_limit(&mut self, w: WindowId, name: &str, max: (f32, f32)) {
+        if let Some(v) = self.find(w, name) {
+            self.tree.views[v].max_limit = Point::new(max.0, max.1);
+            self.relayout_window(w);
+        }
+    }
+
     /// Fits a named owner's height to its visible content instead of stretching it
     /// inside a larger saved dock page. Recomputes after collapsed rows change.
     pub fn fit_view_height(&mut self, w: WindowId, name: &str) {
