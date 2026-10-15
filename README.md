@@ -1,5 +1,7 @@
 # Open Rubi-Ka
 
+![Open Rubi-Ka](banner.jpg)
+
 A native, Linux-first client for the classic Anarchy Online engine in the build that Project Rubi-Ka runs, forked
 from [aorust](https://github.com/reiserFSs/aorust) (a macOS client). It reads the player's own client install and
 ships no game assets. Windows is the second target. The project's own focus is proper high-resolution and ultrawide
