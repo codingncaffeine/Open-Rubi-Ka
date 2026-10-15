@@ -1,3 +1,32 @@
+# Build output
 target/
-.DS_Store
 /win/
+.DS_Store
+
+# Local working folders (plans, probes, snapshots and third-party reference clones stay local)
+/local-notes/
+/scratch/
+/snapshots/
+/refs/
+
+# Never any original game content in the repo (the client lives outside the repo tree)
+/client/
+cd_image/
+*.db
+*.db-journal
+*.rdbpatch
+*.uvga
+*.uvgi
+*.mdb
+*.ldb
+*.abiff
+*.cir
+*.til
+*.nam
+version.id
+patch.version
+
+# Credentials and unredacted captures
+*.secret
+*.cred
+/captures/raw/
