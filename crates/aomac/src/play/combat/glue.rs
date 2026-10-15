@@ -339,7 +339,7 @@ impl Play {
                 // the own avatar's enter / stop clips follow its movement role (`Player::update`); the others' pose changes come from the zone stream
                 ActionEvent::Pose { dynel, from, to } if dynel != own => {
                     if let Some(id) = Pose::transition_anim(from, to) {
-                        self.zone.world.play_once(dynel, id as u32);
+                        self.zone.world.play_posture(dynel, id as u32);
                     }
                 }
                 ActionEvent::Pose { .. } => {}

@@ -599,11 +599,24 @@ impl Player {
 
         let role = self.movement.role();
         let moving = self.movement.speed() > 0.01 && self.movement.grounded();
+        self.avatar.set_stance(zone.world.wielded_set(self.char_id as i32));
         // the new pose's enter / stop clip plays once over its idle clip (`Pose::transition_anim`, GC 0x1006d330)
         let now = Pose::from_role(&role);
         if let Some(from) = self.pose.replace(now).filter(|&b| b != now && self.cast_loop.is_none()) {
-            if let Some((name, _)) = Pose::transition_anim(from, now).and_then(anim_name) {
-                self.play(Role::Clip(name.into()), false);
+            if let Some(id) = Pose::transition_anim(from, now) {
+                if matches!(id, 0xd5 | 0xd6) {
+                    self.transient = None;
+                    self.cast_loop = None;
+                    self.avatar.set_body_priority(0);
+                    self.avatar.set_clip_scale(None);
+                    self.avatar.set_cast_loop(false);
+                    let idle = if self.fighting && role == Role::Idle { Role::IdleCombat } else { role.clone() };
+                    if let Err(e) = self.avatar.play_posture(&self.store, id, AvatarPose::still(idle)) {
+                        eprintln!("avatar posture: {e:#}");
+                    }
+                } else if let Some((name, _)) = anim_name(id) {
+                    self.play(Role::Clip(name.into()), false);
+                }
             }
         }
         // the airborne->grounded edge plays the jump-landing clip once over the resuming movement pose (`jump-land-*`);
@@ -625,7 +638,6 @@ impl Player {
             None if self.fighting && role == Role::Idle => AvatarPose::still(Role::IdleCombat),
             None => AvatarPose::still(role),
         };
-        self.avatar.set_stance(zone.world.wielded_set(self.char_id as i32));
         self.avatar.set_clip_scale(self.transient.as_ref().and(self.clip_scale));
         self.avatar.set_cast_loop(self.cast_loop == Some(true));
         self.avatar.set_airborne(!grounded);
@@ -859,6 +871,144 @@ fn fight_target_position(zone: &Zone, own: i32, own_pos: [f32; 3]) -> Option<[f3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Offline, real-CAT Player::frame regression, including the movement FSM and transient dispatch.
+    /// AOMAC_POSTURE_TRACE writes both CSVs; AOMAC_POSTURE_PNG also renders every sampled frame.
+    #[test]
+    fn own_sit_stand_player_frame_pose_continuity() {
+        use std::fmt::Write as _;
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let output = std::env::var_os("AOMAC_POSTURE_TRACE").map(std::path::PathBuf::from);
+        if let Some(output) = &output { std::fs::create_dir_all(output).unwrap(); }
+        let pngs = std::env::var_os("AOMAC_POSTURE_PNG").is_some();
+        let store = RecordStore::open(&dir).unwrap();
+        let scene = if pngs { Some(ao_formats::playfield::load_playfield(&store, &dir, 4604).unwrap()) } else { None };
+        let distance = |a: &[ao_scene::Vertex], b: &[ao_scene::Vertex]| {
+            assert_eq!(a.len(), b.len());
+            a.iter().zip(b).map(|(a, b)| glam::Vec3::from(a.pos).distance(glam::Vec3::from(b.pos))).fold(0.0_f32, f32::max)
+        };
+        let mut baseline_error = 0.0_f32;
+        for before in [true, false] {
+            let mut update = avatar::tests::own_update();
+            update.pos = [0.0; 3];
+            let mut zone = Zone::new(7);
+            zone.own_update = Some(Box::new(update));
+            let mut player = Player::new(&dir, &mut zone, 0).expect("captured own avatar");
+            player.collision = None;
+            player.zones = None;
+            player.movement.teleport([0.0; 3], 0.0);
+            if player.movement.fsm().mode != mode::RUN { assert!(player.movement.transition(mv::SWITCH_RUN)); }
+            let mut host = Host::headless();
+            let version = if before { "before" } else { "after" };
+            for (label, action, mode, transition, idle) in [
+                ("sit", mv::SWITCH_SIT_GROUND, mode::SIT_GROUND, "ground-start", Role::SitGround),
+                ("stand", mv::LEAVE_SIT, mode::RUN, "ground-stop", Role::Idle),
+            ] {
+                let id = if label == "sit" { 0xd5 } else { 0xd6 };
+                let duration = avatar::tests::posture_duration(&mut player.avatar, &player.store, id, before);
+                let mut csv = String::from("frame,fsm,transient,clip,clip_ms,duration,prev_clip,prev_ms,prev_once,fade_elapsed,fade_ms,posture_clip,posture_ms,posture_duration,posture_blend,idle_delay,max_vertex_step,reference_step,pose_error\n");
+                let mut previous = None;
+                let mut previous_reference = None;
+                let mut previous_clock = None;
+                let mut started = false;
+                let mut ended = false;
+                let mut after = 0;
+                let mut max_step = (0.0_f32, -60);
+                let mut max_error = (0.0_f32, -60);
+                let mut queue_reference = None;
+                let mut authored_bound = 0.0_f32;
+                for frame_no in -60..600 {
+                    if frame_no == 0 {
+                        assert!(player.movement.transition(action));
+                        assert_eq!(player.movement.fsm().mode, mode);
+                        if !before {
+                            queue_reference = Some(avatar::tests::posture_reference(&mut player.avatar, &player.store, id, &idle));
+                        }
+                        if before {
+                            // Reproduce the original scheduling, not merely its sampler: suppress
+                            // queue dispatch and play a transient until the whole clip finishes.
+                            player.pose = Some(Pose::from_role(&idle));
+                            player.play(Role::Clip(transition.into()), false);
+                        }
+                    }
+                    let had_transient = player.transient.is_some();
+                    host.actors.clear();
+                    host.dynamic_lights.clear();
+                    player.frame(1.0 / 60.0, &mut host, &mut zone, false);
+                    if before && had_transient && player.transient.is_none() {
+                        avatar::tests::posture_baseline_idle(&mut player.avatar);
+                    }
+                    let clock = avatar::tests::posture_clock(&player.avatar);
+                    if let Some((id, ms)) = previous_clock {
+                        if id == clock.0 { assert!(clock.1 >= ms, "{label}: clip restarted at {frame_no}"); }
+                    }
+                    previous_clock = Some(clock);
+                    if frame_no >= 0 {
+                        assert_eq!(player.movement.fsm().mode, mode, "{label}: FSM flicker at {frame_no}");
+                        let active = if before {
+                            match &player.transient {
+                                Some((Role::Clip(name), false)) if name == transition => true,
+                                None => false,
+                                other => panic!("{label}: unexpected transient {other:?} at {frame_no}"),
+                            }
+                        } else {
+                            assert!(player.transient.is_none(), "{label}: queue fell back to transient");
+                            player.avatar.posture_active()
+                        };
+                        let elapsed = (frame_no + i32::from(!before)) as f32 * (1000.0 / 60.0);
+                        if (elapsed - duration).abs() > 0.02 {
+                            assert_eq!(active, elapsed < duration, "{label}: finite enter lifetime at {frame_no}");
+                        }
+                        if active {
+                            assert!(!ended, "{label}: restarted transition at {frame_no}");
+                            started = true;
+                        } else {
+                            assert!(started, "{label}: skipped enter/exit clip");
+                            ended = true;
+                            assert_eq!(player.movement.role(), idle);
+                            after += 1;
+                        }
+                    }
+                    let (actor, reference, details) = avatar::tests::posture_sample(&player.avatar, before, frame_no, queue_reference.as_ref());
+                    let skin = actor.skin.as_ref().expect("real CAT skin").clone();
+                    let step = previous.as_ref().map_or(0.0, |old: &Vec<ao_scene::Vertex>| distance(old, &skin));
+                    let reference_step = previous_reference.as_ref().map_or(0.0, |old: &Vec<ao_scene::Vertex>| distance(old, &reference));
+                    authored_bound = authored_bound.max(reference_step);
+                    let error = distance(&skin, &reference);
+                    if step > max_step.0 { max_step = (step, frame_no); }
+                    if error > max_error.0 { max_error = (error, frame_no); }
+                    if before {
+                        baseline_error = baseline_error.max(error);
+                    } else {
+                        assert!(error < 1e-4, "{label} frame {frame_no}: queue pose diverged ({error}); {details}");
+                        assert!(step <= reference_step + 2e-4,
+                            "{label} frame {frame_no}: anomalous single-frame displacement {step}, authored/blended reference {reference_step}");
+                    }
+                    let transient = match &player.transient { Some((Role::Clip(name), _)) => name.as_str(), _ => "-" };
+                    writeln!(csv, "{frame_no},{},{transient},{details},{step:.7},{reference_step:.7},{error:.7}",
+                        player.movement.fsm().mode).unwrap();
+                    if let (Some(output), Some(scene)) = (&output, &scene) {
+                        let eye = [3.0, 1.4, 3.0];
+                        let png = output.join(format!("own-{label}-{version}-{:04}.png", frame_no + 60));
+                        ao_render::render_to_png_actors(scene, &[(avatar::MODEL_KEY, player.avatar.model().clone())],
+                            vec![actor], eye, [0.0, 0.9, 0.0], 640, 480, &png, 0.0).unwrap();
+                    }
+                    previous = Some(skin.as_ref().clone());
+                    previous_reference = Some(reference);
+                    if ended && after >= 60 { break; }
+                }
+                assert!(started && ended && after == 60, "{label}: transition did not finish");
+                if !before { assert!(max_step.0 <= authored_bound + 2e-4, "{label}: frame motion exceeds the CAT/retail authored envelope {authored_bound}"); }
+                eprintln!("own-{label}-{version}: interval={duration:.3}ms max_vertex_step={:.7}@frame{} authored_bound={authored_bound:.7} max_pose_error={:.7}@frame{}; frames start -60, include full enter and 60 after",
+                    max_step.0, max_step.1, max_error.0, max_error.1);
+                if let Some(output) = &output {
+                    std::fs::write(output.join(format!("own-{label}-{version}.csv")), csv).unwrap();
+                }
+            }
+        }
+        assert!(baseline_error > 0.01, "real CAT baseline must reproduce the wrapped-outgoing pose defect, got {baseline_error}");
+    }
 
     #[test]
     fn fight_facing_uses_live_pose_and_current_fight_not_selection() {

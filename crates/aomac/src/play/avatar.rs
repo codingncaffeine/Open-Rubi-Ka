@@ -16,6 +16,15 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 /// Model key of the own avatar for `Renderer::add_actor_model` (`Host::actor_models`).
 pub const MODEL_KEY: u64 = 0x4156_0000_0000_0001;
 
+/// GC 1006d330 subtracts the double at 101606a8 from the enter interval duration.
+pub(super) const POSTURE_IDLE_LEAD_MS: f32 = 500.0;
+
+/// GC 100108be mode 1 plays the intro interval, falling back to the entire clip.
+pub(super) fn posture_interval_end(clip: &CatAnim) -> f32 {
+    clip.events.iter().find(|(ms, name)| name == "loopstart" && *ms > 0 && (*ms as f32) <= clip.duration)
+        .map_or(clip.duration, |(ms, _)| *ms as f32)
+}
+
 /// What the avatar should be doing; the movement state machine fills it in each frame.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AvatarPose {
@@ -171,7 +180,7 @@ fn stance_clip(set: i32, r: &Role) -> Option<String> {
 /// Movement playback uses interval mode 2 (GC 0x1006be27 -> 0x1003c392 -> 0x100108be):
 /// start at `loopstart`, loop to `loopend`; no separate run-start clip or inherited gait phase.
 fn movement_loop(r: &Role) -> bool {
-    matches!(r, Role::Idle | Role::Walk | Role::WalkBack | Role::WalkLeft | Role::WalkRight | Role::Run | Role::RunBack | Role::Swim | Role::IdleSwim)
+    matches!(r, Role::Idle | Role::SitGround | Role::Walk | Role::WalkBack | Role::WalkLeft | Role::WalkRight | Role::Run | Role::RunBack | Role::Swim | Role::IdleSwim)
         || matches!(r, Role::Clip(name) if name == "turn-left" || name == "turn-right")
 }
 
@@ -212,10 +221,10 @@ pub fn clip_time(a: &CatAnim, ms: f32, once: bool) -> f32 {
 
 /// DS 0x10073f23's infinite-count predecessor path extends a short remaining interval by
 /// ceil(200 / interval) whole cycles before clamping. Positive-count fades use the shared helper.
-fn body_fade_ms(old: &CatAnim, ms: f32, old_role: &Role, new_once: bool) -> f32 {
-    let (start, end) = if movement_loop(old_role) { loop_span(old).unwrap_or((0.0, old.duration)) } else { (0.0, old.duration) };
+pub(super) fn body_fade_ms(old: &CatAnim, ms: f32, old_once: bool, old_movement_loop: bool, new_once: bool) -> f32 {
+    let (start, end) = if old_movement_loop { loop_span(old).unwrap_or((0.0, old.duration)) } else { (0.0, old.duration) };
     let duration = end - start;
-    if !one_shot(old_role, false) && !new_once && duration > 0.0 {
+    if !old_once && !new_once && duration > 0.0 {
         let mut remaining = duration - (ms - start).rem_euclid(duration);
         if remaining < 200.0 {
             remaining += (200.0 / duration).ceil() * duration;
@@ -309,6 +318,9 @@ impl Fader {
 struct ActionClip {
     clip: Arc<CatAnim>,
     ms: f32,
+    duration: f32,
+    posture: bool,
+    before_body: bool,
     layer: u8,
     priority: i32,
     fade_ms: f32,
@@ -324,7 +336,7 @@ struct ActionClip {
 impl ActionClip {
     fn take_notes(&mut self) -> impl Iterator<Item = super::combat::notes::FiredNote> + '_ {
         let slot = self.slot;
-        super::combat::notes::fire(&self.clip.events, self.ms.min(self.clip.duration), &mut self.note_fired)
+        super::combat::notes::fire(&self.clip.events, self.ms.min(self.duration), &mut self.note_fired)
             .filter_map(move |id| attributed_note(id, slot))
     }
     fn finish_notes(&mut self) -> impl Iterator<Item = super::combat::notes::FiredNote> + '_ {
@@ -334,8 +346,8 @@ impl ActionClip {
     }
     fn sample(&self) -> ao_formats::character::AnimLayer<'_> {
         ao_formats::character::AnimLayer {
-            clip: &self.clip, ms: self.ms.min(self.clip.duration), layers: self.layers,
-            blend: ao_formats::character::animation_blend(self.ms, self.clip.duration, self.fade_ms),
+            clip: &self.clip, ms: self.ms.min(self.duration), layers: self.layers,
+            blend: ao_formats::character::animation_blend(self.ms, self.duration, self.fade_ms),
         }
     }
 }
@@ -378,6 +390,8 @@ pub struct Avatar {
     /// Playback rate factor of a hit-reaction clip ([`Avatar::set_clip_scale`]).
     clip_scale: Option<f32>,
     cast_loop: bool,
+    /// Playback semantics installed on the current node, separate from the next cast configuration.
+    body_once: bool,
     /// Bit `i` = event `i` of the clip has fired its note (cleared when a clip starts).
     note_fired: u32,
     /// Local clip time ([`clip_time`]) as of the last [`Avatar::update`], to detect a looping clip's wrap and re-arm
@@ -390,12 +404,16 @@ pub struct Avatar {
     stance: Option<i32>,
     /// Milliseconds into the current clip.
     ms: f32,
+    /// SetAnimationDelay freezes only the new idle node, not the enter or preceding idle.
+    body_delay_ms: f32,
     /// Body-layer crossfade (`VisualCATMesh_t::SetAnimation` DS 0x10073f23: `CATAnimBlend_t` anim1 = previous clip, anim2 =
     /// new one, blended over `body_fade_ms` on the incoming clip's clock): the role's previous clip, kept alive while
     /// `prev_fade_elapsed < prev_fade_ms`.
     prev_clip: Option<Arc<CatAnim>>,
     prev_ms: f32,
     prev_rate: f32,
+    /// The outgoing node keeps its playback count while the new role fades in.
+    prev_once: bool,
     prev_fade_elapsed: f32,
     prev_fade_ms: f32,
     transform: Mat4,
@@ -412,7 +430,7 @@ impl Avatar {
         let heads = head_table(store, breed, gender, 2)?;
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
         let rig = ActorRig::player(store, &assets, &l.look, &l.attachments)?;
-        let mut a = Self { id, rig, current_skin: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, note_fired: 0, body_phase: 0.0, airborne: false, notes: Vec::new(), stance: None, ms: 0.0, prev_clip: None, prev_ms: 0.0, prev_rate: 1.0, prev_fade_elapsed: 0.0, prev_fade_ms: 0.0, transform: Mat4::IDENTITY };
+        let mut a = Self { id, rig, current_skin: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, body_once: false, note_fired: 0, body_phase: 0.0, airborne: false, notes: Vec::new(), stance: None, ms: 0.0, body_delay_ms: 0.0, prev_clip: None, prev_ms: 0.0, prev_rate: 1.0, prev_once: false, prev_fade_elapsed: 0.0, prev_fade_ms: 0.0, transform: Mat4::IDENTITY };
         a.set_pose(store, AvatarPose::default())?;
         a.set_transform([u.pos[0], u.pos[1], -u.pos[2]], u.yaw().map_or(0.0, |y| -y));
         Ok(a)
@@ -487,11 +505,37 @@ impl Avatar {
         #[cfg(not(test))]
         let _ = role;
         let previous = self.actions.iter().rev().find(|a| a.priority == priority);
-        let fade_ms = previous.map_or(200.0, |a| ao_formats::character::animation_fade_ms(a.clip.duration, a.ms));
+        let fade_ms = previous.map_or(200.0, |a| ao_formats::character::animation_fade_ms(a.duration, a.ms));
         let at = self.actions.partition_point(|a| a.priority >= priority);
-        self.actions.insert(at, ActionClip { clip, ms: 0.0, layer, priority, fade_ms, layers: 3, note_fired: 0, rate, key, slot, #[cfg(test)] role });
+        self.actions.insert(at, ActionClip { duration: clip.duration, posture: false, before_body: false, clip, ms: 0.0, layer, priority, fade_ms, layers: 3, note_fired: 0, rate, key, slot, #[cfg(test)] role });
         // DS 100702d4 refreshes masks on clip load, not on node expiration.
         self.refresh_masks();
+    }
+
+    /// GC 1006d330: enqueue the infinite mode-2 idle first, then a priority-0 mode-1 enter.
+    /// DS 100737db/10072eeb freezes the idle clock; the finite enter keeps its own fade/lifetime.
+    pub fn play_posture(&mut self, store: &RecordStore, id: u16, idle: AvatarPose) -> Result<()> {
+        let Some((clip_id, _, _)) = super::combat::anim::resolve_clip(&self.assets.names, self.anim_set, id, false) else { return Ok(()) };
+        let clip = self.assets.anim(store, clip_id)?;
+        let duration = posture_interval_end(&clip);
+        let idle_fade = self.actions.iter().rev().find(|action| action.priority == self.body_priority && !action.before_body)
+            .map(|action| animation_fade_ms(action.duration, action.ms));
+        self.set_pose(store, idle)?;
+        if let Some(fade) = idle_fade { self.prev_fade_ms = fade; }
+        self.body_delay_ms = (duration - POSTURE_IDLE_LEAD_MS).max(0.0);
+        let idle_duration = self.clip.as_ref().map_or(0.0, |idle| loop_span(idle).map_or(idle.duration, |(start, end)| end - start));
+        let fade_ms = animation_fade_ms(idle_duration, 0.0);
+        self.start_action(clip, 0, 0, 1.0, (None, -1, None));
+        let action = self.actions.iter_mut().rev().find(|action| action.priority == 0).unwrap();
+        action.duration = duration;
+        action.fade_ms = fade_ms;
+        action.posture = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn posture_active(&self) -> bool {
+        self.actions.iter().any(|action| action.posture)
     }
     pub fn set_body_priority(&mut self, priority: i32) {
         if priority != self.body_priority {
@@ -504,7 +548,7 @@ impl Avatar {
     fn refresh_masks(&mut self) {
         use ao_formats::character::animation_layer_mask;
         let mut state = (i32::MAX, 0, 0);
-        let at = self.actions.partition_point(|a| a.priority >= self.body_priority);
+        let at = self.actions.partition_point(|a| a.priority > self.body_priority || (a.priority == self.body_priority && a.before_body));
         let (before, after) = self.actions.split_at_mut(at);
         for action in before {
             action.layers = animation_layer_mask(&mut state, action.priority, u32::from(action.layer), action.layers);
@@ -537,11 +581,17 @@ impl Avatar {
             };
             let old_ms = self.ms;
             let old_rate = self.rate;
-            let old_clip = self.clip.clone();
+            // An idle that has not acquired any weight is not the visible predecessor.
+            let old_clip = if self.prev_clip.is_some() && self.prev_fade_elapsed == 0.0 { None } else { self.clip.clone() };
+            self.body_delay_ms = 0.0;
+            for action in &mut self.actions {
+                if action.priority == self.body_priority { action.before_body = true; }
+            }
             self.ms = clip.as_ref().filter(|_| movement_loop(&pose.role)).and_then(|a| loop_span(a)).map_or(0.0, |s| s.0);
             // body-layer crossfade (DS 0x10073f23): keep the outgoing clip blended underneath while it fades.
             if let Some(old) = old_clip {
-                self.prev_fade_ms = body_fade_ms(&old, old_ms, &self.pose.role, one_shot(&pose.role, self.cast_loop));
+                self.prev_once = self.one_shot();
+                self.prev_fade_ms = body_fade_ms(&old, old_ms, self.prev_once, movement_loop(&self.pose.role), one_shot(&pose.role, self.cast_loop));
                 self.prev_fade_elapsed = 0.0;
                 self.prev_ms = old_ms;
                 self.prev_rate = old_rate;
@@ -559,6 +609,7 @@ impl Avatar {
         if let Some(k) = self.clip_scale {
             self.rate *= k;
         }
+        self.body_once = one_shot(&pose.role, self.cast_loop);
         self.pose = pose;
         Ok(())
     }
@@ -575,7 +626,7 @@ impl Avatar {
 
 
     fn one_shot(&self) -> bool {
-        one_shot(&self.pose.role, self.cast_loop)
+        self.body_once
     }
 
     /// Rate factor of the one-shot clip that plays (a hit reaction, `Dynels::react_to_hit`); set every frame before [`Avatar::set_pose`].
@@ -621,10 +672,14 @@ impl Avatar {
     /// Advances the clip by `dt` seconds at the pose's speed.
     pub fn update(&mut self, dt: f32) {
         self.sample_pose.set(true);
-        self.ms += dt * 1000.0 * self.rate;
+        let elapsed = dt * 1000.0 * self.rate;
+        let delay = self.body_delay_ms.min(elapsed.abs());
+        self.body_delay_ms -= delay;
+        let body_elapsed = elapsed.signum() * (elapsed.abs() - delay);
+        self.ms += body_elapsed;
         if self.prev_clip.is_some() {
             self.prev_ms += dt * 1000.0 * self.prev_rate;
-            self.prev_fade_elapsed += dt * 1000.0 * self.rate.abs();
+            self.prev_fade_elapsed += body_elapsed.abs();
             if self.prev_fade_elapsed >= self.prev_fade_ms {
                 self.prev_clip = None;
             }
@@ -632,11 +687,11 @@ impl Avatar {
         for action in &mut self.actions {
             action.ms += dt * 1000.0 * action.rate;
             self.notes.extend(action.take_notes());
-            if action.ms > action.clip.duration {
+            if action.ms > action.duration && !action.posture {
                 self.notes.extend(action.finish_notes());
             }
         }
-        self.actions.retain(|a| a.ms <= a.clip.duration);
+        self.actions.retain(|a| a.ms <= a.duration);
         // the own walk/run/jump clip's own notes (`FUN_1003c036`'s per-frame holder walk, not just the swing overlays):
         // `fire` needs the looping clip's current cycle position, and a wrap re-arms `note_fired` for the next cycle.
         if let Some(clip) = self.clip.clone() {
@@ -661,12 +716,15 @@ impl Avatar {
 
     fn layers(&self) -> impl Clone + Iterator<Item = ao_formats::character::AnimLayer<'_>> {
         use ao_formats::character::AnimLayer;
-        let prev_body = self.prev_clip.as_ref().map(|a| AnimLayer { clip: a, ms: clip_time(a, self.prev_ms, false), layers: self.body_layers, blend: 1.0 });
+        let prev_body = self.prev_clip.as_ref().map(|a| AnimLayer { clip: a, ms: clip_time(a, self.prev_ms, self.prev_once), layers: self.body_layers, blend: 1.0 });
         let body_blend = if self.prev_clip.is_some() { (self.prev_fade_elapsed / self.prev_fade_ms).clamp(0.0, 1.0) } else { 1.0 };
         let body = self.clip.as_ref().map(|a| AnimLayer { clip: a, ms: clip_time(a, self.ms, self.one_shot()), layers: self.body_layers, blend: body_blend });
-        let at = self.actions.partition_point(|a| a.priority >= self.body_priority);
-        let (before, after) = self.actions.split_at(at);
-        before.iter().map(ActionClip::sample).chain(prev_body).chain(body).chain(after.iter().map(ActionClip::sample))
+        let high = self.actions.partition_point(|a| a.priority > self.body_priority);
+        let at = self.actions.partition_point(|a| a.priority > self.body_priority || (a.priority == self.body_priority && a.before_body));
+        let (higher, rest) = self.actions.split_at(high);
+        let (older, after) = rest.split_at(at - high);
+        higher.iter().map(ActionClip::sample).chain(prev_body).chain(older.iter().map(ActionClip::sample))
+            .chain(body).chain(after.iter().map(ActionClip::sample))
     }
 
     /// Own CAT mesh uses the same native camera-distance refresh policy as remote meshes.
@@ -776,11 +834,169 @@ impl Avatar {
 
 #[cfg(test)]
 pub(super) mod tests {
+    pub(in crate::play) struct PostureReference {
+        old: Arc<CatAnim>,
+        old_ms: f32,
+        old_rate: f32,
+        idle: Arc<CatAnim>,
+        enter: Arc<CatAnim>,
+        duration: f32,
+        delay: f32,
+        idle_start: f32,
+        idle_fade: f32,
+        enter_fade: f32,
+    }
+
+    pub(in crate::play) fn posture_reference(avatar: &mut Avatar, store: &RecordStore, id: u16, idle: &Role) -> PostureReference {
+        let (enter, _, _) = super::super::combat::anim::resolve_clip(&avatar.assets.names, avatar.anim_set, id, false).unwrap();
+        let enter = avatar.assets.anim(store, enter).unwrap();
+        let clips = avatar.assets.clips(store, avatar.rig.model_id).unwrap();
+        let idle_id = clips.iter().find(|(name, _)| *name == idle.clip_name()).unwrap().1;
+        let idle = avatar.assets.anim(store, idle_id).unwrap();
+        let old = avatar.clip.clone().unwrap();
+        let (old_start, old_end) = loop_span(&old).unwrap_or((0.0, old.duration));
+        let old_span = old_end - old_start;
+        let mut remaining = old_span - (avatar.ms - old_start).rem_euclid(old_span);
+        if remaining < 200.0 { remaining += (200.0 / old_span).ceil() * old_span; }
+        let (idle_start, idle_end) = loop_span(&idle).unwrap_or((0.0, idle.duration));
+        let duration = enter.events.iter().find(|(_, name)| name == "loopstart").map_or(enter.duration, |(ms, _)| *ms as f32);
+        PostureReference { old, old_ms: avatar.ms, old_rate: avatar.rate, idle, enter, duration,
+            delay: (duration - 500.0).max(0.0), idle_start, idle_fade: remaining.clamp(200.0, 300.0),
+            enter_fade: (idle_end - idle_start).clamp(200.0, 300.0) }
+    }
+
+    impl PostureReference {
+        fn sample(&self, avatar: &Avatar, frame_no: i32) -> Vec<ao_scene::Vertex> {
+            use ao_formats::character::AnimLayer;
+            let elapsed = (frame_no + 1) as f32 * (1000.0 / 60.0);
+            let idle_elapsed = (elapsed - self.delay).max(0.0);
+            let old = (idle_elapsed < self.idle_fade).then_some(AnimLayer {
+                clip: &self.old, ms: clip_time(&self.old, self.old_ms + elapsed * self.old_rate, false), layers: 3, blend: 1.0,
+            });
+            let idle = AnimLayer { clip: &self.idle, ms: clip_time(&self.idle, self.idle_start + idle_elapsed, false),
+                layers: 3, blend: (idle_elapsed / self.idle_fade).clamp(0.0, 1.0) };
+            let enter = (elapsed <= self.duration).then_some(AnimLayer {
+                clip: &self.enter, ms: elapsed.min(self.duration), layers: 3,
+                blend: if elapsed <= self.enter_fade { elapsed / self.enter_fade } else { (self.duration - elapsed) / self.enter_fade }.clamp(0.0, 1.0),
+            });
+            avatar.rig.pose_composed(old.into_iter().chain(Some(idle)).chain(enter)).0
+        }
+    }
+    /// Samples real CAT geometry against the independent 60 Hz retail queue timeline.
+    /// The baseline caller recreates old transient scheduling; its outgoing sampler wraps.
+    pub(in crate::play) fn posture_sample(avatar: &Avatar, before: bool, frame_no: i32, reference: Option<&PostureReference>) -> (ActorFrame, Vec<ao_scene::Vertex>, String) {
+        let posture = avatar.actions.iter().rev().find(|action| action.posture);
+        let expected = if let Some(reference) = reference {
+            assert!((avatar.prev_fade_ms - reference.idle_fade).abs() < 1e-4, "idle fade must come from the preceding configured CAT interval at enqueue");
+            if let Some(action) = posture {
+                assert!((action.fade_ms - reference.enter_fade).abs() < 1e-4, "enter fade must come from the queued idle interval at elapsed zero");
+            }
+            reference.sample(avatar, frame_no)
+        } else {
+            let expected_layers = avatar.layers().enumerate().map(|(i, layer)| {
+                if i == 0 && avatar.prev_clip.is_some() && avatar.prev_once {
+                    ao_formats::character::AnimLayer { ms: avatar.prev_ms.min(layer.clip.duration), ..layer }
+                } else { layer }
+            });
+            avatar.rig.pose_composed(expected_layers).0
+        };
+        let mut frame = avatar.frame();
+        if before {
+            let old_layers = avatar.layers().enumerate().map(|(i, layer)| {
+                if i == 0 && avatar.prev_clip.is_some() {
+                    ao_formats::character::AnimLayer { ms: clip_time(layer.clip, avatar.prev_ms, false), ..layer }
+                } else {
+                    layer
+                }
+            });
+            frame.skin = Some(Arc::new(avatar.rig.pose_composed(old_layers).0));
+        }
+        let trace = format!("{},{:.4},{:.4},{},{:.4},{},{:.4},{:.4},{},{:.4},{:.4},{:.4},{:.4}",
+            avatar.clip_id, avatar.ms, avatar.clip.as_ref().map_or(0.0, |a| a.duration),
+            avatar.prev_clip.as_ref().map_or(0, |a| a.source_id), avatar.prev_ms, avatar.prev_once,
+            avatar.prev_fade_elapsed, avatar.prev_fade_ms, posture.map_or(0, |a| a.clip.source_id),
+            posture.map_or(0.0, |a| a.ms), posture.map_or(0.0, |a| a.duration),
+            posture.map_or(0.0, |a| a.sample().blend), avatar.body_delay_ms);
+        (frame, expected, trace)
+    }
+    pub(in crate::play) fn posture_clock(avatar: &Avatar) -> (u32, f32) {
+        (avatar.clip_id, avatar.ms)
+    }
+    pub(in crate::play) fn posture_duration(avatar: &mut Avatar, store: &RecordStore, id: u16, before: bool) -> f32 {
+        let (id, _, _) = super::super::combat::anim::resolve_clip(&avatar.assets.names, avatar.anim_set, id, false).unwrap();
+        let clip = avatar.assets.anim(store, id).unwrap();
+        if before { clip.duration } else { posture_interval_end(&clip) }
+    }
+
+    pub(in crate::play) fn posture_baseline_idle(avatar: &mut Avatar) {
+        // The original ground idle started at zero rather than the queued mode-2 interval.
+        if avatar.pose.role == Role::SitGround {
+            avatar.ms = 1000.0 / 60.0;
+            avatar.sample_pose.set(true);
+        }
+    }
     use super::*;
     use ao_net::{
         frame::Frame,
         n3::{self, dynel::Dynel, N3},
     };
+
+    #[test]
+    fn own_interrupted_loop_keeps_installed_playback_count() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
+        avatar.set_cast_loop(true);
+        avatar.set_pose(&store, AvatarPose::still(Role::Clip("ground-start".into()))).unwrap();
+        let duration = avatar.clip.as_ref().unwrap().duration;
+        avatar.update((duration + 100.0) / 1000.0);
+        avatar.set_cast_loop(false);
+        avatar.set_pose(&store, AvatarPose::still(Role::Idle)).unwrap();
+        assert!(!avatar.prev_once, "new cast configuration must not reclassify the outgoing looping node");
+        let previous = avatar.layers().next().unwrap();
+        assert_eq!(previous.ms, clip_time(previous.clip, duration + 100.0, false));
+    }
+
+    #[test]
+    fn own_delayed_sit_reversal_preserves_visible_pose() {
+        use ao_formats::character::AnimLayer;
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
+        avatar.update(1.0);
+        avatar.play_posture(&store, 0xd5, AvatarPose::still(Role::SitGround)).unwrap();
+        avatar.update(0.1);
+        assert!(avatar.body_delay_ms > 0.0 && avatar.prev_fade_elapsed == 0.0);
+        let before = avatar.rig.pose_composed(avatar.layers()).0;
+        let standing = avatar.prev_clip.clone().unwrap();
+        let standing_ms = avatar.prev_ms;
+        let old_enter = avatar.actions.last().unwrap();
+        let old_clip = old_enter.clip.clone();
+        let old_ms = old_enter.ms;
+        let old_duration = old_enter.duration;
+        let old_fade = old_enter.fade_ms;
+        avatar.play_posture(&store, 0xd6, AvatarPose::still(Role::Idle)).unwrap();
+        let switched = avatar.rig.pose_composed(avatar.layers()).0;
+        let delta = |a: &[ao_scene::Vertex], b: &[ao_scene::Vertex]| a.iter().zip(b)
+            .map(|(a, b)| Vec3::from(a.pos).distance(Vec3::from(b.pos))).fold(0.0_f32, f32::max);
+        assert!(delta(&before, &switched) < 1e-5, "a zero-time reversal must not expose the delayed seated idle");
+        let new_enter = avatar.actions.last().unwrap();
+        let new_clip = new_enter.clip.clone();
+        let new_fade = new_enter.fade_ms;
+        let dt = 1000.0 / 60.0;
+        // Absolute one-frame bound from the two authored enters, unchanged standing
+        // clock, and retail envelopes; no test-object layer list is used.
+        let old_weight = if old_ms + dt <= old_fade { (old_ms + dt) / old_fade } else { (old_duration - old_ms - dt) / old_fade }.clamp(0.0, 1.0);
+        let expected = avatar.rig.pose_composed([
+            AnimLayer { clip: &standing, ms: clip_time(&standing, standing_ms + dt, false), layers: 3, blend: 1.0 },
+            AnimLayer { clip: &old_clip, ms: old_ms + dt, layers: 3, blend: old_weight },
+            AnimLayer { clip: &new_clip, ms: dt, layers: 3, blend: (dt / new_fade).clamp(0.0, 1.0) },
+        ].into_iter()).0;
+        avatar.update(1.0 / 60.0);
+        let actual = avatar.rig.pose_composed(avatar.layers()).0;
+        assert!(delta(&actual, &expected) < 1e-4);
+        assert!(delta(&switched, &actual) <= delta(&switched, &expected) + 1e-4);
+    }
 
     #[test]
     fn unlit_hidden_avatar_does_not_sample_a_pose_for_lights() {
@@ -854,7 +1070,7 @@ pub(super) mod tests {
             (0, "attack".into()), (0, "attack_effect_1".into()),
             (0, "attack_effect_4".into()), (0, "swish_punch".into()),
         ], version: 0, duration: 1000.0, signature: 0, param: 0.0, tracks: vec![] };
-        let mut action = ActionClip { clip: Arc::new(clip), ms: 100.0, layer: 1, priority: -1, fade_ms: 200.0, layers: 3, note_fired: 0, rate: 1.0, key: None, slot: -1, role: None };
+        let mut action = ActionClip { clip: Arc::new(clip), ms: 100.0, duration: 1000.0, posture: false, before_body: false, layer: 1, priority: -1, fade_ms: 200.0, layers: 3, note_fired: 0, rate: 1.0, key: None, slot: -1, role: None };
         assert_eq!(action.take_notes().map(|note| note.id).collect::<Vec<_>>(), vec![id::SWISH_PUNCH]);
         assert_eq!(action.take_notes().count(), 0, "authored notes still fire only once");
     }
@@ -998,7 +1214,7 @@ pub(super) mod tests {
         assert!(start > 0.0);
         assert_eq!(avatar.ms, start, "GC 100108be mode 2 skips the intro, not a run-start transition");
         assert_eq!(avatar.prev_clip.as_ref().unwrap().source_id, idle_clip.source_id);
-        assert_eq!(avatar.prev_fade_ms, body_fade_ms(&idle_clip, 0.0, &Role::Idle, false));
+        assert_eq!(avatar.prev_fade_ms, body_fade_ms(&idle_clip, 0.0, false, true, false));
         let layers: Vec<_> = avatar.layers().collect();
         assert_eq!(layers.len(), 2);
         assert_eq!((layers[0].clip.source_id, layers[0].blend), (idle_clip.source_id, 1.0));
@@ -1245,11 +1461,11 @@ pub(super) mod tests {
         assert_eq!(clip_time(&a, 5000.0, true), 1000.0);
         let b = CatAnim { events: vec![], ..a };
         assert_eq!(clip_time(&b, 1100.0, false), 100.0);
-        assert_eq!(body_fade_ms(&c, 550.0, &Role::Run, false), 300.0, "50 ms left in a 400 ms loop is extended by a cycle, then clamped");
-        assert_eq!(body_fade_ms(&c, 350.0, &Role::Run, false), 250.0, "250 ms left requires no extra cycle");
-        assert_eq!(body_fade_ms(&c, 550.0, &Role::Run, true), 200.0, "positive-count successor has no infinite-cycle extension");
+        assert_eq!(body_fade_ms(&c, 550.0, false, true, false), 300.0, "50 ms left in a 400 ms loop is extended by a cycle, then clamped");
+        assert_eq!(body_fade_ms(&c, 350.0, false, true, false), 250.0, "250 ms left requires no extra cycle");
+        assert_eq!(body_fade_ms(&c, 550.0, false, true, true), 200.0, "positive-count successor has no infinite-cycle extension");
         let short = CatAnim { duration: 100.0, ..b };
-        assert_eq!(body_fade_ms(&short, 90.0, &Role::Idle, false), 210.0, "ceil(200 / 100) cycles plus the 10 ms remainder");
+        assert_eq!(body_fade_ms(&short, 90.0, false, true, false), 210.0, "ceil(200 / 100) cycles plus the 10 ms remainder");
     }
 
     fn client() -> Option<std::path::PathBuf> {

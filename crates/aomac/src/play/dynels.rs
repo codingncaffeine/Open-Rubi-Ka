@@ -534,9 +534,10 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
             }
         }
     }
-    // weapon stance clips: players resolve the id by file name in the model's set, NPCs through their record (parent chain only)
-    for &id in STANCE_IDS {
+    // Resolve posture transitions with the model, not after the first visible sit/stand.
+    for &id in STANCE_IDS.iter().chain([0xd5, 0xd6, 0xed, 0xef, 0x68, 0x69].iter()) {
         let ids: Vec<u32> = match &rec {
+            Some(rec) if matches!(id, 0xd5 | 0xd6 | 0xed | 0xef | 0x68 | 0x69) => ao_formats::character::anim_key_variants(rec, id as u32).to_vec(),
             Some(rec) => ao_formats::character::holder_variants(rec, id as u32).to_vec(),
             None => canim::resolve_clip(&assets.names, canim::clip_set(look.breed, look.sex), id, false).map(|c| c.0).into_iter().collect(),
         };
@@ -642,10 +643,16 @@ pub struct Char {
     pose: ao_net::n3::motion::Pose,
     anim: u32,
     special: Special,
+    posture_idle: Option<u32>,
+    restart_body: bool,
+    body_delay_ms: f32,
     actions: Vec<ActionAnim>,
     base_layers: u32,
     clip_ms: f32,
     clip_rate: f32,
+    body_once: bool,
+    body_loop: bool,
+    previous_body: Option<PreviousBody>,
     terminal_pose: bool,
     submitted: bool,
     /// Mount transforms of the last pose.
@@ -664,6 +671,16 @@ pub struct Char {
     body_phase: f32,
 }
 
+/// DS 0x10073f23 keeps the outgoing body alive on its own playback clock.
+struct PreviousBody {
+    clip: Arc<CatAnim>,
+    ms: f32,
+    rate: f32,
+    once: bool,
+    elapsed: f32,
+    fade_ms: f32,
+}
+
 /// Authored action playback is independent of locomotion and its markers.
 struct ActionAnim {
     id: u32,
@@ -678,19 +695,25 @@ struct ActionAnim {
     key: Option<u16>,
     slot: i32,
     delay: Option<i32>,
+    posture: bool,
+    before_body: bool,
 }
 
 impl ActionAnim {
+    fn duration(&self, clip: &CatAnim) -> f32 {
+        if self.posture { super::avatar::posture_interval_end(clip) } else { clip.duration }
+    }
     fn advance(&mut self, clip: &CatAnim, dt: f32, mut emit: impl FnMut(super::combat::notes::FiredNote)) -> bool {
         use super::combat::notes::{fire, finish, id, FiredNote};
+        let duration = self.duration(clip);
         let slot = self.slot;
         let mut emit_note = |note| {
             if slot >= 0 || !matches!(note, id::ATTACK | id::ATTACK_EFFECT_1..=id::ATTACK_EFFECT_4) {
                 emit(FiredNote { id: note, slot });
             }
         };
-        if self.ms >= clip.duration {
-            for id in finish(&clip.events, &mut self.note_fired) { emit_note(id); }
+        if self.ms >= duration {
+            if !self.posture { for id in finish(&clip.events, &mut self.note_fired) { emit_note(id); } }
             return false;
         }
         if self.ms == 0.0 {
@@ -699,7 +722,7 @@ impl ActionAnim {
             }
         }
         self.ms += (dt * 1000.0 * self.rate).abs();
-        for id in fire(&clip.events, self.ms.min(clip.duration), &mut self.note_fired) { emit_note(id); }
+        for id in fire(&clip.events, self.ms.min(duration), &mut self.note_fired) { emit_note(id); }
         true
     }
 }
@@ -711,17 +734,23 @@ impl Char {
 
     fn layers<'a>(&'a self, built: &'a Built) -> impl Clone + Iterator<Item = AnimLayer<'a>> {
         let priority = self.base_priority();
+        let previous = self.previous_body.as_ref().map(|body| AnimLayer {
+            clip: &body.clip, ms: super::avatar::clip_time(&body.clip, body.ms, body.once),
+            layers: self.base_layers, blend: 1.0,
+        });
+        let blend = self.previous_body.as_ref().map_or(1.0, |body| (body.elapsed / body.fade_ms).clamp(0.0, 1.0));
         let base = built.clips.get(&self.anim)
             .and_then(|clips| clips.get(self.roll.variant % clips.len().max(1)))
-            .map(|clip| AnimLayer { clip, ms: super::avatar::clip_time(clip, self.clip_ms, !matches!(self.special, Special::None | Special::Cast(_))), layers: self.base_layers, blend: 1.0 });
+            .map(|clip| AnimLayer { clip, ms: super::avatar::clip_time(clip, self.clip_ms, self.body_once), layers: self.base_layers, blend });
         let action_layer = |action: &'a ActionAnim| {
             let clips = built.clips.get(&action.id)?;
             let clip = clips.get(action.variant? % clips.len().max(1))?;
-            Some(AnimLayer { clip, ms: action.ms.min(clip.duration), layers: action.layers, blend: ao_formats::character::animation_blend(action.ms, clip.duration, action.fade_ms) })
+            Some(AnimLayer { clip, ms: action.ms.min(action.duration(clip)), layers: action.layers, blend: ao_formats::character::animation_blend(action.ms, action.duration(clip), action.fade_ms) })
         };
         let before = self.actions.iter().filter(move |action| action.priority > priority).filter_map(action_layer);
-        let after = self.actions.iter().filter(move |action| action.priority <= priority).filter_map(action_layer);
-        before.chain(base).chain(after)
+        let older = self.actions.iter().filter(move |action| action.priority == priority && action.before_body).filter_map(action_layer);
+        let after = self.actions.iter().filter(move |action| action.priority < priority || (action.priority == priority && !action.before_body)).filter_map(action_layer);
+        before.chain(previous).chain(older).chain(base).chain(after)
     }
 
     fn refresh_layers(&mut self) {
@@ -747,10 +776,14 @@ fn advance_clip_clock(ms: &mut f32, rate: &mut f32, dt: f32, started: bool, star
     *ms += (dt * 1000.0 * *rate).abs();
 }
 
+fn movement_loop(state: AnimState) -> bool {
+    matches!(state, AnimState::Idle | AnimState::Walk | AnimState::WalkBack | AnimState::WalkLeft | AnimState::WalkRight | AnimState::Run | AnimState::RunBack | AnimState::TurnLeft | AnimState::TurnRight | AnimState::Swim | AnimState::IdleSwim | AnimState::SitGround | AnimState::Sleep | AnimState::Lounge | AnimState::IdleCrawl)
+}
+
 /// GC 0x1006be27 -> 0x100108be interval mode 2 applies to remote characters too.
 /// Return the authored first sample and notes skipped before that interval.
 fn movement_interval(clip: &CatAnim, state: AnimState) -> (f32, u32) {
-    let start = if matches!(state, AnimState::Idle | AnimState::Walk | AnimState::WalkBack | AnimState::WalkLeft | AnimState::WalkRight | AnimState::Run | AnimState::RunBack | AnimState::TurnLeft | AnimState::TurnRight | AnimState::Swim | AnimState::IdleSwim) {
+    let start = if movement_loop(state) {
         super::avatar::loop_span(clip).map_or(0.0, |span| span.0)
     } else { 0.0 };
     let notes = clip.events.iter().enumerate().filter(|(_, (ms, _))| (*ms as f32) < start).fold(0, |mask, (i, _)| mask | 1u32 << (i & 31));
@@ -1277,16 +1310,27 @@ impl Dynels {
         if let Some(Model::Ready { built, .. }) = self.models.get(&c.key) {
             if built.clips.contains_key(&anim_id) {
                 c.special = Special::Once(anim_id);
-                c.clip_ms = 0.0;
                 return;
             }
         }
         self.pending_clips.push((c.key, look.clone(), anim_id, id));
     }
 
+    /// GC 0x1006d330 queues the delayed infinite idle first, then the finite enter at priority zero.
+    pub fn play_posture(&mut self, id: i32, anim_id: u32) {
+        let Some(c) = self.chars.get(&id) else { return };
+        // Every supported posture was loaded with the model; never replay a stale worker response.
+        if !matches!(self.models.get(&c.key), Some(Model::Ready { built, .. }) if built.clips.contains_key(&anim_id)) { return; }
+        let Some(c) = self.chars.get_mut(&id).filter(|c| !matches!(c.special, Special::Die(_))) else { return };
+        c.posture_idle = Some(anim_id);
+        c.special = Special::None;
+        for action in &mut c.actions { if action.priority == 0 { action.before_body = true; } }
+        self.start_node(id, ActionAnim { id: anim_id, layer: canim::Layer::Body, priority: 0, layers: 3, fade_ms: 200.0, ms: 0.0, variant: None, note_fired: 0, rate: 1.0, key: None, slot: -1, delay: None, posture: true, before_body: false });
+    }
+
     /// Original producer's layer wins over the generic name-table mapping.
     pub fn play_action(&mut self, id: i32, anim_id: u32, layer: canim::Layer, priority: i32) {
-        self.start_node(id, ActionAnim { id: anim_id, layer, priority, layers: 3, fade_ms: 200.0, ms: 0.0, variant: None, note_fired: 0, rate: 1.0, key: None, slot: -1, delay: None });
+        self.start_node(id, ActionAnim { id: anim_id, layer, priority, layers: 3, fade_ms: 200.0, ms: 0.0, variant: None, note_fired: 0, rate: 1.0, key: None, slot: -1, delay: None, posture: false, before_body: false });
     }
 
     fn start_node(&mut self, id: i32, mut node: ActionAnim) {
@@ -1296,7 +1340,7 @@ impl Dynels {
             let outgoing = ActionAnim {
                 id: c.anim, layer: canim::Layer::Body, priority: -1, layers: c.base_layers, fade_ms: 200.0,
                 ms: c.clip_ms, variant: Some(c.roll.variant), note_fired: c.note_fired,
-                rate: c.clip_rate, key: None, slot: -1, delay: None,
+                rate: c.clip_rate, key: None, slot: -1, delay: None, posture: false, before_body: false,
             };
             let at = c.actions.partition_point(|action| action.priority >= -1);
             c.actions.insert(at, outgoing);
@@ -1332,7 +1376,7 @@ impl Dynels {
         let anim = anim.unwrap_or(ATTACK_KEY);
         let slot = self.note_slot(id).unwrap_or(-1);
         let delay = self.swing_delay.get(&id).filter(|entry| entry.0 == anim).map(|entry| entry.1);
-        self.start_node(id, ActionAnim { id: anim, layer: canim::Layer::Body, priority: -1, layers: 3, fade_ms: 200.0, ms: 0.0, variant: None, note_fired: 0, rate: 1.0, key: Some(key), slot, delay });
+        self.start_node(id, ActionAnim { id: anim, layer: canim::Layer::Body, priority: -1, layers: 3, fade_ms: 200.0, ms: 0.0, variant: None, note_fired: 0, rate: 1.0, key: Some(key), slot, delay, posture: false, before_body: false });
     }
 
     pub fn pick_item_swing(&mut self, id: i32, special: i32, key: u16) -> Option<(u16, i32, u16)> {
@@ -1383,8 +1427,8 @@ impl Dynels {
     pub fn die(&mut self, id: i32, anim: u32) {
         self.cancel_nano_visuals(id);
         if let Some(c) = self.chars.get_mut(&id) {
-            if !matches!(c.special, Special::Die(_)) {
-                c.clip_ms = 0.0;
+            if !matches!(c.special, Special::Die(_)) && c.anim == anim {
+                c.restart_body = true;
             }
             c.special = Special::Die(anim);
         }
@@ -1658,7 +1702,6 @@ impl Dynels {
         if who == self.own { self.nano_animations.push(None); }
         if let Some(c) = self.chars.get_mut(&who).filter(|c| matches!(c.special, Special::Cast(_))) {
             c.special = Special::None;
-            c.clip_ms = 0.0;
         }
         let mut renderer = self.effects.take();
         self.casting.retain(|cast| {
@@ -1670,7 +1713,6 @@ impl Dynels {
             if cast.who == self.own { self.nano_animations.push(None); }
             else if let Some(c) = self.chars.get_mut(&cast.who).filter(|c| matches!(c.special, Special::Cast(_)) || c.special == Special::Once(cast.release_anim)) {
                 c.special = Special::None;
-                c.clip_ms = 0.0;
             }
             if let Some(renderer) = &mut renderer { renderer.delete(cast.handle); }
             false
@@ -1700,7 +1742,6 @@ impl Dynels {
             if who == self.own { self.nano_animations.push(None); }
             else if let Some(c) = self.chars.get_mut(&who).filter(|c| matches!(c.special, Special::Cast(_)) || c.special == Special::Once(cast.release_anim)) {
                 c.special = Special::None;
-                c.clip_ms = 0.0;
             }
             if let Some(renderer) = &mut self.effects { renderer.delete(cast.handle); }
             false
@@ -1731,10 +1772,7 @@ impl Dynels {
     fn nano_clip(&mut self, who: i32, animation: u32, looping: bool) {
         let Some(character) = self.chars.get_mut(&who).filter(|c| !matches!(c.special, Special::Die(_))) else { return };
         character.special = Special::None;
-        character.clip_ms = 0.0;
-        character.note_fired = 0;
-        character.body_phase = 0.0;
-        character.roll.key = None;
+        character.restart_body = true;
         self.pending_clips.retain(|clip| clip.3 != who);
         self.replay.retain(|clip| clip.0 != who);
         self.once_rate.remove(&who);
@@ -2520,7 +2558,10 @@ impl Dynels {
                         visual_flags: u.visual_flags as i32,
                         in_play: u.flags & ao_net::n3::dynel::flag::IN_PLAY != 0,
                         visible: u.is_npc() || who.instance == self.own || u.flags & ao_net::n3::dynel::flag::IN_PLAY != 0,
+                        restart_body: false,
                         parent: u.parent.filter(|p| *p != ao_net::msg::Identity::default()),
+                        posture_idle: None,
+                        body_delay_ms: 0.0,
                         pose,
                         anim: 0x78,
                         special: if u.max_health > 0 && u.health <= 0 { Special::Die(DIE_KEY) } else { Special::None },
@@ -2528,6 +2569,9 @@ impl Dynels {
                         base_layers: 3,
                         clip_ms: 0.0,
                         clip_rate: 1.0,
+                        body_once: false,
+                        body_loop: false,
+                        previous_body: None,
                         terminal_pose: false,
                         submitted: false,
                         parts: vec![],
@@ -2720,7 +2764,6 @@ impl Dynels {
                             }
                             if available && c.special == Special::None {
                                 c.special = Special::Once(id);
-                                c.clip_ms = 0.0;
                             }
                         }
                     }
@@ -2849,6 +2892,12 @@ impl Dynels {
             let dist = (dx * dx + (p[1] - cam[1]).powi(2) + dz * dz).sqrt();
             // clip: death / attack override the movement state; walking and running scale the clip with the real speed
             let state = c.pose.anim;
+            // Finish before selecting the next body, never rewind the outgoing clip before skinning.
+            if matches!(c.special, Special::Once(_)) && c.body_once && !c.restart_body
+                && built.clips.get(&c.anim).and_then(|clips| clips.get(c.roll.variant)).is_some_and(|clip| c.clip_ms >= clip.duration)
+            {
+                c.special = Special::None;
+            }
             let mut movement_rate = c.special == Special::None;
             let (key, list, rate) = match c.special {
                 Special::Cast(k) => (k, built.clips.get(&k), 1.0),
@@ -2885,11 +2934,34 @@ impl Dynels {
             };
             // the variant is rolled when the clip starts, not while it loops
             let roll_key = (key, matches!(c.special, Special::None).then_some(state));
-            let started = key != c.anim || c.roll.key != Some(roll_key);
+            let started = key != c.anim || c.roll.key != Some(roll_key) || c.restart_body;
+            let incoming_delayed = c.body_delay_ms > 0.0 && c.previous_body.as_ref().is_some_and(|body| body.elapsed == 0.0);
+            let once = !matches!(c.special, Special::None | Special::Cast(_));
+            if started && c.posture_idle.is_none() {
+                c.body_delay_ms = 0.0;
+                for action in &mut c.actions { if action.priority == 0 { action.before_body = true; } }
+            }
+            if started && c.roll.key.is_some() && !incoming_delayed {
+                c.previous_body = built.clips.get(&c.anim).and_then(|clips| clips.get(c.roll.variant)).map(|old| PreviousBody {
+                    clip: Arc::clone(old), ms: c.clip_ms, rate: c.clip_rate, once: c.body_once, elapsed: 0.0,
+                    fade_ms: super::avatar::body_fade_ms(old, c.clip_ms, c.body_once, c.body_loop, once),
+                });
+                if let Some((duration, ms)) = c.actions.iter().rev().filter(|action| action.priority == 0 && action.before_body).find_map(|action| {
+                    let clip = built.clips.get(&action.id)?.get(action.variant?)?;
+                    Some((action.duration(clip), action.ms))
+                }) {
+                    if let Some(previous) = &mut c.previous_body {
+                        previous.fade_ms = ao_formats::character::animation_fade_ms(duration, ms);
+                    }
+                }
+            }
             let clip = list.filter(|l| !l.is_empty()).map(|l| &l[c.roll.pick(roll_key, l.len(), &mut self.rng)]);
             let (clip_start, skipped_notes) = clip.filter(|_| c.special == Special::None).map_or((0.0, 0), |a| movement_interval(a, state));
             if started {
+                c.restart_body = false;
                 c.anim = key;
+                c.body_once = once;
+                c.body_loop = c.special == Special::None && movement_loop(state);
                 c.base_layers = 3;
                 c.refresh_layers();
                 c.clip_ms = clip_start;
@@ -2897,8 +2969,24 @@ impl Dynels {
                 c.body_phase = clip_start;
                 c.terminal_pose = false;
             }
+            if let Some(animation) = c.posture_idle.take() {
+                if let (Some(idle), Some(action)) = (clip, c.actions.iter_mut().rev().find(|action| action.posture && action.id == animation)) {
+                    if let Some(enter) = built.clips.get(&animation).and_then(|clips| clips.first()) {
+                        c.body_delay_ms = (action.duration(enter) - super::avatar::POSTURE_IDLE_LEAD_MS).max(0.0);
+                        let (start, end) = super::avatar::loop_span(idle).unwrap_or((0.0, idle.duration));
+                        action.fade_ms = ao_formats::character::animation_fade_ms(end - start, 0.0);
+                    }
+                }
+                movement_rate = false; // queued idle Play explicitly uses speed 1.0.
+            }
+            let body_dt = if c.body_delay_ms > 0.0 {
+                let elapsed = dt.abs() * 1000.0;
+                let remaining = (elapsed - c.body_delay_ms).max(0.0);
+                c.body_delay_ms = (c.body_delay_ms - elapsed).max(0.0);
+                remaining / 1000.0
+            } else { dt };
             // GC 0x1006be27 / 0x1006fb56 set the rate once after Play, including idle.
-            advance_clip_clock(&mut c.clip_ms, &mut c.clip_rate, dt, started, || {
+            advance_clip_clock(&mut c.clip_ms, &mut c.clip_rate, body_dt, started, || {
                 if movement_rate {
                     let status = c.mover.status();
                     let reference = match status.mode {
@@ -2917,6 +3005,11 @@ impl Dynels {
                     )
                 } else { rate }
             });
+            if let Some(previous) = &mut c.previous_body {
+                previous.ms += (dt * 1000.0 * previous.rate).abs();
+                previous.elapsed += (body_dt * 1000.0 * c.clip_rate).abs();
+                if previous.elapsed >= previous.fade_ms { c.previous_body = None; }
+            }
             // the base clip's own notes (`FUN_1003c036`'s per-frame holder walk, not just the overlay `c.actions`): a wrap
             // of the looping clip's local cycle position re-arms `note_fired` for the step/land notes of its next cycle.
             if let Some(a) = clip {
@@ -2941,16 +3034,8 @@ impl Dynels {
                 action.advance(clip, dt, |note| self.notes.push((*id, note)))
             });
             let dead = matches!(c.special, Special::Die(_));
-            if let Some(a) = clip.filter(|_| !matches!(c.special, Special::None | Special::Cast(_))) {
-                // Legacy emote/nano-release returns to movement; death holds its last frame.
-                if c.clip_ms >= a.duration {
-                    if matches!(c.special, Special::Once(_)) {
-                        c.special = Special::None;
-                        c.clip_ms = 0.0;
-                    } else {
-                        c.clip_ms = a.duration;
-                    }
-                }
+            if let Some(a) = clip.filter(|_| c.body_once) {
+                c.clip_ms = c.clip_ms.min(a.duration);
             }
             if let Some(a) = clip.filter(|a| matches!(c.special, Special::None | Special::Cast(_)) && a.duration > 0.0 && c.clip_ms > 4.0 * a.duration) {
                 c.clip_ms = super::avatar::clip_time(a, c.clip_ms, false);
@@ -3611,6 +3696,178 @@ mod tests {
         assert_eq!(world.chars[&who].mover.pose().anim, AnimState::Idle, "captured stand clears the DC sit too");
     }
 
+    #[test]
+    fn remote_real_posture_clips_preserve_terminal_pose_and_crossfade() {
+        use ao_net::n3::action::id;
+        use std::fmt::Write as _;
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let output = std::env::var_os("AOMAC_POSTURE_TRACE").map(std::path::PathBuf::from);
+        if let Some(output) = &output { std::fs::create_dir_all(output).unwrap(); }
+        let scene = if output.is_some() && std::env::var_os("AOMAC_POSTURE_PNG").is_some() {
+            Some(ao_formats::playfield::load_playfield(&store, &dir, 4604).unwrap())
+        } else { None };
+        let mut assets = ActorAssets::new(&store).unwrap();
+        let mut spawn = captured_posture_player();
+        let N3::Dynel(Dynel::SimpleCharFullUpdate(update)) = &mut spawn.body else { unreachable!() };
+        update.blob[12] = Mode::Run as u8;
+        let who = spawn.header.target.instance;
+        let mut world = Dynels { dir: Some(dir), ..Default::default() };
+        world.on_message(&spawn);
+        let c = &world.chars[&who];
+        let key = c.key;
+        let built = build(&store, &mut assets, &c.look).unwrap();
+        for id in [0xd5, 0xd6] {
+            assert!(built.clips.get(&id).is_some_and(|clips| !clips.is_empty()), "first posture {id:#x} must be preloaded by the real model build");
+        }
+        world.asked.insert(key);
+        world.model_order.push_back(key);
+        world.model_bytes += built_bytes(&built);
+        world.models.insert(key, Model::Ready { built: Box::new(built), uploaded: false });
+        let pos = scene_pos(world.chars[&who].pose.pos);
+        let eye = [pos[0], pos[1] + 1.5, pos[2] + 4.0];
+        let mut host = Host::headless();
+        let mut csv = String::from("frame,dt_ms,clip,clip_ms,rate,idle_delay,head_height,max_vertex_step,layers\n");
+        let mut frame_no = 0usize;
+        let mut previous_vertices: Option<Vec<ao_scene::Vertex>> = None;
+        let mut tick = |world: &mut Dynels, host: &mut Host, dt| {
+            host.actors.clear();
+            host.actor_models.clear();
+            world.update_with_collision(dt, eye, [0.0, 0.0, -1.0], host, None, |_| None);
+            if let Some(output) = &output {
+                let c = &world.chars[&who];
+                let Model::Ready { built, .. } = &world.models[&key] else { unreachable!() };
+                let rig = built.rig.as_ref().unwrap();
+                let (vertices, parts) = rig.pose_composed(c.layers(built));
+                let step = previous_vertices.as_ref().map_or(0.0, |previous| previous.iter().zip(&vertices)
+                    .map(|(a, b)| (glam::Vec3::from(a.pos) - glam::Vec3::from(b.pos)).length()).fold(0.0f32, f32::max));
+                let head = rig.head_attractor_composed(c.layers(built)).map_or(f32::NAN, |head| head[1]);
+                let layers = c.layers(built).map(|layer| format!("{}:{:.6}:{:.6}", layer.clip.source_id, layer.ms, layer.blend)).collect::<Vec<_>>().join(";");
+                writeln!(csv, "{frame_no},{:.6},{:#x},{:.6},{:.6},{:.6},{head:.7},{step:.7},{layers}", dt * 1000.0, c.anim, c.clip_ms, c.clip_rate, c.body_delay_ms).unwrap();
+                if let Some(scene) = &scene {
+                    let actor = ActorFrame {
+                        id: who as u32, model: key, transform: glam::Mat4::from_scale(glam::Vec3::splat(c.scale)).to_cols_array_2d(),
+                        parts, part_attractors: rig.part_attractors(), skin: Some(Arc::new(vertices.clone())), alpha: 1.0, always: true, ..Default::default()
+                    };
+                    let png = output.join(format!("remote-current-{frame_no:04}.png"));
+                    ao_render::render_to_png_actors(scene, &[(key, built.model.clone())], vec![actor],
+                        [3.0, 1.4, 3.0], [0.0, 0.9, 0.0], 640, 480, &png, 0.0).unwrap();
+                }
+                previous_vertices = Some(vertices);
+                frame_no += 1;
+            }
+        };
+        for (action, animation) in [(id::SIT_RELAY, 0xd5), (id::STAND_UP, 0xd6)] {
+            for _ in 0..60 { tick(&mut world, &mut host, 1.0 / 60.0); }
+            let c = &world.chars[&who];
+            let Model::Ready { built, .. } = &world.models[&key] else { unreachable!() };
+            let before = built.rig.as_ref().unwrap().pose_composed(c.layers(built)).0;
+            let old = &built.clips[&c.anim][c.roll.variant];
+            let (start, end) = super::super::avatar::loop_span(old).unwrap_or((0.0, old.duration));
+            let span = end - start;
+            let mut remaining = span - (c.clip_ms - start).rem_euclid(span);
+            if remaining < 200.0 { remaining += (200.0 / span).ceil() * span; }
+            let expected_idle_fade = remaining.clamp(200.0, 300.0);
+            world.on_message(&posture_action(who, action));
+            world.play_posture(who, animation);
+            tick(&mut world, &mut host, 0.0);
+            let c = &world.chars[&who];
+            assert!(c.previous_body.is_some(), "posture entry preserves the old idle");
+            assert!(world.pending_clips.is_empty() && world.replay.is_empty(), "first posture never waits for or replays an asynchronous clip");
+            let Model::Ready { built, .. } = &world.models[&key] else { unreachable!() };
+            assert_eq!(c.previous_body.as_ref().unwrap().fade_ms, expected_idle_fade, "idle fade derives from the outgoing CAT interval at enqueue");
+            let start_pose = built.rig.as_ref().unwrap().pose_composed(c.layers(built)).0;
+            let max_delta = before.iter().zip(&start_pose).map(|(a, b)| (glam::Vec3::from(a.pos) - glam::Vec3::from(b.pos)).length()).fold(0.0f32, f32::max);
+            assert!(max_delta < 1e-5, "zero-time enqueue preserves the real CAT pose: {max_delta}");
+            let node = c.actions.iter().find(|node| node.id == animation).unwrap();
+            let duration = node.duration(&built.clips[&animation][node.variant.unwrap()]);
+            let idle = &built.clips[&c.anim][c.roll.variant];
+            let (start, end) = super::super::avatar::loop_span(idle).unwrap_or((0.0, idle.duration));
+            assert_eq!(node.fade_ms, (end - start).clamp(200.0, 300.0), "enter fade derives from the newly queued idle interval");
+            let delay = (duration - super::super::avatar::POSTURE_IDLE_LEAD_MS).max(0.0);
+            assert_eq!(c.body_delay_ms, delay);
+            let idle_start = c.clip_ms;
+            let delay_frames = (delay / (1000.0 / 60.0)).ceil() as usize;
+            for _ in 0..=delay_frames {
+                let remaining = world.chars[&who].body_delay_ms;
+                if remaining <= 0.0 { break; }
+                let dt_ms = if remaining <= 1000.0 / 60.0 { remaining + 8.0 } else { 1000.0 / 60.0 };
+                tick(&mut world, &mut host, dt_ms / 1000.0);
+            }
+            let c = &world.chars[&who];
+            assert!((c.clip_ms - idle_start - 8.0).abs() < 0.001, "idle clock consumes the delay and advances by leftover time");
+            assert!(c.actions.iter().any(|node| node.id == animation), "enter survives the queued idle waking");
+            let frames = (super::super::avatar::POSTURE_IDLE_LEAD_MS / (1000.0 / 60.0)).ceil() as usize;
+            for _ in 0..frames { tick(&mut world, &mut host, 1.0 / 60.0); }
+            // Sample exactly at the finite node's end: its zero weight must agree with removal.
+            let remaining = world.chars[&who].actions.iter().find(|node| node.id == animation).map_or(0.0, |node| (duration - node.ms).max(0.0));
+            if remaining > 0.0 { tick(&mut world, &mut host, remaining / 1000.0); }
+            let c = &world.chars[&who];
+            let Model::Ready { built, .. } = &world.models[&key] else { unreachable!() };
+            let terminal = built.rig.as_ref().unwrap().pose_composed(c.layers(built)).0;
+            tick(&mut world, &mut host, 0.0);
+            let c = &world.chars[&who];
+            let Model::Ready { built, .. } = &world.models[&key] else { unreachable!() };
+            let handoff = built.rig.as_ref().unwrap().pose_composed(c.layers(built)).0;
+            let max_delta = terminal.iter().zip(&handoff).map(|(a, b)| (glam::Vec3::from(a.pos) - glam::Vec3::from(b.pos)).length()).fold(0.0f32, f32::max);
+            assert!(max_delta < 1e-5, "finite enter removal preserves the real CAT pose: {max_delta}");
+            for _ in 0..60 { tick(&mut world, &mut host, 1.0 / 60.0); }
+            assert!(world.chars[&who].previous_body.is_none());
+        }
+        // The legacy emote/nano Once path must also render its last frame before changing bodies.
+        world.play_once(who, 0xd5);
+        tick(&mut world, &mut host, 0.0);
+        let Model::Ready { built, .. } = &world.models[&key] else { unreachable!() };
+        let duration = built.clips[&0xd5][world.chars[&who].roll.variant].duration;
+        world.chars.get_mut(&who).unwrap().clip_ms = duration - 1.0;
+        tick(&mut world, &mut host, 0.001);
+        assert_eq!(world.chars[&who].special, Special::Once(0xd5));
+        assert_eq!(world.chars[&who].clip_ms, duration, "Once cannot rewind before its final pose is sampled");
+        tick(&mut world, &mut host, 0.0);
+        assert!(world.chars[&who].previous_body.as_ref().unwrap().once, "outgoing Once playback must clamp, not wrap");
+        tick(&mut world, &mut host, 1.0);
+        world.on_message(&posture_action(who, id::SIT_RELAY));
+        world.play_posture(who, 0xd5);
+        tick(&mut world, &mut host, 0.0);
+        tick(&mut world, &mut host, 0.1);
+        let c = &world.chars[&who];
+        assert!(c.body_delay_ms > 0.0, "reverse before the queued sit idle has any weight");
+        let Model::Ready { built, .. } = &world.models[&key] else { unreachable!() };
+        let rig = built.rig.as_ref().unwrap();
+        let before_reverse = rig.pose_composed(c.layers(built)).0;
+        let distance = |a: &[ao_scene::Vertex], b: &[ao_scene::Vertex]| a.iter().zip(b)
+            .map(|(a, b)| (glam::Vec3::from(a.pos) - glam::Vec3::from(b.pos)).length()).fold(0.0f32, f32::max);
+        let mut authored_step = 0.0f32;
+        let mut radius = 0.0f32;
+        for animation in [c.anim, 0xd7, 0xd5, 0xd6] {
+            for clip in built.clips.get(&animation).into_iter().flatten() {
+                let mut previous: Option<Vec<ao_scene::Vertex>> = None;
+                let count = (clip.duration / (1000.0 / 60.0)).ceil() as usize;
+                for frame in 0..=count {
+                    let pose = rig.pose_composed([AnimLayer { clip, ms: (frame as f32 * (1000.0 / 60.0)).min(clip.duration), layers: 3, blend: 1.0 }].into_iter()).0;
+                    radius = radius.max(distance(&before_reverse, &pose));
+                    if let Some(previous) = &previous { authored_step = authored_step.max(distance(previous, &pose)); }
+                    previous = Some(pose);
+                }
+            }
+        }
+        // At most three linear envelopes can change; 200 ms is retail's minimum fade.
+        let next_frame_bound = authored_step + 3.0 * (2.0 * radius) / (200.0 / (1000.0 / 60.0));
+        world.on_message(&posture_action(who, id::STAND_UP));
+        world.play_posture(who, 0xd6);
+        tick(&mut world, &mut host, 0.0);
+        let c = &world.chars[&who];
+        let Model::Ready { built, .. } = &world.models[&key] else { unreachable!() };
+        let after_reverse = built.rig.as_ref().unwrap().pose_composed(c.layers(built)).0;
+        assert!(distance(&before_reverse, &after_reverse) < 1e-5, "reversing a delayed idle cannot promote its invisible pose");
+        tick(&mut world, &mut host, 1.0 / 60.0);
+        let c = &world.chars[&who];
+        let Model::Ready { built, .. } = &world.models[&key] else { unreachable!() };
+        let next = built.rig.as_ref().unwrap().pose_composed(c.layers(built)).0;
+        assert!(distance(&after_reverse, &next) <= next_frame_bound + 1e-5, "reversal step exceeds authored 60-Hz motion plus retail envelope bound");
+        if let Some(output) = output { std::fs::write(output.join("remote-current.csv"), csv).unwrap(); }
+    }
+
     fn captured_posture_player() -> Message {
         frames(include_str!("../../../../docs/captures/zone_enter_ithaca.rec")).iter().find_map(|frame| {
             let m = ao_net::n3::decode(frame).ok()?;
@@ -4176,7 +4433,7 @@ mod tests {
         let samples: Vec<_> = c.layers(&built).map(|layer| (layer.layers, layer.blend)).collect();
         assert_eq!(samples[0], (3, 1.0), "base priority 0 must compose before negative action priorities");
         assert!(samples[1..].iter().all(|sample| sample.1 == 0.5), "action nodes must retain their authored fade weights");
-        c.actions.insert(0, ActionAnim { id: 0x6d, layer: canim::Layer::Upper, priority: 1, layers: 3, fade_ms: 200.0, ms: 100.0, variant: Some(0), note_fired: 0, rate: 1.0, key: None, slot: -1, delay: None });
+        c.actions.insert(0, ActionAnim { id: 0x6d, layer: canim::Layer::Upper, priority: 1, layers: 3, fade_ms: 200.0, ms: 100.0, variant: Some(0), note_fired: 0, rate: 1.0, key: None, slot: -1, delay: None, posture: false, before_body: false });
         c.refresh_layers();
         assert_eq!(c.base_layers, 2);
         c.actions.remove(0);
