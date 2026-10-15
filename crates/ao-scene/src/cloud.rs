@@ -120,7 +120,8 @@ impl Clouds {
             if p[0]<=-1600.0 || p[0]>=1600.0 || p[2]<=-1600.0 || p[2]>=1600.0 || moved {self.respawn(i,moved,layer.altitude);}
             let s=&self.sheets[i];
             let distance=((s.position[0]*s.position[0]+(s.position[1]-layer.altitude).powi(2)+s.position[2]*s.position[2]).sqrt()/1500.0).min(1.0).powi(2);
-            let angle=distance*0.5;
+            //10054ca2 passes .25*t² to10004840, whose quaternion uses half that angle.
+            let angle=distance*0.25;
             let axis=unit([s.position[2],0.0,-s.position[0]]);
             let center=[s.position[0],s.position[1]+layer.altitude*(-1.5)*distance,s.position[2]];
             let grey=((layer.sun_y+0.89).clamp(0.14,1.0)-0.14)*(1.0-layer.thick*0.9)+0.14;
@@ -189,7 +190,7 @@ mod tests {
         for sheet in &mut sim.sheets {sheet.position=[1500.0,100.0,0.0];}
         sim.update(&layer,2,[0.0;3],0.0,1000.0,&mut mesh.vertices);
         let original=mesh.vertices.clone();
-        // At r=1500 the native centre is 100-1.5*100=-50, with a .5-radian tilt.
+        // At r=1500 the native centre is 100-1.5*100=-50, with a .25-radian tilt.
         let centre_y=mesh.vertices[..4].iter().map(|v|v.pos[1]).sum::<f32>()/4.0;
         assert!((centre_y+50.0).abs()<0.001);
         assert!(mesh.vertices[..4].iter().any(|v|v.pos[1] < -50.0));
@@ -198,6 +199,50 @@ mod tests {
         sim.update(&layer,2,[0.0,1000.0,0.0],0.0,500.0,&mut mesh.vertices);
         for (scaled,full) in mesh.vertices.iter().zip(&original) {
             for j in 0..3 {assert_eq!(scaled.pos[j],full.pos[j]*0.5);}
+        }
+    }
+    #[test]
+    fn native_bend_matches_quaternion_quarter_radian_at_clamped_radius() {
+        fn quaternion_rotate(v:[f32;3],axis:[f32;3],half_angle:f32)->[f32;3] {
+            let (s,w)=half_angle.sin_cos();
+            let [x,y,z]=axis.map(|a|a*s);
+            [
+                (1.0-2.0*(y*y+z*z))*v[0]+2.0*(x*y-z*w)*v[1]+2.0*(x*z+y*w)*v[2],
+                2.0*(x*y+z*w)*v[0]+(1.0-2.0*(x*x+z*z))*v[1]+2.0*(y*z-x*w)*v[2],
+                2.0*(x*z-y*w)*v[0]+2.0*(y*z+x*w)*v[1]+(1.0-2.0*(x*x+y*y))*v[2],
+            ]
+        }
+        let layer=CloudLayer {mesh:0,altitude:100.0,wind:[0.0;3],storm:0.0,thick:0.0,sun_y:0.0,light:[0.0;3],light_direction:[0.0,1.0,0.0],ambient:[0.0;3]};
+        let mut sim=Clouds::default();let mut mesh=Clouds::mesh();
+        sim.update(&layer,2,[0.0;3],0.0,1000.0,&mut mesh.vertices);
+        // Independent known axes/centres: r=1500, r=750, and r>1500 (clamped).
+        //10054c93 multiplies t² by .25;10004865 halves it before sin/cos.
+        for (position,axis,half_angle,centre_y) in [
+            ([1500.0,100.0,0.0],[0.0,0.0,-1.0],0.125,-50.0),
+            ([0.0,100.0,750.0],[1.0,0.0,0.0],0.03125,62.5),
+            ([1200.0,100.0,1200.0],[std::f32::consts::FRAC_1_SQRT_2,0.0,-std::f32::consts::FRAC_1_SQRT_2],0.125,-50.0),
+        ] {
+            sim.sheets[0].position=position;
+            let basis=[[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]];
+            for (source,b) in sim.sheets[0].vertices.iter_mut().zip(basis) {
+                source.pos=b.map(|v|v*100.0);source.normal=b;
+            }
+            sim.update(&layer,2,[0.0;3],0.0,1000.0,&mut mesh.vertices);
+            let mut wrong_position_error=0.0;let mut wrong_normal_error=0.0;
+            for (actual,b) in mesh.vertices.iter().zip(basis) {
+                let expected=quaternion_rotate(b,axis,half_angle);
+                let wrong=quaternion_rotate(b,axis,half_angle*2.0);
+                let centre=[position[0],centre_y,position[2]];
+                for j in 0..3 {
+                    let sign=if j==2 {-1.0}else{1.0};
+                    assert!((actual.pos[j]-sign*(centre[j]+expected[j]*100.0)).abs()<0.001);
+                    assert!((actual.normal[j]-sign*expected[j]).abs()<1e-6);
+                    wrong_position_error+=(actual.pos[j]-sign*(centre[j]+wrong[j]*100.0)).abs();
+                    wrong_normal_error+=(actual.normal[j]-sign*wrong[j]).abs();
+                }
+            }
+            assert!(wrong_position_error>10.0,"positions must reject the old doubled tilt");
+            assert!(wrong_normal_error>0.1,"normals must reject the old doubled tilt");
         }
     }
     #[test]
