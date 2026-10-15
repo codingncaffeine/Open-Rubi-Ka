@@ -102,9 +102,6 @@ impl Play {
             self.fight_sit();
             return true;
         }
-        if super::module::is_special_id(id as i32) {
-            self.zone.world.start_special_bar(self.zone.char_id as i32, id as i32);
-        }
         let mode = self.player.as_ref().map_or(0, |p| p.mode());
         self.fight.as_mut().is_some_and(|m| m.special_action(id as i32, &self.zone, mode))
     }
@@ -412,9 +409,6 @@ impl Play {
     }
 
     fn fight_cmd(&mut self, c: Command, mode: u32) {
-        if let Command::Special(id) = c {
-            self.zone.world.start_special_bar(self.zone.char_id as i32, id);
-        }
         if let Some(m) = self.fight.as_mut() {
             m.command(c, &self.zone, mode);
         }
@@ -842,21 +836,9 @@ mod health_tests {
     }
 
 
-    /// `docs/captures/zone_special_burst_fixr_ithaca.rec`: a real Burst(148) exchange captured live
-    /// (`AOMAC_LIVE_CHAR=Aomacfixr AOMAC_NET_TRACE=... AOMAC_LIVE_STEPS='goto=hunt,Q=0.1,wait=5,M=0.1,...'`, docs/zone/
-    /// combat-timers.md §5). Aomacfixr's own `CharSecSpecAttackIIR_t` send (special 148) is replayed as the player
-    /// pressing Burst; the own rifle (Solar-Powered Assault Rifle, template 121569, docs/zone/actions.md) is seeded
-    /// from the real rdb because the server never re-announces an already-worn weapon
-    /// (`arms.rs::captured_wear_and_unwear_of_the_rifle`'s own documented gap) -- Burst itself is confirmed absent
-    /// from Aomacfixr's own `SpecialAttackWeaponIIR_t` list in this same capture, so the bar must fall back to the
-    /// wielded weapon (`special_or_wielded_item`).
+    /// The real Burst capture pins the outgoing action and matching server result, not a HUD timer.
     #[test]
-    fn captured_burst_drives_the_special_bar() {
-        let dir = match ao_gui::client_dir() { d if d.join("cd_image/rdb.db").exists() => d, _ => return };
-        let own = 33588;
-        let mut zone = crate::play::zone::Zone::new(own);
-        zone.world.arms = crate::play::combat::arms::Armory::open(&dir);
-        zone.world.arms.wield(own as i32, 999999, 6, Some(121569), &[]);
+    fn captured_burst_matches_the_server_result() {
         let mut sent_special = None;
         let mut got_info = false;
         for l in include_str!("../../../../../docs/captures/zone_special_burst_fixr_ithaca.rec").lines() {
@@ -867,12 +849,10 @@ mod health_tests {
             let Ok(m) = ao_net::n3::decode(&f) else { continue };
             if dir_ == ">" {
                 if let ao_net::n3::N3::Misc(ao_net::n3::misc::Misc::CharSecSpecAttack(s)) = &m.body {
-                    zone.world.start_special_bar(own as i32, s.special);
                     sent_special = Some(s.special);
                 }
                 continue;
             }
-            zone.on_frame(&f);
             if let ao_net::n3::N3::Misc(ao_net::n3::misc::Misc::SpecialAttackInfo(s)) = &m.body {
                 assert_eq!(Some(s.special), sent_special, "the server's result matches what was sent");
                 got_info = true;
@@ -880,12 +860,5 @@ mod health_tests {
         }
         assert_eq!(sent_special, Some(148), "Burst");
         assert!(got_info, "the capture must contain the server's SpecialAttackInfo result");
-        assert!(zone.world.arms.special_item(own as i32, 148).is_none(), "Burst has no own special-list entry");
-        let (progress, total) = zone.world.special_bar_progress().expect("Burst falls back to the wielded rifle");
-        assert_eq!(progress, 0.0);
-        // Solar-Powered Assault Rifle's real AttackDelay + RechargeDelay, raw hundredths / 100 (no initiative scaling).
-        let item = zone.world.arms.slot_item(own as i32, 6).unwrap();
-        assert_eq!(total, (item.delay + item.recharge) as f32 / 100.0);
-        assert!(total > 0.1 && total < 20.0, "a sane round time: {total}s");
     }
 }

@@ -20,14 +20,6 @@ use ao_net::n3::outgoing::{n3_frame, DYNEL_CHAR};
 use ao_net::msg::Identity;
 use std::path::Path;
 
-/// `id` is one of the special-attack action ids `special_action`/`Command::Special` forwards to
-/// `N3Msg_SecondarySpecialAttack` (`act::BRAWL`/`DIMACH`/Fast Attack(0x79)/Sneak-Burst-Fling(0x92..=0x94)/Aimed Shot
-/// (0x96)/Full Auto family(0x97)/`act::FULL_AUTO`/Backstab(0x1e9)). Shared with `combat/glue.rs`'s HUD Special-bar
-/// trigger so both stay in lockstep.
-pub fn is_special_id(id: i32) -> bool {
-    matches!(id, act::BRAWL | act::DIMACH | 0x79 | 0x92..=0x94 | 0x96 | 0x97 | act::FULL_AUTO | 0x1e9)
-}
-
 /// What the player asked for (key bindings `ACTION_*`, hotbar special actions, mouse).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -535,7 +527,7 @@ impl Module {
     pub fn special_action(&mut self, id: i32, zone: &Zone, mode: u32) -> bool {
         match id {
             act::ATTACK | 0x4e => self.command(Command::Attack, zone, mode),
-            _ if is_special_id(id) => self.command(Command::Special(id), zone, mode),
+            act::BRAWL | act::DIMACH | 0x79 | 0x92..=0x94 | 0x96 | 0x97 | act::FULL_AUTO | 0x1e9 => self.command(Command::Special(id), zone, mode),
             _ => return false,
         }
         true

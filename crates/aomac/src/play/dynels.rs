@@ -811,11 +811,6 @@ pub struct Dynels {
     /// initiative scaling, no `AttackDelay` sum) -- traced to `ReloadIIR_t` 0x26515E61's apply, not a guess.
     /// docs/zone/combat-timers.md.
     reload_bar: Option<(f32, f32)>,
-    /// `(elapsed, total)` of the predicted Special bar (kind 2 "Special"), started by `Dynels::start_special_bar` when
-    /// the player sends a special attack. Duration = `AttackDelay` + `RechargeDelay` of the special's own list item
-    /// (Brawl/Dimach/...) or, absent one, the wielded weapon (Burst/Fling/Full Auto): `combat::arms::
-    /// special_or_wielded_item`, GC `FUN_1003b947`. docs/zone/combat-timers.md.
-    special_bar: Option<(f32, f32)>,
     /// (swing clip, `ItemDelay`) of the last [`Dynels::pick_swing`] of a character: the clip plays sped up by [`canim::swing_speed_scale`].
     swing_delay: HashMap<i32, (u32, i32)>,
     /// (clip, playback rate) of the last [`Dynels::react_to_hit`] of a character.
@@ -971,7 +966,6 @@ impl Default for Dynels {
             arms: Default::default(),
             attack_bars: HashMap::new(),
             reload_bar: None,
-            special_bar: None,
             swing_delay: HashMap::new(),
             once_rate: HashMap::new(),
             weapons: HashMap::new(),
@@ -1513,12 +1507,6 @@ impl Dynels {
                 self.reload_bar = None;
             }
         }
-        if let Some((elapsed, total)) = self.special_bar.as_mut() {
-            *elapsed += dt;
-            if *elapsed >= *total {
-                self.special_bar = None;
-            }
-        }
     }
 
     /// Restarts the Attack bar of `slot` at a swing of the own character (`CombatEvent::Hit`/`Miss` whose attacker is
@@ -1556,25 +1544,6 @@ impl Dynels {
     /// `(progress 0..1, total seconds)` of the open Reload bar, if any.
     pub fn reload_bar_progress(&self) -> Option<(f32, f32)> {
         self.reload_bar.map(|(elapsed, total)| ((elapsed / total).min(1.0), total))
-    }
-
-    /// Starts the Special bar (`combat/glue.rs`'s `fight_special`/`fight_cmd`, when the player sends a special
-    /// attack): duration = `AttackDelay`(0x126) + `RechargeDelay`(0xd2) of `combat::arms::special_or_wielded_item`,
-    /// GC `FUN_1003b947` (gated by `FUN_1003bac9`'s wield-state check; confirmed live, `docs/captures/zone_special_
-    /// burst_fixr_ithaca.rec`: Aomacfixr's `CharSecSpecAttackIIR_t`/`SpecialAttackInfoIIR_t` exchange for Burst(148)).
-    /// A no-op without a resolvable item (neither a special-list entry nor a wielded hand). docs/zone/combat-timers.md §5.
-    pub fn start_special_bar(&mut self, own: i32, special: i32) {
-        if let Some(item) = self.arms.special_or_wielded_item(own, special) {
-            let total = (item.delay + item.recharge) as f32 / 100.0;
-            if total > 0.0 {
-                self.special_bar = Some((0.0, total));
-            }
-        }
-    }
-
-    /// `(progress 0..1, total seconds)` of the open Special bar, if any.
-    pub fn special_bar_progress(&self) -> Option<(f32, f32)> {
-        self.special_bar.map(|(elapsed, total)| ((elapsed / total).min(1.0), total))
     }
 
     /// `(progress 0..1, total seconds)` of the own character's active nano cast, for the HUD "Nano program" timer
@@ -4014,14 +3983,6 @@ mod tests {
         assert!((half - 0.5).abs() < 0.01, "{half}");
         d.update_attack_bars(own, false, reload_total);
         assert!(d.reload_bar_progress().is_none(), "the reload bar closes once its duration elapses");
-        // Special: Burst(148) is not in the own specials list (live, Aomacfixr) -> falls back to the wielded hand
-        assert!(d.special_bar_progress().is_none());
-        d.start_special_bar(own, 148);
-        let (sp0, special_total) = d.special_bar_progress().expect("falls back to the wielded rifle");
-        assert_eq!(special_total, 10.0, "AttackDelay(500) + RechargeDelay(500), raw, /100");
-        assert_eq!(sp0, 0.0);
-        d.update_attack_bars(own, false, special_total);
-        assert!(d.special_bar_progress().is_none(), "the special bar closes once its duration elapses");
     }
 }
 
