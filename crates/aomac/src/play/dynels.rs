@@ -1598,9 +1598,9 @@ impl Dynels {
 
     fn effect_anchor(&self, who: i32, anchor: i32, slot: i32) -> Option<glam::Mat4> {
         let c = self.chars.get(&who)?;
-        let Model::Ready { built, .. } = self.models.get(&c.key)? else { return None };
         let world = glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(c.scale), glam::Quat::from_rotation_y(scene_yaw(c.pose.yaw)), glam::Vec3::from(scene_pos(c.pose.pos)));
         if anchor==0 {return Some(world);}
+        let Model::Ready { built, .. } = self.models.get(&c.key)? else { return None };
         let rig=built.rig.as_ref()?;
         let matrix = if c.current_skin.is_some() {
             if anchor == 3000 { rig.cached_weapon_effect_anchor(if slot == 8 { 2 } else { 1 }, &c.pose_cache) } else { rig.cached_effect_anchor(anchor, &c.pose_cache) }
@@ -2232,19 +2232,28 @@ impl Dynels {
         ).map(|_| ())
     }
 
+    pub(in crate::play) fn report_effect_failure(&mut self, message: std::fmt::Arguments<'_>) {
+        if let Some(renderer) = &mut self.effects { renderer.report_failure(message); }
+    }
+
     /// GUI world feedback creates the authored Font control on the real dynel.
     pub fn floating_text(&mut self, who:i32, text:&str, color:u32, mut own_anchor:impl FnMut(i32)->Option<glam::Mat4>) -> anyhow::Result<()> {
         use anyhow::Context;
         use super::combat::effects::{Binding,Creation,EffectConfig};
+        // GC10058e36/10011108: feedback resolves the subject dynel before
+        // creating Font12122; an already removed subject creates no effect.
+        if who != self.own && !self.chars.contains_key(&who) { return Ok(()); }
         let Some(mut renderer)=self.effects.take() else {return Ok(())};
         let result=(|| {
             let attractor=renderer.attractor(12122,0).context("missing floating text effect 12122")?;
             let mut resolve=|_: (u32,u32),id| if who==self.own {own_anchor(id)}else{self.effect_anchor(who,id,0)};
             let identity=(CHAR_KIND as u32,who as u32);
             renderer.prepare_anchors(identity,&mut resolve);
-            let source=resolve(identity,attractor).or_else(||resolve(identity,0)).context("missing floating text visual dynel")?;
+            let source=resolve(identity,attractor).or_else(||resolve(identity,0));
+            let source_nonvisual=source.is_none();
+            let source=source.unwrap_or(glam::Mat4::IDENTITY);
             let [a,r,g,b]=color.to_be_bytes().map(|v|v as f32/255.0);
-            let handle=renderer.spawn_configured(Binding {group:0,attractor,effect:12122,note:0,color:0},source,source.w_axis.truncate(),EffectConfig {creation:Creation::Dynel,track_source:true,source_identity:Some(identity),start_color:Some([r,g,b,a]),stop_color:Some([r,g,b,a]),..Default::default()})?;
+            let handle=renderer.spawn_configured(Binding {group:0,attractor,effect:12122,note:0,color:0},source,source.w_axis.truncate(),EffectConfig {creation:Creation::Dynel,track_source:true,source_nonvisual,source_identity:Some(identity),start_color:Some([r,g,b,a]),stop_color:Some([r,g,b,a]),..Default::default()})?;
             renderer.set_text(handle,text.as_bytes())
         })();
         self.effects=Some(renderer);
@@ -3106,6 +3115,63 @@ fn model_state(world: &Dynels, key: u64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effect_roots_exist_before_async_meshes_and_disappear_with_dynels() {
+        let spawn = frames(include_str!("../../../../docs/captures/zone_ithaca.rec")).iter().find_map(|frame| {
+            let m = ao_net::n3::decode(frame).ok()?;
+            matches!(&m.body, N3::Dynel(Dynel::SimpleCharFullUpdate(_))).then_some(m)
+        }).expect("captured visual character");
+        let mut world = Dynels::default();
+        world.on_message(&spawn);
+        let who = spawn.header.target.instance;
+        let c = &world.chars[&who];
+        let key = c.key;
+        let expected = glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(c.scale), glam::Quat::from_rotation_y(scene_yaw(c.pose.yaw)), glam::Vec3::from(scene_pos(c.pose.pos)));
+        for model in [None, Some(Model::Loading), Some(Model::Failed)] {
+            world.models.remove(&key);
+            if let Some(model) = model { world.models.insert(key, model); }
+            assert_eq!(world.effect_anchor(who, 0, 0), Some(expected));
+            assert_eq!(world.effect_anchor(who, 2000, 0), None, "no fabricated named connector");
+        }
+        world.chars.remove(&who);
+        assert_eq!(world.effect_anchor(who, 0, 0), None, "deleted dynels have no root");
+        let item = ao_net::msg::Identity { kind: 0xc76a, instance: 9 };
+        world.test_prop(item, vec![]);
+        assert_eq!(world.item_effect_anchor(item, 0), None, "unresolved items are not necessarily visual dynels");
+        assert_eq!(world.item_effect_anchor(item, 2000), None);
+        world.props.remove(&(item.kind, item.instance));
+        assert_eq!(world.item_effect_anchor(item, 0), None);
+    }
+
+    #[test]
+    fn floating_text_builds_its_visual_on_the_loading_subject_dynel() -> anyhow::Result<()> {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return Ok(()); }
+        let spawn = frames(include_str!("../../../../docs/captures/zone_ithaca.rec")).iter().find_map(|frame| {
+            let m = ao_net::n3::decode(frame).ok()?;
+            matches!(&m.body, N3::Dynel(Dynel::SimpleCharFullUpdate(_))).then_some(m)
+        }).expect("captured visual character");
+        let mut world = Dynels { effects: Some(super::super::combat::effects::Renderer::open(&dir)?), ..Default::default() };
+        world.on_message(&spawn);
+        let who = spawn.header.target.instance;
+        let key = world.chars[&who].key;
+        world.models.insert(key, Model::Loading);
+        let root = world.effect_anchor(who, 0, 0).unwrap();
+        world.floating_text(who, "17", 0xffffff00, |_| panic!("remote feedback must not attach to own player"))?;
+        assert_eq!(world.effects.as_ref().unwrap().resource_counts().3, 1, "SetText creates the private glyph visual");
+        let mut host = Host::headless();
+        world.effects.as_mut().unwrap().frame(0.1, &mut host, None);
+        let text = host.actors.first().expect("floating text render actor");
+        let skin = text.skin.as_ref().expect("world-space glyph vertices");
+        assert!(!skin.is_empty());
+        assert!(skin.iter().all(|v| (glam::Vec3::from_array(v.pos) - root.w_axis.truncate()).length() < 3.0));
+        world.chars.remove(&who);
+        let count = world.effects.as_ref().unwrap().resource_counts().0;
+        world.floating_text(who, "18", 0xffffff00, |_| panic!("removed subject is rejected first"))?;
+        assert_eq!(world.effects.as_ref().unwrap().resource_counts().0, count);
+        Ok(())
+    }
 
     #[test]
     fn name_preferences_follow_independent_stores() {

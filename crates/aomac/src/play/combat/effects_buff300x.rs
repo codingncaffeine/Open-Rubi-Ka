@@ -138,7 +138,7 @@ impl Sequencer {
                 if time<entry.start {finished=false;}
                 else if !entry.entered && (time<entry.end || entry.end<entry.start) {
                     // GC100ec640 forwards its stored Vector/Matrix/Dynel/RConnector creation mode.
-                    let config=EffectConfig {creation:self.config.creation,resource_connector:self.config.resource_connector,duration:(entry.end>0.0).then_some(entry.end-entry.start),source_identity:self.config.source_identity,source_attractor:self.config.source_attractor,source_appearance:self.config.source_appearance,track_source:self.config.track_source,..Default::default()};
+                    let config=EffectConfig {creation:self.config.creation,resource_connector:self.config.resource_connector,duration:(entry.end>0.0).then_some(entry.end-entry.start),source_identity:self.config.source_identity,source_nonvisual:self.config.source_nonvisual,source_attractor:self.config.source_attractor,source_appearance:self.config.source_appearance,track_source:self.config.track_source,..Default::default()};
                     entry.child=r.spawn_configured(Binding {group:0,attractor:0,effect:entry.effect,note:0,color:0},self.source,self.target,config)?;
                     entry.entered=true;
                 }
@@ -172,6 +172,25 @@ mod tests {
             count+=1;
         }
         ensure!(count>0,"missing installed Sequencer records");
+        Ok(())
+    }
+    #[test]
+    fn nonvisual_sequencer_frames_preserve_meta_child_locator() -> Result<()> {
+        let dir=ao_gui::client_dir();
+        if !dir.join("Setupf/gfxtweak.bin").exists() || !dir.join("cd_image/rdb.db").exists() {return Ok(());}
+        let mut renderer=Renderer::open(&dir)?;
+        let config=EffectConfig {creation:super::super::Creation::Dynel,source_identity:Some((50000,1)),source_nonvisual:true,track_source:true,..Default::default()};
+        for (meta,child) in [(47001,43048),(47374,43625)] {
+            let template=Template {kind:3004,words:vec![0,1,meta,0,1.0f32.to_bits()]};
+            let mut sequencer=Sequencer::new(&template,Mat4::IDENTITY,Vec3::ZERO,config)?;
+            assert!(sequencer.frame(0.0,&mut renderer)?);
+            assert!(sequencer.entries[0].entered);
+            let child=renderer.active.iter().find(|active|active.effect==child).expect("authored meta child");
+            assert_eq!(child.config.source_identity,config.source_identity);
+            assert!(child.config.source_nonvisual,"child must not resolve anchors for a nonvisual dynel");
+            assert!(renderer.anchors.is_empty(),"nonvisual children need no invented anchors");
+            renderer.clear();
+        }
         Ok(())
     }
     #[test]

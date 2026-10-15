@@ -181,7 +181,9 @@ impl Play {
             };
             if let Some((who,text,color))=floating {
                 let player=self.player.as_ref();
-                if let Err(error)=self.zone.world.floating_text(who,&text,color,|anchor|player.and_then(|p|p.effect_anchor(anchor)).map(|m|glam::Mat4::from_cols_array_2d(&m))) {eprintln!("floating text: {error:#}");}
+                if let Err(error)=self.zone.world.floating_text(who,&text,color,|anchor|player.and_then(|p|p.effect_anchor(anchor)).map(|m|glam::Mat4::from_cols_array_2d(&m))) {
+                    self.zone.world.report_effect_failure(format_args!("floating text dynel {who}: {error:#}"));
+                }
             }
         }
         if std::env::var_os("AOMAC_COMBAT_LOG").is_some() {

@@ -1,7 +1,7 @@
 //! Authored visual effect templates (`Setupf/gfxtweak.bin`).
 //! GC `FUN_10106be2` reads the record count, then `CMSBlock` records.
 use anyhow::{ensure, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// `FUN_100a761f` / `100a7803` / `100a7863` → `FUN_1009ad2c`.
@@ -337,9 +337,14 @@ pub struct Renderer {
     mesh_children: HashMap<u32,(u32,meshattrs::MeshChildren)>,
     retired_screens: Vec<(Option<global::GlobalEffect>,Option<nightvision::NightVision>)>,
     shadows: bool,
+    diagnostics: HashSet<String>,
 }
 
 impl Renderer {
+    pub(crate) fn report_failure(&mut self, message: std::fmt::Arguments<'_>) {
+        report_effect_failure(&mut self.diagnostics, message);
+    }
+
     /// Native ordinary-texture preference affects future resource loads, not cached visuals.
     pub fn set_texture_quality(&self, quality: i32) {
         self.store.set_other_texture_quality(quality);
@@ -363,7 +368,7 @@ impl Renderer {
         let mut anchor_ids: Vec<_> = templates.by_id.values().filter_map(|t| t.words.get(7).map(|v| *v as i32)).chain(1000..=1018).chain(2000..=2023).chain([0,3000,3001]).collect();
         anchor_ids.sort_unstable();
         anchor_ids.dedup();
-        Ok(Self { templates, store, names, models: HashMap::new(), active: vec![], rng: CrtRand::new(1), next_actor: ACTOR_BASE, generation: u64::MAX, beam_state:beams::BeamState::default(),bph_last:HashMap::new(),elapsed:0.0,smoke_wind:Vec3::ZERO,spawning:vec![],anchors:HashMap::new(),source_runtime:HashMap::new(),collision:None,anchor_ids,control_work:vec![],composition_work:vec![],native_work:vec![],buff_work:vec![],buff_models:HashMap::new(),retired_buff_models:vec![],random:R250::new(0xe6f1),display_random:R250::new(0xe6f1),mesh_resources:HashMap::new(),mesh_uploaded:HashMap::new(),aux_sounds:vec![],vulcan_sequence:0,screen_resources:HashMap::new(),screen_uploaded:false,nano2_state:nano2::Nano2State::default(),hit_locations:hitlocation::HitLocations::default(),source_torso_factor:HashMap::new(),hit_clock_ms:0,native_fog:std::rc::Rc::new(std::cell::Cell::new(ao_render::NativeFog::default())),mesh_attr_cache:HashMap::new(),mesh_children:HashMap::new(),retired_screens:Vec::new(),shadows:true })
+        Ok(Self { diagnostics:HashSet::new(),templates, store, names, models: HashMap::new(), active: vec![], rng: CrtRand::new(1), next_actor: ACTOR_BASE, generation: u64::MAX, beam_state:beams::BeamState::default(),bph_last:HashMap::new(),elapsed:0.0,smoke_wind:Vec3::ZERO,spawning:vec![],anchors:HashMap::new(),source_runtime:HashMap::new(),collision:None,anchor_ids,control_work:vec![],composition_work:vec![],native_work:vec![],buff_work:vec![],buff_models:HashMap::new(),retired_buff_models:vec![],random:R250::new(0xe6f1),display_random:R250::new(0xe6f1),mesh_resources:HashMap::new(),mesh_uploaded:HashMap::new(),aux_sounds:vec![],vulcan_sequence:0,screen_resources:HashMap::new(),screen_uploaded:false,nano2_state:nano2::Nano2State::default(),hit_locations:hitlocation::HitLocations::default(),source_torso_factor:HashMap::new(),hit_clock_ms:0,native_fog:std::rc::Rc::new(std::cell::Cell::new(ao_render::NativeFog::default())),mesh_attr_cache:HashMap::new(),mesh_children:HashMap::new(),retired_screens:Vec::new(),shadows:true })
     }
     pub fn shared_native_fog(&self)->ao_render::SharedNativeFog {self.native_fog.clone()}
     /// GC100ece3a/100ecb5a/100ecee4: Shadows controls the CAT shadow visual,
@@ -386,9 +391,9 @@ impl Renderer {
         let active = std::mem::take(&mut self.active);
         for mut a in active {
             if let Some(c) = &mut a.control { c.cancel(self); }
-            if let Some(c) = &mut a.composition { if let Err(error)=c.cancel(self) { eprintln!("effect cancellation: {error:#}"); } }
+            if let Some(c) = &mut a.composition { if let Err(error)=c.cancel(self) { report_effect_failure(&mut self.diagnostics, format_args!("effect cancellation: {error:#}")); } }
             if let Some(native)=&mut a.native_replicated { native.cancel(self); }
-            if let Some(buff)=&mut a.buff { if let Err(error)=buff.cancel(self) {eprintln!("buff cancellation: {error:#}");} }
+            if let Some(buff)=&mut a.buff { if let Err(error)=buff.cancel(self) {report_effect_failure(&mut self.diagnostics, format_args!("buff cancellation: {error:#}"));} }
         }
         self.active.clear();
         self.retired_buff_models.extend(self.buff_models.iter().filter(|(_,model)|model.uploaded).map(|(&handle,_)|0xfac2_0000_0000_0000|u64::from(handle)));
@@ -407,9 +412,9 @@ impl Renderer {
             let mut a = self.active.swap_remove(index);
             self.delete_mesh_children(handle);
             if let Some(c) = &mut a.control { c.cancel(self); }
-            if let Some(c) = &mut a.composition { if let Err(error)=c.cancel(self) { eprintln!("effect cancellation: {error:#}"); } }
+            if let Some(c) = &mut a.composition { if let Err(error)=c.cancel(self) { report_effect_failure(&mut self.diagnostics, format_args!("effect cancellation: {error:#}")); } }
             if let Some(native)=&mut a.native_replicated { native.cancel(self); }
-            if let Some(buff)=&mut a.buff { if let Err(error)=buff.cancel(self) {eprintln!("buff cancellation: {error:#}");} }
+            if let Some(buff)=&mut a.buff { if let Err(error)=buff.cancel(self) {report_effect_failure(&mut self.diagnostics, format_args!("buff cancellation: {error:#}"));} }
             if self.buff_models.remove(&handle).is_some_and(|model|model.uploaded) {self.retired_buff_models.push(0xfac2_0000_0000_0000|u64::from(handle));}
         }
     }
@@ -487,23 +492,23 @@ impl Renderer {
             a.raw_source=source;
             if a.config.resource_connector.is_some() {a.config.resource_connector=Some(source);}
             a.source=if matches!(template.kind,1001|1004|1005|1006|1007|1008|1009|1012|1018|1023|3020) {
-                match sprites::connector(template,source) { Ok(m)=>m,Err(error)=>{eprintln!("effect connector: {error:#}");return;} }
+                match sprites::connector(template,source) { Ok(m)=>m,Err(error)=>{report_effect_failure(&mut self.diagnostics, format_args!("effect connector: {error:#}"));return;} }
             } else {source};
             if let Some(s) = &mut a.sprite { s.update_source(a.source); }
             if let Some(c) = &mut a.composition { c.update_source(source);forwarded=c.forwarded_children(); }
             if let Some(c) = &mut a.control { c.update_source(a.source); }
             if let Some(p)=&mut a.particle {p.update_source(a.source);}
-            if let Some(p)=&mut a.particle2 {if let Err(error)=p.update_source(source) {eprintln!("effect particle connector: {error:#}");}}
-            if let Some(p)=&mut a.bparticle {if let Err(error)=p.update_source(source) {eprintln!("BParticle connector: {error:#}");}}
+            if let Some(p)=&mut a.particle2 {if let Err(error)=p.update_source(source) {report_effect_failure(&mut self.diagnostics, format_args!("effect particle connector: {error:#}"));}}
+            if let Some(p)=&mut a.bparticle {if let Err(error)=p.update_source(source) {report_effect_failure(&mut self.diagnostics, format_args!("BParticle connector: {error:#}"));}}
             if let Some(p)=&mut a.mparticle {p.update_source(source);}
-            if let Some(mesh)=&mut a.mesh {if let Err(error)=mesh.update_source(source) {eprintln!("rock connector: {error:#}");}}
-            if let Some(tower)=&mut a.tower {if let Err(error)=tower.update_source(source) {eprintln!("tower connector: {error:#}");}}
-            if let Some(t)=&mut a.tracer_mesh { if let Err(error)=t.set_anchors(source,a.target) {eprintln!("effect mesh connector: {error:#}");} }
+            if let Some(mesh)=&mut a.mesh {if let Err(error)=mesh.update_source(source) {report_effect_failure(&mut self.diagnostics, format_args!("rock connector: {error:#}"));}}
+            if let Some(tower)=&mut a.tower {if let Err(error)=tower.update_source(source) {report_effect_failure(&mut self.diagnostics, format_args!("tower connector: {error:#}"));}}
+            if let Some(t)=&mut a.tracer_mesh { if let Err(error)=t.set_anchors(source,a.target) {report_effect_failure(&mut self.diagnostics, format_args!("effect mesh connector: {error:#}"));} }
             if let Some(aux)=&mut a.aux { aux.update_source(source); }
             if let Some(native)=&mut a.native_replicated { native.update_source(source); }
-            if let Some(buff)=&mut a.buff {if let Err(error)=buff.update_source(source) {eprintln!("buff source: {error:#}");}forwarded_child=buff.forwarded_child();}
+            if let Some(buff)=&mut a.buff {if let Err(error)=buff.update_source(source) {report_effect_failure(&mut self.diagnostics, format_args!("buff source: {error:#}"));}forwarded_child=buff.forwarded_child();}
             if template.kind==1019 {
-                if let Some(b)=&mut a.beam { if let Err(error)=b.update_source(source) {eprintln!("effect connector: {error:#}");} }
+                if let Some(b)=&mut a.beam { if let Err(error)=b.update_source(source) {report_effect_failure(&mut self.diagnostics, format_args!("effect connector: {error:#}"));} }
             }
         }
         if let Some(children)=forwarded { for child in children {if child!=0 {self.update_source(child,source);}} }
@@ -563,21 +568,21 @@ impl Renderer {
                 if let Some(source) = self.anchors.get(&(identity,a.attractor)).copied().flatten().or_else(||self.anchors.get(&(identity,0)).copied().flatten()) {
                     a.raw_source=source;
                     let source=if matches!(template.kind,1001|1004|1005|1006|1007|1008|1009|1012|1018|1023|3020) {
-                        match sprites::connector(template,source) {Ok(m)=>m,Err(error)=>{eprintln!("effect connector: {error:#}");continue;}}
+                        match sprites::connector(template,source) {Ok(m)=>m,Err(error)=>{report_effect_failure(&mut self.diagnostics, format_args!("effect connector: {error:#}"));continue;}}
                     } else {source};
                     a.source = source;
                     if let Some(s) = &mut a.sprite { s.update_source(source); }
                     if let Some(c) = &mut a.control { c.update_source(source); }
                     if let Some(c) = &mut a.composition { c.update_source(source); }
                     if let Some(p)=&mut a.particle {p.update_source(source);}
-                    if let Some(p)=&mut a.particle2 {if let Err(error)=p.update_source(a.raw_source) {eprintln!("effect particle connector: {error:#}");}}
-                    if let Some(p)=&mut a.bparticle {if let Err(error)=p.update_source(a.raw_source) {eprintln!("BParticle connector: {error:#}");}}
+                    if let Some(p)=&mut a.particle2 {if let Err(error)=p.update_source(a.raw_source) {report_effect_failure(&mut self.diagnostics, format_args!("effect particle connector: {error:#}"));}}
+                    if let Some(p)=&mut a.bparticle {if let Err(error)=p.update_source(a.raw_source) {report_effect_failure(&mut self.diagnostics, format_args!("BParticle connector: {error:#}"));}}
                     if let Some(p)=&mut a.mparticle {p.update_source(a.raw_source);}
-                    if let Some(mesh)=&mut a.mesh {if let Err(error)=mesh.update_source(source) {eprintln!("rock connector: {error:#}");}}
-                    if let Some(tower)=&mut a.tower {if let Err(error)=tower.update_source(source) {eprintln!("tower connector: {error:#}");}}
-                    if let Some(t)=&mut a.tracer_mesh { if let Err(error)=t.set_anchors(source,a.target) {eprintln!("effect mesh connector: {error:#}");} }
+                    if let Some(mesh)=&mut a.mesh {if let Err(error)=mesh.update_source(source) {report_effect_failure(&mut self.diagnostics, format_args!("rock connector: {error:#}"));}}
+                    if let Some(tower)=&mut a.tower {if let Err(error)=tower.update_source(source) {report_effect_failure(&mut self.diagnostics, format_args!("tower connector: {error:#}"));}}
+                    if let Some(t)=&mut a.tracer_mesh { if let Err(error)=t.set_anchors(source,a.target) {report_effect_failure(&mut self.diagnostics, format_args!("effect mesh connector: {error:#}"));} }
                     if let Some(aux)=&mut a.aux {aux.update_source(source);}
-                    if let Some(buff)=&mut a.buff {if let Err(error)=buff.update_source(source) {eprintln!("buff source: {error:#}");}}
+                    if let Some(buff)=&mut a.buff {if let Err(error)=buff.update_source(source) {report_effect_failure(&mut self.diagnostics, format_args!("buff source: {error:#}"));}}
                 }
             }
             if let Some(c) = &mut a.control {
@@ -597,14 +602,14 @@ impl Renderer {
             }
             if let Some(nano)=&mut a.nano2 {nano.refresh_anchors(|id|self.anchors.get(&(identity,id)).copied().flatten());}
             if let Some(buff)=&mut a.buff {
-                if let Err(error)=buff.refresh_anchors(|id|self.anchors.get(&(identity,id)).copied().flatten()) {eprintln!("buff anchors: {error:#}");}
+                if let Err(error)=buff.refresh_anchors(|id|self.anchors.get(&(identity,id)).copied().flatten()) {report_effect_failure(&mut self.diagnostics, format_args!("buff anchors: {error:#}"));}
             }
             if let Some(s) = &mut a.sprite {
                 let mut matrices = [Mat4::IDENTITY;14];
                 let ids = s.anchor_ids();
                 if ids.len() <= matrices.len() && ids.iter().enumerate().all(|(i,id)| {
                     if let Some(m) = self.anchors.get(&(identity,*id)).copied().flatten() { matrices[i]=m;true } else { false }
-                }) { if let Err(error)=s.update_anchors(&matrices[..ids.len()]) {eprintln!("effect anchors: {error:#}");} }
+                }) { if let Err(error)=s.update_anchors(&matrices[..ids.len()]) {report_effect_failure(&mut self.diagnostics, format_args!("effect anchors: {error:#}"));} }
             }
         }
     }
@@ -618,7 +623,7 @@ impl Renderer {
             return;
         }
         if let Some(mut buff)=self.active[index].buff.take() {
-            if let Err(error)=buff.graceful(self) {eprintln!("buff termination: {error:#}");}
+            if let Err(error)=buff.graceful(self) {report_effect_failure(&mut self.diagnostics, format_args!("buff termination: {error:#}"));}
             if let Some(a)=self.active.iter_mut().find(|a|a.actor==handle) {a.buff=Some(buff);}
             return;
         }
@@ -725,7 +730,7 @@ impl Renderer {
         let attractor = if let Some(explicit) = config.source_attractor.filter(|&id| id != 0) { explicit } else if binding.attractor != 0 { binding.attractor } else if !uses_common_source_header(template.kind) {0} else {template.word(7)? as i32};
         let source = if config.track_source && !config.source_nonvisual && uses_common_source_header(template.kind) {
             let who=config.source_identity.context("dynel effect requires source identity")?;
-            self.anchors.get(&(who,attractor)).copied().flatten().or_else(||self.anchors.get(&(who,0)).copied().flatten()).with_context(|| format!("missing effect {} source anchor {attractor} and root",binding.effect))?
+            self.anchors.get(&(who,attractor)).copied().flatten().or_else(||self.anchors.get(&(who,0)).copied().flatten()).with_context(|| format!("missing effect {} source dynel {who:?} anchor {attractor} and root",binding.effect))?
         } else {source};
         let raw_source=source;
         let source = if matches!(template.kind,1001|1004|1005|1006|1007|1008|1009|1012|1018|1023|3020) { sprites::connector(template,source)? } else { source };
@@ -953,10 +958,10 @@ impl Renderer {
                 match buff.prepare_source(scene,actor,&mut self.rng) {
                     Ok(true) if buff.needs_private_model()=>match self.buff_model(&buff) {
                         Ok(model)=>{self.buff_models.insert(self.active[index].actor,model);}
-                        Err(error)=>eprintln!("buff model: {error:#}"),
+                        Err(error)=>report_effect_failure(&mut self.diagnostics, format_args!("buff model: {error:#}")),
                     },
                     Ok(_)=>{},
-                    Err(error)=>eprintln!("buff source geometry: {error:#}"),
+                    Err(error)=>report_effect_failure(&mut self.diagnostics, format_args!("buff source geometry: {error:#}")),
                 }
             }
             self.active[index].buff=Some(buff);
@@ -1001,7 +1006,7 @@ impl Renderer {
         }
         for (handle,mut c) in work.drain(..) {
             if !self.is_active(handle) { c.cancel(self);continue; }
-            let alive = match c.frame(dt.abs(),self) { Ok(alive) => alive,Err(error) => { eprintln!("effect control: {error:#}");c.cancel(self);false } };
+            let alive = match c.frame(dt.abs(),self) { Ok(alive) => alive,Err(error) => { report_effect_failure(&mut self.diagnostics, format_args!("effect control: {error:#}"));c.cancel(self);false } };
             if alive {
                 if let Some(a) = self.active.iter_mut().find(|a| a.actor==handle) { a.control=Some(c); }
                 else { c.cancel(self); }
@@ -1013,11 +1018,11 @@ impl Renderer {
             if let Some(c) = a.composition.take() { work.push((a.actor,c)); }
         }
         for (handle,mut c) in work.drain(..) {
-            if !self.is_active(handle) { if let Err(error)=c.cancel(self) { eprintln!("effect cancellation: {error:#}"); } continue; }
-            let alive = match c.frame(dt.abs(),self) { Ok(alive) => alive,Err(error) => { eprintln!("effect composition: {error:#}");if let Err(error)=c.cancel(self) { eprintln!("effect cancellation: {error:#}"); } false } };
+            if !self.is_active(handle) { if let Err(error)=c.cancel(self) { report_effect_failure(&mut self.diagnostics, format_args!("effect cancellation: {error:#}")); } continue; }
+            let alive = match c.frame(dt.abs(),self) { Ok(alive) => alive,Err(error) => { report_effect_failure(&mut self.diagnostics, format_args!("effect composition: {error:#}"));if let Err(error)=c.cancel(self) { report_effect_failure(&mut self.diagnostics, format_args!("effect cancellation: {error:#}")); } false } };
             if alive {
                 if let Some(a) = self.active.iter_mut().find(|a| a.actor==handle) { a.composition=Some(c); }
-                else if let Err(error)=c.cancel(self) { eprintln!("effect cancellation: {error:#}"); }
+                else if let Err(error)=c.cancel(self) { report_effect_failure(&mut self.diagnostics, format_args!("effect cancellation: {error:#}")); }
             } else { self.delete(handle); }
         }
         self.composition_work = work;
@@ -1029,7 +1034,7 @@ impl Renderer {
             if !self.is_active(handle) { native.cancel(self); continue; }
             let alive=match native.frame(dt.abs(),self) {
                 Ok(alive)=>alive,
-                Err(error)=>{eprintln!("replicated effect: {error:#}");false}
+                Err(error)=>{report_effect_failure(&mut self.diagnostics, format_args!("replicated effect: {error:#}"));false}
             };
             if alive {
                 if let Some(a)=self.active.iter_mut().find(|a| a.actor==handle) {a.native_replicated=Some(native);}
@@ -1048,7 +1053,7 @@ impl Renderer {
             if let Some(identity)=buff.identity() {
                 if let Some(active)=self.active.iter().find(|a|a.actor==handle && a.config.track_source) {
                     let source=self.anchors.get(&(identity,active.attractor)).copied().flatten().or_else(||self.anchors.get(&(identity,0)).copied().flatten());
-                    if let Err(error)=buff.refresh_source(source) {eprintln!("buff source locator: {error:#}");let _=buff.cancel(self);self.delete(handle);continue;}
+                    if let Err(error)=buff.refresh_source(source) {report_effect_failure(&mut self.diagnostics, format_args!("buff source locator: {error:#}"));let _=buff.cancel(self);self.delete(handle);continue;}
                 }
                 if let Some(runtime)=self.source_runtime.get(&identity) {
                     if let Some(root)=self.anchors.get(&(identity,0)).copied().flatten() {buff.set_vehicle_direction(root.transform_vector3(Vec3::NEG_Z).normalize_or_zero());}
@@ -1060,7 +1065,7 @@ impl Renderer {
             let terrain:Option<&mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>>=match &mut collision {Some(f)=>Some(&mut **f),None=>None};
             let alive=match buff.frame(dt.abs(),self,terrain) {
                 Ok(alive)=>alive,
-                Err(error)=>{eprintln!("buff control: {error:#}");false},
+                Err(error)=>{report_effect_failure(&mut self.diagnostics, format_args!("buff control: {error:#}"));false},
             };
             if alive {
                 if let Some(a)=self.active.iter_mut().find(|a|a.actor==handle) {a.buff=Some(buff);}
@@ -1116,11 +1121,11 @@ impl Renderer {
                     Ok(true)=>{
                         let mut unavailable=|_:Vec3|None;
                         let terrain: &mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>=match collision.as_deref_mut() {Some(terrain)=>terrain,None=>&mut unavailable};
-                        if let Some((id,_))=tower.scene() {match tower.actor(effect.actor,MESH_MODEL_BASE|u64::from(id),terrain) {Ok(Some(actor))=>host.actors.push(actor),Ok(None)=>{},Err(error)=>{eprintln!("tower actor: {error:#}");return false;}}}
+                        if let Some((id,_))=tower.scene() {match tower.actor(effect.actor,MESH_MODEL_BASE|u64::from(id),terrain) {Ok(Some(actor))=>host.actors.push(actor),Ok(None)=>{},Err(error)=>{report_effect_failure(&mut self.diagnostics, format_args!("tower actor: {error:#}"));return false;}}}
                         return true;
                     },
                     Ok(false)=>return false,
-                    Err(error)=>{eprintln!("tower effect: {error:#}");return false;}
+                    Err(error)=>{report_effect_failure(&mut self.diagnostics, format_args!("tower effect: {error:#}"));return false;}
                 }
             }
             if template.kind==3028 && effect.config.source_identity.is_some() && runtime.is_none() {return false;}
@@ -1147,16 +1152,16 @@ impl Renderer {
                 match mesh.frame(step,&mut self.random,terrain) {
                     Ok(true)=>{host.actors.extend(mesh.actors(effect.actor,MESH_MODEL_BASE));return true;},
                     Ok(false)=>return false,
-                    Err(error)=>{eprintln!("mesh particle: {error:#}");return false;}
+                    Err(error)=>{report_effect_failure(&mut self.diagnostics, format_args!("mesh particle: {error:#}"));return false;}
                 }
             }
             if let Some(mesh)=&mut effect.mesh {
                 if template.kind==1029 && mesh.sequence+50<self.vulcan_sequence {return false;}
-                let Some(terrain)=collision.as_deref_mut() else { eprintln!("effect {} needs native terrain collision",effect.effect);return false; };
+                let Some(terrain)=collision.as_deref_mut() else { report_effect_failure(&mut self.diagnostics, format_args!("effect {} needs native terrain collision",effect.effect));return false; };
                 match mesh.frame_with_pool(step,&mut self.random,terrain,&mut live_rocks) {
                     Ok(true)=>host.actors.extend(mesh.actors(effect.actor,MESH_MODEL_BASE)),
                     Ok(false)=>return false,
-                    Err(error)=>{ eprintln!("effect mesh: {error:#}");return false; }
+                    Err(error)=>{ report_effect_failure(&mut self.diagnostics, format_args!("effect mesh: {error:#}"));return false; }
                 }
                 return true;
             }
@@ -1172,7 +1177,7 @@ impl Renderer {
                 match mesh.frame(step) {
                     Ok(true)=>{if !mesh.scenes()[0].1.meshes.is_empty() {host.actors.extend(mesh.actors(effect.actor,MESH_MODEL_BASE));}},
                     Ok(false)=>return false,
-                    Err(error)=>{eprintln!("effect tracer mesh: {error:#}");return false;}
+                    Err(error)=>{report_effect_failure(&mut self.diagnostics, format_args!("effect tracer mesh: {error:#}"));return false;}
                 }
                 return true;
             }
@@ -1191,7 +1196,7 @@ impl Renderer {
                     ) {
                         let mut ground=|point:Vec3|surface.borrow().closest(point.to_array(),-1).map(|hit|(Vec3::from_array(hit.pos),Vec3::from_array(hit.normal)));
                         let mut ray=|from:Vec3,to:Vec3|surface.borrow().line(from.to_array(),to.to_array()).map(|hit|(Vec3::from_array(hit.p),Vec3::from_array(hit.n)));
-                        if let Err(error)=buff.update_shadow_world(body.w_axis.truncate(),head_height,Vec3::from_array(sun),camera,dungeon,&mut ground,&mut ray) {eprintln!("shadow projection: {error:#}");return false;}
+                        if let Err(error)=buff.update_shadow_world(body.w_axis.truncate(),head_height,Vec3::from_array(sun),camera,dungeon,&mut ground,&mut ray) {report_effect_failure(&mut self.diagnostics, format_args!("shadow projection: {error:#}"));return false;}
                     } else {return true;}
                 }
                 if let (Some(center),Some(wind))=(host.effect_environment_center,host.effect_environment_wind) {buff.set_environment(Vec3::from_array(center),Vec3::from_array(wind));}
@@ -1199,7 +1204,7 @@ impl Renderer {
                 if let Some((id,flags))=host.effect_playfield {buff.set_playfield(id,flags);}
                 if let Some((depth,flags,direction))=runtime.and_then(|runtime|runtime.liquid) {buff.update_liquid(depth,flags,direction);}
                 else if runtime.is_some() {buff.clear_liquid();}
-                if let Some(handle)=effect.config.hit_location_handle {let hit=self.hit_locations.sample(handle,&mut |identity,id|self.anchors.get(&(identity,id)).copied().flatten());if let Err(error)=buff.update_hit_location(hit) {eprintln!("hit location: {error:#}");return false;}}
+                if let Some(handle)=effect.config.hit_location_handle {let hit=self.hit_locations.sample(handle,&mut |identity,id|self.anchors.get(&(identity,id)).copied().flatten());if let Err(error)=buff.update_hit_location(hit) {report_effect_failure(&mut self.diagnostics, format_args!("hit location: {error:#}"));return false;}}
                 buff.apply_material(&mut host.actors);
                 if let Some(actor)=buff.morph_actor(effect.actor,0xfac2_0000_0000_0000|u64::from(effect.actor)) {host.actors.push(actor);}
                 let terrain:Option<&mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>>=match &mut collision {Some(f)=>Some(&mut **f),None=>None};
@@ -1217,7 +1222,7 @@ impl Renderer {
                                     cached.uploaded=true;
                                     host.actor_model_updates.push((0xfac2_0000_0000_0000|u64::from(effect.actor),model.scene));
                                 }
-                                Err(error)=>{eprintln!("dynamic buff model: {error:#}");return false;}
+                                Err(error)=>{report_effect_failure(&mut self.diagnostics, format_args!("dynamic buff model: {error:#}"));return false;}
                             }
                         }
                         let skin:Vec<_>=groups.into_iter().flatten().collect();
@@ -1228,7 +1233,7 @@ impl Renderer {
                         return true;
                     },
                     Ok(None)=>return false,
-                    Err(error)=>{eprintln!("buff vertices: {error:#}");return false;},
+                    Err(error)=>{report_effect_failure(&mut self.diagnostics, format_args!("buff vertices: {error:#}"));return false;},
                 }
             }
             let duration = effect.stop_at.unwrap_or_else(|| if template.kind == 1006 { f32::from_bits(template.word(8).unwrap_or(0)) } else { effect.config.duration.unwrap_or(f32::from_bits(template.word(8).unwrap_or(0))) });
@@ -1263,11 +1268,11 @@ impl Renderer {
                 let Ok(Some(groups)) = s.vertices(effect.elapsed,camera,right,up,&mut self.random,&mut self.display_random,&mut self.rng) else { return false };
                 for group in groups { skin.extend(group); }
             } else if let Some(c) = &mut effect.control {
-                let groups=match c.vertices(effect.elapsed,camera,right,up) {Ok(Some(groups))=>groups,Ok(None)=>return true,Err(error)=>{eprintln!("effect control vertices: {error:#}");return false;}};
+                let groups=match c.vertices(effect.elapsed,camera,right,up) {Ok(Some(groups))=>groups,Ok(None)=>return true,Err(error)=>{report_effect_failure(&mut self.diagnostics, format_args!("effect control vertices: {error:#}"));return false;}};
                 for group in groups { skin.extend(group); }
                 if skin.is_empty() { return true; }
             } else if let Some(c) = &mut effect.composition {
-                let groups=match c.vertices(effect.elapsed,camera,right,up) {Ok(Some(groups))=>groups,Ok(None)=>return true,Err(error)=>{eprintln!("effect composition vertices: {error:#}");return false;}};
+                let groups=match c.vertices(effect.elapsed,camera,right,up) {Ok(Some(groups))=>groups,Ok(None)=>return true,Err(error)=>{report_effect_failure(&mut self.diagnostics, format_args!("effect composition vertices: {error:#}"));return false;}};
                 for group in groups { skin.extend(group); }
                 if skin.is_empty() { return true; }
             } else if let Some(native)=&mut effect.native_replicated {
@@ -1342,7 +1347,7 @@ impl Renderer {
                 Some(world*Mat4::from_cols_array_2d(&attr.transform))
             });
             if let Some(parent)=self.active.iter_mut().find(|effect|effect.actor==*owner) {parent.tracer_mesh=mesh.take();}
-            if let Err(error)=result {eprintln!("mesh attractor effects: {error:#}");children.delete(self);return false;}
+            if let Err(error)=result {report_effect_failure(&mut self.diagnostics, format_args!("mesh attractor effects: {error:#}"));children.delete(self);return false;}
             true
         });
         entries.extend(std::mem::take(&mut self.mesh_children));self.mesh_children=entries;
@@ -1357,6 +1362,16 @@ impl Renderer {
         host.actor_models.retain(|(key,_)|!self.retired_buff_models.contains(key));
         host.actor_model_updates.retain(|(key,_)|!self.retired_buff_models.contains(key));
         host.actor_model_removals.append(&mut self.retired_buff_models);
+    }
+}
+
+/// Keep the first complete diagnostic for each cause, even if its control is recreated.
+/// Logging never changes the control's retry, recovery, or retirement behavior.
+fn report_effect_failure(seen:&mut HashSet<String>,message:std::fmt::Arguments<'_>) {
+    let message=message.to_string();
+    if !seen.contains(&message) {
+        eprintln!("{message}");
+        seen.insert(message);
     }
 }
 fn native_priority(kind:i32)->Option<i32> {match kind {1017|2015|3024|3030=>Some(6),2014=>Some(7),_=>None}}
@@ -1506,6 +1521,17 @@ mod tests {
         for kind in [1001,1002,1029,2008,3010,3025] {
             assert!(uses_common_source_header(kind),"class {kind} initializes a source locator");
         }
+    }
+    #[test]
+    fn persistent_effect_diagnostics_keep_first_and_distinct_causes() {
+        let mut seen=HashSet::new();
+        for _ in 0..3 {
+            report_effect_failure(&mut seen,format_args!("buff control: authored effect 43048: missing root"));
+        }
+        report_effect_failure(&mut seen,format_args!("buff control: authored effect 43625: missing root"));
+        report_effect_failure(&mut seen,format_args!("buff anchors: authored effect 43048: missing root"));
+        assert_eq!(seen.len(),3,"different effects and diagnostic paths remain observable");
+        assert!(seen.contains("buff control: authored effect 43048: missing root"));
     }
     #[test]
     #[ignore = "installed authored shadow control"]

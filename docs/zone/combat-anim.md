@@ -318,6 +318,27 @@ The corpse holds the resulting death pose, rather than bind pose; corrected fiel
   are named special/attack/destruction/flare/smoke/sparks/flames/beam attractors.
   Both valid numeric ranges explicitly retry authored `Attractor01_head` if the requested geometry
   is absent. Unknown IDs return no anchor; no guessed position is introduced.
+* GC `1010603b` first initializes the world matrix to identity, then reads the
+  actual static/CAT visual's world frame. Anchor **0** skips named lookup;
+  **2000** asks for the right-hand attractor above, then head. If both named
+  lookups fail, the visual's root frame remains unchanged. A visual dynel with
+  neither mesh has the initialized identity frame, not a guessed body offset.
+  A missing/nonvisual dynel fails initialization (`1010668c`) or permanently
+  invalidates an existing locator (`1010603b`); no camera/player substitution.
+* The native mesh lookup is synchronous, while this port builds CPU meshes on
+  a worker. The port's visual dynel world frame is already present at full
+  update, independently of `Model::Ready`: root lookup must not be gated by
+  the mesh build. Named lookups still require actual authored geometry.
+  `effect_roots_exist_before_async_meshes_and_disappear_with_dynels` covers
+  loading/failed meshes and removed characters/items.
+* The reported `47001 → 43048` and `47374 → 43625` pairs are class2007 meta
+  wrappers, forwarding the original Dynel and explicit attractor unchanged
+  (`100e5b66`). Their children use classes2004/3003 and attractors2000/0.
+  Sequencer (`100ec640`), BPHFSM (`100d3b0e`) and orbit's Dynel cord
+  (`100d52dc`) must preserve a rejected/nonvisual source when reconstructing
+  child configurations; losing that state falsely retried named/root lookup.
+  Per-renderer diagnostics now retain the first complete cause and distinguish
+  different effects/paths; repeated causes do not print every frame.
 * 3000 is **weapon-object muzzle world geometry**: `FUN_10105917` casts to WeaponItem and
   calls `FUN_1009bded`. That follows the parent character, selects hand place 1 (slot 6)
   or 2 (slot 8), finds the stat-209 WeaponMesh child, and asks `VisualMesh_t::GetAttrMatrix(0)`.

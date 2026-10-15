@@ -232,6 +232,16 @@ black, category > 0x52 → `0xffff0000`), `SetText(text)`. Effect `0x2f5a` = rec
 ctor `FUN_100df42d` [GC 0x100df42d], params `FUN_100decc3` [GC 0x100decc3], 32 params at file offset 22128): **duration 1.3 s** (param 0x1a), glyph size `0.01` (param 0x1c), **rise `0.4 · elapsed`** (param 0x1d; `FUN_100deb04` [GC 0x100deb04] sets the billboard offset `(0, 0.4 · t, 0)`
 every `Process`), bitmap-font **material 40** (param 9, `_EffectHandler_t::MMGetMaterial`; glyph advances `DAT_102c460a`, 3 bytes per char; `GfxVisualDiaBill`, render priority 7), constant colour (`SetColor` → start = stop colour).
 Anchored with `InitDynelTemplate` on the dynel (locator template params 0..7: `7, 0,0,0,0,0,0, 1000` …); the exact height above the head is **[UNRESOLVED]** (locator offset not decoded).
+The attachment is **the formatter's subject dynel A**, not the attacker,
+selected target, own avatar or a separate text dynel. `10058e36` resolves the
+character before dispatch; a removed subject produces no world effect.
+`100df42d` creates the Font control and its locator, retaining that same identity.
+The actual **GfxVisualDiaBill is created by SetText `100dee29`**, after replacing
+any prior glyph visual, not by a server spawn or a pre-existing text object.
+In the port this is `floating_text` → `Renderer::set_text` → private glyph model.
+A loading subject retains its real world root while named geometry is pending;
+`floating_text_builds_its_visual_on_the_loading_subject_dynel` checks world-space
+glyph vertices near that subject and no new visual after its removal.
 Exposed as data: `log::HUD_NUMBER`, `log::WORLD_NUMBER`, `floating_number(space, category)` (`FloatingNumber{color, rise_speed, life, font, space}`).
 
 ## 7. Tables

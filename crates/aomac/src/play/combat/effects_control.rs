@@ -85,7 +85,7 @@ impl Controller {
         self.delay=self.template.float(20)?;
         if self.remaining!=0 {
             let argb=|start:usize| -> Result<[f32;4]> { Ok([self.template.float(start+1)?,self.template.float(start+2)?,self.template.float(start+3)?,self.template.float(start)?]) };
-            let config=EffectConfig { creation:super::Creation::Dynel,track_source:true,start_color:Some(self.config.start_color.unwrap_or(argb(12)?)), stop_color:Some(self.config.stop_color.unwrap_or(argb(16)?)),source_identity:self.config.source_identity,source_appearance:self.config.source_appearance,..EffectConfig::default() };
+            let config=EffectConfig { creation:super::Creation::Dynel,track_source:true,start_color:Some(self.config.start_color.unwrap_or(argb(12)?)), stop_color:Some(self.config.stop_color.unwrap_or(argb(16)?)),source_identity:self.config.source_identity,source_nonvisual:self.config.source_nonvisual,source_appearance:self.config.source_appearance,..EffectConfig::default() };
             for i in [10,11] {
                 let effect=self.template.word(i)? as i32;
                 if effect!=0 {

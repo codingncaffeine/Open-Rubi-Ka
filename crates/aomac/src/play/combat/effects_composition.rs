@@ -162,7 +162,7 @@ impl Composition {
             } else {
                 let source=if i==0 { Mat4::from_translation(self.orbit_position(self.angle,true)?) } else {self.source};
                 // GC100d52dc: orbit child uses Vector, cord child uses Dynel with attractor zero.
-                (source,EffectConfig {creation:if i==0 {super::Creation::Vector} else {super::Creation::Dynel},track_source:i==1,start_color:Some(start),stop_color:Some(stop),source_identity:if i==1 {self.config.source_identity} else {None},source_appearance:self.config.source_appearance,..Default::default()})
+                (source,EffectConfig {creation:if i==0 {super::Creation::Vector} else {super::Creation::Dynel},track_source:i==1,start_color:Some(start),stop_color:Some(stop),source_identity:if i==1 {self.config.source_identity} else {None},source_nonvisual:i==1 && self.config.source_nonvisual,source_appearance:self.config.source_appearance,..Default::default()})
             };
             let binding=Binding {group:0,attractor:0,effect:id,note:0,color:0};
             match renderer.spawn_configured(binding,source,self.target,config) {
