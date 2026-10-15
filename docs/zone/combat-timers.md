@@ -24,21 +24,54 @@ Position: `TimerSystemModule_t::FindNextFreePos` [GUI 0x10051779] stacks concurr
 **Every `TimerEntry_t` in Gamecode.dll is unambiguously identifiable**, independent of which kind it ends up as: its
 shared_ptr control block (`FUN_1003d9ec`) is built with `boost::detail::sp_counted_impl_p<TimerEntry_t>::vftable`
 (RTTI-typed, not a guess -- `~/aomac-ghidra/re.sh Gamecode DumpRefs.java "TimerEntry_t"` finds this exact mangled
-name). Its only wrapper, `FUN_1003da5d` (assign + wrap + a second helper), is called by exactly one place,
-`FUN_1003d7ce` -- the actual "construct `TimerEntry_t`, emit `GlobalSignals+0x1f8`" (`StartTimerBar`'s own signal,
-confirmed via `ShutdownMessage`'s `SignalBase_c::_Disconnect((SignalBase_c*)(GlobalSignals+0x1f8), ...)`) helper.
+name). `FUN_1003da5d` (assign + wrap) has **three** callers: `FUN_1003d7ce`, plus weapon-slot constructors
+`FUN_1009b37e` (dummy weapon, called by `FUN_10082512`) and `FUN_1009b415` (wielded weapon, called by
+`FUN_1009c0ca`). The latter two retain an entry in the slot object rather than constructing one on each start.
+The earlier assertion that `FUN_1003d7ce` was its only caller missed the Attack path.
+`FUN_1003d7ce` is the construct-and-start helper; `FUN_1003d6b1` registers/starts an existing entry, sets its
+kind at `+0x14`, and calls `FUN_1003d85b` to emit the start signal for the client character.
 `DumpCallers 1003d7ce` finds six call sites. The kind argument must be checked at each caller:
 the item-use state machine `FUN_1003b947` passes literal **4 (Item)**, not 2 (Special).
 The generic GUI's kind-2 label alone does not identify a special-attack trigger.
 
-## 2. Attack (kind 1): existing reconstruction
+## 2. Attack (kind 1): confirmed-fight trigger traced
 
-Duration = `combat::arms::item_round_seconds` (initiative-scaled `AttackDelay`(294) + `RechargeDelay`(210), the same
-formula the item-info DPS tooltip already used, `chat::item_info_combat::delay`/`FUN_1006772b`/`FUN_10067849`).
-Per-hand (`Armory::attack_slots`, GC 0x10068969), restarts on each swing (`CombatEvent::Hit`/`Miss`'s `slot`).
-No direct Gamecode caller of kind 1 specifically was traced among the six `FUN_1003d7ce` sites (none of the six
-match an ordinary-attack context); this remains the pre-existing reconstruction. The former claim that a
-special-attack timer independently corroborated this formula was wrong: `FUN_1003b947` is item use (§5).
+**Starting an attack request is not starting its timer.** Gamecode `FUN_10067c34` only sets pending byte
+`ctrl+0x79`, constructs `AttackIIR_t`, and calls `SendIIRToObservers`; it has no timer call.
+Received `AttackIIR_t::Execute` (`FUN_1007c545`) calls `FUN_10069c68(target, 0)`. After `CanAttack`
+(`FUN_10069556`) accepts the target, this calls `FUN_100681e5`, which visits the weapon slots and calls
+`FUN_10067de8(slot, force)`. That function gets the slot's retained entry with `FUN_1006b0a3` and starts it
+through **`FUN_1003d6b1(..., kind = 1)`**. `DumpAsm 10067de8 10067e8d` pins `EBX = 1`
+(`0x10067e1c`/`0x10067e1e`), `PUSH EBX` (`0x10067e60`), then the recharge/attack durations,
+the entry shared pointer, and the call at `0x10067e88`. At `0x10069d9d`–`0x10069db6`, fight setup
+forces a fresh start when no kind-1 timer exists (`FUN_1003ceb9`); the slot helper otherwise respects its
+retained entry's flags. Opening the first entry belongs to accepted fight setup, before the first
+`AttackInfoIIR_t`, not a sent request or its first hit.
+The same setup is refreshed during fighting equipment changes (`FUN_1006a700`, `FUN_1006a772`).
+`StopFight`'s `FUN_10068b7f` emits the own character's timer-stop signal at `GlobalSignals+0x1fc`.
+
+The port already follows that trigger end to end: keys/action shortcuts reach `Module::default_attack`,
+which sets `AttackGate` and queues the request only. `Combat::on_frame` starts combat for received `Attack`
+(or a full update's active target); `Module::attacking()` reads that confirmed state. `combat/glue.rs`
+passes it to `Dynels::update_attack_bars`; `HudStats::update_attack_timers` mirrors those entries into windows.
+Server refusal actions `0x93`/`0x76` do not start combat or bars. No behavioral send-vs-confirm change is
+warranted by this trace. The reported refused-Attack association was an inference; its deleted logs/screenshots
+cannot establish otherwise, and the surviving successful fights do not supply retail widget timing.
+
+Offscreen live acceptance (2026-10-15, Aomacfixr 33588, ICC4582) corroborates the ordering:
+sent Attack at **18017 ms**, received Attack at **18222 ms**, first own hit at **19203 ms**.
+Before sending, `attacking=false`, Attack entries empty; the post-confirmation/pre-hit sample had
+`attacking=true`, slot6 progress **0.35511562**, total **2.2333333 s**, and the inspected frame showed
+Attack. After the second hit/StopFight it was absent. No rejected server request was exercised live;
+the refusal regression covers that path. Relevant original frames are retained in
+`docs/captures/zone_tab_rifle_fixr_ithaca.rec` (a combat-only subset, no login credentials).
+
+**Remaining reconstruction, not established by this trigger trace:** the port displays a summed
+initiative-scaled `AttackDelay`(294) + `RechargeDelay`(210) cycle (`item_round_seconds`) and resets it on
+each own `CombatEvent::Hit`/`Miss`. Retail `FUN_10067de8` separately obtains those two durations through
+`FUN_10067bef` -> `FUN_1006772b` and `FUN_10067c0d` -> `FUN_10067849`; its entry flags and cycle update
+are not yet traced into equivalent HUD progress. This investigation establishes the opening trigger, not
+the phase/restart model. The former special-attack corroboration was wrong: `FUN_1003b947` is item use (§5).
 
 ## 3. Reload (kind 5): traced to its exact caller, not a guess
 
@@ -110,8 +143,12 @@ The existing kind-4 Item wear/unwear bar remains intact as well.
   start, restart on swing, ignore an untracked slot, clear on fight stop) and the exact Reload duration (raw
   `RechargeDelay`/100, pinned to `5.0` for stat `0xd2 = 500`, no initiative term, no `AttackDelay` sum).
 * `combat::glue::health_tests::captured_fight_drives_the_attack_bar`: replays `docs/captures/zone_fight_ithaca.rec`
-  through a real `Module` + `Zone`, checking the Attack bar for the own character's bare hands opens, restarts once
-  per own swing and clears on `StopFight`.
+  through a real `Module` + `Zone`, checking that the outgoing Attack has no bar, the received own Attack
+  opens it before any own hit/miss, and the existing swing/reset/stop reconstruction remains covered.
+* `combat::module::tests::attack_key_round_trip` / `server_refusal_prints_text_and_clears_the_gate`: exercise
+  actual command send/pending, confirmation before any hit, stop, and refusal through the timer state.
+  These assertions use message-stat weapons and do not require the installed client database.
+  The capture regression above does require that database for its existing bare-hands item fixture.
 * `combat::glue::health_tests::captured_burst_matches_the_server_result`: preserves the capture's matching sent
   `CharSecSpecAttackIIR_t`/received `SpecialAttackInfoIIR_t` special ids without asserting timer behaviour.
 * `hud_stats::tests::combat_timer_bars_stack_and_show_mid_fight`: dispatches actual Burst/Brawl actions and checks

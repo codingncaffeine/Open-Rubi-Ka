@@ -731,22 +731,29 @@ mod tests {
     /// fight, the next press sends StopFight, its echo ends the fight.
     #[test]
     fn attack_key_round_trip() {
-        let (mut m, z, t) = primed();
+        let (mut m, mut z, t) = primed();
+        z.world.arms.wield(OWN as i32, 500, 6, None, &[(0x126, 500), (0xd2, 500)]);
         m.command(Command::Attack, &z, 2);
         let out = sent(&mut m);
         assert!(matches!(&out[..], [Misc::Attack(a)] if a.target.instance == t && a.flag == 0), "{out:?}");
+        z.world.update_attack_bars(OWN as i32, m.attacking(), 1.0);
+        assert!(z.world.attack_bar_progress(OWN as i32, &z.stats).is_empty(), "sending Attack only sets the pending gate, not the timer");
         m.command(Command::Attack, &z, 2);
         assert!(sent(&mut m).is_empty());
         assert_eq!(m.take_feedback(), vec![net::FB_PLEASE_WAIT]);
         let echo = n3_frame(0, OWN, net::attack(OWN as i32, Identity { kind: DYNEL_CHAR, instance: t }, 0));
         m.on_frame(&echo);
         assert!(m.attacking());
+        z.world.update_attack_bars(OWN as i32, m.attacking(), 0.0);
+        assert_eq!(z.world.attack_bar_progress(OWN as i32, &z.stats).len(), 1, "confirmed Attack starts the timer before any AttackInfo");
         m.command(Command::Attack, &z, 2);
         let out = sent(&mut m);
         assert!(matches!(&out[..], [Misc::StopFight(s)] if s.flag), "{out:?}");
         assert!(m.attacking(), "the fight state changes only when the server echoes");
         m.on_frame(&n3_frame(0, OWN, net::stop_fight(OWN as i32)));
         assert!(!m.attacking());
+        z.world.update_attack_bars(OWN as i32, m.attacking(), 0.0);
+        assert!(z.world.attack_bar_progress(OWN as i32, &z.stats).is_empty());
     }
 
     /// Unwear retains item key 3 before slot removal; combat idle replaces its gesture during a fight.
@@ -882,13 +889,16 @@ mod tests {
     /// The live refusal of an attack on a Surf Lizard (`CharacterAction` 0x93 then 0x76 with instance 6): texts, gate cleared.
     #[test]
     fn server_refusal_prints_text_and_clears_the_gate() {
-        let (mut m, z, _) = primed();
+        let (mut m, mut z, _) = primed();
+        z.world.arms.wield(OWN as i32, 500, 6, None, &[(0x126, 500), (0xd2, 500)]);
         m.command(Command::Attack, &z, 2);
         m.take_outbox();
         let own = Identity { kind: DYNEL_CHAR, instance: OWN as i32 };
         let mk = |act: i32, a: Identity| n3_frame(0, OWN, action::character_action_for(own, &ao_net::n3::world::CharacterAction { action: act, param: 0, identity_a: a, identity_b: Identity::default(), text: String::new() }));
         m.on_frame(&mk(0x93, Identity::default()));
         m.on_frame(&mk(0x76, Identity { kind: 0, instance: 6 }));
+        z.world.update_attack_bars(OWN as i32, m.attacking(), 1.0);
+        assert!(z.world.attack_bar_progress(OWN as i32, &z.stats).is_empty(), "a refused Attack never opens an Attack timer");
         assert_eq!(m.take_feedback(), vec!["Feedback_StartingAttackFailed", "Feedback_PvpNotAllowedInThisDistrict"]);
         m.command(Command::Attack, &z, 2);
         assert_eq!(sent(&mut m).len(), 1, "the guard is clear again");

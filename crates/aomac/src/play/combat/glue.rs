@@ -800,18 +800,30 @@ mod health_tests {
         // the_rifle` seeds it for the sibling rifle capture (item 43712, `BARE_HANDS_KEY` = 100 in `combat::arms`).
         zone.world.arms.list(own as i32, false, &[(43712, 100)]);
         m.test_add_char(0xfd6a9, "Beach Leet", true, 12);
-        let (mut own_swings, mut restarts, mut snapshot) = (0, 0, None);
+        let (mut own_swings, mut restarts, mut snapshot, mut confirmed_start) = (0, 0, None, false);
         for l in include_str!("../../../../../docs/captures/zone_fight_ithaca.rec").lines() {
             let mut p = l.split(' ');
             let (_, dir_, hex) = (p.next().unwrap(), p.next().unwrap(), p.next().unwrap());
             let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
             let f = ao_net::frame::Frame::decode_with(&b, false).unwrap().unwrap().0;
             if dir_ == ">" {
+                if matches!(ao_net::n3::decode(&f).unwrap().body, ao_net::n3::N3::Misc(ao_net::n3::misc::Misc::Attack(_))) {
+                    zone.world.update_attack_bars(own as i32, m.attacking(), 0.1);
+                    assert!(zone.world.attack_bar_progress(own as i32, &zone.stats).is_empty(), "the captured outgoing Attack precedes confirmed combat");
+                }
                 continue;
             }
             m.on_frame(&f);
             zone.on_frame(&f);
             zone.world.update_attack_bars(own as i32, m.attacking(), 0.1);
+            let message = ao_net::n3::decode(&f).unwrap();
+            if let ao_net::n3::N3::Misc(ao_net::n3::misc::Misc::Attack(_)) = message.body {
+                if message.header.target.instance == own as i32 {
+                    assert_eq!(own_swings, 0, "the captured Attack echo precedes the first own hit/miss");
+                    assert!(!zone.world.attack_bar_progress(own as i32, &zone.stats).is_empty(), "confirmed Attack, not AttackInfo, opens the bar");
+                    confirmed_start = true;
+                }
+            }
             for e in m.take_events() {
                 if let Some((attacker, ctx)) = hit_of(&e) {
                     if attacker == own as i32 {
@@ -825,6 +837,7 @@ mod health_tests {
                 snapshot.get_or_insert(bar);
             }
         }
+        assert!(confirmed_start, "the capture must exercise the own Attack echo");
         assert!(own_swings >= 3 && restarts == own_swings, "{own_swings} {restarts}");
         let (slot, progress, total) = snapshot.expect("the fight capture must open the own character's Attack bar at least once");
         assert_eq!(slot, 0, "Aomacvolk fights bare-handed (no WeaponItemFullUpdate in this capture)");
