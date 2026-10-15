@@ -73,27 +73,74 @@ each own `CombatEvent::Hit`/`Miss`. Retail `FUN_10067de8` separately obtains tho
 are not yet traced into equivalent HUD progress. This investigation establishes the opening trigger, not
 the phase/restart model. The former special-attack corroboration was wrong: `FUN_1003b947` is item use (§5).
 
-## 3. Reload (kind 5): traced to its exact caller, not a guess
+## 3. Reload (kind 5): native trigger and Solar rifle ammunition evidence
 
-* **Message class**: `ReloadIIR_t` 0x26515E61 (present in `ao_net::n3::outgoing`'s known-class table, not yet
-  decoded into the `Misc`/`World` enums). Its apply is `FUN_10076780` (a bare vtable `Execute` slot, confirmed by
-  `DumpCallers` on it resolving to a `<no function>` DATA ref -- a vtable entry, not a direct call) -> `FUN_10069274`.
-* `FUN_10069274(ctrl, weaponIdentity, old, newCount, flag)`: reads the weapon's stat `0x1a` (26, the same
-  current-ammo stat `chat/item_info.rs::ammo` already reads as "count"), and if it is present (`-1 < count`), **sets**
-  stat `0x1a` to `newCount` (the clip refilling), calls `FUN_10068a89(weapon)`, then prints `Feedback_Reloading`.
+### Solar-Powered Assault Rifle does not have a finite clip
+
+Read-only inspection of installed `cd_image/rdb.db`, table `rdb_1000020`, id **121569**
+("Solar-Powered Assault Rifle", 705-byte record) establishes:
+
+| Stat | Value | Little-endian stat-pair offset in record |
+| --- | --- | --- |
+| `AmmoMag` (212 / `0xd4`) | **-1** (no finite magazine) | `0x84` |
+| `AmmoType` (420 / `0x1a4`) | **10** (`SelfSupplied`) | `0xc4` |
+| `AttackDelay` (294 / `0x126`) | 100 (1.00 s raw) | `0xac` |
+| `RechargeDelay` (210 / `0xd2`) | 150 (1.50 s raw) | `0x74` |
+| Current ammo (26 / `0x1a`) | absent from the static template | — |
+
+The record's own description says its slugs are made by nanobots eating from its casing.
+The client's ammunition display distinguishes ammo type 10 as `SelfSupplied`
+(`chat/item_info.rs::weapon`); `ammo` reads capacity from **212**, not Health stat 27.
+Thus there is **no finite shots-per-clip count** to exhaust for this weapon, not a large conventional
+clip that merely needed more shots. Do not infer consumption from its bullet muzzle effect or firing animation.
+
+Surviving capture `docs/captures/zone_wear_rifle_borealis.rec` supplies the instance values:
+at **19373, 25452 and 28594 ms** (lines 3, 7, 13), weapon identity `{0xc74a, 13948944}`,
+held by character 33512, has `StaticInstance` 23 = **121569** and current ammo 26 = **0**.
+Those are wear/unwear/re-wear snapshots, **not** a shot-depletion experiment.
+`zone_special_burst_fixr_ithaca.rec` at 17690 ms records character 33588's one Burst result
+with ammo field **-1**, not a clip decrement. Neither capture contains `ReloadIIR_t`.
+The deleted real-window logs/screenshots cannot establish a shot count or an omitted reload;
+the reported Island Reet kill alone does not imply this self-supplied weapon should reload.
+Runtime behavior is intentionally unchanged for this report.
+
+### Native Reload message and timer
+
+* **Message class**: `ReloadIIR_t` **0x26515E61** remains registered but undecoded in the port.
+  Fresh Gamecode `ReadSubClass` **0x100766e1**, corroborated by writer **0x1007673a**, establishes a
+  **28-byte body**: ammo-source `Identity`, weapon `Identity`, remaining-source-count `i32`,
+  new-clip-count `i32`, and flag **`i32`** (nonzero becomes true, despite the in-memory one-byte bool).
+  The common 13-byte N3 header is separate. Constructor **0x100767ca** corroborates the object fields.
+* Apply **0x10076780** resolves the header character, then calls **0x10069274** with both identities
+  and counts. The ammo-source is updated/removed through **0x10049036** / **0x10049073** according to
+  the flag. If weapon current ammo 26 is nonnegative, it sets that stat to the new count,
+  calls **0x10068a89(weapon)** and prints `Feedback_Reloading`.
 * `FUN_10068a89` is one of the six `FUN_1003d7ce` callers and explicitly passes literal **kind 5**.
   Its first instructions (`~/aomac-ghidra re.sh Gamecode DumpAsm.java 10068a89 10068ac7`) push `(0xd2, 2)` into the item's
   effective-stat accessor (`(**vtable+0x3c)(statId, mode)`, the same accessor used for `(0x1a,2)` ammo and `(0x126,2)`
   AttackDelay elsewhere) before constructing the `TimerEntry_t` -- i.e. **the duration passed to kind 5 is the
   weapon's own `RechargeDelay` stat (210/0xd2), alone, with no `AttackDelay` term and no initiative scaling** (no
-  `GameTime_t`/initiative-slope code runs anywhere in this function). `Dynels::start_reload_bar` now uses exactly
+  `GameTime_t`/initiative-slope code runs anywhere in this function). `Dynels::start_reload_bar` uses
   `item.recharge as f32 / 100.0` (the hundredths-to-seconds divisor is `StartTimerBar`'s own kind-4 branch constant
   `_DAT_101adfa8 = 100.0`, read directly from GUI.dll).
-* **Trigger, as ported**: this client has no captured `ReloadIIR_t` to pin the wire layout from, so the bar is still
-  opened client-side when the player sends the Reload special action (`hud_use.rs` 0x6e, action id `RELOAD` ->
-  `CharacterActionIIR_t` 0xd2, `FUN_1006949a`/`FUN_10029e66`, unchanged by this pass) rather than on a decoded
-  `ReloadIIR_t`. The *duration value* is no longer a guess; the exact server-side trigger timing (whether retail
-  opens the bar on send or waits for `ReloadIIR_t`'s echo) remains unresolved for lack of a capture.
+* **Native trigger is resolved:** `DumpCallers 10068a89` finds only **0x1006931b** inside the
+  Reload apply helper **0x10069274**. The manual Reload action **0x6e**, dispatched by **0x1004256c**,
+  reaches sender **0x1006949a**, which only gates and sends `CharacterActionIIR_t` action **0xd2**.
+  It does **not** start the timer on send. Ordinary hit application **0x1006a8f3** assigns the server's
+  ammo field to stat 26 for ammo-bearing weapons; it does not locally decrement a clip or send Reload.
+* **Port limitation, outside this Solar-rifle report:** `hud_use.rs` still predicts a Reload bar on a
+  manual send instead of decoding the server message. The former statement that the native trigger
+  timing was unknown is withdrawn: it is the server apply above. End-to-end ordinary finite-ammo
+  reload behavior still needs a finite-magazine capture; do not add a fabricated automatic reload
+  for the self-supplied Solar rifle to compensate for that separate gap.
+* **Offscreen live evidence (2026-10-15):** Aomacfixr 33588 wielded template **121569**, weapon
+  **24763172**. Both received weapon updates at **5291 ms** carried current ammo26 **0**.
+  The two normal own hits at **19203 / 21389 ms** dealt **11 / 2** damage in slot6 and each supplied
+  ammo field **-1**; the 12-HP Beach Leet died. Across the full recorded 86.81 s session there were
+  **zero received ReloadIIR (0x26515E61)**. Reload was absent from the inspected fight/post-kill
+  frames and timer samples. The relevant weapon/start/hit/stop/death/quit frames are retained in
+  `zone_tab_rifle_fixr_ithaca.rec`; that subset alone is not the full-session absence proof.
+  With AmmoMag=-1 and SelfSupplied=10, no automatic Reload was due; runtime is unchanged.
 
 ## 4. Nano (kind 3): reuses an already-correct, independently-traced formula
 
@@ -139,6 +186,12 @@ The existing kind-4 Item wear/unwear bar remains intact as well.
 
 * `combat::arms::tests::round_delay_matches_the_item_info_dps_cell` / `item_round_seconds_sums_attack_and_recharge_in_
   hundredths` / `attack_slots_follow_wielded_hands`: the Attack-bar formula against the tooltip's own fixture.
+* `combat::arms::tests::captured_solar_rifle_keeps_zero_ammo_across_wear_unwear` checks all three real
+  rifle replications (template, holder, weapon identity, ammo zero and absence of a Reload message).
+  `solar_assault_rifle_has_self_supplied_ammo_and_no_finite_clip` pins the installed template's
+  `AmmoType = 10`, `AmmoMag = -1`, absent static current count and exact raw delays, then checks the
+  same template under the capture's ammo-zero override through `Armory`. The latter skips without
+  the installed database; the capture-only regression does not.
 * `dynels::tests::attack_and_reload_bars_track_hands_swings_and_fight_state`: the state machine (open on fight
   start, restart on swing, ignore an untracked slot, clear on fight stop) and the exact Reload duration (raw
   `RechargeDelay`/100, pinned to `5.0` for stat `0xd2 = 500`, no initiative term, no `AttackDelay` sum).

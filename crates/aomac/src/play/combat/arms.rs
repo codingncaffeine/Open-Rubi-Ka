@@ -433,6 +433,90 @@ mod tests {
         assert!(a.weapon_item(24763172).is_some(), "but the bag item is resolvable for a later explicit wield");
     }
 
+    /// The captured Solar rifle carries ammo count zero, not an exhausted conventional clip.
+    /// Its template's self-supplied ammunition is pinned separately below; docs/zone/combat-timers.md §3.
+    #[test]
+    fn captured_solar_rifle_keeps_zero_ammo_across_wear_unwear() {
+        let mut updates = 0;
+        for line in include_str!("../../../../../docs/captures/zone_wear_rifle_borealis.rec").lines() {
+            let mut fields = line.split_whitespace();
+            let _ms = fields.next().unwrap();
+            let direction = fields.next().unwrap();
+            let hex = fields.next().unwrap();
+            if direction != "<" { continue; }
+            let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
+            let (frame, _) = ao_net::frame::Frame::decode_with(&bytes, false).unwrap().unwrap();
+            let m = ao_net::n3::decode(&frame).unwrap();
+            assert_ne!(m.header.msg_type, 0x2651_5e61, "wear/unwear does not report a reload");
+            if let N3::Dynel(Dynel::WeaponItemFullUpdate(w)) = m.body {
+                assert_eq!((m.header.target.instance, w.parent.instance), (13948944, 33512));
+                assert_eq!(w.stats.iter().find(|&&(id, _)| id == 23).map(|&(_, value)| value), Some(121569));
+                assert_eq!(w.stats.iter().find(|&&(id, _)| id == 26).map(|&(_, value)| value), Some(0));
+                updates += 1;
+            }
+        }
+        assert_eq!(updates, 3, "wear, unwear and re-wear all preserve the same ammo count");
+    }
+
+    #[test]
+    fn solar_assault_rifle_has_self_supplied_ammo_and_no_finite_clip() {
+        let dir = std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join("Games/ProjectRubiKa/client");
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let store = RecordStore::open(&dir).unwrap();
+        let template = item_template(&store, 121569).unwrap().unwrap();
+        assert_eq!(template.name.as_deref(), Some("Solar-Powered Assault Rifle"));
+        assert_eq!(template.stat(420), Some(10), "AmmoType: SelfSupplied, not conventional bullets");
+        assert_eq!(template.stat(212), Some(-1), "AmmoMag: no finite shots-per-clip limit");
+        assert_eq!(template.stat(26), None, "current count comes from replication, not the static record");
+        assert_eq!((template.stat(294), template.stat(210)), (Some(100), Some(150)));
+        let mut arms = Armory::open(&dir);
+        arms.wield(33512, 13948944, 6, Some(121569), &[(26, 0)]);
+        let item = arms.slot_item(33512, 6).unwrap();
+        assert_eq!((item.ammo, item.delay, item.recharge), (10, 100, 150));
+    }
+
+    /// Retained live subset: the self-supplied rifle kills a Beach Leet without reporting clip consumption.
+    #[test]
+    fn captured_solar_rifle_hits_report_no_clip_decrement() {
+        let own = 33588;
+        let target = 0xf99f3;
+        let mut weapons = 0;
+        let mut hits = Vec::new();
+        let mut lifecycle = Vec::new();
+        for line in include_str!("../../../../../docs/captures/zone_tab_rifle_fixr_ithaca.rec").lines() {
+            let mut fields = line.split_whitespace();
+            let _ms = fields.next().unwrap();
+            let direction = fields.next().unwrap();
+            let hex = fields.next().unwrap();
+            if direction != "<" { continue; }
+            let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
+            let (frame, _) = ao_net::frame::Frame::decode_with(&bytes, false).unwrap().unwrap();
+            let m = ao_net::n3::decode(&frame).unwrap();
+            // This is a selected subset, not evidence of absence throughout the full live session.
+            assert_ne!(m.header.msg_type, 0x2651_5e61, "the retained subset contains no Reload message");
+            match m.body {
+                N3::Dynel(Dynel::WeaponItemFullUpdate(w)) => {
+                    assert_eq!((m.header.target.instance, w.parent.instance, w.byte_71), (24763172, own, 6));
+                    assert_eq!(w.stats.iter().find(|&&(id, _)| id == 23).map(|&(_, value)| value), Some(121569));
+                    assert_eq!(w.stats.iter().find(|&&(id, _)| id == 26).map(|&(_, value)| value), Some(0));
+                    weapons += 1;
+                }
+                N3::Misc(Misc::AttackInfo(hit)) if m.header.target.instance == own => {
+                    assert_eq!((hit.slot, hit.value_20, hit.other.instance), (6, -1, target));
+                    hits.push(hit.damage);
+                    lifecycle.push("hit");
+                }
+                N3::Misc(Misc::StopFight(_)) if m.header.target.instance == own => lifecycle.push("stop"),
+                N3::World(World::CharacterAction(action)) if m.header.target.instance == target && action.action == 0x63 => lifecycle.push("death"),
+                N3::Misc(Misc::ToClientQuit) if m.header.target.instance == target => lifecycle.push("quit"),
+                _ => {}
+            }
+        }
+        assert_eq!(weapons, 2);
+        assert_eq!(hits, [11, 2], "two server-confirmed slot-6 hits, not animation-note counts");
+        assert_eq!(lifecycle, ["hit", "hit", "stop", "death", "quit"]);
+    }
+
     #[test]
     fn a_weapon_record_without_the_stat_keeps_the_item_default() {
         let mut a = Armory::default();
