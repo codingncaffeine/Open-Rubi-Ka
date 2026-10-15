@@ -366,6 +366,7 @@ impl Gui {
             w.fx.movable = title.is_some();
             w.fx.resizable = title.is_some();
             w.fx.title_move = title.is_some();
+            w.fx.rollup_page = title.is_none();
             w.bd.pin = title.is_some();
             w.bd.fade = title.is_some();
         }
@@ -492,7 +493,9 @@ impl Gui {
     }
 
     fn refresh_window_size_limits(&mut self, w: WindowId) {
-        if self.windows.get(w).and_then(Option::as_ref).is_some_and(|win| win.fx.preferred_limits) {
+        // RollupController owns page extents; live content changes must not
+        // reapply the free DockWindow's preferred minimum to its fixed area.
+        if self.windows.get(w).and_then(Option::as_ref).is_some_and(|win| win.fx.preferred_limits && !win.fx.rollup_page) {
             if let Some((min, max)) = self.window_preferred_size_limits(w) {
                 self.set_window_size_limits(w, min, max);
             }
@@ -1130,7 +1133,8 @@ impl Gui {
                 // `Window::FadeTo` multiplies the frame art as well
                 out.cmds[first..].iter_mut().for_each(|c| c.scale_alpha(alpha));
             }
-            self.draw_view(root, pos.0 as f32, pos.1 as f32, [255; 3], alpha, true, &mut out.cmds);
+            let inherited = clip.map(|c| Rect::new(c[0] as f32, c[1] as f32, c[2] as f32 - 1.0, c[3] as f32 - 1.0));
+            self.draw_view(root, pos.0 as f32, pos.1 as f32, [255; 3], alpha, true, inherited, &mut out.cmds);
         }
         out.cmds.push(DrawCmd::Clip(None));
         self.draw_popup(&mut out.cmds);
@@ -1218,7 +1222,7 @@ impl Gui {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_view(&mut self, id: ViewId, ox: f32, oy: f32, parent_tint: [u8; 3], parent_alpha: f32, is_root: bool, out: &mut Vec<DrawCmd>) {
+    fn draw_view(&mut self, id: ViewId, ox: f32, oy: f32, parent_tint: [u8; 3], parent_alpha: f32, is_root: bool, inherited: Option<Rect>, out: &mut Vec<DrawCmd>) {
         if !is_root && self.text_fades.contains_key(&id) {
             return self.draw_fade_lines(id, ox, oy, parent_tint, out); // the text area is hidden; its fade lines ignore `parent_alpha`
         }
@@ -1229,6 +1233,14 @@ impl Gui {
         // origin of this view's top-left in screen px
         let (x0, y0) = if is_root { (ox, oy) } else { (ox + v.frame.l, oy + v.frame.t) };
         let rect = Rect::new(x0, y0, x0 + v.frame.width(), y0 + v.frame.height());
+        // View::_Render 0x1014d2e3 intersects every node, but flag 1 clips only
+        // that node's virtual Render, not its recursive children.
+        let intersection = inherited.map_or(rect, |parent| rect.intersect(&parent));
+        let outer = if v.flags & 1 != 0 {
+            Some(push_clip(out, [intersection.l.floor() as i32, intersection.t.floor() as i32, intersection.r.floor() as i32 + 1, intersection.b.floor() as i32 + 1]))
+        } else {
+            None
+        };
         let tint = mul(parent_tint, self.map_color(v.color));
         let alpha = parent_alpha * v.alpha;
         if v.backdrop > 0.0 {
@@ -1288,6 +1300,9 @@ impl Gui {
             }
             _ => {}
         }
+        if let Some(outer) = outer {
+            out.push(DrawCmd::Clip(outer));
+        }
         let tint = if matches!(v.kind, Kind::RadioButton { .. }) && !v.enabled { mul(tint, [0x90; 3]) } else { tint };
         // children
         match &v.kind {
@@ -1295,7 +1310,7 @@ impl Gui {
                 let (vw, vh) = self.viewport(id);
                 let outer = push_clip(out, [rect.l as i32, rect.t as i32, (rect.l + vw) as i32, (rect.t + vh) as i32]);
                 for c in &v.children {
-                    self.draw_view(*c, x0, y0, tint, alpha, false, out);
+                    self.draw_view(*c, x0, y0, tint, alpha, false, Some(intersection), out);
                 }
                 out.push(DrawCmd::Clip(outer));
                 self.draw_scrollbar(out, id, rect, tint, alpha);
@@ -1307,13 +1322,13 @@ impl Gui {
                 });
                 let off = off.unwrap_or_default();
                 for c in &v.children {
-                    self.draw_view(*c, x0 - off.x, y0 - off.y, tint, alpha, false, out);
+                    self.draw_view(*c, x0 - off.x, y0 - off.y, tint, alpha, false, Some(intersection), out);
                 }
             }
             Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) | Kind::Text(_) | Kind::PowerBar(_) => {}
             _ => {
                 for c in &v.children {
-                    self.draw_view(*c, x0, y0, tint, alpha, false, out);
+                    self.draw_view(*c, x0, y0, tint, alpha, false, Some(intersection), out);
                 }
             }
         }
@@ -2521,6 +2536,43 @@ mod clip_tests {
             gui.set_text_scale(scale, smooth);
             assert_eq!(gui.glyphs.version, version, "unchanged frames must retain the atlas");
         }
+    }
+
+    #[test]
+    fn view_clip_is_local_but_every_ancestor_constrains_flagged_descendants() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut root = View::new(Kind::View);
+        root.frame = Rect::new(0.0, 0.0, 99.0, 99.0);
+        root.flags = 1;
+        root.backdrop = 1.0;
+        let root = gui.tree.add(root);
+        let mut child = View::new(Kind::View);
+        child.frame = Rect::new(50.0, 10.0, 149.0, 39.0);
+        child.flags = 0;
+        child.backdrop = 1.0;
+        let child = gui.tree.add(child);
+        gui.tree.append_child(root, child);
+        let mut grandchild = View::new(Kind::View);
+        grandchild.frame = Rect::new(0.0, 0.0, 99.0, 29.0);
+        grandchild.flags = 1;
+        grandchild.backdrop = 1.0;
+        let grandchild = gui.tree.add(grandchild);
+        gui.tree.append_child(child, grandchild);
+        let mut out = Vec::new();
+        gui.draw_view(root, 0.0, 0.0, [255; 3], 1.0, true, Some(Rect::new(20.7, 0.0, 90.9, 100.0)), &mut out);
+        let mut clip = None;
+        let mut solids = Vec::new();
+        for cmd in out {
+            match cmd {
+                DrawCmd::Clip(c) => clip = c,
+                DrawCmd::Solid { .. } => solids.push(clip),
+                _ => {}
+            }
+        }
+        assert_eq!(solids, vec![Some([20, 0, 91, 100]), None, Some([50, 10, 91, 40])]);
+        assert_eq!(clip, None, "self clips must restore before returning");
     }
 
     #[test]

@@ -301,7 +301,7 @@ impl HudTeam {
     /// `TeamView_c` ctor `FUN_100785f0`: header `BorderView` (client borders 4, 2, 4, 2), the button row (borders 0, 5, 0, 5), six `TeamBar_c`s.
     fn build(&mut self, gui: &mut Gui) -> anyhow::Result<Win> {
         let xml = "<root><BorderView name=\"team_background\" bg_gfx=\"GFX_GUI_TAB_BACKGROUND\" tl_gfx=\"none\" tr_gfx=\"none\" bl_gfx=\"none\" br_gfx=\"none\" left_gfx=\"none\" top_gfx=\"none\" right_gfx=\"none\" bottom_gfx=\"none\" view_layout=\"vertical\"><View view_layout=\"vertical\" name=\"team_root\">\
-                   <View name=\"header_border\"><TextView name=\"header\" layout_borders=\"Rect(4,2,4,2)\" max_size=\"Point(16000,-1)\"/></View>\
+                   <View name=\"header_border\"><TextView name=\"header\" view_flags=\"5\" font=\"NORMAL\" layout_borders=\"Rect(4,2,4,2)\" max_size=\"Point(16000,-1)\"/></View>\
                    <View name=\"buttons\" view_layout=\"horizontal\" layout_borders=\"Rect(0,5,0,5)\"/>\
                    <View name=\"rows\" view_layout=\"vertical\"/></View></BorderView></root>";
         let title = self.text("Team");
@@ -568,6 +568,42 @@ mod tests {
     }
 
     #[test]
+    fn long_header_is_single_line_and_clipped_to_actual_client() {
+        let dir = ao_gui::client_dir();
+        let Ok(mut gui) = Gui::new(&dir, None) else { return };
+        let mut h = HudTeam::new(&dir, (1280, 800));
+        h.open(&mut gui);
+        let w = h.win.as_ref().unwrap().window;
+        let mut rollup = crate::play::hud_rollup::Rollup::new(&dir, (1280, 800));
+        rollup.register_window(&mut gui, "team_view", w).unwrap();
+        let (left, top, _) = rollup.area();
+        assert!(rollup.dock_event(&mut gui, &Event::TabDropped { window: w, tab: 0, x: left, y: top, target: None }));
+        gui.set_text(w, "header", &"Long team header ".repeat(40));
+        assert_eq!(gui.window_size(w).0, crate::play::hud_rollup::AREA_W, "live text must not widen a docked page");
+        let client = gui.view_rect(w, "body").unwrap();
+        let header = gui.view_rect(w, "header").unwrap();
+        let mut clip = None;
+        let mut glyphs = 0;
+        let mut overflow = false;
+        for cmd in gui.frame(0.0).cmds {
+            match cmd {
+                ao_gui::DrawCmd::Clip(c) => clip = c,
+                ao_gui::DrawCmd::Glyph { dst, .. } if dst[1] == header.t as i32 => {
+                    glyphs += 1;
+                    let [l, t, r, b] = clip.expect("header glyphs must be clipped");
+                    assert!(l >= client.l as i32 && t >= client.t as i32);
+                    assert!(r <= client.r as i32 + 1 && b <= client.b as i32 + 1);
+                    assert!(b <= header.b as i32 + 1);
+                    overflow |= dst[0] > client.r as i32;
+                }
+                _ => {}
+            }
+        }
+        assert!(glyphs > 0 && overflow, "exercise a header wider than the client");
+        assert!(header.b < gui.view_rect(w, "idx0").unwrap().t);
+    }
+
+    #[test]
     fn join_info_leader_and_leave() {
         let mut h = HudTeam::new(&ao_gui::client_dir(), (1024, 768));
         feed(&mut h, member(ME, "Me"));
@@ -615,8 +651,25 @@ mod tests {
                 }
             }
         }
+        // Drag the blank title strip, not the short "Team" tab label. This
+        // follows the real input/event route instead of fabricating TabDropped.
+        gui.set_window_outer_frame(w, (200, 200, ow, oh));
         let (left, top, _) = rollup.area();
-        assert!(rollup.dock_event(&mut gui, &ao_gui::Event::TabDropped { window: w, tab: 0, x: left, y: top, target: None }));
+        let mut dropped = false;
+        for input in [
+            ao_gui::InputEvent::MouseDown { x: 300.0, y: 210.0, button: MouseButton::Left },
+            ao_gui::InputEvent::MouseMove { x: (left + 20) as f32, y: (top + 10) as f32 },
+            ao_gui::InputEvent::MouseUp { x: (left + 20) as f32, y: (top + 10) as f32, button: MouseButton::Left },
+        ] {
+            rollup.input(&mut gui, &input, 0);
+            for event in gui.input(input) {
+                dropped |= matches!(event, Event::TabDropped { window, .. } if window == w);
+                rollup.dock_event(&mut gui, &event);
+            }
+        }
+        assert!(dropped, "moving the sole-tab title must produce a dock drop");
+        assert!(gui.view_rect(w, "rollup_header").is_some());
+        assert!(rollup.dock_states(&gui).iter().any(|s| s.name == "RollupArea" && s.identities.iter().any(|key| key == "team_view")));
         for _ in 0..4 {
             rollup.event(&mut gui, &ao_gui::Event::CanvasClick { window: w, view: "arrow".into(), x: 0.0, y: 0.0 });
             assert_eq!(gui.window_size(w).0, crate::play::hud_rollup::AREA_W);

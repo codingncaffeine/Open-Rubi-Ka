@@ -167,6 +167,11 @@ impl Rollup {
                 if x >= left && y >= top && y < bottom {
                     self.dock_page(gui, &key, y);
                 } else if let Some((target, index)) = target {
+                    // DockWindow::Drop 0x1003bbf2 cancels a sole-tab self-drop.
+                    // A title move must not rewrite its saved selected-tab sentinel.
+                    if target == window && gui.window_tabs(window).0.len() == 1 {
+                        return true;
+                    }
                     if let Some(t) = self.group_of(target) {
                         let name = self.groups[t].name.clone();
                         let old = self.groups[t].keys.iter().position(|k| *k == key);

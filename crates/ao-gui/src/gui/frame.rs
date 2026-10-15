@@ -40,6 +40,7 @@ pub(super) struct WinFx {
     pub min: (u32, u32),
     pub max: (u32, u32),
     pub preferred_limits: bool,
+    pub rollup_page: bool,
 }
 
 pub(super) struct ViewTabs {
@@ -395,6 +396,11 @@ impl Gui {
             let hit = hit_item(o, p, fx.movable, fx.resizable);
             if hit != 0 {
                 self.ix.frame_drag = Some(FrameDrag { window: wid, hit, mouse0: p, start: o });
+                // [INFERENCE] Forward sole-tab title-strip moves to the same
+                // drop route; retail 0x1003ba71 confirms tab drags, not this strip.
+                if hit == 1 && fx.title_move && fx.tabs.len() == 1 {
+                    self.ix.tab_drag = Some(TabDrag { window: wid, tab: 0, mouse0: p, moved: false });
+                }
                 return true;
             }
             return false;
