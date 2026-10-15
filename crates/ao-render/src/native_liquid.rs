@@ -4,7 +4,8 @@ use ao_scene::{liquid::Surface, Vertex};
 use super::{Renderer, Vec3};
 use crate::gpu_stats::GpuStatsExt;
 
-pub(super) const PIPE: usize = 28;
+// The two native passes follow the final ordinary/sky pipeline, not the native blend block.
+pub(super) const PIPE: usize = super::SKY_GLOW_PIPE + 1;
 
 pub(super) struct LiquidRun {
     pub source: Surface,
@@ -168,6 +169,43 @@ mod tests {
         assert_eq!(edge, 0.03);
         let shallow = layer_uv(&flat, 0, 4, 0, 5.0, edge, &wave);
         close(shallow, [0.25 + 0.045 * wave[0], 0.5 + 0.045 * wave[1]]);
+    }
+
+    #[test]
+    fn native_water_passes_alpha_blend_over_a_red_floor() {
+        use ao_scene::{liquid::SourceTriangle, Instance, Mesh, Scene, Submesh, IDENTITY};
+        let vertices: Vec<_> = [[-20.0, 0.0, -20.0], [20.0, 0.0, -20.0], [20.0, 0.0, 20.0], [-20.0, 0.0, 20.0]]
+            .map(|pos| Vertex { pos, normal: [0.0, 1.0, 0.0], ..Default::default() }).into();
+        let indices = vec![0, 1, 2, 0, 2, 3];
+        let source = Surface::new(0, 0, indices.as_chunks::<3>().0.iter().map(|triangle| SourceTriangle {
+            kind: 0x80ff_ffff, vertices: std::array::from_fn(|i| vertices[triangle[i] as usize]),
+        }).collect()).unwrap();
+        let first = Submesh { liquid: true, two_sided: true, blend: ao_scene::Blend::AlphaBlend,
+            base_color: [0.0, 0.0, 1.0, 1.0], emissive: [1.0; 3], ..Submesh::new(indices.clone(), None) };
+        let mut second = first.clone();
+        second.indices.iter_mut().for_each(|index| *index += 4);
+        let mut water_vertices = vertices.clone();
+        water_vertices.extend_from_within(..);
+        let floor = Submesh { two_sided: true, base_color: [1.0, 0.0, 0.0, 1.0],
+            emissive: [1.0; 3], ..Submesh::new(indices, None) };
+        let scene = Scene {
+            meshes: vec![
+                Mesh { vertices: water_vertices, submeshes: vec![first, second] },
+                Mesh { vertices: vertices.into_iter().map(|mut vertex| { vertex.pos[1] = -1.0; vertex }).collect(), submeshes: vec![floor] },
+            ],
+            instances: vec![Instance { mesh: 0, transform: IDENTITY }, Instance { mesh: 1, transform: IDENTITY }],
+            liquids: vec![source], ..Default::default()
+        };
+        let path = std::env::temp_dir().join(format!("aomac-native-water-{}.png", std::process::id()));
+        super::super::render_to_png(&scene, [0.0, 10.0, 0.0], [0.0, 0.0, -0.1], 64, 64, &path).unwrap();
+        let mut decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap())).read_info().unwrap();
+        let mut pixels = vec![0; decoder.output_buffer_size()];
+        decoder.next_frame(&mut pixels).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let pixel = &pixels[(32 * 64 + 32) * 4..][..3];
+        // Two half-alpha passes: red -> (128,0,128) -> (64,0,192), in D3D7 gamma bytes.
+        // The stale slot uses SRCCOLOR/ONE, leaving red at 255 instead.
+        assert!((55..75).contains(&pixel[0]) && pixel[1] < 5 && (180..205).contains(&pixel[2]), "{pixel:?}");
     }
 
     #[test]

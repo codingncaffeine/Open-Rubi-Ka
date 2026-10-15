@@ -719,8 +719,10 @@ fn build_pipelines(
         // `SourceColorOne` is not contiguous with them (it sits after the other native blends), so it gets a lone
         // dedicated sky slot at the very end of the table (`SKY_GLOW_PIPE`) instead.
         .chain(std::iter::once((Blend::SourceColorOne, true, true, false, false, false)));
-    let pipes = pipe_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false, 0))
+    assert_eq!(pipe_specs.clone().count(), native_liquid::PIPE, "native liquid passes must follow the sky glow pipeline");
+    let pipes: Vec<_> = pipe_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false, 0))
         .chain((12..=13).map(|effect| mk(Blend::AlphaBlend, true, false, false, false, false, false, effect))).collect();
+    assert_eq!(pipes.len(), native_liquid::PIPE + 2);
     let actor_pipes = (0..=7).flat_map(|effect| pipe_specs.clone().map(move |spec| (effect, spec)))
         .map(|(effect, (b, two, sky, env, fade, sprite))| mk(b, two, sky, env, fade, sprite, true, effect)).collect();
     let ground_pipes = (8..=11).map(|effect| mk(Blend::Opaque, false, false, false, false, false, false, effect)).collect();
