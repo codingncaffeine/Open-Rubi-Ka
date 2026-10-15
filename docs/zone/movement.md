@@ -262,6 +262,37 @@ Heading convention (see the module doc): `q = (0, sin(yaw/2), 0, cos(yaw/2))`, f
 `atan2(dx, dz)` equals `2*atan2(q.y, q.w)` to < 0.01 rad, reverse moves point at `yaw + π`, left turns decrease `yaw`; unit test
 `heading_convention_matches_capture`. Scene mapping: scene = (x, y, −z) ⇒ `ao_render::Camera` yaw = `yaw`.
 
+### Combat target facing: live vehicle position, not the last packet
+
+Fresh Gamecode dumps (`DumpFn.java 1007c467 1007c24a 1007c366 1007c137 10023a43`, 2026-10-15):
+`CharTurn_t` constructor **1007c467** initializes the turn and calls **1007c24a**. Direction helper
+**1007c137** resolves the current fight target, reads its global position and the own vehicle's global position,
+then **10023a43** subtracts target minus own. **1007c24a** uses horizontal cross
+`desired.z*forward.x - desired.x*forward.z` and dot `desired.x*forward.x + desired.z*forward.z`,
+stores the absolute `atan2` angle and chooses the Y rotation axis from the cross sign. With our server forward
+`(sin yaw, cos yaw)`, this is the shortest signed heading error `wrap(atan2(dx,dz)-yaw)`; positive error turns right.
+**1007c366** clamps the frame's angular step to the remaining angle before composing the body rotation.
+The existing `Movement::step` sign, wrap and clamping therefore remain unchanged.
+
+`Zone::on_frame` dispatches each decoded packet to `Dynels::on_message`: full updates initialize `Mover`,
+DC moves update it, and `remote_pose(..., 0)` refreshes `Char::pose`. During each in-world frame,
+`Player::frame` runs before `Dynels::update_with_collision`; the latter calls `advance(dt)` and draws
+`scene_pos(c.pose.pos)`. Consequently the position available to the player is the latest completed visual
+vehicle pose (at most one render tick behind integration), not the arbitrarily old `Zone::dynels[id].pos`
+network snapshot. `Dynels::character_position` exposes this server-space pose without a Z flip.
+Both fight-facing and chase refresh consume it; no frame scheduling changes or render-space conversion are introduced.
+Fight-facing resolves `zone.fight_target[own]` every frame, never HUD selection, and clears on stop, missing
+target or replacement. The own-target case uses the own `Movement` position.
+
+Deterministic regressions: `combat_facing_quadrants_and_shortest_wrap` covers four quadrants, shortest arcs
+across both ±π boundaries and stopped turning; `fight_facing_uses_live_pose_and_current_fight_not_selection`
+keeps a stale packet snapshot while advancing a real remote mover, then replaces/stops/removes the fight target.
+The live harness adds `heading=target:offset` and `facing=max_error` (radians); the latter asserts against
+the **current fight target's live pose** and logs the snapshot separately. For a selected nearby Beach Leet,
+use `goto=hunt,heading=target:3.141593,Q=0.1,wait=1,facing=0.15` for behind; use offsets
+`1.570796` and `-1.570796` for left/right in separate fights (stop with Q before re-heading).
+No live session was run for this change; those commands are verification instructions, not live evidence.
+
 ## 7. Jump and falling
 
 `JumpStart.Apply` [GC 0x1006d792] → `vtbl[0x2c]` = `FUN_1006f9e9(h)`: ignored while `PlayerVehicle+0x164 ≠ 0` (a jump is in progress);

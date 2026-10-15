@@ -5,6 +5,8 @@
 //! `wait=secs`, `shot=name` (PNG into AOMAC_LIVE_SHOTS), `pos` prints the own position, `press=F8|CTRL+F8|SHIFT+F8` taps keys (camera),
 //! `drag=right:dx:dy` / `drag=left:dx:dy` mouse-look with raw counts, `cam` prints the camera and lens. HUD steps: `ui=u|ctrl+1` window hotkey (Ctrl+1 = Wear in shipped KeyBindings).
 //! `heading=server_yaw` rotates in place through right mouse input to the requested heading (radians), before idle/capture steps.
+//! `heading=target:offset` starts relative to the selected target's live server bearing; `facing=max_error` asserts
+//! the current fight target's live bearing (radians), e.g. `goto=hunt,heading=target:3.141593,Q=0.1,wait=1,facing=0.15`.
 //! `move=x:y` hover; `click`, `rightclick`, `doubleclick` take `[shift+|ctrl+|alt+]x:y` (prefixes may combine), through GUI mouse input.
 //! `clickdyn=<instance>` world click on a dynel, `mdrag=x1:y1:x2:y2` GUI drag, `watch=secs` own-stat changes.
 //! `rightclickitem=<slot hex>` real right-click on the bag/wear cell currently showing `inv`'s slot (bug 10 equip/unequip/use).
@@ -714,6 +716,21 @@ fn live_walk() {
             }
             "shot" => l.shot(v),
             "pos" => eprintln!("{}", l.pos()),
+            "facing" => {
+                let tolerance: f32 = v.parse().expect("facing requires maximum error in radians");
+                assert!(tolerance.is_finite() && tolerance >= 0.0, "facing tolerance must be finite and nonnegative");
+                assert!(l.p.player.is_some(), "facing requires own player");
+                let own = l.p.zone.char_id as i32;
+                let target = *l.p.zone.fight_target.get(&own).expect("facing requires active own fight target");
+                let pos = l.p.zone.world.character_position(target).expect("fight target has no live pose");
+                let own = l.p.zone.own().expect("facing requires own character");
+                let me = own.pos;
+                let yaw = own.yaw.expect("facing requires own yaw");
+                let bearing = (pos[0] - me[0]).atan2(pos[2] - me[2]);
+                let error = heading_error(bearing, yaw);
+                eprintln!("facing: target={target} live={pos:?} snapshot={:?} own={me:?} yaw={yaw} bearing={bearing} error={error}", l.p.zone.dynels.get(&target).map(|d| d.pos));
+                assert!(error.abs() <= tolerance, "fight facing error {error} exceeds {tolerance}");
+            }
             "inputstate" => {
                 eprintln!("inputstate: target={:?} wear_open={} text_focus={} host_look={} mode={:?} camp={:?} logout={:?} world_message={:?}",
                     l.p.zone.selected_target(), l.p.hud.as_ref().is_some_and(|h| h.is_open(super::super::hud::WindowKind::Character)),
@@ -996,7 +1013,13 @@ fn live_walk() {
                 }
             }
             "heading" => {
-                let target: f64 = v.parse().expect("heading requires server yaw in radians");
+                let target: f64 = if let Some(offset) = v.strip_prefix("target:") {
+                    let offset: f64 = offset.parse().expect("heading=target:offset requires radians");
+                    let id = l.p.zone.selected_target().expect("relative heading requires selection");
+                    let target = l.p.zone.world.character_position(id.instance).expect("selection has no live pose");
+                    let own = l.p.zone.own().unwrap().pos;
+                    f64::from((target[0] - own[0]).atan2(target[2] - own[2])) + offset
+                } else { v.parse().expect("heading requires server yaw in radians") };
                 assert!(target.is_finite(), "heading must be finite");
                 let target = target.rem_euclid(std::f64::consts::TAU) as f32;
                 let prefs_xml = std::fs::read_to_string(l.p.dir.join("cd_image/gui/Default/CharPrefs.xml")).unwrap_or_default();

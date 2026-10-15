@@ -557,17 +557,13 @@ impl Player {
             if self.follow_gated() {
                 self.movement.drop_chase();
             } else {
-                let p = if t == self.char_id as i32 { Some(self.movement.pos()) } else { zone.dynels.get(&t).map(|d| d.pos) };
+                let p = if t == self.char_id as i32 { Some(self.movement.pos()) } else { zone.world.character_position(t) };
                 self.movement.set_chase_pos(p);
             }
         }
         // `CharFight_t::Update` [GC 0x1007bb81]: the own character auto-faces its live fight target while standing
         // (`Movement::set_face_target`, docs/zone/movement.md).
-        {
-            let t = zone.fight_target.get(&(self.char_id as i32)).copied();
-            let p = t.and_then(|t| if t == self.char_id as i32 { Some(self.movement.pos()) } else { zone.dynels.get(&t).map(|d| d.pos) });
-            self.movement.set_face_target(p);
-        }
+        self.movement.set_face_target(fight_target_position(zone, self.char_id as i32, self.movement.pos()));
         for (id, v) in self.movement.take_stat_writes() {
             zone.stats.insert(id, v);
         }
@@ -843,9 +839,55 @@ fn jump_land_clip(role: &Role, two_h: bool) -> &'static str {
     }
 }
 
+fn fight_target_position(zone: &Zone, own: i32, own_pos: [f32; 3]) -> Option<[f32; 3]> {
+    let target = *zone.fight_target.get(&own)?;
+    if target == own { Some(own_pos) } else { zone.world.character_position(target) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fight_facing_uses_live_pose_and_current_fight_not_selection() {
+        let own = 25988;
+        let mut zone = Zone::new(own as u32);
+        for line in include_str!("../../../../docs/captures/zone_ithaca.rec").lines() {
+            let mut fields = line.split(' ');
+            let (Some(_), Some("<"), Some(hex)) = (fields.next(), fields.next(), fields.next()) else { continue };
+            let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
+            if let Some((frame, _)) = Frame::decode_with(&bytes, false).unwrap() { zone.on_frame(&frame); }
+            if zone.world.chars.keys().filter(|id| **id != own).count() >= 2 { break; }
+        }
+        let ids: Vec<_> = zone.world.chars.keys().copied().filter(|id| *id != own).take(2).collect();
+        assert_eq!(ids.len(), 2);
+        let (target, replacement) = (ids[0], ids[1]);
+        let snapshot = zone.dynels[&target].pos;
+        let live = [snapshot[0] + 20.0, snapshot[1], snapshot[2] + 30.0];
+        let mut mover = ao_net::n3::motion::Mover::new(live, 0.0);
+        mover.set_features(4);
+        assert!(mover.on_move_type(1));
+        zone.world.chars.get_mut(&target).unwrap().mover = mover;
+        zone.world.advance(0.0);
+        zone.fight_target.insert(own, target);
+        zone.set_target(Some(ao_net::msg::Identity { kind: 50000, instance: replacement }));
+        let own_pos = [10.0, 0.0, 20.0];
+        assert_eq!(fight_target_position(&zone, own, own_pos), Some(live), "no render-space Z flip or snapshot fallback");
+        zone.world.advance(0.5);
+        let moved = zone.world.character_position(target).unwrap();
+        assert_ne!(moved, live);
+        assert_eq!(zone.dynels[&target].pos, snapshot, "wire snapshot stays stale between packets");
+        assert_eq!(fight_target_position(&zone, own, own_pos), Some(moved));
+        zone.fight_target.insert(own, replacement);
+        assert_eq!(fight_target_position(&zone, own, own_pos), zone.world.character_position(replacement));
+        zone.fight_target.remove(&own);
+        assert_eq!(fight_target_position(&zone, own, own_pos), None);
+        zone.fight_target.insert(own, target);
+        zone.world.chars.remove(&target);
+        assert_eq!(fight_target_position(&zone, own, own_pos), None, "vanished target must not revive its stale snapshot");
+        zone.fight_target.insert(own, own);
+        assert_eq!(fight_target_position(&zone, own, own_pos), Some(own_pos));
+    }
 
 
     #[test]

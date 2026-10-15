@@ -1064,6 +1064,11 @@ impl Dynels {
         self.props.get(&(id.kind, id.instance)).map(|p| p.pos)
     }
 
+    /// Current remote vehicle pose in server coordinates, before the render-space Z flip.
+    pub fn character_position(&self, id: i32) -> Option<[f32; 3]> {
+        self.chars.get(&id).map(|c| c.pose.pos)
+    }
+
     pub fn texture_quality(&self) -> i32 { self.texture_quality }
 
     /// Native CAT observer changes the resource family for future loads, not cached models.

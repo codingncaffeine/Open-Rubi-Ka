@@ -1751,6 +1751,31 @@ mod tests {
     use super::*;
     use ao_net::n3::outgoing::{char_dc_move, parse_char_dc_move};
 
+    #[test]
+    fn combat_facing_quadrants_and_shortest_wrap() {
+        use std::f32::consts::{FRAC_PI_4, PI};
+        for yaw in [FRAC_PI_4, 3.0 * FRAC_PI_4, -3.0 * FRAC_PI_4, -FRAC_PI_4] {
+            let mut m = Movement::new([10.0, 0.0, 20.0], 0.0, 0);
+            m.set_face_target(Some([10.0 + yaw.sin() * 10.0, 0.0, 20.0 + yaw.cos() * 10.0]));
+            m.update(0.01, &Flat(0.0));
+            assert_eq!(m.yaw().is_sign_positive(), yaw.is_sign_positive(), "wrong initial direction for {yaw}");
+            run(&mut m, &Flat(0.0), 2.0);
+            assert!(wrap(m.yaw() - yaw).abs() < 1e-5, "quadrant {yaw}: {}", m.yaw());
+        }
+        for (start, target, sign) in [(PI - 0.05, -PI + 0.05, 1.0), (-PI + 0.05, PI - 0.05, -1.0)] {
+            let mut m = Movement::new([0.0; 3], start, 0);
+            m.set_face_target(Some([target.sin() * 10.0, 0.0, target.cos() * 10.0]));
+            m.update(0.001, &Flat(0.0));
+            assert!(wrap(m.yaw() - start) * sign > 0.0, "must take short arc across pi");
+            run(&mut m, &Flat(0.0), 1.0);
+            assert!(wrap(m.yaw() - target).abs() < 1e-5);
+            m.set_face_target(None);
+            let stopped = m.yaw();
+            run(&mut m, &Flat(0.0), 1.0);
+            assert_eq!(m.yaw(), stopped, "stopping fight clears auto-turn");
+        }
+    }
+
     /// The support test of `EnsureSurfaceAlignment` on a floor at height `ground` (0.48 m tolerance, no sweep).
     fn carried(ground: f32, new: [f32; 3], body: &Body) -> Aligned {
         let on = new[1] - 0.48 <= ground && body.vy <= 0.1;
