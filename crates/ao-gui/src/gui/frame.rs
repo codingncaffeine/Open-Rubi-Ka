@@ -69,6 +69,7 @@ pub(super) struct Ix {
     pub frame_drag: Option<FrameDrag>,
     pub tab_drag: Option<TabDrag>,
     pub menu: Option<super::popup::Menu>,
+    pub menu_generation: u64,
     pub sel: Option<super::select::Sel>,
     /// Seconds since the last auto-scroll step of a selection drag.
     pub sel_timer: f32,

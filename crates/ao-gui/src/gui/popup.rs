@@ -46,6 +46,7 @@ impl MenuItem {
 }
 
 pub(super) struct Menu {
+    generation: u64,
     items: Vec<MenuItem>,
     at: (i32, i32),
     bounds: (i32, i32),
@@ -76,17 +77,31 @@ struct Panel {
 }
 
 impl Gui {
-    /// Opens a popup menu with its top-left at `at` (kept inside `bounds` = the screen size). Replaces an open one.
-    pub fn open_menu(&mut self, at: (i32, i32), bounds: (i32, i32), items: Vec<MenuItem>) {
-        self.ix.menu = Some(Menu { items, at, bounds, path: vec![], hover: None, drag: None });
+    /// Opens a popup menu and returns its generation. Replacing a menu queues its
+    /// `MenuClosed` event; owners must ignore closures of older generations.
+    pub fn open_menu(&mut self, at: (i32, i32), bounds: (i32, i32), items: Vec<MenuItem>) -> u64 {
+        self.close_menu();
+        self.ix.menu_generation += 1;
+        let generation = self.ix.menu_generation;
+        self.ix.menu = Some(Menu { generation, items, at, bounds, path: vec![], hover: None, drag: None });
+        generation
     }
 
+    /// Closes the current menu and queues its generation-scoped dismissal event.
     pub fn close_menu(&mut self) {
-        self.ix.menu = None;
+        if let Some(menu) = self.ix.menu.take() {
+            self.widgets_sync();
+            self.events.push(Event::MenuClosed { generation: menu.generation });
+        }
     }
 
     pub fn menu_open(&self) -> bool {
         self.ix.menu.is_some()
+    }
+
+    /// Generation of the currently open popup, if any.
+    pub fn menu_generation(&self) -> Option<u64> {
+        self.ix.menu.as_ref().map(|menu| menu.generation)
     }
 
     fn menu_levels(m: &Menu) -> Vec<&[MenuItem]> {
@@ -172,10 +187,10 @@ impl Gui {
                 self.menu_slide(x);
             } else if it.enabled && !it.sep && it.sub.is_empty() {
                 self.menu_picked(it.id);
-                self.ix.menu = None;
+                self.close_menu();
             }
         } else if !on {
-            self.ix.menu = None;
+            self.close_menu();
         }
     }
 

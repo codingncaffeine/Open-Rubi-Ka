@@ -96,8 +96,17 @@ fn dropdown_opens_a_popup_and_selects_by_index_with_ids() {
     // a second press while open closes it without a change
     click(&mut g, r.l + 10.0, r.t + 10.0);
     assert!(g.menu_open());
+    let generation = g.menu_generation().unwrap();
     let ev = click(&mut g, r.l + 10.0, r.t + 10.0);
-    assert!(!g.menu_open() && ev.is_empty());
+    assert!(!g.menu_open());
+    assert_eq!(ev, vec![Event::MenuClosed { generation }]);
+    // Replacing a widget popup must release its internal pick routing immediately.
+    click(&mut g, r.l + 10.0, r.t + 10.0);
+    let old = g.menu_generation().unwrap();
+    let new = g.open_menu((400, 400), (800, 600), vec![ao_gui::MenuItem::entry(99, "External")]);
+    assert_eq!(g.input(InputEvent::MouseMove { x: 405.0, y: 403.0 }), vec![Event::MenuClosed { generation: old }]);
+    let ev = click(&mut g, 405.0, 403.0);
+    assert_eq!(ev, vec![Event::MenuPicked { id: 99 }, Event::MenuClosed { generation: new }]);
     // programmatic selection by id
     g.dropdown_select_id(w, "dd", 5, false);
     assert_eq!(g.dropdown_text(w, "dd"), "omni");

@@ -168,18 +168,19 @@ fn popup_menu_picks_checks_and_closes() {
     let f = g.frame(0.0);
     assert!(!f.cmds.is_empty());
     let evs = g.input(InputEvent::MouseDown { x: 150.0, y: 60.0, button: MouseButton::Left });
-    assert!(evs.is_empty() || matches!(evs[0], Event::MenuPicked { .. }));
+    assert!(evs.is_empty() || matches!(evs[0], Event::MenuPicked { .. } | Event::MenuClosed { .. }));
     g.close_menu();
-    g.open_menu((50, 50), (800, 600), vec![MenuItem::check(3, "Timestamps", true), MenuItem::entry(4, "Disabled").disabled()]);
+    g.input(InputEvent::MouseMove { x: 0.0, y: 0.0 }); // drain the explicit close notification
+    let generation = g.open_menu((50, 50), (800, 600), vec![MenuItem::check(3, "Timestamps", true), MenuItem::entry(4, "Disabled").disabled()]);
     // the disabled item does nothing, the check item is picked
     assert!(g.input(InputEvent::MouseDown { x: 60.0, y: 70.0, button: MouseButton::Left }).is_empty());
     assert!(g.menu_open());
     let evs = g.input(InputEvent::MouseDown { x: 60.0, y: 53.0, button: MouseButton::Left });
-    assert_eq!(evs, vec![Event::MenuPicked { id: 3 }]);
+    assert_eq!(evs, vec![Event::MenuPicked { id: 3 }, Event::MenuClosed { generation }]);
     assert!(!g.menu_open());
     // a click outside closes without picking and without reaching the windows underneath
-    g.open_menu((50, 50), (800, 600), vec![MenuItem::entry(9, "X")]);
-    assert!(g.input(InputEvent::MouseDown { x: 700.0, y: 500.0, button: MouseButton::Left }).is_empty());
+    let generation = g.open_menu((50, 50), (800, 600), vec![MenuItem::entry(9, "X")]);
+    assert_eq!(g.input(InputEvent::MouseDown { x: 700.0, y: 500.0, button: MouseButton::Left }), vec![Event::MenuClosed { generation }]);
     assert!(!g.menu_open());
 }
 

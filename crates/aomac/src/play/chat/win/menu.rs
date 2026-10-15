@@ -53,12 +53,24 @@ impl ChatWindows {
         v
     }
 
+    /// `FUN_1009989e`: a subscribed channel that does not carry the read-only bit.
+    pub(super) fn can_talk_to(&self, d: usize, group: u64) -> bool {
+        self.wins[d].cfg.shows(group) && !self.readonly_groups.contains(&group)
+    }
+
     /// The window menu of one window (`FUN_100998bc` + `FUN_10096f9f`).
-    fn window_menu(&self, d: usize) -> Vec<MenuItem> {
+    pub(super) fn window_menu(&self, d: usize) -> Vec<MenuItem> {
         let c = &self.wins[d].cfg;
         let mut mode = vec![MenuItem::check(id(OP_MODE, 0), &self.label("ChatWindowMenu_Style_Mode_Normal"), c.visual_mode == 0)];
         mode.push(MenuItem::check(id(OP_MODE, 2), &self.label("ChatWindowMenu_Style_Mode_Borderless"), c.visual_mode == 2));
         let mut m = vec![MenuItem::submenu(&self.label("ChatWindowMenu_Style_Mode"), mode)];
+        // `FUN_10099305`: style changes are disabled for every document sharing a tabbed frame.
+        if self.frames[self.wins[d].frame].docs.len() > 1 {
+            m[0].enabled = false;
+            for item in &mut m[0].sub {
+                item.enabled = false;
+            }
+        }
         if c.visual_mode != 0 {
             // two `PopupMenuSliderItem_c` (0..1): inactive first (`FUN_10099801`), then active (`FUN_100997be`)
             let sub = vec![MenuItem::slider(id(OP_SLIDER_INACTIVE, 0), c.alpha_inactive), MenuItem::slider(id(OP_SLIDER_ACTIVE, 0), c.alpha_active)];
@@ -93,8 +105,14 @@ impl ChatWindows {
             ]
         } else {
             let c = &self.wins[d].cfg;
-            let talk: Vec<MenuItem> = groups.iter().enumerate().map(|(i, g)| MenuItem::check(id(OP_TALK_TO, i as u32), &self.group_name(*g), c.output_group == *g)).collect();
-            let subscribe: Vec<MenuItem> = groups.iter().enumerate().map(|(i, g)| MenuItem::check(id(OP_SUBSCRIBE, i as u32), &self.group_name(*g), c.shows(*g))).collect();
+            let talk: Vec<MenuItem> = groups.iter().enumerate().filter(|(_, g)| self.can_talk_to(d, **g))
+                .map(|(i, g)| MenuItem::check(id(OP_TALK_TO, i as u32), &self.group_name(*g), c.output_group == *g)).collect();
+            // `FUN_100ab09c` -> `FUN_10084e73`: the same three folders as the configuration panel.
+            let subscribe: Vec<MenuItem> = ["Public Groups", "Private Groups", "Combat Messages"].iter().enumerate().map(|(folder, label)| {
+                let items = groups.iter().enumerate().filter(|(_, g)| config::group_folder(**g) == folder)
+                    .map(|(i, g)| MenuItem::check(id(OP_SUBSCRIBE, i as u32), &self.group_name(*g), c.shows(*g))).collect();
+                MenuItem::submenu(label, items)
+            }).collect();
             // order: window submenu (`FUN_10097289` inserts it first), separator, then `FUN_100ab4dc`'s entries (**GUESS**: the relative order of the two inserters)
             vec![
                 MenuItem::submenu(&self.label("ChatWindowMenu_Visual"), self.window_menu(d)),
@@ -111,7 +129,7 @@ impl ChatWindows {
             ]
         };
         self.menu = Some(Ctx { frame: fi, groups, user });
-        gui.open_menu(at, (self.screen.0 as i32, self.screen.1 as i32), items);
+        self.menu_generation = Some(gui.open_menu(at, (self.screen.0 as i32, self.screen.1 as i32), items));
     }
 
     /// Test hook: chooses the entry `op`/`arg` of the menu of frame `fi` as if clicked.
@@ -137,12 +155,7 @@ impl ChatWindows {
             OP_NEW => self.config_operation(gui, d, "NewWindow"),
             OP_MODE => {
                 let mode = arg as i32;
-                if self.wins[d].cfg.visual_mode != mode {
-                    // A borderless document cannot share a tab strip; reuse the existing tear-out path before changing its style.
-                    if mode != 0 && self.frames[fi].docs.len() > 1 {
-                        self.tab_dropped(gui, self.frames[fi].id, self.frames[fi].sel, None);
-                    }
-                    let fi = self.wins[d].frame;
+                if self.frames[fi].docs.len() == 1 && self.wins[d].cfg.visual_mode != mode {
                     self.wins[d].cfg.visual_mode = mode;
                     // `FUN_10096ec5` -> `Window::SetStyle`: the frame keeps its outer rectangle, the client shrinks / grows by the border
                     self.rebuild_frame(gui, fi);
@@ -166,10 +179,16 @@ impl ChatWindows {
                 let c = &mut self.wins[d].cfg;
                 if op == OP_BEHIND {
                     c.backmost ^= true;
+                    if c.backmost {
+                        c.frontmost = false;
+                    }
                 } else {
                     c.frontmost ^= true;
+                    if c.frontmost {
+                        c.backmost = false;
+                    }
                 }
-                // **GUESS**: frontmost wins if both are set
+                // `FUN_10096d7b` / `FUN_10096d43`: enabling one clears the other; disabling only clears itself.
                 let layer = if c.frontmost { 1 } else if c.backmost { -1 } else { 0 };
                 gui.set_window_layer(self.frames[fi].id, layer);
             }
@@ -179,7 +198,9 @@ impl ChatWindows {
                 let c = &mut self.wins[d].cfg;
                 let shown: Vec<bool> = known.iter().map(|g| c.shows(*g)).collect();
                 c.autosubscribe = !c.autosubscribe;
-                c.set = known.iter().zip(shown).filter(|(_, s)| *s != c.autosubscribe).map(|(g, _)| *g).collect();
+                let autosubscribe = c.autosubscribe;
+                c.set.retain(|g| !known.contains(g));
+                c.set.extend(known.iter().zip(shown).filter(|(_, s)| *s != autosubscribe).map(|(g, _)| *g));
             }
             OP_TALK_TO => {
                 if let Some(g) = ctx.groups.get(arg as usize) {
@@ -195,7 +216,11 @@ impl ChatWindows {
             OP_IGNORE | OP_OPEN_CHAT | OP_SEND_TELL => {
                 self.dirty = false;
                 if let Some(u) = ctx.user {
-                    return vec![if op == OP_IGNORE { WinOut::IgnoreUser(u) } else { WinOut::OpenTell(u) }];
+                    if op == OP_SEND_TELL {
+                        self.focus_input_text(gui, &format!("/tell {u} "));
+                    } else {
+                        return vec![if op == OP_IGNORE { WinOut::IgnoreUser(u) } else { WinOut::OpenTell(u) }];
+                    }
                 }
             }
             _ => {}
@@ -217,7 +242,8 @@ impl ChatWindows {
             OP_SLIDER_ACTIVE => w.cfg.alpha_active = value,
             _ => return,
         }
-        w.alpha = alpha_of(&w.cfg, w.active);
+        // Both retail slider callbacks pass false to their setter: FadeTo(value, 0), not the current activation's alpha.
+        w.alpha = value;
         w.target = w.alpha;
         gui.set_window_alpha(w.id, w.alpha);
         self.dirty = true;

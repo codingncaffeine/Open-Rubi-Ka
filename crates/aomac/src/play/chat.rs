@@ -159,7 +159,7 @@ pub(super) struct Chat {
 enum Back {
     Line(ChatLine, Option<String>),
     Msg(line::ChatMsg),
-    Group(u64, String),
+    Group(u64, String, u32),
     Ungroup(u64),
 }
 
@@ -193,7 +193,7 @@ impl Chat {
                 match b {
                     Back::Line(l, h) => self.line_to(gui, l, h.as_deref()),
                     Back::Msg(m) => self.msg(gui, m),
-                    Back::Group(g, n) => self.group(g, n),
+                    Back::Group(g, n, flags) => self.group(g, n, flags),
                     Back::Ungroup(g) => self.ungroup(g),
                 }
             }
@@ -229,10 +229,10 @@ impl Chat {
             None => self.backlog.push(Back::Msg(m)),
         }
     }
-    fn group(&mut self, g: u64, n: String) {
+    fn group(&mut self, g: u64, n: String, flags: u32) {
         match &mut self.win {
-            Some(w) => w.add_group(g, &n),
-            None => self.backlog.push(Back::Group(g, n)),
+            Some(w) => w.add_group(g, &n, flags),
+            None => self.backlog.push(Back::Group(g, n, flags)),
         }
     }
     fn ungroup(&mut self, g: u64) {
@@ -605,7 +605,7 @@ impl Chat {
                     self.line(gui, ChatLine::new(ChatKind::System, t));
                 }
                 Out::NameOp { op, id, name } => self.name_op(gui, op, id, &name, texts),
-                Out::GroupAdd { group, name, .. } => self.group(group, name),
+                Out::GroupAdd { group, name, flags } => self.group(group, name, flags),
                 Out::GroupRemove { group, .. } => self.ungroup(group),
                 Out::Social(e) => self.social_event(gui, e, texts),
                 Out::OpenTell { id, name } => self.social_open_tell_out(gui, id, &name, texts),

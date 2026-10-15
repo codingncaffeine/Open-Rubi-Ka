@@ -37,7 +37,7 @@ Decompile dumps used (not committed): `ChatGUIModule_c::Initialize` 0x100872bd, 
 * Window alpha (modes ≠ 0): `FUN_10096b23`: the selected tab's window is *active* (`+0xda`) → `Window::FadeTo(window_transparency_active, 0.2 s)`
   else `FadeTo(window_transparency_inactive, 1 s)` (200000 / 1000000 µs). Defaults 0.8 / 0.3 (`_DAT_101b8a54` = 0.8, `_DAT_101ae0ec` = 0.3);
   the menu's two sliders write them (`FUN_10096db3` / `FUN_10096de4`).
-  *Port*: `Gui::set_window_alpha` multiplies everything drawn in the window; active = the window's input bar has the keyboard focus. The fade scope is the *whole* window, text included:
+  *Port*: `Gui::set_window_alpha` multiplies everything drawn in the window; active = the window's input bar has the keyboard focus. Slider changes preview the selected alpha immediately, independent of that activation state (`100997be` / `10099801` → `10096db3` / `10096de4` → `Window::FadeTo`); the next activation transition restores the normal active/inactive fade. The fade scope is the *whole* window, text included:
   `Window::FadeTo` 0x10155856 stores the target, `Window::UpdateFadeLevel` 0x10155653 interpolates and calls `View::SetAlpha(rootView, base × level)` on the window's root view (and the tab views),
   so an inactive default window really is 30 % text on a 30 % black panel (checked, not a port artefact). Mode 0 calls `FadeTo(1.0)` (no fade).
 * `is_frontmost` / `is_backmost` (chat_window_config) set window flags 0x100 / 0x200 (`FUN_10097ae3`): ported as `Gui::set_window_layer` (1 / -1), toggled by the menu entries *AlwaysOnTop* / *AlwaysBehind* (§12) and persisted.
@@ -237,7 +237,7 @@ Screenshots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac chat_win_shot 
 * **Persistence (GUESS)**: the config keys contain only `tab_index` and the per-window `WindowFrame`; the document-to-window grouping (`+0x98`, assigned in `FUN_100abfa3`'s loop and `FUN_100974b5`) is not written by
   `FUN_1009a77b`. The port groups windows in mode 0 whose saved `WindowFrame` is identical into one frame, ordered by `tab_index`, and writes the same frame into every tab of a frame.
 * Port: `Gui::set_window_tabs`, `window_tabs`, `Event::TabSelected`, `Event::TabDropped { window, tab, x, y, target }`; `ChatWindows::{select_tab, tab_dropped}` (reorder, dock, tear-out; rebuilds the GUI windows).
-  Switching a docked document to Borderless now tears it into its own frame using the existing tear-out path, so the mode remains selectable. This is a port interaction policy, not a verified retail multi-tab mode-change rule.
+  Mode changes are disabled for every document in a multi-tab frame (`10099305`, called by `100998bc`): a child document's parent-window name differs from its own identity, and a root document is blocked while other documents share its frame. Tear a tab out before changing its mode; the previous automatic Borderless tear-out policy was not retail behavior.
 
 ## 12. Menus (`PopupMenu_c`)
 
@@ -246,8 +246,8 @@ Screenshots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac chat_win_shot 
   *DisableTextInput* (`+0x167 == 0`), *Style_HideInputBarWhenInactive* (`+0x169`, disabled when text input is off), *Style_FadeMessages*. `FUN_10096f9f` appends separator + *Style_AlwaysBehind* (window flag 0x200)
   and *Style_AlwaysOnTop* (0x100). Strings are text-db category 10001 keys (`LDBface::GetText(0x2711, key)`; the keys above are read from the DLL, the texts from `text.mdb`).
 * **Icon / right-click menu** `FUN_10097289` (opened by `FUN_100983b0` on the window's icon menu): the window menu as the first entry (header *ChatWindowMenu_Visual*) + separator;
-  `GroupChatView_c::FUN_100ab4dc` inserts *TalkToChannel* ▸, *ChannelSubscribeMenu* ▸, boolean *AutoSubscribeChannels* (`+0x163`), separator, then *ChatConfiguration*, *RenameWindow*, *DeleteWindow*, *NewWindow*
-  (implemented through the shared configuration/dialog operations; the relative order of the two inserters is a **GUESS**). Group lists: sorted by name (**GUESS**; the original iterates its group map).
+  `GroupChatView_c::FUN_100ab4dc` inserts *TalkToChannel* ▸, *ChannelSubscribeMenu* ▸, boolean *AutoSubscribeChannels* (`+0x163`), separator, then *ChatConfiguration*, *RenameWindow*, *DeleteWindow*, *NewWindow*.
+  The supplied retail screenshot confirms Visual first, then Talk/Subscribe/Autosubscribe and the configuration/document actions. Group lists are sorted by name (**GUESS**; the original iterates its group map).
 * **User-link menu** `FUN_1008e135` (a `user://NAME` link under a right press, `FUN_1008f5dd`): *IgnoreUser*, *OpenChat*, *SendTell* (each present when its `ChatView` flag bit 0x1/0x2/0x4 is set; **GUESS** all three);
   the slots re-emit `NAME` on signals +0x148 / +0x14c / +0x150. Port: IgnoreUser → `/ignore NAME`, OpenChat and SendTell → the tell window / `/tell NAME ` (`WinOut::IgnoreUser` / `OpenTell`).
 * The text view itself shows no menu (`DISABLE_RC_MENU` 0x200 → `TextRenderer_c::MouseDown` button 2 falls through to the parent `View::MouseDown`), so the right press reaches `ChatView`.
@@ -280,7 +280,7 @@ The shipped template instead says `visual_mode 2` (`prefs/NewChar/Chat/Windows/W
 The screenshot's mode-0 appearance does not establish a shipped fresh-character default. Its group-decorated tab titles are `FUN_100ab980` with `ChatShowOGrpInTitleBar` = the shipped **true** (`cd_image/gui/Default/LoginPrefs.xml:8`; input-group prompt is true at line 7).
 
 **Intentional user-requested default deviation (2026-10-06).** Fresh characters in the port intentionally adopt the existing NewChar data and start in Normal mode (0), with Default Window and Combat docked into one framed tab strip and the Default Window input line enabled. This deliberately replaces the adopted mode-2 layout with the requested retail screenshot look; neither template adoption nor framed/tabbed appearance is claimed to be the original fresh-character default. The original no-document code fallback remains 400x200 (§2).
-`fresh_layout` changes only newly adopted template/code defaults: mode 0, shared first-window frame, ordered tab indices. Mode 0 retains its opaque text (`FadeTo(1.0)`, §2) and retail framed background art; saved per-window modes, opacity, output groups and frames are never overridden. Normal and Borderless remain selectable through the Visual > Mode menu and persist.
+`fresh_layout` changes only newly adopted template/code defaults: mode 0, shared first-window frame, ordered tab indices. Mode 0 retains its opaque text (`FadeTo(1.0)`, §2) and retail framed background art; saved per-window modes, opacity, output groups and frames are never overridden. Normal and Borderless remain selectable through the Visual > Mode menu for standalone documents and persist; docked tabs must first be separated (§11).
 
 **Character-local saved documents.** `ChatWindows::new_for_character` uses the account/`Char<ID>` directory supplied by `DValues::char_dir` (`LoadUserConfig` 0x1006bacd; see `dvalue.rs::open_user`), rather than sharing root `Chat/Windows` between all characters. Existing port root `Chat/Windows` is renamed once into the first character without its own window archive; existing character archives take precedence and are not overwritten. Unrelated logs/preferences are untouched. Regression tests `chat_documents_are_character_local_and_legacy_customizations_survive_once` and `fresh_characters_start_framed_tabbed_with_input_and_can_switch_modes` cover migration, isolation, fresh tabs/input and saved Borderless reload.
 
@@ -329,3 +329,34 @@ Shots with a world-like backdrop (sky gradient over mottled pavement): `AOMAC_SH
 
 Regression checks added (not run by the worker): `message_archive_appends_without_overwriting`, `native_log_header_and_body_round_trip`, `native_document_dialogs_persist_and_remove_archives`; the latter covers duplicate-name prompts, startup removal protection, actual clear/cancel, archive/config persistence, closed-clone reload, and preserving unrelated history on deletion. SettingsChat also added `native_window_menu_and_live_archive` and private-rights regressions. Real-window acceptance is not done (user using Mac); no window, input, screenshot, build or test was launched for this implementation.
 
+
+## 17. Right-click configuration audit (2026-10-15)
+
+The supplied retail menu crop confirms the two unlabeled transparency rows: **inactive first, active second**. `GUI.dll 100998bc` reads document offsets `+0x174` and `+0x170`, associates the respective `…InactiveToolTip`/`…ActiveToolTip` keys, and connects `10099801`/`100997be`. Those callbacks store the setting and immediately preview its value in the existing window through `10096de4`/`10096db3`; selecting the active slider while the input is inactive must therefore still visibly change the window. Normal mode intentionally has no transparency submenu (`100998bc`) and remains alpha 1 (`10096ec5`).
+
+| Entry | Native effect / persistence contract |
+|---|---|
+| Talk to Channel | `100aaf20` includes only subscribed, writable groups (`1009989e`: reject group flags bit 1, otherwise `1009985f`); `100aae12` → `1009a06f` selects `output_group`. `10083e53` registers every local group except Vicinity with read-only flag 2. |
+| Subscribe Channels | `100ab09c` constructs Public Groups, Private Groups, Combat Messages; `10084e73` classifies IDs `[0x42000000,0x4200001a)` with high word 0 as combat, high word 14 as private, all others public. `100aae63` toggles document membership; `selected_group_names`/`selected_group_ids` persist it with the autosubscribe inversion described in §4. |
+| Autosubscribe new channels | `is_autosubscribe_window`; existing membership is retained while new announcements follow the new policy. |
+| ChatConfiguration | `100aa966` toggles `chat_group_window`; `100ad888` constructs GroupControlWindow with its ChatConfig tab, `100ad160` the Chat Windows list beside the selected document's options. Document operations are shared with the menu (§16), not independent settings copies. |
+| Rename / Delete / New Window | Native dialogs, duplicate-name rejection, startup deletion protection and archive handling in §16. Names and document identity persist in each Config.xml. |
+| Visual > Mode | `visual_mode`, 0 Normal / 2 Borderless; `10096ec5` changes the frame style and preserves its outer rectangle. |
+| Visual > Transparency | `window_transparency_inactive` / `window_transparency_active`; each row immediately previews its own value, then activation transitions use the saved pair. |
+| Show timestamps | `show_timestamps`, used when formatting delivered messages. |
+| Disable text input | Inverse of `is_textinput_enabled`; rebuilds the input layout and disables the Autohide menu entry. |
+| Autohide inputbar | `hide_input_when_inactive`; input visibility follows document activation. |
+| Timeout messages | `is_message_fading_enabled`; uses the independent text fade path and DValue delay/time (§5.1), not window alpha. |
+| Always Behind / Always On Top | `10096d7b` enables flag 0x200 while clearing 0x100; `10096d43` enables 0x100 while clearing 0x200. Disabling clears only its own flag. Saved as `chat_window_config/is_backmost` / `is_frontmost`; they are mutually exclusive, not a “frontmost wins” priority rule. |
+
+`1009dc28` also reads legacy nested keys before top-level values: `chat_view_config/deactivate_on_send` and `hide_input_when_inactive`, plus `chat_window_config/WindowTransparencyActive`, `WindowTransparencyInactive` and `visual_mode`. Explicit top-level values override those fallbacks. It registers each saved `selected_group_names`/`selected_group_ids` pair before the chat server announces channels, so offline private/public names remain available in the configuration tree and do not vanish from the next save. `is_wildcard_window` forces autosubscribe off. The current writer remains the retail top-level format (`1009a77b`), not a second competing persistence scheme.
+
+Popup ownership is generation-scoped in the port: closing or replacing an `ao-gui` popup emits `MenuClosed` for that generation, after any successful `MenuPicked`. Chat clears only the matching context. This prevents a dismissed chat/configuration popup from consuming a later HUD/shop menu selection, while slider drags keep their context. This is port event routing, not a claim about the original client's internal signal types.
+
+Frame reconstruction must reapply the cached prompt and inactive input visibility, not wait for a focus transition: the recreated editor initially has neither the old hint nor a hidden input panel. The manager also marks `/ch` output changes dirty and flushes pending documents on close, matching the shutdown-save responsibility of `10094a28`. Autosubscribe conversion preserves entries for unannounced/unnamed channels instead of discarding them while rebuilding the known-channel set.
+
+The configuration panel now retains the selected document in its archive after create/remove/fallback, restores saved inactive groups with the native white/`ff6666` active-state coloring (`100a0620`), and resets the transient Hide Channels filter when reopened. Chat, configuration and log windows persist `WindowPinButtonState` through the existing frame APIs (`Window::LoadWndConfig` `10154d6e`). XML string loading removes only the format's enclosing quotes, preserving literal quotes in user window names.
+
+Regression coverage includes pointer-driven second-slider dragging, both layer transitions, channel menu eligibility/category boundaries, saved/offline subscription retention, SendTell versus OpenChat, disabled docked mode changes, all three chat popup contexts dismissed/replaced before unrelated menu picks, nested-key precedence, saved channel/name/output/layer/pin reload, rebuilt hints/input visibility, configuration archive restoration and shutdown flush. No real window, desktop input or live session was used for this audit.
+
+Verification (headless, 2026-10-15): `CARGO_TARGET_DIR=/tmp/Chat7/target cargo test --release --workspace -j 2` passed **1857 tests, 39 suites, 60 ignored**; `cargo clippy --release --workspace --all-targets -j 2 -- -D warnings` passed. These exercise offscreen GUI events and persistence, not a real-window acceptance run.

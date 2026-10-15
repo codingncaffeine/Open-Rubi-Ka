@@ -61,6 +61,7 @@ fn event_window(event: &Event) -> Option<WindowId> {
         Event::Clicked { window, .. } | Event::TextChanged { window, .. }
         | Event::EnterPressed { window, .. } | Event::Escape { window }
         | Event::CloseRequested { window } | Event::WindowFrame { window }
+        | Event::FramePin { window, .. }
         | Event::LinkClicked { window, .. } => Some(*window),
         _ => None,
     }
@@ -231,6 +232,7 @@ impl ChatWindows {
             return Err(error);
         }
         self.config.selected = document;
+        self.config.archive_dirty = true;
         self.dirty = true;
         Ok(())
     }
@@ -270,6 +272,7 @@ impl ChatWindows {
         }
         self.reindex();
         self.config.selected = self.wins.first().map_or(String::new(), |win| win.cfg.window_name.clone());
+        self.config.archive_dirty = true;
         if self.last_active == name { self.last_active.clone_from(&self.config.selected); }
         self.dirty = true;
         Ok(())
@@ -337,6 +340,7 @@ impl ChatWindows {
             ((x,y),WindowSize::Fixed(width,height))
         });
         let window = gui.open_tabbed_window_xml("ChatLog",&title,&source,position,size)?;
+        gui.set_window_pinned(window,cfg.log_pinned);
         if cfg.log_frame.is_none() {
             let (width,height) = gui.outer_size(window);
             gui.set_window_pos(window,((self.screen.0 as i32-width as i32)/2,(self.screen.1 as i32-height as i32)/2));
@@ -363,12 +367,13 @@ impl ChatWindows {
         let Some(document) = self.config_logs.iter().find(|(_,log)| log.window == window).map(|(document,_)| document.clone()) else { return; };
         let index = self.wins.iter().position(|win| win.cfg.window_name == document);
         match event {
-            Event::WindowFrame { .. } | Event::CloseRequested { .. } | Event::Escape { .. } => {
+            Event::WindowFrame { .. } | Event::FramePin { .. } | Event::CloseRequested { .. } | Event::Escape { .. } => {
                 if let (Some(index),Some((x,y,width,height))) = (index,gui.window_outer_frame(window)) {
                     self.wins[index].cfg.log_frame = Some([x as f32,y as f32,(x+width as i32-1) as f32,(y+height as i32-1) as f32]);
+                    self.wins[index].cfg.log_pinned = gui.window_pinned(window);
                     self.dirty = true;
                 }
-                if !matches!(event,Event::WindowFrame { .. }) {
+                if matches!(event,Event::CloseRequested { .. } | Event::Escape { .. }) {
                     self.config_logs.remove(&document);
                     gui.close_window(window);
                 }

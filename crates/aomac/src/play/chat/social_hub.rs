@@ -54,7 +54,7 @@ impl Chat {
                 }
                 SocialOut::GroupAdd { group, name } => {
                     self.net.set_group(group, Some(&name));
-                    self.group(group, name);
+                    self.group(group, name, 0);
                     // the invite dialog's choice: every chat window shows the group iff its box was ticked (`FUN_1009d129` / `FUN_1009ce7b`)
                     if let (Some(sel), Some(w)) = (self.pg_windows.remove(&(group as u32)), self.win.as_mut()) {
                         for (wn, _) in w.window_list() {

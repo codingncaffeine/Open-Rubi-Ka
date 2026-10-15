@@ -46,9 +46,10 @@ impl ChatWindows {
 
     pub(super) fn new_with_prefs(gui: &mut Gui, screen: (u32, u32), prefs: Option<PathBuf>) -> Result<Self> {
         let client = ao_gui::client_dir();
-        let mut cfgs = prefs.as_deref().map(read_windows).unwrap_or_default();
+        let mut saved_groups = HashMap::new();
+        let mut cfgs = prefs.as_deref().map(|dir| read_windows_with_groups(dir, &mut |id, name| { saved_groups.insert(id, name); })).unwrap_or_default();
         if cfgs.is_empty() {
-            cfgs = read_windows(&client.join("prefs/NewChar"));
+            cfgs = read_windows_with_groups(&client.join("prefs/NewChar"), &mut |id, name| { saved_groups.insert(id, name); });
             cfgs.iter_mut().for_each(|c| c.template = true);
         }
         if cfgs.is_empty() {
@@ -64,18 +65,27 @@ impl ChatWindows {
             screen,
             groups: LOCAL_GROUPS.iter().map(|(i, n)| (*i, n.to_string())).collect(),
             inactive_groups: Default::default(),
+            readonly_groups: LOCAL_GROUPS.iter().filter_map(|(id, _)| (*id != G_VICINITY).then_some(*id)).collect(),
             text: TextDb::load(&client).ok(),
             prefs,
             last_active: String::new(),
             next_n: 0,
             dirty: false,
             menu: None,
+            menu_generation: None,
             pw: WinPrefs::default(),
             config: Default::default(),
             config_ops: None,
             config_logs: HashMap::new(),
             config_log_files: HashMap::new(),
         };
+        // `1009dc28` restores named subscriptions with active=false, before server announcements.
+        for (id, name) in saved_groups {
+            if let std::collections::hash_map::Entry::Vacant(entry) = s.groups.entry(id) {
+                entry.insert(name);
+                s.inactive_groups.insert(id);
+            }
+        }
         s.last_active = cfgs.iter().find(|c| c.startup).or(cfgs.first()).map(|c| c.window_name.clone()).unwrap_or_default();
         for c in cfgs {
             s.add_doc(c);
@@ -213,6 +223,11 @@ impl ChatWindows {
         for (i, &d) in docs.iter().enumerate() {
             self.wins[d].id = id;
             self.wins[d].fade = None; // new GUI views: `update` re-applies `is_message_fading_enabled`
+            self.wins[d].hint.clear();
+            self.wins[d].active = false;
+            if self.wins[d].cfg.textinput {
+                gui.set_visible(id, &format!("input_border_{}", self.wins[d].n), !self.wins[d].cfg.hide_input_when_inactive);
+            }
             self.wins[d].unread &= i != sel; // `FUN_1009adae`: the visible view starts read
             gui.show_collapsing(id, &self.wins[d].chat(), i == sel);
             self.refresh(gui, d);
@@ -222,6 +237,7 @@ impl ChatWindows {
         (self.wins[d].alpha, self.wins[d].target) = (a, a);
         let s = &self.wins[d];
         gui.set_window_alpha(id, a);
+        gui.set_window_pinned(id, s.cfg.pinned);
         // `is_backmost` / `is_frontmost` -> window flags 0x200 / 0x100 (`FUN_10097ae3`); default: normal stacking. **GUESS**: frontmost wins if both are set.
         gui.set_window_layer(id, if s.cfg.frontmost { 1 } else if s.cfg.backmost { -1 } else { 0 });
         gui.set_window_visible(id, docs.iter().any(|&d| self.wins[d].cfg.open));
@@ -278,9 +294,14 @@ impl ChatWindows {
     }
 
     /// `ChatGUIModule_c::AddGroup` (0x10085f91): a group the chat server announced (windows that do not exclude it show it).
-    pub fn add_group(&mut self, id: u64, name: &str) {
+    pub fn add_group(&mut self, id: u64, name: &str, flags: u32) {
         self.groups.insert(id, name.to_string());
         self.inactive_groups.remove(&id);
+        if flags & 2 != 0 {
+            self.readonly_groups.insert(id);
+        } else {
+            self.readonly_groups.remove(&id);
+        }
     }
 
     pub fn remove_group(&mut self, id: u64) {
@@ -370,11 +391,13 @@ impl ChatWindows {
             | Event::LinkClicked { window, .. }
             | Event::TextChanged { window, .. }
             | Event::FrameIcon { window, .. }
+            | Event::FramePin { window, .. }
             | Event::TabSelected { window, .. }
             | Event::TabDropped { window, .. }
             | Event::WindowFrame { window }
             | Event::CloseRequested { window }
             | Event::ContextMenu { window, .. } => *window,
+            Event::MenuClosed { generation } => return self.menu_generation == Some(*generation),
             Event::MenuPicked { .. } | Event::MenuSlider { .. } => return self.menu.is_some(),
             _ => return false,
         };
@@ -386,6 +409,14 @@ impl ChatWindows {
     }
 
     pub fn event(&mut self, gui: &mut Gui, ev: &Event) -> Vec<WinOut> {
+        if let Event::MenuClosed { generation } = ev {
+            if self.menu_generation == Some(*generation) {
+                self.menu_generation = None;
+                self.menu = None;
+                self.config_clear_menu();
+            }
+            return vec![];
+        }
         if self.config_ops_event(gui, ev) || self.config_event(gui, ev) {
             return self.config_take_outputs();
         }
@@ -452,6 +483,12 @@ impl ChatWindows {
                         self.frames[fi].placed = r;
                         self.sync_frame_cfg(fi);
                     }
+                }
+            }
+            Event::FramePin { window, pinned } => {
+                if let Some(fi) = self.frame_of(*window) {
+                    for &d in &self.frames[fi].docs { self.wins[d].cfg.pinned = *pinned; }
+                    self.dirty = true;
                 }
             }
             Event::TabDropped { window, tab, target, .. } => self.tab_dropped(gui, *window, *tab, *target),
@@ -608,7 +645,7 @@ impl ChatWindows {
 
     /// Activation fades (`FUN_10096b23`): the window whose input bar has the keyboard focus is *active* (alpha
     /// `window_transparency_active`, fade 0.2 s), all others fade to `window_transparency_inactive` over 1 s. Pending changes are written once the
-    /// pointer is idle (the original writes at shutdown, `FUN_10094a28`; the port has no shutdown hook).
+    /// pointer is idle and again by `close_all` (the original writes at shutdown, `FUN_10094a28`).
     pub fn update(&mut self, gui: &mut Gui, dt: f32) {
         self.config_ops_update(gui,dt);
         self.sync_decor(gui);
@@ -693,9 +730,9 @@ impl ChatWindows {
     /// Focus the input bar like `focus_input` and put `text` into it (`StartChatCmdMessage` opens it with "/").
     pub fn focus_input_text(&mut self, gui: &mut Gui, text: &str) {
         self.focus_input(gui);
-        if let Some(w) = self.active_win() {
-            let (id, v) = (w.id, w.input());
-            gui.set_text(id, &v, text);
+        if let Some(i) = gui.focused_view().as_deref().and_then(|view| self.index_of_input(view)) {
+            let w = &self.wins[i];
+            gui.set_text(w.id, &w.input(), text);
         }
     }
 
@@ -711,6 +748,7 @@ impl ChatWindows {
         let name = self.active_win().map(|w| w.cfg.window_name.clone());
         if let Some(w) = self.wins.iter_mut().find(|w| Some(&w.cfg.window_name) == name.as_ref()) {
             w.cfg.output_group = id;
+            self.dirty = true;
         }
     }
 

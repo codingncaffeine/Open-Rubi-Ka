@@ -108,6 +108,10 @@ pub enum Event {
     ContextMenu { window: WindowId, x: i32, y: i32, link: Option<String> },
     /// An entry of the popup menu opened with `Gui::open_menu` was chosen.
     MenuPicked { id: u32 },
+    /// A popup was dismissed, including replacement and explicit closure. A pick
+    /// is delivered first; slider changes do not close the popup. Match the
+    /// generation returned by `Gui::open_menu` before clearing owner context.
+    MenuClosed { generation: u64 },
     /// A slider item of the popup menu changed (`value` 0.0..=1.0); the menu stays open.
     MenuSlider { id: u32, value: f32 },
     /// The selection of a `DropdownMenu` changed (`DropdownMenu_c::SelectByIndex(.., true)`, signal `+0x128`): list index and item id.

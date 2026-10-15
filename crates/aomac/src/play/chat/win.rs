@@ -200,6 +200,8 @@ pub struct Cfg {
     /// `chat_window_config/WindowFrame` (l, t, r, b), inclusive.
     pub frame: Option<[f32; 4]>,
     pub log_frame: Option<[f32; 4]>,
+    pub pinned: bool,
+    pub log_pinned: bool,
     pub default_window: bool,
     /// Loaded from the client template / code defaults, not from the character's own saved config (not serialized).
     pub template: bool,
@@ -233,6 +235,8 @@ impl Cfg {
             set: vec![],
             frame: None,
             log_frame: None,
+            pinned: false,
+            log_pinned: false,
             default_window: false,
             template: false,
             tab_index: 0,
@@ -241,27 +245,34 @@ impl Cfg {
         }
     }
 
+    #[cfg(test)]
     pub fn parse(src: &str) -> Option<Cfg> {
+        Self::parse_with_groups(src, &mut |_, _| {})
+    }
+
+    fn parse_with_groups(src: &str, groups: &mut dyn FnMut(u64, String)) -> Option<Cfg> {
         let root = xml::parse(src).ok()?;
         let find = |n: &str| root.children.iter().find(|c| c.attr("name") == Some(n));
         let val = |n: &str| find(n).and_then(|c| c.attr("value"));
-        let s = |n: &str| val(n).map(|v| v.trim_matches('"').to_string());
+        let s = |n: &str| val(n).map(|v| config::unquote(v).to_owned());
         let b = |n: &str, d: bool| val(n).map_or(d, |v| v == "true");
         let f = |n: &str, d: f32| val(n).and_then(|v| v.parse().ok()).unwrap_or(d);
+        let nested = |archive: &str, key: &str| find(archive)?.children.iter().find(|c| c.attr("name") == Some(key))?.attr("value");
         let mut c = Cfg::blank(&s("name")?, &s("window_name").unwrap_or_default());
         c.startup = b("is_startup_window", false);
         c.open = b("is_window_open", false);
         c.autosubscribe = b("is_autosubscribe_window", false);
+        if b("is_wildcard_window", false) { c.autosubscribe = false; }
         c.fading = b("is_message_fading_enabled", false);
         c.logged = b("is_logged", false);
         c.clickthrough = b("is_clickthrough", false);
         c.textinput = b("is_textinput_enabled", true);
-        c.deactivate_on_send = b("deactivate_on_send", true);
-        c.hide_input_when_inactive = b("hide_input_when_inactive", false);
+        c.deactivate_on_send = b("deactivate_on_send", nested("chat_view_config", "deactivate_on_send").is_none_or(|v| v == "true"));
+        c.hide_input_when_inactive = b("hide_input_when_inactive", nested("chat_view_config", "hide_input_when_inactive") == Some("true"));
         c.show_timestamps = b("show_timestamps", false);
-        c.alpha_active = f("window_transparency_active", 0.8);
-        c.alpha_inactive = f("window_transparency_inactive", 0.3);
-        c.visual_mode = val("visual_mode").and_then(|v| v.parse().ok()).unwrap_or(0);
+        c.alpha_active = f("window_transparency_active", nested("chat_window_config", "WindowTransparencyActive").and_then(|v| v.parse().ok()).unwrap_or(0.8));
+        c.alpha_inactive = f("window_transparency_inactive", nested("chat_window_config", "WindowTransparencyInactive").and_then(|v| v.parse().ok()).unwrap_or(0.3));
+        c.visual_mode = val("visual_mode").or_else(|| nested("chat_window_config", "visual_mode")).and_then(|v| v.parse().ok()).unwrap_or(0);
         c.output_group = s("output_group").and_then(|g| parse_ident(&g)).unwrap_or(0);
         if let Some(a) = find("selected_group_ids") {
             c.set = a.children.iter().filter_map(|e| e.attr("value")?.parse().ok()).collect();
@@ -282,7 +293,14 @@ impl Cfg {
         let flag = |k: &str| find("chat_window_config").is_some_and(|a| a.children.iter().any(|e| e.attr("name") == Some(k) && e.attr("value") == Some("true")));
         c.frontmost = flag("is_frontmost");
         c.backmost = flag("is_backmost");
+        c.pinned = flag("WindowPinButtonState");
+        c.log_pinned = nested("log_window_config", "WindowPinButtonState") == Some("true");
         c.tab_index = val("tab_index").and_then(|v| v.parse().ok()).unwrap_or(0);
+        if let Some(names) = find("selected_group_names") {
+            for (&id, name) in c.set.iter().zip(&names.children) {
+                if let Some(name) = name.attr("value") { groups(id, config::unquote(name).to_owned()); }
+            }
+        }
         Some(c)
     }
 
@@ -298,10 +316,12 @@ impl Cfg {
         }
         o += "    </Array>\n    <Archive code=\"0\" name=\"log_window_config\">\n";
         if let Some([l,t,r,b]) = self.log_frame { let _ = writeln!(o, "        <Rect name=\"WindowFrame\" value=\"Rect({l},{t},{r},{b})\" />"); }
+        let _ = writeln!(o, "        <Bool name=\"WindowPinButtonState\" value=\"{}\" />", self.log_pinned);
         o += "    </Archive>\n    <Archive code=\"0\" name=\"chat_window_config\">\n";
         if let Some(r) = self.frame {
             let _ = writeln!(o, "        <Rect name=\"WindowFrame\" value=\"Rect({:.6},{:.6},{:.6},{:.6})\" />", r[0], r[1], r[2], r[3]);
         }
+        let _ = writeln!(o, "        <Bool name=\"WindowPinButtonState\" value=\"{}\" />", self.pinned);
         let _ = writeln!(o, "        <Bool name=\"is_backmost\" value=\"{}\" />\n        <Bool name=\"is_frontmost\" value=\"{}\" />", self.backmost, self.frontmost);
         o += "    </Archive>\n    <Archive code=\"0\" name=\"chat_view_config\" />\n";
         let _ = writeln!(o, "    <Int32 name=\"visual_mode\" value=\"{}\" />", self.visual_mode);
@@ -356,13 +376,18 @@ fn code_defaults() -> Vec<Cfg> {
     vec![d, c]
 }
 
+#[cfg(test)]
 fn read_windows(dir: &Path) -> Vec<Cfg> {
+    read_windows_with_groups(dir, &mut |_, _| {})
+}
+
+fn read_windows_with_groups(dir: &Path, groups: &mut dyn FnMut(u64, String)) -> Vec<Cfg> {
     let mut v: Vec<(String, Cfg)> = std::fs::read_dir(dir.join("Chat/Windows"))
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|e| {
-            let c = Cfg::parse(&std::fs::read_to_string(e.path().join("Config.xml")).ok()?)?;
+            let c = Cfg::parse_with_groups(&std::fs::read_to_string(e.path().join("Config.xml")).ok()?, groups)?;
             Some((e.file_name().to_string_lossy().into_owned(), c))
         })
         .collect();
@@ -507,6 +532,14 @@ impl ChatWindows {
     /// Closes every chat window frame.
     pub fn close_all(&mut self, gui: &mut Gui) {
         self.config_ops_close_all(gui);
+        for frame in &mut self.frames {
+            if let Some(outer) = gui.window_outer_frame(frame.id) { frame.placed = outer; }
+            let pinned = gui.window_pinned(frame.id);
+            for &d in &frame.docs { self.wins[d].cfg.pinned = pinned; }
+        }
+        if !self.frames.is_empty() {
+            if let Err(error) = self.save() { eprintln!("chat: saving windows on close failed: {error}"); }
+        }
         if let Some(win) = self.config.window.take() { gui.close_window(win); }
         for f in self.frames.drain(..) {
             gui.close_window(f.id);
@@ -520,6 +553,7 @@ pub struct ChatWindows {
     screen: (u32, u32),
     groups: HashMap<u64, String>,
     inactive_groups: std::collections::HashSet<u64>,
+    readonly_groups: std::collections::HashSet<u64>,
     text: Option<TextDb>,
     prefs: Option<PathBuf>,
     /// `ChatLastActiveWindow` (`window_name`).
@@ -528,6 +562,7 @@ pub struct ChatWindows {
     /// A frame / tab / setting changed and has not been written yet ([`ChatWindows::update`] saves once the pointer is idle).
     dirty: bool,
     /// What the open popup menu acts on.
+    menu_generation: Option<u64>,
     menu: Option<menu::Ctx>,
     /// Chat DValues in effect ([`WinPrefs`]).
     pw: WinPrefs,

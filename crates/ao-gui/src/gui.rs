@@ -424,7 +424,7 @@ impl Gui {
             self.ix.sel = None;
             self.ix.sel_timer = 0.0;
         }
-        if self.wx.forget_views(&dead) { self.ix.menu = None; }
+        if self.wx.forget_views(&dead) { self.close_menu(); }
         self.tip_forget_views(&dead);
         self.items.retain(|v| !gone(*v));
         self.view_tabs.retain(|v, _| !gone(*v));
@@ -2285,7 +2285,8 @@ impl Gui {
     }
 
     fn key_down(&mut self, key: Key, mods: Modifiers) {
-        if key == Key::Escape && self.ix.menu.take().is_some() {
+        if key == Key::Escape && self.menu_open() {
+            self.close_menu();
             return;
         }
         // Ctrl+C with a selection in a read-only text (`CopyActiveSelectionToClipboard` 0x10160f84)

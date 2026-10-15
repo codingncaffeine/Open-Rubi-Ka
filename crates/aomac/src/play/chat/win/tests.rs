@@ -3,6 +3,9 @@
 use super::*;
 use ao_gui::{InputEvent, Key};
 
+mod menu;
+mod dismissal;
+
 fn msg(group: u64, name: &str, from: &str, text: &str, kind: u8) -> ChatMsg {
     ChatMsg { group, group_name: name.into(), from_name: from.into(), text: text.into(), kind, ..Default::default() }
 }
@@ -194,8 +197,17 @@ fn fresh_characters_start_framed_tabbed_with_input_and_can_switch_modes() {
     ch.focus_input(&mut gui);
     assert!(gui.window_visible(ch.frames[0].id));
     assert!(ch.wins.iter().all(|w| w.cfg.open));
+    let mode_menu = ch.window_menu(0).remove(0);
+    assert!(!mode_menu.enabled && mode_menu.sub.iter().all(|item| !item.enabled));
     ch.test_pick(&mut gui, 0, OP_MODE, 2);
-    assert_eq!(ch.frames.len(), 2, "changing a docked tab to borderless tears it out");
+    assert_eq!(ch.frames.len(), 1, "a shared tabbed frame cannot change mode");
+    assert_eq!(ch.wins[0].cfg.visual_mode, 0);
+    ch.tab_dropped(&mut gui, ch.frames[0].id, 0, None);
+    assert_eq!(ch.frames.len(), 2);
+    let frame = ch.wins[0].frame;
+    let mode_menu = ch.window_menu(0).remove(0);
+    assert!(mode_menu.enabled && mode_menu.sub.iter().all(|item| item.enabled));
+    ch.test_pick(&mut gui, frame, OP_MODE, 2);
     assert_eq!(ch.wins[0].cfg.visual_mode, 2);
     ch.wins[0].cfg.frame = Some([1200.0, 100.0, 1499.0, 199.0]);
     ch.wins[0].cfg.alpha_inactive = 0.42;
@@ -648,7 +660,7 @@ fn tab_title_names_the_output_group_when_the_dvalue_is_on() {
     // mode 0: the strip carries the titles, a changed output group re-titles it on the next update
     ch.test_pick(&mut gui, 0, OP_MODE, 0);
     ch.set_output_group(3u64 << 32 | 1);
-    ch.add_group(3u64 << 32 | 1, "Clan OOC");
+    ch.add_group(3u64 << 32 | 1, "Clan OOC", 0);
     ch.update(&mut gui, 0.0);
     let f = ch.frames[0].id;
     assert_eq!(gui.window_tabs(f).0, ["Default Window <font color=green>[Clan OOC]</font>"]);
@@ -760,7 +772,7 @@ fn chat_configuration_native_private_group_rights() {
         (6, 107, vec![WinOut::LeaveGroup(6)]),
     ] {
         let group = 0xe_0000_0000 | u64::from(owner);
-        ch.add_group(group, "Private");
+        ch.add_group(group, "Private", 0);
         ch.event(&mut gui, &Event::ListItemMouse { window, view: "groups".into(), id: group_ident(group), button: 2, clicks: 1, x: 20, y: 20 });
         assert_eq!(ch.event(&mut gui, &Event::MenuPicked { id: operation << 16 }), expected);
     }
