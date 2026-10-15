@@ -85,7 +85,7 @@ games category, macOS ≥ 12). The client is found from `$HOME/Games/ProjectRubi
 Login → Cancel / timeout → late `Bg::Connected(Ok/Err)` (stale results are dropped, the session closed, the hidden LoginWindow is
 shown again, not recreated), and the `SlotLoginReply` routing: `LoginError` → `ShowError(0x0d, code)`, `Rejected` → `(0x21, detail)`
 (signed `%d`, also during character creation), connection lost → `(3,0)`. Error URLs are recorded instead of opened under `cfg(test)`.
-`AOMAC_PREFS_DIR` redirects the prefs directory. Both skip without the client.
+`AOMAC_PREFS_DIR` redirects the prefs directory and must be absolute. Empty overrides are treated as unset and use an absolute `HOME` plus `Library/Application Support/aomac`; missing/empty or relative bases emit an error and disable persistence rather than writing into cwd. The live harness uses its thread-private scratch directory when the override is unset or empty, and rejects invalid explicit overrides. Both skip without the client.
 Tests use `play::prefs::test_dir()` for a stable, thread-private scratch directory, unique across test processes and removed when the test thread exits; `set_test_dir` keeps the preference override thread-local. Social/LFT save-and-reopen tests must never share or clear another test's directory.
 
 `AOMAC_SHOT_DIR=<dir> cargo test --release -p aomac shots -- --nocapture` renders login, character select, the delete dialog and every

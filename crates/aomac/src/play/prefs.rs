@@ -26,15 +26,34 @@ pub struct Prefs {
 }
 
 /// aomac's prefs directory (stand-in for the client's `prefs/`; also holds `CharacterViewer.xml`).
+/// Empty environment values are unset; a nonempty override or HOME must be absolute, never cwd-relative.
 pub fn dir() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(d) = TEST_DIR.with(|t| t.borrow().clone()) {
-        return Some(d);
+        return resolve_dir(Some(d.as_os_str()), None);
     }
-    if let Some(d) = std::env::var_os("AOMAC_PREFS_DIR") {
-        return Some(d.into()); // tests / scratch runs
+    resolve_dir(std::env::var_os("AOMAC_PREFS_DIR").as_deref(), std::env::var_os("HOME").as_deref())
+}
+
+fn resolve_dir(override_dir: Option<&std::ffi::OsStr>, home: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    if let Some(d) = override_dir.filter(|d| !d.is_empty()) {
+        let path = PathBuf::from(d);
+        if path.is_absolute() {
+            return Some(path);
+        }
+        eprintln!("prefs: AOMAC_PREFS_DIR must be absolute, got {}; preferences disabled", path.display());
+        return None;
     }
-    Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/aomac"))
+    if let Some(h) = home.filter(|h| !h.is_empty()) {
+        let path = PathBuf::from(h);
+        if path.is_absolute() {
+            return Some(path.join("Library/Application Support/aomac"));
+        }
+        eprintln!("prefs: HOME must be absolute, got {}; preferences disabled", path.display());
+    } else {
+        eprintln!("prefs: no absolute preferences directory: AOMAC_PREFS_DIR and HOME are unset or empty; preferences disabled");
+    }
+    None
 }
 
 #[cfg(test)]
@@ -178,6 +197,56 @@ impl Prefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preference_bases_must_be_absolute_and_empty_values_are_unset() {
+        use std::ffi::OsStr;
+        let home = Some(OsStr::new("/isolated/home"));
+        let expected = Some(PathBuf::from("/isolated/home/Library/Application Support/aomac"));
+        assert_eq!(resolve_dir(None, home), expected);
+        assert_eq!(resolve_dir(Some(OsStr::new("")), home), expected);
+        assert_eq!(resolve_dir(Some(OsStr::new("/isolated/prefs")), None), Some(PathBuf::from("/isolated/prefs")));
+        for unset in [None, Some(OsStr::new(""))] {
+            assert_eq!(resolve_dir(None, unset), None);
+            assert_eq!(resolve_dir(Some(OsStr::new("")), unset), None);
+            assert_eq!(resolve_dir(Some(OsStr::new("/isolated/prefs")), unset), Some(PathBuf::from("/isolated/prefs")));
+        }
+        for relative in [".", "prefs", "~/prefs"] {
+            assert_eq!(resolve_dir(Some(OsStr::new(relative)), home), None, "invalid override must not fall back to HOME");
+            assert_eq!(resolve_dir(None, Some(OsStr::new(relative))), None);
+        }
+    }
+
+    #[test]
+    fn empty_override_saves_preferences_and_allocates_screenshots_under_home_not_cwd() {
+        const CHILD: &str = "AOMAC_PREFS_SAVE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(TEST_DIR.with(|t| t.borrow().is_none()), "exercise the real environment resolver");
+            Prefs { server: "isolated-home-regression".into(), ..Default::default() }.save();
+            let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+            let expected = home.join("Library/Application Support/aomac");
+            assert_eq!(next_screenshot_path(), Some(expected.join("Screenshots/scrn0000.png")));
+            assert!(std::fs::read_to_string(expected.join("prefs.txt")).unwrap().contains("server=isolated-home-regression\n"));
+            return;
+        }
+        let root = test_dir();
+        let cwd = root.join("cwd");
+        let home = root.join("home");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", std::thread::current().name().unwrap(), "--nocapture"])
+            .current_dir(&cwd)
+            .env(CHILD, "1")
+            .env("AOMAC_PREFS_DIR", "")
+            .env("HOME", &home)
+            .output().unwrap();
+        assert!(output.status.success(), "child failed: {output:?}");
+        assert_eq!(std::fs::read_dir(&cwd).unwrap().count(), 0, "never write preferences or Screenshots in cwd");
+        let expected = home.join("Library/Application Support/aomac");
+        assert!(expected.join("prefs.txt").is_file());
+        assert!(expected.join("Screenshots").is_dir());
+    }
 
     #[test]
     fn parallel_test_directories_are_stable_and_cleaned_without_changing_native_environment() {

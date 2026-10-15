@@ -544,9 +544,10 @@ fn live_walk() {
     let mut lines = std::io::stdin().lock().lines();
     let (user, pass) = (lines.next().unwrap().unwrap(), lines.next().unwrap().unwrap());
     let want = std::env::var("AOMAC_LIVE_CHAR").unwrap_or_else(|_| "Aomacvolk".into());
-    if std::env::var_os("AOMAC_PREFS_DIR").is_none() {
+    if std::env::var_os("AOMAC_PREFS_DIR").is_none_or(|value| value.is_empty()) {
         super::super::prefs::set_test_dir(super::super::prefs::test_dir());
     }
+    super::super::prefs::dir().expect("live harness requires an absolute preferences directory");
     // `AOMAC_AUDIO_LOG=1`: the real audio engine runs in the harness and `audio` steps print its status (combat music, voices)
     let audio = std::env::var_os("AOMAC_AUDIO_LOG").and_then(|_| ao_audio::Audio::start(&dir).map_err(|e| eprintln!("audio disabled: {e:#}")).ok()).inspect(|a| {
         // muted to the speakers unless `AOMAC_AUDIO_UNMUTE` is set (voices / RMS are still logged)

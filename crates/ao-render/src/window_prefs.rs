@@ -30,11 +30,30 @@ pub struct Saved {
 
 /// `play/prefs.rs::dir()`'s own directory pick, duplicated here since `ao-render` cannot depend on the `aomac` binary crate:
 /// `AOMAC_PREFS_DIR` first (agents' isolated prefs dirs), else `~/Library/Application Support/aomac`.
+/// Empty values are unset; reject relative bases rather than writing beneath the working directory.
 fn dir() -> Option<PathBuf> {
-    if let Some(d) = std::env::var_os("AOMAC_PREFS_DIR") {
-        return Some(d.into());
+    resolve_dir(std::env::var_os("AOMAC_PREFS_DIR").as_deref(), std::env::var_os("HOME").as_deref())
+}
+
+fn resolve_dir(override_dir: Option<&std::ffi::OsStr>, home: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    if let Some(d) = override_dir.filter(|d| !d.is_empty()) {
+        let path = PathBuf::from(d);
+        if path.is_absolute() {
+            return Some(path);
+        }
+        eprintln!("window prefs: AOMAC_PREFS_DIR must be absolute, got {}; preferences disabled", path.display());
+        return None;
     }
-    Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/aomac"))
+    if let Some(h) = home.filter(|h| !h.is_empty()) {
+        let path = PathBuf::from(h);
+        if path.is_absolute() {
+            return Some(path.join("Library/Application Support/aomac"));
+        }
+        eprintln!("window prefs: HOME must be absolute, got {}; preferences disabled", path.display());
+    } else {
+        eprintln!("window prefs: no absolute preferences directory: AOMAC_PREFS_DIR and HOME are unset or empty; preferences disabled");
+    }
+    None
 }
 
 fn path() -> Option<PathBuf> {
@@ -101,6 +120,55 @@ pub fn clamp_to_monitor(pos: (i32, i32), size: (u32, u32), monitor_pos: (i32, i3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preference_bases_must_be_absolute_and_empty_values_are_unset() {
+        use std::ffi::OsStr;
+        let home = Some(OsStr::new("/isolated/home"));
+        let expected = Some(PathBuf::from("/isolated/home/Library/Application Support/aomac"));
+        assert_eq!(resolve_dir(None, home), expected);
+        assert_eq!(resolve_dir(Some(OsStr::new("")), home), expected);
+        assert_eq!(resolve_dir(Some(OsStr::new("/isolated/prefs")), None), Some(PathBuf::from("/isolated/prefs")));
+        for unset in [None, Some(OsStr::new(""))] {
+            assert_eq!(resolve_dir(None, unset), None);
+            assert_eq!(resolve_dir(Some(OsStr::new("")), unset), None);
+            assert_eq!(resolve_dir(Some(OsStr::new("/isolated/prefs")), unset), Some(PathBuf::from("/isolated/prefs")));
+        }
+        for relative in [".", "prefs", "~/prefs"] {
+            assert_eq!(resolve_dir(Some(OsStr::new(relative)), home), None, "invalid override must not fall back to HOME");
+            assert_eq!(resolve_dir(None, Some(OsStr::new(relative))), None);
+        }
+    }
+
+    #[test]
+    fn empty_override_saves_window_preferences_under_home_not_cwd() {
+        const CHILD: &str = "AOMAC_WINDOW_PREFS_SAVE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let saved = Saved { width: 1280, height: 800, ..Default::default() };
+            save(&saved);
+            assert_eq!(load(), Some(saved));
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("aomac-window-prefs-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let cwd = root.join("cwd");
+        let home = root.join("home");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", std::thread::current().name().unwrap(), "--nocapture"])
+            .current_dir(&cwd)
+            .env(CHILD, "1")
+            .env("AOMAC_PREFS_DIR", "")
+            .env("HOME", &home)
+            .output().unwrap();
+        let cwd_entries = std::fs::read_dir(&cwd).unwrap().count();
+        let saved = std::fs::read_to_string(home.join("Library/Application Support/aomac/Window.cfg"));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(output.status.success(), "child failed: {output:?}");
+        assert_eq!(cwd_entries, 0, "never write Window.cfg in cwd");
+        assert_eq!(parse(&saved.unwrap()), Some(Saved { width: 1280, height: 800, ..Default::default() }));
+    }
 
     #[test]
     fn round_trips_size_position_fullscreen_and_monitor_and_rejects_garbage() {
