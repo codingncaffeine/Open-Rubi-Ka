@@ -2326,6 +2326,36 @@ impl Dynels {
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && canim::death_anim_from_action(a.action, a.identity_b.instance as u32).is_some() => {
                 self.die(who.instance, a.identity_b.instance as u32)
             }
+            N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && matches!(a.action, ao_net::n3::action::id::SIT_RELAY | ao_net::n3::action::id::STAND_UP) => {
+                use ao_net::n3::action::{id, mv, wait};
+                if let Some(c) = self.chars.get_mut(&who.instance) {
+                    let transition = if a.action == id::SIT_RELAY {
+                        mv::SWITCH_TO_SIT_GROUND
+                    } else {
+                        match c.mover.wait_state() {
+                            wait::SLEEP => mv::LEAVE_SLEEP,
+                            wait::LOUNGE => mv::LEAVE_LOUNGE,
+                            _ => mv::LEAVE_SIT,
+                        }
+                    };
+                    c.mover.on_move_type(transition);
+                }
+            }
+            N3::Unknown(body) if who.kind == CHAR_KIND && m.header.msg_type == ao_net::n3::action::SOCIAL_ACTION_CMD => {
+                use ao_net::n3::action::{self, mv};
+                if let Ok(social) = action::parse_social_body(who, body) {
+                    if social.state == 1 {
+                        let transition = match social.anim {
+                            action::SLEEP_EMOTE => Some(mv::SWITCH_TO_SLEEP),
+                            action::LOUNGE_EMOTE => Some(mv::SWITCH_TO_LOUNGE),
+                            _ => None,
+                        };
+                        if let (Some(c), Some(transition)) = (self.chars.get_mut(&who.instance), transition) {
+                            c.mover.on_move_type(transition);
+                        }
+                    }
+                }
+            }
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && a.action == ACTION_UNWIELD => self.unwield_slot(who.instance, a.identity_b.instance),
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && matches!(a.action, 0x66 | 0x6c) => {
                 self.cancel_nano_cast(who.instance, if a.action == 0x66 { 0 } else { a.identity_b.kind });
@@ -2420,6 +2450,11 @@ impl Dynels {
                 }
                 // players: [INFERENCE] bit 4 (their moves are applied live); NPCs get their record's `Features` when the model is built
                 mover.set_features(if u.is_npc() { 2 } else { 4 });
+                // PC type-30 relays are real sits; preserve the NPC spawn-placement exception.
+                mover.set_sit_allowed(!u.is_npc());
+                for &(stat, value) in &u.pairs {
+                    mover.on_stat(stat, value);
+                }
                 mover.on_stat(ao_net::n3::motion::STAT_RUN_SPEED, u.run_speed as i32);
                 mover.on_stat(ao_net::n3::motion::STAT_MAX_HEALTH, u.max_health);
                 mover.on_stat(STAT_HEALTH, u.health);
@@ -2452,7 +2487,7 @@ impl Dynels {
                         terminal_pose: false,
                         submitted: false,
                         parts: vec![],
-                        features_set: !u.is_npc(),
+                        features_set: !u.is_npc() || u.pairs.iter().any(|p| p.0 == ao_net::n3::motion::STAT_FEATURES),
                         bounds: None,
                         current_skin: None,
                         cadence: Default::default(),
@@ -2484,6 +2519,9 @@ impl Dynels {
                 if let Some(c) = self.chars.get_mut(&who.instance) {
                     for &(stat, value) in &s.stats {
                         c.mover.on_stat(stat, value);
+                        if stat == ao_net::n3::motion::STAT_FEATURES {
+                            c.features_set = true;
+                        }
                         if stat == super::zone::IN_PLAY_STAT as i32 {
                             c.in_play = value != 0;
                         }
@@ -3405,6 +3443,129 @@ mod tests {
                 (dir == "<").then(|| Frame::decode_with(&b, false).ok().flatten().map(|(f, _)| f)).flatten()
             })
             .collect()
+    }
+
+    #[test]
+    fn captured_remote_sitting_player_stands_before_forward_locomotion() {
+        use ao_net::n3::{action::id, outgoing::{char_dc_move, n3_frame, CharMove}};
+        let mut spawn = frames(include_str!("../../../../docs/captures/zone_ithaca.rec")).iter().find_map(|frame| {
+            let m = ao_net::n3::decode(frame).ok()?;
+            (m.header.target.instance == 33491 && matches!(&m.body, N3::Dynel(Dynel::SimpleCharFullUpdate(_)))).then_some(m)
+        }).expect("captured remote Stanko SCFU at 70758 ms");
+        // No capture has a seated SCFU: reproduce the reported initial posture
+        // by changing only the decoded movement mode in this real remote fixture.
+        let N3::Dynel(Dynel::SimpleCharFullUpdate(u)) = &mut spawn.body else { unreachable!() };
+        u.blob[12] = Mode::SitGround as u8;
+        let who = spawn.header.target.instance;
+        let mut stand = frames(include_str!("../../../../docs/captures/zone_kill_ithaca.rec")).iter().find_map(|frame| {
+            let m = ao_net::n3::decode(frame).ok()?;
+            matches!(&m.body, N3::World(World::CharacterAction(a)) if a.action == id::STAND_UP).then_some(m)
+        }).expect("captured incoming stand relay at 106841 ms");
+        // Retarget the captured own stand relay to the captured remote player:
+        // retail cases 0x15/0x16 use exactly the same handler for either identity.
+        stand.header.target = spawn.header.target;
+        let mut world = Dynels::default();
+        world.on_message(&spawn);
+        assert_eq!(world.chars[&who].mover.pose().anim, AnimState::SitGround);
+        world.on_message(&stand);
+        let pos = world.chars[&who].mover.sim_pos();
+        let forward = CharMove { action: 1, pos, rot: [0.0, 0.0, 0.0, 1.0], elapsed_ms: 0, look: [0.0; 2] };
+        world.on_message(&ao_net::n3::decode(&n3_frame(1, 1, char_dc_move(who, &forward))).unwrap());
+        let c = world.chars.get_mut(&who).unwrap();
+        assert!(matches!(c.mover.pose().anim, AnimState::Walk | AnimState::Run), "stand relay must replace sitting with locomotion");
+        let pose = c.mover.advance(0.25);
+        assert_ne!(pose.pos[2], pos[2], "forward movement advances the standing character");
+        assert_eq!(pose.pos[1], pos[1], "ground locomotion does not hover upward");
+        let stopped = CharMove { action: 21, pos: c.mover.sim_pos(), ..forward };
+        world.on_message(&ao_net::n3::decode(&n3_frame(1, 1, char_dc_move(who, &stopped))).unwrap());
+        let sit = CharMove { action: 30, ..stopped };
+        world.on_message(&ao_net::n3::decode(&n3_frame(1, 1, char_dc_move(who, &sit))).unwrap());
+        assert_eq!(world.chars.get_mut(&who).unwrap().mover.advance(0.25).anim, AnimState::SitGround, "PC sit DC persists beyond the transition one-shot");
+        world.on_message(&stand);
+        assert_eq!(world.chars[&who].mover.pose().anim, AnimState::Idle, "captured stand clears the DC sit too");
+    }
+
+    fn captured_posture_player() -> Message {
+        frames(include_str!("../../../../docs/captures/zone_enter_ithaca.rec")).iter().find_map(|frame| {
+            let m = ao_net::n3::decode(frame).ok()?;
+            matches!(&m.body, N3::Dynel(Dynel::SimpleCharFullUpdate(u)) if !u.is_npc()).then_some(m)
+        }).unwrap()
+    }
+
+    fn posture_action(who: i32, action_id: i32) -> Message {
+        use ao_net::n3::{action, outgoing::n3_frame};
+        let none = ao_net::msg::Identity::default();
+        ao_net::n3::decode(&n3_frame(1, 1, action::character_action(who, &action::simple(action_id, none, none)))).unwrap()
+    }
+
+    #[test]
+    fn remote_stand_selects_sleep_and_lounge_from_full_update_and_stat() {
+        use ao_net::n3::{action::{id, stat, wait}, dynel::StatUpdate, motion::STAT_FEATURES};
+        for (mode, wait_state) in [(Mode::Sleep, wait::SLEEP), (Mode::Lounge, wait::LOUNGE)] {
+            for initial in [false, true] {
+                let mut spawn = captured_posture_player();
+                let who = spawn.header.target.instance;
+                let N3::Dynel(Dynel::SimpleCharFullUpdate(u)) = &mut spawn.body else { unreachable!() };
+                u.blob[12] = mode as u8;
+                u.pairs.extend([(STAT_FEATURES, 4), (stat::WAIT_STATE, if initial { wait_state } else { 0 })]);
+                let mut world = Dynels::default();
+                world.on_message(&spawn);
+                if !initial {
+                    let mut update = spawn.clone();
+                    update.body = N3::Dynel(Dynel::Stat(StatUpdate { stats: vec![(stat::WAIT_STATE, wait_state)], rest: vec![] }));
+                    world.on_message(&update);
+                }
+                world.on_message(&posture_action(who, id::STAND_UP));
+                assert_eq!(world.chars[&who].mover.status().mode, Mode::SitGround, "{mode:?}, initial={initial}");
+            }
+        }
+    }
+
+    #[test]
+    fn remote_accepted_sleep_and_lounge_update_mover_and_wait_state() {
+        use ao_net::n3::{action::{self, id, wait}, outgoing::n3_frame};
+        for (emote, mode, wait_state) in [(action::SLEEP_EMOTE, Mode::Sleep, wait::SLEEP), (action::LOUNGE_EMOTE, Mode::Lounge, wait::LOUNGE)] {
+            let spawn = captured_posture_player();
+            let who = spawn.header.target.instance;
+            let mut world = Dynels::default();
+            world.on_message(&spawn);
+            world.on_message(&posture_action(who, id::SIT_RELAY));
+            let mut payload = action::social_action(who, 1, emote);
+            world.on_message(&ao_net::n3::decode(&n3_frame(1, 1, payload.clone())).unwrap());
+            assert_eq!(world.chars[&who].mover.status().mode, Mode::SitGround, "unaccepted social does not change mode");
+            payload[16] = 1; // SocialActionCmd state = accepted, as in combat/actions.rs.
+            world.on_message(&ao_net::n3::decode(&n3_frame(1, 1, payload)).unwrap());
+            assert_eq!(world.chars[&who].mover.status().mode, mode);
+            assert_eq!(world.chars[&who].mover.wait_state(), wait_state);
+            world.on_message(&posture_action(who, id::STAND_UP));
+            assert_eq!(world.chars[&who].mover.status().mode, Mode::SitGround);
+            world.on_message(&posture_action(who, id::STAND_UP));
+            assert!(matches!(world.chars[&who].mover.status().mode, Mode::Walk | Mode::Run), "a second stand must leave sit, not repeat the sleep/lounge exit");
+        }
+    }
+
+    #[test]
+    fn remote_sit_relay_keeps_features_and_movement_guards() {
+        use ao_net::n3::{action::id, motion::{MoveType, STAT_FEATURES}};
+        let mut spawn = captured_posture_player();
+        let who = spawn.header.target.instance;
+        let N3::Dynel(Dynel::SimpleCharFullUpdate(u)) = &mut spawn.body else { unreachable!() };
+        u.blob[12] = Mode::Run as u8;
+        u.pairs.push((STAT_FEATURES, 2));
+        let mut world = Dynels::default();
+        world.on_message(&spawn);
+        world.on_message(&posture_action(who, id::SIT_RELAY));
+        assert_eq!(world.chars[&who].mover.status().mode, Mode::Run, "Features without mask 4 cannot sit");
+        let mover = &mut world.chars.get_mut(&who).unwrap().mover;
+        mover.on_stat(STAT_FEATURES, 4);
+        mover.on_move_type(MoveType::ForwardStart as u8);
+        world.on_message(&posture_action(who, id::SIT_RELAY));
+        assert_eq!(world.chars[&who].mover.status().mode, Mode::Run, "moving characters cannot sit");
+        world.chars.get_mut(&who).unwrap().mover.on_move_type(MoveType::FullStop as u8);
+        world.on_message(&posture_action(who, id::SIT_RELAY));
+        assert_eq!(world.chars[&who].mover.status().mode, Mode::SitGround);
+        world.chars.get_mut(&who).unwrap().mover.on_move_type(MoveType::ForwardStart as u8);
+        assert_eq!(world.chars[&who].mover.status().mode, Mode::SitGround, "movement must not invent a stand relay");
     }
 
     fn client() -> Option<PathBuf> {

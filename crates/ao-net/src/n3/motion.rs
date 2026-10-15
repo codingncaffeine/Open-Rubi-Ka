@@ -522,6 +522,8 @@ pub struct Mover {
     max_health: i32,
     turn_speed: i32,
     features: i32,
+    /// Stat 430; movement Apply handlers also write it (docs/zone/movement.md §10).
+    wait_state: i32,
     sit_ok: bool,
     reported_mode: Option<i32>,
     /// Turn started by a mouse-turn type (10/13): the vehicle's turn rate is 0, the heading comes with the messages.
@@ -559,6 +561,7 @@ impl Mover {
             max_health: 0,
             turn_speed: 0,
             features: 2,
+            wait_state: 0,
             sit_ok: false,
             reported_mode: None,
             mouse_turn: false,
@@ -639,6 +642,10 @@ impl Mover {
         MoveType::from_id(id).is_some_and(|t| self.apply_guarded(t, self.features & 4 != 0))
     }
 
+    pub fn wait_state(&self) -> i32 {
+        self.wait_state
+    }
+
     /// `StatIIR_t` pair. RunSpeed (156) is the speed skill, Health/MaxHealth (27/1) scale it below 15 % health,
     /// TurnSpeed (267) the turn rate, Features (224) the FSM gate. CurrentMovementMode (173) is kept for [`Mover::reported_mode`]
     /// only: the client never reads it (no `PUSH 0xad` in Gamecode/N3), the mode changes through move types.
@@ -649,6 +656,7 @@ impl Mover {
             STAT_MAX_HEALTH => self.max_health = value,
             STAT_TURN_SPEED => self.turn_speed = value,
             STAT_FEATURES => self.set_features(value),
+            super::action::stat::WAIT_STATE => self.wait_state = value,
             STAT_CURRENT_MOVEMENT_MODE => self.reported_mode = Some(value),
             0 => {
                 self.flags = value as u32;
@@ -718,6 +726,17 @@ impl Mover {
         let previous_mode = self.status.mode;
         let applied = self.status.transition(t, ok);
         if applied {
+            // Retail mode Apply writes WaitState, not ordinary forward/strafe movement.
+            use MoveType::*;
+            match t {
+                SwitchToSitGroundMode | LeaveLoungeMode if ok => self.wait_state = 2,
+                SwitchToSleepMode => self.wait_state = super::action::wait::SLEEP,
+                SwitchToLoungeMode => self.wait_state = super::action::wait::LOUNGE,
+                SwitchToCrawlMode => self.wait_state = 0xe,
+                LeaveSitMode | LeaveCrawlMode | LeaveSleepMode if ok => self.wait_state = 0,
+                SwitchToSwimMode => self.wait_state = 0,
+                _ => {}
+            }
             if t == MoveType::JumpStart {
                 self.jump_pending = true;
             }
@@ -1085,6 +1104,29 @@ mod tests {
     use super::*;
     use crate::n3::{capture, decode, dynel::Dynel, misc::Misc, Message, N3};
     use std::collections::HashMap;
+
+    #[test]
+    fn leave_apply_writes_wait_state_even_without_mode_change() {
+        use crate::n3::action::{stat, wait};
+        let mut mover = Mover::new([0.0; 3], 0.0);
+        mover.set_features(4);
+        mover.on_move_type(MoveType::SwitchToSleepMode as u8);
+        mover.on_move_type(MoveType::LeaveSitMode as u8);
+        assert_eq!(mover.status().mode, Mode::Sleep);
+        assert_eq!(mover.wait_state(), 0, "LeaveSit Apply still runs when mode is not sit");
+        mover.on_move_type(MoveType::LeaveLoungeMode as u8);
+        assert_eq!(mover.status().mode, Mode::Sleep);
+        assert_eq!(mover.wait_state(), 2, "LeaveLounge Apply still writes 2 without a mode change");
+        mover.on_stat(stat::WAIT_STATE, wait::SLEEP);
+        mover.set_features(2);
+        mover.on_move_type(MoveType::LeaveSleepMode as u8);
+        assert_eq!(mover.status().mode, Mode::Frozen);
+        assert_eq!(mover.wait_state(), wait::SLEEP, "failed Features gate runs Frozen Apply, not LeaveSleep");
+        mover.set_features(4);
+        mover.on_move_type(MoveType::LeaveSitMode as u8);
+        assert_eq!(mover.status().mode, Mode::Frozen);
+        assert_eq!(mover.wait_state(), 0, "allowed LeaveSit Apply also runs from Frozen");
+    }
 
     fn surface_step(m: &mut Mover, dt: f32, floor: impl Fn([f32; 3]) -> f32) -> Pose {
         surface_step_ceiling(m, dt, floor, |_| None)
