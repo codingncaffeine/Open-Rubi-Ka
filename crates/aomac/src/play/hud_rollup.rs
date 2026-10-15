@@ -193,7 +193,7 @@ impl Rollup {
             "<root><View view_layout=\"vertical\" h_alignment=\"left\">\
              <View name=\"rollup_header\" view_layout=\"stacked\" min_size=\"Point({w},{header})\" max_size=\"Point({w},{header})\"><CanvasView name=\"header_bg\" min_size=\"Point({w},{header})\" max_size=\"Point({w},{header})\"/>\
              <View view_layout=\"horizontal\" v_alignment=\"top\">{}<TextView name=\"title\" value=\"{}\" layout_borders=\"Rect(8,2,0,2)\"/><HLayoutSpacer/>{}{}</View></View>\
-             <View view_layout=\"stacked\" name=\"body\" h_alignment=\"left\" min_size=\"Point({w},{bh})\" max_size=\"Point({w},{bh})\"><CanvasView name=\"body_bg\" min_size=\"Point({w},{bh})\" max_size=\"Point({w},{bh})\"/>{view_xml_inner}</View>\
+             <CanvasView name=\"body\" view_layout=\"vertical\" h_alignment=\"left\" min_size=\"Point({w},{bh})\" max_size=\"Point({w},{bh})\">{view_xml_inner}</CanvasView>\
              </View></root>",
             canvas("icon", icon, "2,2,0,2"),
             esc(title),
@@ -212,7 +212,7 @@ impl Rollup {
         gui.set_canvas(window, "header_bg", vec![CanvasItem::Solid { dst: [0.0, 0.0, w as f32, header as f32], color: 0x000000, alpha: 0.85 }]);
         gui.set_canvas(window, "icon", image(gui, ICON, [0.0, 0.0, icon.0 as f32, icon.1 as f32]).into_iter().collect());
         gui.set_canvas(window, "close", image(gui, CLOSE, [0.0, 0.0, close.0 as f32, close.1 as f32]).into_iter().collect());
-        self.paint_body_background(gui, window, "body_bg");
+        self.paint_body_background(gui, window, "body");
         let mut page = Page { key: key.to_string(), window, expanded: cfg.expanded, title: title.to_string(), docked: true, wrapped: false };
         self.paint_arrow(gui, &mut page, arrow);
         if !cfg.expanded {
@@ -282,12 +282,21 @@ impl Rollup {
             gui.resize_window(page.window, WindowSize::Preferred);
             gui.set_view_pref_size(page.window, "body", (0.0, height), (16000.0, 16000.0));
         } else {
+            if page.docked {
+                if let Some(config) = self.config.iter().find(|c| c.key == page.key) {
+                    let height = config.height + (BODY_TOP + BODY_BOTTOM) as f32;
+                    gui.set_view_pref_size(page.window, "body", (AREA_W as f32, height), (AREA_W as f32, height));
+                }
+            } else {
+                // RollupPage's saved height/column width do not constrain a free DockWindow.
+                gui.set_view_pref_size(page.window, "body", (-1.0, -1.0), (-1.0, -1.0));
+            }
             gui.resize_window(page.window, WindowSize::Preferred);
         }
         let height = gui.window_size(page.window).1;
         gui.resize_window(page.window, WindowSize::Fixed(width, height));
         if page.docked {
-            self.paint_body_background(gui, page.window, if page.wrapped { "docked_body_bg" } else { "body_bg" });
+            self.paint_body_background(gui, page.window, if page.wrapped { "docked_body_bg" } else { "body" });
         }
     }
 

@@ -398,6 +398,22 @@ mod tests {
         m.serial += 1;
         m.update(&mut gui, 0.0);
         assert_eq!(m.shown(), vec![(2, vec!["Team Job".into(), "00:00:00".into()]), (1, vec!["Rat Hunt".into(), "00:01:30".into()])]);
+        let win = m.win.as_ref().unwrap().win;
+        for (width, height) in [CLIENT, (640, 400), (900, 600)] {
+            gui.resize_window(win, ao_gui::WindowSize::Fixed(width, height));
+            let scroll = gui.view_rect(win, "lv_scroll").unwrap();
+            let header = gui.view_rect(win, "lv_head").unwrap();
+            let icon = gui.view_rect(win, "lv_icon0").unwrap();
+            let name = gui.view_rect(win, "lv_row0").unwrap();
+            let remaining = gui.view_rect(win, "lv_cell0_1").unwrap();
+            assert_eq!((header.l, header.t), (scroll.l, scroll.t));
+            assert_eq!(header.height(), gui.font_height(ao_gui::FontId::Normal) as f32 - 1.0 + 6.0);
+            assert_eq!((icon.l, icon.t), (scroll.l, header.b + 1.0));
+            assert_eq!((name.l, name.t), (icon.l + lv::ICON_COL + 6.0, icon.t));
+            assert_eq!((remaining.l, remaining.t), (name.l + 200.0 + 6.0, icon.t));
+            assert_eq!(gui.view_rect(win, "lv_row1").unwrap().t - name.t, 19.0);
+            assert!(m.icon_at(&gui, icon.l + 2.0, icon.t + 2.0));
+        }
         // the remaining time counts down with the server clock
         m.update(&mut gui, 30.0);
         assert_eq!(m.shown()[1].1[1], "00:01:00");

@@ -1,8 +1,8 @@
 //! Style-0 window frame interaction: `WndBorder` hit-testing, move / resize, the multi-tab strip with tab dragging and the frame's
 //! icon / context events (docs/chat/gui.md §2, §10; docs/gui.md §6.1).
 //!
-//! RE: `WndBorder::HitTest` 0x101593d6 (hit items: 1 move, 2 left, 3 top, 4 right, 5 bottom, 6 TL, 7 TR, 8 BL, 9 BR; window flag 0x8 = not movable, 0x10 / 0x20 =
-//! not resizable horizontally / vertically, 0x1 = no hit at all), `Layout` 0x1015a1d9 (rect +0x23c = the move zone), `MouseDown` 0x101595f7,
+//! RE: `WndBorder::HitTest` 0x101593d6 (hit items: 1 move, 2 left, 3 top, 4 right, 5 bottom, 6 TL, 7 TR, 8 BL, 9 BR; flag 0x8 = not movable;
+//! all eight resize regions require `(flags & 0x30) == 0`, not independent axis flags; 0x1 = no hit at all), `Layout` 0x1015a1d9 (rect +0x23c = the move zone), `MouseDown` 0x101595f7,
 //! `MouseMove` 0x10159c27, `MouseUp` 0x101596a7, `DoSetFrame` 0x10159888.
 
 use super::*;
@@ -170,6 +170,13 @@ impl Gui {
     /// Returns the allocated pixel widths for the owner's tab hit areas.
     pub fn set_view_tabs(&mut self, w: WindowId, name: &str, titles: &[String], selected: usize, width: u32) -> Vec<f32> {
         let Some(v) = self.find(w,name) else { return vec![] };
+        let widths = self.tab_widths(titles, width.saturating_sub(2) as f32);
+        self.view_tabs.insert(v, ViewTabs { titles:titles.to_vec(), widths:widths.clone(), selected });
+        widths
+    }
+
+    /// `TopBorderView::Layout` 0x1014725e: equal-weight allocation with 6 px overlap.
+    fn tab_widths(&mut self, titles: &[String], available: f32) -> Vec<f32> {
         let n = titles.len();
         // Tab::CalculatePreferredSize(false) 0x10146217..101462aa
         // measures just the first title character, not the full title.
@@ -177,12 +184,9 @@ impl Gui {
         let max: Vec<_> = titles.iter().map(|t| self.tab_title_width(t) as f32 + 1.0 + TAB_PAD_L + TAB_PAD_R).collect();
         let mut widths = vec![0.0;n];
         if n != 0 {
-            // TopBorderView default left margin 2 (float 0x101ae17c);
-            // neighbouring tabs overlap 6 px (double 0x101b36a8).
-            layout::space_out(n,width.saturating_sub(2) as f32 + n.saturating_sub(1) as f32 * 6.0,min.iter().sum(),1.0,&min,&max,None,&mut widths);
+            layout::space_out(n,available + n.saturating_sub(1) as f32 * 6.0,min.iter().sum(),1.0,&min,&max,None,&mut widths);
             for (i,w) in widths.iter_mut().enumerate() { *w = (w.round()).clamp(min[i],max[i]); }
         }
-        self.view_tabs.insert(v, ViewTabs { titles:titles.to_vec(), widths:widths.clone(), selected });
         widths
     }
 
@@ -314,21 +318,22 @@ impl Gui {
         Some(Rect::new(x as f32, y as f32, (x + ow as i32 - 1) as f32, (y + oh as i32 - 1) as f32))
     }
 
-    /// Tab rectangles (screen pixels, inclusive) of a tabbed window: tabs sit side by side, the first 20 px from the left edge of the `TabView`
-    /// (`TabView::SetLeftMargin`), each `title width + 1 + 5 + 16` wide (`FUN_101461dc`). **GUESS**: no gap between tabs.
+    /// Allocated tab rectangles, clipped to the strip's button margins for both rendering and hit-testing.
+    /// `WndBorder::Layout` 0x1015a1d9 reserves 18 px per right button via `TabView::SetRightMargin`.
     pub(super) fn tab_rects(&mut self, w: WindowId) -> Vec<Rect> {
         let (tabs, _) = self.window_tabs(w);
         let Some(o) = self.outer_of(w) else { return vec![] };
+        let Some(win) = self.windows[w].as_ref() else { return vec![] };
+        let right_margin = 18.0 * (1 + usize::from(win.bd.pin) + usize::from(win.bd.help.is_some())) as f32;
         let tv = o.resize(BORDER.0, BORDER.1, -BORDER.2, -BORDER.3);
         let mut l = tv.l + TAB_LEFT_MARGIN;
-        tabs.iter()
-            .map(|t| {
-                let wd = self.tab_title_width(t) as f32 + 1.0 + TAB_PAD_L + TAB_PAD_R;
-                let r = Rect::new(l, tv.t, l + wd - 1.0, tv.t + TAB_H - 1.0);
-                l += wd;
-                r
-            })
-            .collect()
+        let right = tv.r - right_margin;
+        let widths = self.tab_widths(&tabs, (right - l + 1.0).max(0.0));
+        widths.into_iter().map(|width| {
+            let r = Rect::new(l, tv.t, (l + width - 1.0).min(right), tv.t + TAB_H - 1.0);
+            l += width - 6.0;
+            r
+        }).collect()
     }
 
     fn is_tabbed(&self, w: WindowId) -> bool {
@@ -499,6 +504,10 @@ impl Gui {
 
     /// One tab: 3-slice art (active / inactive) and the title (`Tab::SetSelected` 0x10146110: selected text white, unselected colour 0).
     pub(super) fn draw_tab(&mut self, out: &mut Vec<DrawCmd>, tab: Rect, title: &str, selected: bool, col: [u8; 3], fade: f32) {
+        if tab.is_empty() {
+            return;
+        }
+        let tab_clip = push_clip(out, [tab.l as i32, tab.t as i32, tab.r as i32 + 1, tab.b as i32 + 1]);
         let names = if selected {
             ["GFX_GUI_TAB_ACTIVE_LEFT", "GFX_GUI_TAB_ACTIVE_MIDDLE", "GFX_GUI_TAB_ACTIVE_RIGHT"]
         } else {
@@ -521,6 +530,7 @@ impl Gui {
             pen += self.draw_string(out, FontId::Normal, &run.text, pen, tab.t as i32, c, alpha, false);
         }
         out.push(DrawCmd::Clip(outer));
+        out.push(DrawCmd::Clip(tab_clip));
     }
 
     /// Runs of a tab title (`FUN_100ab980` builds `name` + ` <font color=green>[group]</font>`; markup-free titles give one run).
@@ -540,6 +550,48 @@ impl Gui {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_tabs_allocate_and_clip_before_all_right_buttons() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let w = gui.open_window_xml("title", "<root><View/></root>", (100, 200), WindowSize::Fixed(130, 60)).unwrap();
+        gui.frame_tabbed(w, "A very long generic window title");
+        let title = gui.window_tabs(w).0[0].clone();
+        let natural = gui.tab_title_width(&title) as f32 + 1.0 + TAB_PAD_L + TAB_PAD_R;
+        let mut previous = f32::INFINITY;
+        for (pin, help, count) in [(false, false, 1), (true, false, 2), (true, true, 3)] {
+            gui.set_window_pin_button(w, pin);
+            gui.set_window_help(w, help.then_some("help.html"));
+            let rect = gui.tab_rects(w)[0];
+            let outer = gui.outer_of(w).unwrap();
+            assert_eq!(rect.r, outer.r - BORDER.2 - 18.0 * count as f32);
+            assert!(rect.width() + 1.0 < natural);
+            assert!(rect.r < previous);
+            previous = rect.r;
+            for (button, button_rect) in gui.border_buttons(w) {
+                if button != border::Btn::Icon {
+                    assert!(!rect.contains(Point::new(button_rect.l, rect.t)));
+                }
+            }
+            let root = gui.windows[w].as_ref().unwrap().root;
+            let mut commands = vec![];
+            gui.draw_tab_strip(&[None; 9], outer, root, [255; 3], &mut commands);
+            let clip = [rect.l as i32, rect.t as i32, rect.r as i32 + 1, rect.b as i32 + 1];
+            assert!(commands.iter().any(|cmd| matches!(cmd, DrawCmd::Clip(Some(c)) if *c == clip)));
+            assert_eq!(current_clip(&commands), None);
+        }
+        gui.set_window_tabs(w, &["First lengthy title".into(), "Second lengthy title".into()], 1);
+        let tabs = gui.tab_rects(w);
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[1].l, tabs[0].r - 5.0);
+        assert_eq!(gui.window_tabs(w).1, 1);
+        gui.resize_window(w, WindowSize::Fixed(0, 60));
+        let tabs = gui.tab_rects(w);
+        assert!(tabs.iter().all(Rect::is_empty));
+        assert!(tabs.iter().all(|r| !r.contains(Point::new(r.l, r.t))));
+    }
 
     fn outer() -> Rect {
         Rect::new(100.0, 200.0, 399.0, 349.0) // 300 x 150 px

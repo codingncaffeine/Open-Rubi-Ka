@@ -102,8 +102,10 @@ struct Window {
     title: Option<String>,
     /// `Window::FadeTo` target: multiplies everything drawn in the window (chat windows, docs/chat/gui.md).
     alpha: f32,
-    /// Stacking layer: -1 backmost (window flag 0x200), 0 normal, 1 frontmost (flag 0x100); creation order inside a layer.
+    /// Stacking layer: -1 backmost (window flag 0x200), 0 normal, 1 frontmost (flag 0x100).
     layer: i8,
+    /// Mutable stacking order within the layer (`Window::MoveToFront`).
+    stack: u64,
     /// Frame interaction set by the application (`gui/frame.rs`).
     fx: frame::WinFx,
     /// Border buttons / hover fade (`gui/border.rs`).
@@ -315,7 +317,8 @@ impl Gui {
         let mut ctx = BuildCtx { gfx: &self.gfx, localize: &*self.localize, warnings: Vec::new() };
         let root = build(&mut self.tree, &mut ctx, view_el).ok_or_else(|| anyhow!("{name}: cannot build root"))?;
         self.warnings.extend(ctx.warnings.into_iter().map(|w| format!("{name}: {w}")));
-        self.windows.push(Some(Window { root, pos, visible: true, clip: None, default_button: None, framed: false, title: None, alpha: 1.0, layer: 0, fx: Default::default(), bd: Default::default() }));
+        let stack = self.windows.iter().flatten().map(|w| w.stack).max().map_or(0, |n| n + 1);
+        self.windows.push(Some(Window { root, pos, visible: true, clip: None, default_button: None, framed: false, title: None, alpha: 1.0, layer: 0, stack, fx: Default::default(), bd: Default::default() }));
         let id = self.windows.len() - 1;
         self.resize_window(id, size);
         Ok(id)
@@ -961,10 +964,23 @@ impl Gui {
         }
     }
     /// `Window` flags 0x200 (backmost, -1) / 0x100 (frontmost, 1) of `SetStyle` (`ChatWindow_c` 0x10097ae3 from `is_backmost` / `is_frontmost`;
-    /// the control-centre bar windows use flags 0xe3c, i.e. backmost). Normal windows stack in creation order.
+    /// the control-centre bar windows use flags 0xe3c, i.e. backmost).
     pub fn set_window_layer(&mut self, w: WindowId, layer: i8) {
         if let Some(Some(win)) = self.windows.get_mut(w) {
             win.layer = layer.clamp(-1, 1);
+        }
+    }
+    /// `Window::MoveToFront` (GUI.dll 0x10155564), preserving the window's layer.
+    pub fn move_window_to_front(&mut self, w: WindowId) {
+        let stack = self.windows.iter().flatten().map(|w| w.stack).max().unwrap_or(0) + 1;
+        if let Some(Some(win)) = self.windows.get_mut(w) {
+            win.stack = stack;
+        }
+    }
+
+    fn raise_window_at(&mut self, x: f32, y: f32) {
+        if let Some(w) = self.pointer_owner(x, y) {
+            self.move_window_to_front(w);
         }
     }
     pub fn window_alpha(&self, w: WindowId) -> f32 {
@@ -1121,7 +1137,7 @@ impl Gui {
         self.tick_text_fades();
         let mut out = DrawList::default();
         let mut order: Vec<(WindowId, &Window)> = self.windows.iter().enumerate().filter_map(|(i, w)| w.as_ref().filter(|w| w.visible).map(|w| (i, w))).collect();
-        order.sort_by_key(|(_, w)| w.layer); // stable: creation order inside a layer
+        order.sort_by_key(|(_, w)| (w.layer, w.stack));
         type Job = (WindowId, ViewId, (i32, i32), bool, f32, Option<String>, Option<[i32; 4]>);
         let wins: Vec<Job> = order.into_iter().map(|(i, w)| (i, w.root, w.pos, w.framed, w.alpha * w.bd.cur, w.title.clone(), w.clip)).collect();
         for (wid, root, pos, framed, alpha, title, clip) in wins {
@@ -1603,8 +1619,8 @@ impl Gui {
         self.draw_border(out, &o, outer, [255; 3], 0.33);
         let i = self.frame_gfx(["GFX_GUI_TAB_BORDER_TL", "GFX_GUI_TAB_BORDER_TR", "GFX_GUI_TAB_BORDER_BL", "GFX_GUI_TAB_BORDER_BR", "GFX_GUI_TAB_BORDER_LEFT", "GFX_GUI_TAB_BORDER_TOP", "GFX_GUI_TAB_BORDER_RIGHT", "GFX_GUI_TAB_BORDER_BOTTOM", "GFX_GUI_TAB_BACKGROUND"]);
         let col = self.map_color(0x1000000);
-        if let Some(title) = title {
-            self.draw_tab_strip(&i, outer, root, title, col, out);
+        if title.is_some() {
+            self.draw_tab_strip(&i, outer, root, col, out);
         } else {
             // DoSetFrame 0x10159888: inner border view = client frame grown by 1 on every side
             let client = Rect::new(pos.0 as f32 - 1.0, pos.1 as f32 - 1.0, pos.0 as f32 + f.width() + 1.0, pos.1 as f32 + f.height() + 1.0);
@@ -1618,29 +1634,20 @@ impl Gui {
     /// the 18 px strip; the selected tab (`GFX_GUI_TAB_ACTIVE_LEFT/MIDDLE/RIGHT`, 17 rows, layer-2 alpha, `Tab::SetSelected` 0x10146110 text colour 0xffffff,
     /// font NORMAL) sits 20 px from the left edge with the title 5 px inside; its width is the title width + 1 + 5 + 16 (`FUN_101461dc`).
     /// UNRESOLVED: the title's vertical offset inside the tab (drawn at the tab top like any `TextView`) and +-1 px of the strip height.
-    fn draw_tab_strip(&mut self, box_gfx: &[Option<GfxId>; 9], outer: Rect, root: ViewId, title: &str, col: [u8; 3], out: &mut Vec<DrawCmd>) {
+    fn draw_tab_strip(&mut self, box_gfx: &[Option<GfxId>; 9], outer: Rect, root: ViewId, col: [u8; 3], out: &mut Vec<DrawCmd>) {
         let tv = outer.resize(3.0, 7.0, -3.0, -3.0);
         let top = Rect::new(tv.l, tv.t + TAB_BOX_TOP, tv.r, tv.b);
         self.draw_border(out, box_gfx, top, col, BUTTON_ALPHA);
-        // several tabs (`Window::InsertTab`, `set_window_tabs`): side by side, the selected one with the active art
-        let (tabs, sel) = match self.windows.iter().flatten().find(|w| w.root == root) {
-            Some(w) if !w.fx.tabs.is_empty() => (w.fx.tabs.clone(), w.fx.sel),
-            _ => (vec![title.to_string()], 0),
-        };
-        let mut l = tv.l + TAB_LEFT_MARGIN;
-        let mut drawn = vec![];
-        for (i, t) in tabs.iter().enumerate() {
-            let w = self.tab_title_width(t) as f32 + 1.0 + TAB_PAD_L + TAB_PAD_R;
-            let tab = Rect::new(l, tv.t, l + w - 1.0, tv.t + TAB_H - 1.0);
-            l += w;
-            if i == sel {
-                drawn.push((t, tab));
-            } else {
-                self.draw_tab(out, tab, t, false, col, 1.0);
+        // Use the same button-aware allocation as frame hit-testing; selected tabs render last.
+        let Some(wid) = self.windows.iter().position(|w| w.as_ref().is_some_and(|w| w.root == root)) else { return };
+        let (tabs, sel) = self.window_tabs(wid);
+        let rects = self.tab_rects(wid);
+        for selected in [false, true] {
+            for (i, (title, tab)) in tabs.iter().zip(&rects).enumerate() {
+                if (i == sel) == selected {
+                    self.draw_tab(out, *tab, title, selected, col, 1.0);
+                }
             }
-        }
-        for (t, tab) in drawn {
-            self.draw_tab(out, tab, t, true, col, 1.0);
         }
     }
 
@@ -1779,6 +1786,7 @@ impl Gui {
                 if self.ix.menu.is_some() {
                     self.menu_mouse_down(x, y);
                 } else {
+                    self.raise_window_at(x, y);
                     self.mouse_down(x, y);
                 }
             }
@@ -1797,6 +1805,7 @@ impl Gui {
                 if self.ix.menu.is_some() {
                     self.menu_mouse_down(x, y);
                 } else {
+                    self.raise_window_at(x, y);
                     if let Some((_, v)) = self.hit(x, y) { self.view_mouse_down(v, 2); }
                     self.widget_right_down(x, y);
                     self.frame_right_down(x, y);
@@ -1813,9 +1822,9 @@ impl Gui {
     }
 
     fn windows_top_down(&self) -> Vec<(WindowId, ViewId, (i32, i32))> {
-        let mut v: Vec<(i8, WindowId, ViewId, (i32, i32))> = self.windows.iter().enumerate().filter_map(|(i, w)| w.as_ref().filter(|w| w.visible).map(|w| (w.layer, i, w.root, w.pos))).collect();
+        let mut v: Vec<_> = self.windows.iter().enumerate().filter_map(|(i, w)| w.as_ref().filter(|w| w.visible).map(|w| (w.layer, w.stack, i, w.root, w.pos))).collect();
         v.sort_by_key(|k| (k.0, k.1));
-        v.into_iter().rev().map(|(_, i, r, p)| (i, r, p)).collect()
+        v.into_iter().rev().map(|(_, _, i, r, p)| (i, r, p)).collect()
     }
 
     fn windows_at(&self, x: f32, y: f32) -> Vec<(WindowId, ViewId, (i32, i32))> {
@@ -2513,6 +2522,26 @@ fn delete_selection(t: &mut TextData) -> bool {
 #[cfg(test)]
 mod clip_tests {
     use super::*;
+
+    #[test]
+    fn mouse_down_raises_windows_without_pinning_shortcut_bars() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let xml = r#"<root><CanvasView name="body" min_size="Point(100,100)" max_size="Point(100,100)"/></root>"#;
+        let options = gui.open_window_xml("options", xml, (0, 0), WindowSize::Fixed(100, 100)).unwrap();
+        let bar = gui.open_window_xml("shortcut2", xml, (50, 0), WindowSize::Fixed(100, 100)).unwrap();
+        assert_eq!(gui.windows_top_down()[0].0, bar, "new native windows start in front");
+        gui.input(InputEvent::MouseDown { x: 10.0, y: 10.0, button: MouseButton::Left });
+        gui.input(InputEvent::MouseUp { x: 10.0, y: 10.0, button: MouseButton::Left });
+        assert_eq!(gui.windows_top_down()[0].0, options);
+        assert_eq!(gui.hit(75.0, 10.0).unwrap().0, options, "draw and input share stacking order");
+        gui.input(InputEvent::MouseDown { x: 125.0, y: 10.0, button: MouseButton::Right });
+        assert_eq!(gui.windows_top_down()[0].0, bar);
+        gui.set_window_layer(bar, -1);
+        gui.move_window_to_front(bar);
+        assert_eq!(gui.windows_top_down()[0].0, options, "raise preserves backmost/frontmost layers");
+    }
 
     #[test]
     fn anti_aliased_text_at_one_x_reclaims_the_atlas_on_live_changes() {

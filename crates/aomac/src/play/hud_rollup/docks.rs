@@ -110,6 +110,7 @@ impl Rollup {
         gui.show_collapsing(p.window, "rollup_header", false);
         gui.show_collapsing(p.window, "body", true);
         gui.set_visible(p.window, "docked_body_bg", false);
+        if !p.wrapped { gui.set_canvas(p.window, "body", vec![]); }
         gui.set_window_dock_frame(p.window, Some(&p.title));
         self.resize_page(gui, p);
         gui.set_window_pos(p.window, (x, y));
@@ -334,6 +335,8 @@ impl Rollup {
                 gui.show_collapsing(p.window, "rollup_header", false);
                 gui.show_collapsing(p.window, "body", true);
                 gui.set_visible(p.window, "docked_body_bg", false);
+                if !p.wrapped { gui.set_canvas(p.window, "body", vec![]); }
+                if !p.wrapped { self.resize_page(gui, &self.pages[i]); }
             }
         }
         let rank = |k:&str| self.config.iter().position(|c| c.key == k).unwrap_or(usize::MAX);
@@ -346,6 +349,29 @@ impl Rollup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn free_page_releases_column_limits_but_keeps_owner_width_constraints() {
+        let dir = ao_gui::client_dir();
+        let Ok(mut gui) = Gui::new(&dir, None) else { return };
+        let mut rollup = Rollup::new(&dir, (1280, 800));
+        for (key, max_width) in [("elastic", 16000), ("vertical", 100)] {
+            let xml = format!("<root><CanvasView name=\"owner\" min_size=\"Point(100,80)\" max_size=\"Point({max_width},16000)\"/></root>");
+            let window = rollup.open_page(&mut gui, key, key, &xml, 150.0).unwrap();
+            gui.set_window_preferred_size_limits(window, true);
+            rollup.free_page(&mut gui, key, 100, 100);
+            let (min, max) = gui.window_preferred_size_limits(window).unwrap();
+            assert_eq!(min, (101, 81), "page dimensions must not become owner minima");
+            assert_eq!(max.0, max_width + 1, "fixed owner widths survive the free transition");
+            gui.resize_window(window, WindowSize::Fixed(400, 300));
+            assert_eq!(gui.window_size(window), (400.min(max_width + 1), 300));
+            let saved = rollup.dock_states(&gui);
+            rollup.dock_page(&mut gui, key, AREA_TOP);
+            rollup.restore_docks(&mut gui, &saved);
+            assert_eq!(gui.window_preferred_size_limits(window).unwrap(), (min, max));
+            assert_eq!(gui.window_size(window).0, 400.min(max_width + 1));
+        }
+    }
+
     #[test]
     fn friends_wrapper_paints_native_body_only_while_docked() {
         let dir = ao_gui::client_dir();

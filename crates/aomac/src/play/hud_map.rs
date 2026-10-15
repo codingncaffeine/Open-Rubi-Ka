@@ -128,7 +128,7 @@ pub(in crate::play) fn ground_map(scene: &ao_scene::Scene, report: &ao_formats::
 }
 
 fn canvas_xml(name: &str, size: (u32, u32)) -> String {
-    format!("<CanvasView name=\"{name}\" min_size=\"Point({},{})\" max_size=\"Point({},{})\"/>", size.0, size.1, size.0, size.1)
+    format!("<CanvasView name=\"{name}\" min_size=\"Point({},{})\" max_size=\"Point(16000,{})\"/>", size.0.saturating_sub(1), size.1.saturating_sub(1), if name == "buttons" { BUTTONS_H - 1 } else { 16000 })
 }
 
 impl HudMap {
@@ -175,16 +175,7 @@ impl HudMap {
                 );
                 match gui.open_tabbed_window_xml("PlanetMapView", PLANET_TITLE, &xml, PLANET_POS, WindowSize::Fixed(PLANET_SIZE.0, PLANET_SIZE.1)) {
                     Ok(window) => {
-                        let tips = BUTTONS
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, b)| {
-                                let title = self.texts.as_ref()?.by_key(ao_formats::screens::CAT_GUI, b.3)?;
-                                let (l, w) = button_rect(i);
-                                Some(CanvasTip { rect: [l, 0.0, l + w, BUTTONS_H as f32], title, body: String::new() })
-                            })
-                            .collect();
-                        gui.set_canvas_tips(window, "buttons", tips);
+                        set_button_tips(gui, window, self.texts.as_ref());
                         self.planet = Some(Planet { window, map: None, tried: None, level: 0, center: [0.0; 2], followed: None, tiles: HashMap::new(), pressed: None, hold: false })
                     }
                     Err(e) => eprintln!("planet map: {e:#}"),
@@ -230,6 +221,9 @@ impl HudMap {
     pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, _zone: &Zone) -> bool {
         if let Some(p) = self.planet.as_mut() {
             match ev {
+                Event::WindowFrame { window } if *window == p.window => {
+                    set_button_tips(gui, p.window, self.texts.as_ref());
+                }
                 Event::CloseRequested { window } if *window == p.window => {
                     self.close_planet(gui);
                     self.closed.push(WindowKind::PlanetMap);
@@ -241,7 +235,7 @@ impl HudMap {
                         // the pressed `Button_c` shows its pressed art only while the pointer is over it
                         _ => {
                             if let Some((i, _)) = p.pressed {
-                                p.pressed = Some((i, button_index_at(*x, *y) == Some(i)));
+                                p.pressed = Some((i, button_index_at(*x, *y, gui.canvas_size(p.window, "buttons").0 as f32) == Some(i)));
                             }
                         }
                     }
@@ -249,7 +243,7 @@ impl HudMap {
                 }
                 Event::CanvasPress { window, view, x, y, button, clicks } if *window == p.window => {
                     match (view.as_str(), button) {
-                        ("buttons", MouseButton::Left) => p.pressed = button_index_at(*x, *y).map(|i| (i, true)),
+                        ("buttons", MouseButton::Left) => p.pressed = button_index_at(*x, *y, gui.canvas_size(p.window, "buttons").0 as f32).map(|i| (i, true)),
                         // `BitmapTileView_c` signals (ctor of the view, `FUN_1004bc1f`): double click with the left button zooms in (`LAB_1004b447`),
                         // with the right button out (`LAB_1004b468`), around the clicked point (`FUN_1004b422` stores it for `FUN_1004bc1f`)
                         ("map", MouseButton::Left) if *clicks == 2 => p.zoom_at(1, gui.canvas_size(p.window, "map"), [*x, *y]),
@@ -267,7 +261,7 @@ impl HudMap {
                     return true;
                 }
                 Event::CanvasClick { window, view, x, y } if *window == p.window && view == "buttons" => {
-                    if let Some(i) = button_index_at(*x, *y) {
+                    if let Some(i) = button_index_at(*x, *y, gui.canvas_size(p.window, "buttons").0 as f32) {
                         let marker = p.mission_marker(self.mission);
                         match BUTTONS[i].0 {
                             "ZoomIn" => p.zoom(1),
@@ -391,7 +385,7 @@ impl HudMap {
             let down = enabled && p.pressed == Some((i, true));
             let Some(g) = gui.gfx().id(if down { gfx_pressed } else { gfx }) else { continue };
             let (w, h) = gui.gfx().size(g);
-            let (x, _) = button_rect(i);
+            let (x, _) = button_rect(i, gui.canvas_size(p.window, "buttons").0 as f32);
             row.push(CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [x, 0.0, x + w as f32, h as f32], alpha: if enabled { 1.0 } else { 0.4 } });
         }
         gui.set_canvas(p.window, "buttons", row);
@@ -499,19 +493,29 @@ impl HudMap {
     }
 }
 
-fn button_rect(i: usize) -> (f32, f32) {
+fn button_rect(i: usize, width: f32) -> (f32, f32) {
     // zoom buttons on the left, the two centre buttons on the right edge (the original's two HLayout rows)
     let (w, gap) = (27.0, 2.0);
     if i < 2 {
         (gap + i as f32 * (w + gap), w)
     } else {
-        (PLANET_SIZE.0 as f32 - (4 - i) as f32 * (w + gap), w)
+        (width - (4 - i) as f32 * (w + gap), w)
     }
 }
+fn set_button_tips(gui: &mut Gui, window: WindowId, texts: Option<&TextDb>) {
+    let width = gui.canvas_size(window, "buttons").0 as f32;
+    let tips = BUTTONS.iter().enumerate().filter_map(|(i, b)| {
+        let title = texts?.by_key(ao_formats::screens::CAT_GUI, b.3)?;
+        let (left, width) = button_rect(i, width);
+        Some(CanvasTip { rect: [left, 0.0, left + width, BUTTONS_H as f32], title, body: String::new() })
+    }).collect();
+    gui.set_canvas_tips(window, "buttons", tips);
+}
 
-fn button_index_at(x: f32, y: f32) -> Option<usize> {
+
+fn button_index_at(x: f32, y: f32, width: f32) -> Option<usize> {
     (0..BUTTONS.len()).find(|&i| {
-        let (l, w) = button_rect(i);
+        let (l, w) = button_rect(i, width);
         x >= l && x < l + w && y >= 0.0 && y < BUTTONS_H as f32
     })
 }
@@ -625,6 +629,28 @@ fn pick_planet_map(client: &std::path::Path, pf: Option<u32>) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn map_viewports_grow_in_both_axes_and_buttons_follow_width() {
+        let dir = ao_gui::client_dir();
+        let Ok(mut gui) = Gui::new(&dir, None) else { return };
+        let mut rollup = Rollup::new(&dir, (1280, 800));
+        let mut maps = HudMap::new(&dir);
+        maps.open(&mut gui, &mut rollup, WindowKind::PlanetMap);
+        let window = maps.planet.as_ref().unwrap().window;
+        gui.set_window_preferred_size_limits(window, true);
+        let before = gui.canvas_size(window, "map");
+        gui.resize_window(window, WindowSize::Fixed(500, 600));
+        let after = gui.canvas_size(window, "map");
+        assert_eq!((after.0 - before.0, after.1 - before.1), (200, 200));
+        assert_eq!(gui.canvas_size(window, "buttons"), (500, BUTTONS_H));
+        for width in [300.0, 500.0] {
+            for i in 0..4 {
+                let (left, size) = button_rect(i, width);
+                assert_eq!(button_index_at(left + size / 2.0, 13.0, width), Some(i));
+            }
+        }
+    }
+
     use crate::play::zone::DynelState;
     use ao_formats::screens::TextDb;
     use ao_gui::{DrawList, InputEvent};
@@ -822,7 +848,7 @@ mod tests {
         let w = s.map.planet.as_ref().unwrap().window;
         let br = s.gui.view_rect(w, "buttons").unwrap();
         let on_button = |i: usize| {
-            let (l, bw) = button_rect(i);
+            let (l, bw) = button_rect(i, br.width() + 1.0);
             (br.l + l + bw / 2.0, br.t + 13.0)
         };
         // tooltips: texts.mdb 10000 `Click2ZoomEtc` .. `CenterOnMission`, shown after the pointer rests 500 ms

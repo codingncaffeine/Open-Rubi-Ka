@@ -283,28 +283,32 @@ impl ListView {
         // ColumnHeaderButton_c label borders are 3 px per side (GUI 0x10139a17).
         let head_h = gui.font_height(ao_gui::FontId::Normal) as f32 - 1.0 + 6.0;
         if rebuild {
-        let mut xml = format!("<root><View view_layout=\"vertical\"><MultiListView name=\"lv_head\" min_size=\"Point(1,{head_h})\" max_size=\"Point(16000,{head_h})\"/>");
+        // max_size is a preferred floor, not a cap: the embedded MultiListView's
+        // scroll body otherwise shares height slack with the trailing spacer.
+        let mut xml = format!("<root><View view_layout=\"vertical\"><MultiListView name=\"lv_head\" min_size=\"Point(1,{head_h})\" max_size=\"Point(16000,{head_h})\" max_size_limit=\"Point(16000,{head_h})\"/>");
         for (i, key) in self.order.iter().enumerate() {
             let Some(r) = self.row(*key) else { continue };
             let sel = self.selected == Some(r.key);
             let color = if sel { "TEXT_SELECTED" } else { "TEXT" };
-            let gap = "<View min_size=\"Point(4,0)\" max_size=\"Point(4,0)\"/>";
-            let mut line = format!("<CanvasView name=\"lv_icon{i}\" min_size=\"Point({ICON_COL},15)\" max_size=\"Point({ICON_COL},15)\"/>{gap}");
+            let gap = "<View min_size=\"Point(4,0)\" max_size=\"Point(4,0)\" max_size_limit=\"Point(4,0)\"/>";
+            let mut line = format!("<CanvasView name=\"lv_icon{i}\" min_size=\"Point({ICON_COL},15)\" max_size=\"Point({ICON_COL},15)\" max_size_limit=\"Point({ICON_COL},15)\"/>{gap}");
             for (n, c) in self.columns.iter().enumerate() {
                 let text = r.cells.get(n).map_or("", String::as_str);
                 if n == 0 {
                     // the first text column is the clickable name (`Clicked` row<i>)
                     line += &format!(
-                        "<TextButton name=\"lv_row{i}\" text=\"{}\" color=\"{color}\" hover_color=\"TEXT_HOVER\" pressed_color=\"TEXT_SELECTED\" min_size=\"Point({wd},-1)\" max_size=\"Point({wd},-1)\"/>",
+                        "<TextButton name=\"lv_row{i}\" text=\"{}\" color=\"{color}\" hover_color=\"TEXT_HOVER\" pressed_color=\"TEXT_SELECTED\" min_size=\"Point({wd},-1)\" max_size=\"Point({wd},-1)\" max_size_limit=\"Point({wd},16000)\"/>",
                         esc(text),
                         wd = c.width
                     );
                 } else {
-                    line += &format!("<TextView name=\"lv_cell{i}_{n}\" value=\"{}\" color=\"{color}\" min_size=\"Point({wd},-1)\" max_size=\"Point({wd},-1)\"/>", esc(text), wd = c.width);
+                    line += &format!("<TextView name=\"lv_cell{i}_{n}\" value=\"{}\" color=\"{color}\" min_size=\"Point({wd},-1)\" max_size=\"Point({wd},-1)\" max_size_limit=\"Point({wd},16000)\"/>", esc(text), wd = c.width);
                 }
                 line += gap;
             }
-            xml += &format!("<View name=\"lv_line{i}\" view_layout=\"horizontal\" min_size=\"Point(1,15)\" max_size=\"Point(16000,15)\">{line}</View><View min_size=\"Point(0,2)\" max_size=\"Point(16000,2)\"/>");
+            // LayoutList (0x1013520e) anchors cells at the row origin; only the
+            // trailing spacer may consume extra width, never the fixed columns.
+            xml += &format!("<View name=\"lv_line{i}\" view_layout=\"horizontal\" v_alignment=\"top\" min_size=\"Point(1,15)\" max_size=\"Point(16000,15)\">{line}<HLayoutSpacer/></View><View min_size=\"Point(0,2)\" max_size=\"Point(16000,2)\"/>");
         }
         xml += "<VLayoutSpacer/></View></root>";
         if let Err(e) = gui.add_view_xml(w, "lv_content", "List", &xml) {
@@ -556,17 +560,29 @@ mod tests {
         let mut list = ListView::new(Mode::List, vec![Column { id: 1, label: "Name".into(), width: 100.0 }, Column { id: 2, label: "Remaining".into(), width: 80.0 }], 1, 1, (1, false));
         list.set_rows(vec![Row { key: 7, cells: vec!["Mission".into(), "01:00:00".into()], ..Default::default() }, Row { key: 8, cells: vec!["Second".into(), "02:00:00".into()], ..Default::default() }]);
         list.paint(&mut gui, w, ICON_32);
-        let header = gui.view_rect(w, "lv_head").unwrap();
-        let row = gui.view_rect(w, "lv_row0").unwrap();
-        let icon = gui.view_rect(w, "lv_icon0").unwrap();
-        assert!(row.t > header.b);
-        assert!(icon.t > header.b);
-        assert_eq!(list.row_at(&gui, w, row.l, header.t, ICON_32), None);
-        assert_eq!(list.row_at(&gui, w, row.l, row.t, ICON_32), Some(7));
-        assert_eq!(list.row_at(&gui, w, icon.l, icon.t, ICON_32), Some(7));
-        assert_eq!(gui.view_rect(w, "lv_row1").unwrap().t - row.t, 19.0);
-        assert!(gui.frame(0.0).cmds.iter().any(|cmd| matches!(cmd,
-            ao_gui::DrawCmd::Gfx { id: GfxId(0x14f..=0x157), .. })));
+        // The root's VLayoutSpacer keeps the header/rows at the scroll origin;
+        // each row's HLayoutSpacer keeps its fixed columns at the left on resize.
+        for (width, height) in [(220, 150), (640, 400), (900, 600)] {
+            gui.resize_window(w, ao_gui::WindowSize::Fixed(width, height));
+            let scroll = gui.view_rect(w, "lv_scroll").unwrap();
+            let header = gui.view_rect(w, "lv_head").unwrap();
+            let line = gui.view_rect(w, "lv_line0").unwrap();
+            let row = gui.view_rect(w, "lv_row0").unwrap();
+            let icon = gui.view_rect(w, "lv_icon0").unwrap();
+            let remaining = gui.view_rect(w, "lv_cell0_1").unwrap();
+            assert_eq!((header.l, header.t), (scroll.l, scroll.t));
+            assert_eq!(header.height(), gui.font_height(ao_gui::FontId::Normal) as f32 - 1.0 + 6.0);
+            assert_eq!((line.l, line.t), (header.l, header.b + 1.0));
+            assert_eq!((icon.l, icon.t), (line.l, line.t));
+            assert_eq!((row.l, row.t), (icon.l + ICON_COL + 6.0, line.t));
+            assert_eq!((remaining.l, remaining.t), (row.l + 100.0 + 6.0, line.t));
+            assert_eq!(list.row_at(&gui, w, row.l, header.t, ICON_32), None);
+            assert_eq!(list.row_at(&gui, w, row.l, row.t, ICON_32), Some(7));
+            assert_eq!(list.row_at(&gui, w, icon.l, icon.t, ICON_32), Some(7));
+            assert_eq!(gui.view_rect(w, "lv_row1").unwrap().t - row.t, 19.0);
+            assert!(gui.frame(0.0).cmds.iter().any(|cmd| matches!(cmd,
+                ao_gui::DrawCmd::Gfx { id: GfxId(0x14f..=0x157), .. })));
+        }
     }
 
     #[test]
