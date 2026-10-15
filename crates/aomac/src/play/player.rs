@@ -212,6 +212,17 @@ impl Player {
         self.collision.clone()
     }
 
+    /// TargetSelector (GC 0x10025b96): world LOS between both feet raised by 1.6 m (`10157454`).
+    pub(super) fn target_line_of_sight(&self, a: [f32; 3], b: [f32; 3]) -> bool {
+        self.collision.as_ref().is_none_or(|c| {
+            let mut a = scene_pos(a);
+            let mut b = scene_pos(b);
+            a[1] += 1.6;
+            b[1] += 1.6;
+            segment_clear(&c.borrow(), a, b)
+        })
+    }
+
     /// The control options (`ControlPrefs::from_dvalues`) changed: mouse look, zoom, wheel, inversion, own avatar in first person.
     pub fn set_control_prefs(&mut self, p: &ControlPrefs) {
         self.controls.set_prefs(p.clone());

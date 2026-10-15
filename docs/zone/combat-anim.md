@@ -301,7 +301,7 @@ The corpse holds the resulting death pose, rather than bind pose; corrected fiel
   at 219058 ms the character quit precedes corpse `{0xc76a,0xcf3}`, then a late StopFight still targets the removed character.
   The corpse spell's standard fields are `[1,0,0,0]`, type fields `[0,0,503,1,4,17655,0]`.
   At 246428 ms the server sends its inventory, confirming the distinct corpse identity is the loot target.
-* Regression: `captured_kill_replaces_character_with_persistent_corpse` replays every received capture frame, asserting selected death clears,
+* Regression: `captured_kill_replaces_character_with_persistent_corpse` replays every received capture frame, asserting selected death persists until removal (GUI `0x10025fa4`; no Health/death selection gate),
   death movement freezes, owner removal, correct spell alignment/position, and persistence through the late fight/loot frames.
   `corpse_holds_death_pose` compares the held vertices to the actual NPC-record terminal animation pose (real-data test).
 * **Health boundary [CODE]**: computed combat health/death-cause (`FUN_1005ae91`) is not itself the `CharDie` flag transition.

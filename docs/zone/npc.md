@@ -265,8 +265,8 @@ of the same triangles in the submesh's own phase, depth `LESS_EQUAL`). The CAT r
   the stat setter clamps to **≥ 20** (`FUN_10059e6a`: `0x168` → 0x14) and `CharRadius` (0x1a5) = `MonsterScale × value / 100` (same function). Uniform scale of the whole model; `Dynels` applies the same minimum to full-update body scale.
   The own-avatar constructor's zero-to-1.0 fallback and the animation formula's zero-to-1.0 inverse factor (`avatar.md` §3) do not prove that a received non-own full-update zero bypasses this stat-setter clamp. The clamp is therefore retained; changing it requires evidence from the full-update stat path, not a timing symptom.
 * **Visibility**: `DisableVisibility` = `n3VisualDynel+0xc9 = 0` (N3 @0x1001954a; Enable sets 1; the VisualCATMesh has its own `+0x70`). `FUN_10077e13` calls it for
-  every non-own dynel when stat `InPlay` (0xC2) is 0; the update `FUN_10077af2` writes stat 0xC2 = `VisualFlags >> 1 & 1`, 0xDF = bit 3, 0x159 = bit 0x1c, and sets Features
-  bits `0x800` (flag bit 2) and `0x800000` (bit 0x12). VisualFlags bit 0 = NPC (branch that also sets stat 0x21 `Side`, 0x1c7/0x1d2/0x200/0x184).
+  every remote **non-NPC** dynel (`+0x21c==0` and not own) when stat `InPlay` (0xC2) is 0; the update `FUN_10077af2` writes stat 0xC2 = **message main flags** (`param_1+4`) `>> 1 & 1`, 0xDF = bit 3, 0x159 = bit 0x1c, and sets Features
+  bits `0x800` (flag bit 2) and `0x800000` (bit 0x12). Main flags bit 0 = NPC (branch that also sets stat `0x21` Side, `0x1c7/0x1d2/0x200/0x184`); these are not VisualFlags (`0x2a1`).
 
 ## 7. Survey result (`npc_stats`, client v0.7.2)
 

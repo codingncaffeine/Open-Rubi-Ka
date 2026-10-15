@@ -387,11 +387,9 @@ impl Zone {
             }
         }
         self.world.on_message(&m);
-        // Death and corpse replacement invalidate the living character selection even before its quit arrives.
+        // FrameProcess (GUI 0x10025fa4) drops missing dynels, not dying/zero-health characters.
         let removed = match &m.body {
             N3::World(World::Corpse(c)) if c.owner.kind == CHAR_KIND => Some(c.owner.instance),
-            N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && a.action == 99 => Some(who.instance),
-            N3::Dynel(Dynel::Stat(s)) if who.kind == CHAR_KIND && s.stats.iter().any(|&(id, value)| id as u32 == ao_formats::stats::HEALTH && value <= 0) => Some(who.instance),
             N3::Misc(Misc::ToClientQuit) if who.kind == CHAR_KIND => Some(who.instance),
             _ => None,
         };
@@ -418,6 +416,9 @@ impl Zone {
                     // SkillIIR_t::Execute (GC 0x10079494) applies signed values directly.
                     self.character_stats.entry(who.instance).or_default().extend(u.stats.iter().map(|s| (s.0 as u32, s.1)));
                 }
+                N3::Misc(Misc::CharInPlay) => {
+                    self.character_stats.entry(who.instance).or_default().insert(IN_PLAY_STAT, 1);
+                }
                 N3::Dynel(Dynel::SimpleCharFullUpdate(u)) => {
                     // Full-update target restores the same fight controller as AttackIIR_t.
                     if let Some(target) = u.target.filter(|t| t.kind == CHAR_KIND) {
@@ -425,6 +426,7 @@ impl Zone {
                     }
                     let s = self.character_stats.entry(who.instance).or_default();
                     s.extend([(0, u.flags2 as i32), (1, u.max_health), (4, u.breed as i32), (0x1b, u.health), (0x21, u.side as i32), (0x36, u.level as i32), (0x3b, u.sex as i32), (0x185, u.expansion as i32), (0x294, u.account_flags as i32), (0x2a1, u.visual_flags as i32)]);
+                    s.insert(IN_PLAY_STAT, i32::from(u.flags & ao_net::n3::dynel::flag::IN_PLAY != 0));
                     s.extend([(0x2f, i32::from(u.fatness)), (0x168, i32::from(u.monster_scale))]);
                     if let ao_net::n3::dynel::CharClass::Npc(n) = &u.class {
                         s.extend([(0x184, n.tower_type as i32), (0x1c7, n.npc_family as i32), (0x200, n.pet_type as i32)]);
@@ -581,8 +583,8 @@ impl Zone {
                 if who.instance == self.char_id as i32 {
                     self.own_update = Some(u.clone());
                     self.stats.insert(ao_formats::stats::HEALTH, u.health);
-                    // `FUN_10077af2` [GC]: stat `InPlay` (0xC2) = `VisualFlags >> 1 & 1`
-                    self.stats.insert(IN_PLAY_STAT, i32::from(u.visual_flags >> 1 & 1));
+                    // GC 0x10077af2 reads the message's main flags bit 1, not VisualFlags.
+                    self.stats.insert(IN_PLAY_STAT, i32::from(u.flags & ao_net::n3::dynel::flag::IN_PLAY != 0));
                     self.own_serial += 1;
                 }
                 self.dynels.insert(
@@ -1132,6 +1134,30 @@ mod tests {
         let mut z = Zone::new(25988);
         let ev: Vec<_> = frames(include_str!("../../../../docs/captures/zone_ithaca.rec")).iter().map(|f| z.on_frame(f)).collect();
         assert!(!ev.contains(&ZoneEvent::Alive), "the capture holds only relays for other characters");
+    }
+
+    #[test]
+    fn captured_full_updates_and_relays_publish_in_play_for_every_character() {
+        let mut z = Zone::new(0x82e8);
+        let (mut full, mut relay) = (0, 0);
+        for f in frames(include_str!("../../../../docs/captures/zone_enter_ithaca.rec")) {
+            let Ok(m) = ao_net::n3::decode(&f) else { continue };
+            z.on_frame(&f);
+            if m.header.target.kind != CHAR_KIND { continue; }
+            match m.body {
+                N3::Dynel(Dynel::SimpleCharFullUpdate(u)) => {
+                    let expected = i32::from(u.flags & ao_net::n3::dynel::flag::IN_PLAY != 0);
+                    assert_eq!(z.stat_of(m.header.target.instance, IN_PLAY_STAT), Some(expected));
+                    full += 1;
+                }
+                N3::Misc(Misc::CharInPlay) => {
+                    assert_eq!(z.stat_of(m.header.target.instance, IN_PLAY_STAT), Some(1));
+                    relay += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(full > 1 && relay > 0);
     }
 
     #[test]

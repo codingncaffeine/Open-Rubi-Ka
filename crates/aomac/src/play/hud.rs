@@ -1095,7 +1095,7 @@ impl Hud {
             self.outbox.push(ao_net::n3::outgoing::n3_frame(0, zone.char_id, payload));
         }
         // target docks, world click-to-select (hud_target.rs) and the Tab target keys
-        if let Some(pos) = self.target.input(gui, zone, ev) {
+        if let Some(pos) = self.target.input(gui, zone, player, ev) {
             match self.target.world_click(zone, player, cam, lens, self.size, pos, mods) {
                 Some(super::hud_target::WorldClick::Select(id)) => self.click = Some(id),
                 Some(super::hud_target::WorldClick::Info(id)) => self.target.info = Some(id),
@@ -1107,8 +1107,8 @@ impl Hud {
             self.uses.push(SlotUse::SpecialAction(0xb));
         }
         if let InputEvent::Key { key, pressed: true, mods } = ev {
-            if gui.focused_view().is_none() {
-                self.target.key(zone, *key, *mods, &self.fixed);
+            if !gui.text_focused() {
+                self.target.key(zone, player, *key, *mods, &self.fixed);
             }
         }
         // the window / hotbar hot keys are driven by `hot_input` from the physical key stream (`Play::game_input`): any key can be bound
@@ -1756,7 +1756,7 @@ mod tests {
         let mut hud = Hud::new(&mut gui, &dir, (1280, 800)).unwrap();
         let mut zone = Zone::new(1);
         gui.open_window_xml("probe", "<root><CanvasView name=\"w\" min_size=\"Point(100,100)\" max_size=\"Point(100,100)\"/></root>", (380, 280), ao_gui::WindowSize::Fixed(100, 100)).unwrap();
-        hud.target.input(&gui, &mut zone, &InputEvent::MouseMove { x: 400.0, y: 300.0 });
+        hud.target.input(&gui, &mut zone, None, &InputEvent::MouseMove { x: 400.0, y: 300.0 });
         assert!(gui.wants_mouse(400.0, 300.0));
         let mut host = Host::headless();
         host.mods.shift = true;
@@ -2297,12 +2297,12 @@ mod tests {
         // the target keys: Tab by default, Y after the override (`KEY_NEXT_HOSTILE_TARGET`)
         let mods = ao_gui::Modifiers::default();
         let mut zone = Zone::default();
-        assert!(s.hud.target.key(&mut zone, ao_gui::Key::Tab, mods, &s.hud.fixed));
-        assert!(!s.hud.target.key(&mut zone, ao_gui::Key::Letter('y'), mods, &s.hud.fixed));
+        assert!(s.hud.target.key(&mut zone, None, ao_gui::Key::Tab, mods, &s.hud.fixed));
+        assert!(!s.hud.target.key(&mut zone, None, ao_gui::Key::Letter('y'), mods, &s.hud.fixed));
         s.hud.dvalues.prefs.set_int("KEY_NEXT_HOSTILE_TARGET", 106, super::super::dvalue::Kind::Login);
         s.hud.sync_keys();
-        assert!(!s.hud.target.key(&mut zone, ao_gui::Key::Tab, mods, &s.hud.fixed));
-        assert!(s.hud.target.key(&mut zone, ao_gui::Key::Letter('y'), mods, &s.hud.fixed));
+        assert!(!s.hud.target.key(&mut zone, None, ao_gui::Key::Tab, mods, &s.hud.fixed));
+        assert!(s.hud.target.key(&mut zone, None, ao_gui::Key::Letter('y'), mods, &s.hud.fixed));
         // KEY_OPEN_PERK_WINDOW (Shift + P) follows too
         s.hud.dvalues.prefs.set_int("KEY_OPEN_PERK_WINDOW", 106, super::super::dvalue::Kind::Login);
         press(&mut s, K::KeyP, shift);

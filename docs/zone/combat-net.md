@@ -145,8 +145,8 @@ Release handler `FUN_1002c469` (event 1 = left, 2 = right) [RE]:
 
 ### 5.4 Targeting rules
 
-* `GetCloseTarget(cur, forward, friendly)` [GC 0x1001c411] scans the locality dynels around the character (radius constants `0x10157878/0x1015787c`), keeps only `InPlay`(194) ≠ 0, renderable dynels other than self and the current target, classifies friendly vs hostile
-  (non-NPC: team membership via `FUN_1006581f/FUN_10065865`; NPC: its `PetMaster`(196) when it names a friendly), and picks the next/previous one by the angle offset from the current target's bearing (wrapping). [RE, summarised; not ported.]
+* `GetCloseTarget(cur, forward, friendly)` [GC `0x1001c411`] scans kind-50000 locality dynels within **100 m** (`0x10155eb0`), requiring stat InPlay(194) ≠ 0 and IsVisible (virtual +0x8c), excluding self/current. Its worker `0x10025b96` requires playfield LOS with both positions raised by 1.6 m (`0x10157454`); no camera-facing, Health or CanAttack gate.
+  Side (BattleStation side stat `0x29c` instead of `0x21`) classifies candidates; non-NPC team membership (`0x1006581f/0x10065865`) and NPC PetMaster(196) may override it. The metric is **squared-distance delta**, plus 1000 once when negative or tied before current in locality order, not an angle. `0x10157878/0x1015787c` initialize best metrics, not radii. The port applies InPlay, visibility, LOS/range and ordinary side classification; team/pet and BattleStation classification remain unmodelled (see `docs/gui.md` §13.2).
 * `SetTarget(id, forced)` [GUI 0x100257b0]: a non-zero id must be `isIDOnGround` unless forced; stores it in `InputConfig`, sends `AFCM 0x13/0x126`, creates the selection indicator unless `Skill 0x400`-like flag, and fires the tip events `OnSelectingNPC`/`OnSelecting`/`OnSelectingPlayer`.
   `FightingTargetMessage` [GUI 0x10025947] feeds `N3Msg_Consider` (the red/yellow/green con colour).
 

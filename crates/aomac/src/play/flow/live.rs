@@ -869,6 +869,9 @@ fn live_walk() {
             "tab" => {
                 l.p.input(ao_gui::InputEvent::Key { key: ao_gui::Key::Tab, pressed: true, mods: ao_gui::Modifiers::default() }, &mut l.o.host);
                 eprintln!("target {:?}", l.p.zone.target);
+                if let Some(id) = l.p.zone.target {
+                    eprintln!("target state {:?} in_play={:?}", l.p.zone.dynels.get(&id), l.p.zone.stat_of(id, super::super::zone::IN_PLAY_STAT));
+                }
             }
             "stats" => {
                 let mut v: Vec<_> = l.p.zone.stats.iter().collect();
@@ -924,6 +927,7 @@ fn live_walk() {
             "fight" => {
                 let m = l.p.fight.as_ref().unwrap();
                 eprintln!("fight: attacking={} numbers={:?}", m.attacking(), m.numbers().iter().map(|n| n.text.as_str()).collect::<Vec<_>>());
+                eprintln!("fight timers: attack={:?} reload={:?}", l.p.zone.world.attack_bar_progress(l.p.zone.char_id as i32, &l.p.zone.stats), l.p.zone.world.reload_bar_progress());
             }
             // `water`: the nearest deep-water ground points (liquid surface >= 1.19 m above the ground: `Collision::ground` is never below level - 1.2, that is deep enough to swim) within 300 m, for `goto=x:z` (swimming runs)
             "water" => {

@@ -167,11 +167,15 @@ const CLOSE_TARGET_WRAP: f32 = 1000.0;
 /// `N3Msg_GetCloseTarget(current, friendly, forward)` (Gamecode 0x1001c411, called by `TargetingModule_t::Get{Next,Prev}{Friendly,
 /// Hostile}TargetMessage` 0x10025a52…, bound to Tab and the dock arrows). Candidates: dynels within 100 m of the own character
 /// except it and the current target; *hostile* = a `Side` (stat 0x21) different from the own one, *friendly* = the same (players
-/// of the own team and pets of the own team count as friendly: team state not modelled; the `InPlay` stat 0xc2 test is skipped).
+/// of the own team and pets of the own team count as friendly: team state not modelled). Requires InPlay, IsVisible and world LOS.
 /// Ordering: `m = d² − d²(current)` (0 without a current target), `+1000` when negative, and `+1000` when 0 for a candidate listed
 /// before the current one; `forward` takes the smallest `m`, backward the largest (starting at `f32::MIN_POSITIVE`, so `m = 0`
 /// never wins backwards). The original's list order (the locality query's) is unknown: candidates are listed by id.
-pub fn cycle(zone: &Zone, hostile: bool, forward: bool) -> Option<i32> {
+pub fn cycle(zone: &Zone, player: Option<&super::player::Player>, hostile: bool, forward: bool) -> Option<i32> {
+    cycle_with_sight(zone, hostile, forward, |a, b| player.is_none_or(|p| p.target_line_of_sight(a, b)))
+}
+
+fn cycle_with_sight(zone: &Zone, hostile: bool, forward: bool, clear: impl Fn([f32; 3], [f32; 3]) -> bool) -> Option<i32> {
     let me = zone.own()?;
     let my_id = zone.char_id as i32;
     let own_side = zone.stat(stats::SIDE).map_or(me.side, |s| s as u8);
@@ -185,6 +189,10 @@ pub fn cycle(zone: &Zone, hostile: bool, forward: bool) -> Option<i32> {
     for (n, id) in ids.iter().enumerate() {
         let d = &zone.dynels[id];
         if *id == my_id || Some(*id) == cur || d2(d) > CLOSE_TARGET_RADIUS * CLOSE_TARGET_RADIUS || (d.side != own_side) != hostile {
+            continue;
+        }
+        if !zone.stat_of(*id, super::zone::IN_PLAY_STAT).is_some_and(|v| v != 0)
+            || !zone.world.character_visible(*id) || !clear(me.pos, d.pos) {
             continue;
         }
         let mut m = d2(d) - base;
@@ -513,7 +521,7 @@ impl HudTarget {
     /// Raw mouse input before the GUI: dock buttons (hit-tested on their canvases) and world clicks. Returns `Some(pos)` when a
     /// world click completed: the left press was on the world (the pointer not over the GUI) and the pointer travelled at most
     /// [`CLICK_PATH`] up to the release.
-    pub(super) fn input(&mut self, gui: &Gui, zone: &mut Zone, ev: &InputEvent) -> Option<(f32, f32)> {
+    pub(super) fn input(&mut self, gui: &Gui, zone: &mut Zone, player: Option<&super::player::Player>, ev: &InputEvent) -> Option<(f32, f32)> {
         match *ev {
             InputEvent::MouseMove { x, y } => {
                 self.mouse = (x, y);
@@ -532,7 +540,7 @@ impl HudTarget {
                 self.mouse = (x, y);
                 let press = self.pressed.take();
                 if let Some((hostile, part)) = press.filter(|p| self.dock_at(gui, x, y) == Some(*p)) {
-                    self.dock_click(zone, hostile, part);
+                    self.dock_click(zone, player, hostile, part);
                     return None;
                 }
                 if std::mem::take(&mut self.tot_down) && self.tot_at(gui, x, y) {
@@ -583,10 +591,10 @@ impl HudTarget {
     /// SelectSelf`; the hostile button is the Attack button, `N3Msg_PerformSpecialAction(0xb)` = `DefaultAttack(target, false)`
     /// (docs/zone/combat-net.md §5.3; queued in [`Self::attack`], the HUD turns it into a `SlotUse::SpecialAction`). None of these views has a tooltip: the
     /// `CCTargetControl_c` constructor `FUN_100746ec` and `TargetHealthBar_c` / `TargetHeader_c` never call `View::SetToolTip`.
-    fn dock_click(&mut self, zone: &mut Zone, hostile: bool, part: Part) {
+    fn dock_click(&mut self, zone: &mut Zone, player: Option<&super::player::Player>, hostile: bool, part: Part) {
         match part {
             Part::Prev | Part::Next => {
-                if let Some(id) = cycle(zone, hostile, part == Part::Next) {
+                if let Some(id) = cycle(zone, player, hostile, part == Part::Next) {
                     self.select(zone, Some(id));
                 }
             }
@@ -597,7 +605,7 @@ impl HudTarget {
 
     /// The target keys `KEY_NEXT_HOSTILE_TARGET` (Tab), `KEY_PREV_HOSTILE_TARGET` (Shift+Tab), `KEY_NEXT_FRIENDLY_TARGET` (Ctrl+Tab),
     /// `KEY_PREV_FRIENDLY_TARGET` (Ctrl+Shift+Tab): the fixed keys of GUI.dll's hot key table, read from [`FixedKeys`] (the `Login.cfg` `KEY_*` ints).
-    pub(super) fn key(&mut self, zone: &mut Zone, key: ao_gui::Key, mods: ao_gui::Modifiers, fixed: &FixedKeys) -> bool {
+    pub(super) fn key(&mut self, zone: &mut Zone, player: Option<&super::player::Player>, key: ao_gui::Key, mods: ao_gui::Modifiers, fixed: &FixedKeys) -> bool {
         let Some(kid) = gui_key_id(key) else { return false };
         let input = super::options::keys::key_input(kid, mods);
         let step = [
@@ -609,7 +617,7 @@ impl HudTarget {
         .into_iter()
         .find(|(n, ..)| fixed.get(n) == input);
         let Some((_, hostile, next)) = step else { return false };
-        if let Some(id) = cycle(zone, hostile, next) {
+        if let Some(id) = cycle(zone, player, hostile, next) {
             self.select(zone, Some(id));
         }
         true
@@ -895,6 +903,57 @@ mod tests {
         DynelState { name: name.into(), pos: p, yaw: None, npc, side, level: 5, health: 30, max_health: 60 }
     }
 
+    fn captured_character() -> ao_net::n3::Message {
+        include_str!("../../../../docs/captures/zone_enter_ithaca.rec").lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let (_, direction, hex) = (fields.next()?, fields.next()?, fields.next()?);
+            if direction != "<" { return None; }
+            let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
+            let (frame, _) = ao_net::frame::Frame::decode_with(&bytes, false).ok()??;
+            let m = ao_net::n3::decode(&frame).ok()?;
+            matches!(&m.body, ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::SimpleCharFullUpdate(_))).then_some(m)
+        }).expect("captured full character")
+    }
+
+    fn prepare_cycle(z: &mut Zone) {
+        let mut m = captured_character();
+        let ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::SimpleCharFullUpdate(u)) = &mut m.body else { unreachable!() };
+        u.flags |= ao_net::n3::dynel::flag::IN_PLAY;
+        for &id in z.dynels.keys() {
+            m.header.target = Identity { kind: DYNEL_CHAR, instance: id };
+            z.world.on_message(&m);
+            z.character_stats.entry(id).or_default().insert(super::super::zone::IN_PLAY_STAT, 1);
+        }
+    }
+
+    #[test]
+    fn close_target_filters_in_play_visibility_los_and_range_not_health() {
+        let mut z = Zone::new(1);
+        z.dynels.insert(1, dyn_at("Me", [0.0; 3], false, 1));
+        z.dynels.insert(2, dyn_at("Dying", [0.0, 0.0, 5.0], true, 0));
+        prepare_cycle(&mut z);
+        z.dynels.get_mut(&2).unwrap().health = 0;
+        z.world.die(2, 503);
+        assert_eq!(cycle(&z, None, true, true), Some(2), "death is not a native target filter");
+        z.character_stats.get_mut(&2).unwrap().insert(super::super::zone::IN_PLAY_STAT, 0);
+        assert_eq!(cycle(&z, None, true, true), None);
+        z.character_stats.get_mut(&2).unwrap().insert(super::super::zone::IN_PLAY_STAT, 1);
+        assert_eq!(cycle_with_sight(&z, true, true, |a, b| { assert_eq!(a, [0.0; 3]); assert_eq!(b, [0.0, 0.0, 5.0]); false }), None);
+        z.dynels.get_mut(&2).unwrap().pos = [0.0, 0.0, 100.01];
+        assert_eq!(cycle(&z, None, true, true), None);
+        z.dynels.get_mut(&2).unwrap().pos = [0.0, 0.0, 100.0];
+        assert_eq!(cycle(&z, None, true, true), Some(2));
+        let mut hidden = captured_character();
+        hidden.header.target = Identity { kind: DYNEL_CHAR, instance: 2 };
+        let ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::SimpleCharFullUpdate(u)) = &mut hidden.body else { unreachable!() };
+        u.flags &= !ao_net::n3::dynel::flag::IN_PLAY;
+        z.world.on_message(&hidden);
+        assert_eq!(cycle(&z, None, true, true), None, "visibility is independent of cached InPlay");
+        z.world.test_prop(Identity { kind: 0xc76a, instance: 3 }, vec![]);
+        z.dynels.remove(&2);
+        assert_eq!(cycle(&z, None, true, true), None, "Type51050 corpse is not a Type50000 character");
+    }
+
     #[test]
     fn ray_through_the_screen_centre_is_the_view_axis() {
         let cam = Camera::look_at(Vec3::new(0.0, 1.7, 0.0), Vec3::new(0.0, 1.7, -10.0));
@@ -1041,13 +1100,14 @@ mod tests {
         let i = info(&z, 2).unwrap();
         assert!(i.hostile && (i.health - 0.5).abs() < 1e-6 && i.level == 5);
         assert!(!info(&z, 4).unwrap().hostile);
-        assert_eq!(cycle(&z, true, true), Some(2));
+        prepare_cycle(&mut z);
+        assert_eq!(cycle(&z, None, true, true), Some(2));
         z.target = Some(2);
-        assert_eq!(cycle(&z, true, true), Some(3));
+        assert_eq!(cycle(&z, None, true, true), Some(3));
         z.target = Some(3);
-        assert_eq!(cycle(&z, true, true), Some(2));
-        assert_eq!(cycle(&z, true, false), Some(2));
-        assert_eq!(cycle(&z, false, true), Some(4));
+        assert_eq!(cycle(&z, None, true, true), Some(2));
+        assert_eq!(cycle(&z, None, true, false), Some(2));
+        assert_eq!(cycle(&z, None, false, true), Some(4));
     }
 
     /// `N3Msg_GetCloseTarget`: `d² − d²(current)`, `+1000` when negative, only within 100 m, any other-side character is hostile.
@@ -1062,15 +1122,16 @@ mod tests {
         z.dynels.insert(6, dyn_at("Out of range", [0.0, 0.0, 150.0], true, 0));
         z.dynels.insert(7, dyn_at("Omni player", [0.0, 0.0, 20.0], false, 2));
         // nothing selected: forward = nearest, backward = farthest in range
-        assert_eq!(cycle(&z, true, true), Some(2));
-        assert_eq!(cycle(&z, true, false), Some(5));
+        prepare_cycle(&mut z);
+        assert_eq!(cycle(&z, None, true, true), Some(2));
+        assert_eq!(cycle(&z, None, true, false), Some(5));
         // the next farther one (the player of the other side is hostile too)
         z.target = Some(3);
-        assert_eq!(cycle(&z, true, true), Some(7));
-        assert_eq!(cycle(&z, true, false), Some(5), "backwards takes the largest metric: the nearer ones wrapped by +1000 lose to C (1519)");
+        assert_eq!(cycle(&z, None, true, true), Some(7));
+        assert_eq!(cycle(&z, None, true, false), Some(5), "backwards takes the largest metric: the nearer ones wrapped by +1000 lose to C (1519)");
         // from the farthest the wrap (+1000 once) keeps the nearer ones negative: the smallest is the nearest
         z.target = Some(5);
-        assert_eq!(cycle(&z, true, true), Some(2));
+        assert_eq!(cycle(&z, None, true, true), Some(2));
     }
 
     #[test]
@@ -1116,7 +1177,7 @@ mod tests {
             &self.gui
         }
         fn input(&mut self, ev: InputEvent, _host: &mut ao_render::Host) {
-            self.ht.input(&self.gui, &mut self.zone, &ev);
+            self.ht.input(&self.gui, &mut self.zone, None, &ev);
             self.gui.input(ev);
         }
         fn frame(&mut self, dt: f32, size: (u32, u32), _host: &mut ao_render::Host) -> ao_gui::DrawList {
@@ -1259,7 +1320,7 @@ mod tests {
         assert!(r.r > r.l && r.b > r.t);
         let (x, y) = ((r.l + r.r) / 2.0, (r.t + r.b) / 2.0);
         for ev in [InputEvent::MouseDown { x, y, button: MouseButton::Left }, InputEvent::MouseUp { x, y, button: MouseButton::Left }] {
-            assert_eq!(fe.ht.input(&fe.gui, &mut fe.zone, &ev), None, "not a world click");
+            assert_eq!(fe.ht.input(&fe.gui, &mut fe.zone, None, &ev), None, "not a world click");
         }
         assert_eq!(fe.zone.target, Some(1));
         fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);

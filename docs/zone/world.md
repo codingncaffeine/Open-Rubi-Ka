@@ -412,7 +412,7 @@ the corpse to the dead character's relative position when closer than a threshol
     then the gate `FUN_1005859d` [GC 0x1005859d]: not an NPC (`+0x21c`), dynel flag bit 17 (`0x20000`) clear, not dying (`+0x80`), stat
     `InPlay` (0xC2) != 0 and dead flag `0x20` clear (set by `CharDie_t`). [UNRESOLVED] bit 17 has no writer in Gamecode.dll (a `PUSH 0x20000`
     scan finds two readers masking `Features` bit 2 in `FUN_10044842` / `FUN_10044a07` and one clear in `FUN_1005bea6`): taken as clear.
-    Stat `InPlay` comes from the own `SimpleCharFullUpdate` (`FUN_10077af2`: `VisualFlags >> 1 & 1`) and the `CharInPlay` echo.
+    Stat `InPlay` comes from the own `SimpleCharFullUpdate` (`FUN_10077af2`: **main flags** at message `+4`, `>> 1 & 1`, not VisualFlags) and the `CharInPlay` echo.
   * **`StartTeleportTry`** [GC 0x10018f9a] (when the playfield exists and no `TeleportTrier_t` lives): `N3Msg_MovementChanged(0x16, 0, 0, true)`
     (our `Movement::action(SYNC)`, a position sync without FSM transition), `new TeleportTrier_t(30.0)` (f32 @GC 0x10157500) added to the
     playfield, `StartTryingTeleport` [GC 0x10037d48]: elapsed := 0, GUI event 5 (= `TeleportStartedMessage`) and, with a control dynel,

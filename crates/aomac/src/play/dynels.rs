@@ -636,6 +636,8 @@ pub struct Char {
     visual_flags: i32,
     /// Full-update InPlay and attachment state (GC 0x10077af2 / GUI 0x10024d5b).
     in_play: bool,
+    /// n3VisualDynel+0xc9: separate from InPlay (death completion can hide an in-play NPC).
+    visible: bool,
     parent: Option<ao_net::msg::Identity>,
     pose: ao_net::n3::motion::Pose,
     anim: u32,
@@ -1364,6 +1366,11 @@ impl Dynels {
     /// Dynel stat-flag bit 0x10, represented by the character's death state.
     pub fn is_dead(&self, id: i32) -> bool {
         self.chars.get(&id).is_some_and(|c| matches!(c.special, Special::Die(_)))
+    }
+
+    /// GC 0x1001c411 virtual +0x8c → N3 0x10019552.
+    pub(super) fn character_visible(&self, id: i32) -> bool {
+        self.chars.get(&id).is_some_and(|c| c.visible)
     }
 
     /// Wildlife vicinity queries use Type50000 positions; fly landing accepts
@@ -2476,6 +2483,7 @@ impl Dynels {
                         flags: u.flags2 as i32,
                         visual_flags: u.visual_flags as i32,
                         in_play: u.flags & ao_net::n3::dynel::flag::IN_PLAY != 0,
+                        visible: u.is_npc() || who.instance == self.own || u.flags & ao_net::n3::dynel::flag::IN_PLAY != 0,
                         parent: u.parent.filter(|p| *p != ao_net::msg::Identity::default()),
                         pose,
                         anim: 0x78,
@@ -2534,6 +2542,7 @@ impl Dynels {
             N3::Misc(Misc::CharInPlay) => {
                 if let Some(c) = self.chars.get_mut(&who.instance) {
                     c.in_play = true;
+                    c.visible = true;
                 }
             }
             N3::Misc(Misc::FollowTarget(f)) => {
@@ -2910,7 +2919,7 @@ impl Dynels {
                 c.clip_ms = super::avatar::clip_time(a, c.clip_ms, false);
             }
             let sample_pose = c.cadence.sample(host.smooth_animations, dist * dist, rig.bounding_radius, host.previous_visible_actors.contains(&(*id as u32)));
-            if dist > self.char_view_distance {
+            if dist > self.char_view_distance || !c.visible {
                 c.submitted = false;
                 continue;
             }
@@ -2976,7 +2985,7 @@ impl Dynels {
     fn tag_of(&self, id: i32, kind: IndicatorKind, bar: Option<((i32, i32), u32)>) -> Option<Tag> {
         let c = self.chars.get(&id)?;
         let Some(Model::Ready { built, .. }) = self.models.get(&c.key) else { return None };
-        if !c.in_play || !built.visible || c.parent.is_some() || !tag_anchor_visible(c.pose.pos[0]) {
+        if !c.in_play || !c.visible || !built.visible || c.parent.is_some() || !tag_anchor_visible(c.pose.pos[0]) {
             return None;
         }
         let t = name_tag(&NameTagInput { name: &c.name, is_npc: c.npc, flags: c.flags, features: INVALID_STAT, visual_flags: c.visual_flags, side: c.side as i32, ..Default::default() });
@@ -3051,7 +3060,7 @@ impl Dynels {
     pub fn pick_bodies(&self, own: i32) -> Vec<super::hud_pick::PickBody> {
         self.chars
             .iter()
-            .filter(|(id, _)| **id != own)
+            .filter(|(id, c)| **id != own && c.visible)
             .filter_map(|(id, c)| Some(super::hud_pick::PickBody { id: *id, bounds: c.bounds?, pos: scene_pos(c.pose.pos), yaw: scene_yaw(c.pose.yaw), scale: c.scale }))
             .chain(self.own_pick.filter(|body| body.id == own))
             .collect()
@@ -4661,7 +4670,7 @@ mod variant_tests {
             match &m.body {
                 N3::World(World::CharacterAction(a)) if m.header.target.instance == npc && a.action == 99 => {
                     order.push("death");
-                    assert_eq!(zone.target, None);
+                    assert_eq!(zone.target, Some(npc), "death itself does not invalidate selection");
                     assert!(matches!(world.chars[&npc].special, Special::Die(503)));
                     let at = world.chars[&npc].pose.pos;
                     world.advance(1.0);
@@ -4712,6 +4721,7 @@ mod variant_tests {
         kill.header.target.instance = leet;
         z.world.on_message(&kill);
         assert!(matches!(z.world.chars[&leet].special, Special::Die(503)));
+        assert!(z.world.character_visible(leet), "death construction does not hide the NPC");
         let mut host = Host::headless();
         let (eye, fwd) = (crate::play::zone::scene_pos(z.own().unwrap().pos), [0.0, 0.0, -1.0]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
@@ -4735,6 +4745,7 @@ mod variant_tests {
         eprintln!("kill: special {:?} anim {} clips {:?}", c.special, c.anim, built.clips.keys().collect::<Vec<_>>());
         assert!(matches!(c.special, Special::Die(_)));
         assert!(c.anim == 503 || c.anim == DIE_KEY, "playing a death clip, not idle: {}", c.anim);
+        assert!(c.visible, "GC 0x1007b58c requires the corpse-received run flag 0x200 before hiding an NPC");
         // the creature's death sound is a value of its record's key 0x1e list (`FUN_1004570c`), at the corpse-to-be's position
         let want = built.sounds.iter().find(|s| s.0 == canim::npc_sound::DEATH).map(|s| s.1.clone()).unwrap_or_default();
         let pos = crate::play::zone::scene_pos(c.pose.pos);
