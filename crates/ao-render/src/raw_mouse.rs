@@ -93,6 +93,16 @@ mod native {
 
     #[link(name = "GameController", kind = "framework")]
     unsafe extern "C" {}
+    // GCDevice defaults to the main queue, which also runs our entire winit
+    // redraw/render callback. Keep hardware delivery independent of that pump.
+    const HANDLER_PRIORITY: isize = 2; // DISPATCH_QUEUE_PRIORITY_HIGH (queue.h)
+    unsafe extern "C" {
+        fn dispatch_get_global_queue(priority: isize, flags: usize) -> *mut std::ffi::c_void;
+        #[cfg(test)]
+        static _dispatch_main_q: std::ffi::c_void;
+        #[cfg(test)]
+        fn dispatch_async_f(queue: *mut std::ffi::c_void, context: *mut std::ffi::c_void, callback: extern "C" fn(*mut std::ffi::c_void));
+    }
     type MouseMoved = Block<dyn Fn(*mut AnyObject, f32, f32)>;
 
     pub(super) struct Mouse {
@@ -124,6 +134,8 @@ mod native {
                 // Apple's GCMouse.h declares this profile nullable; keep AppKit usable without it.
                 let input: Option<Retained<AnyObject>> = msg_send![&*object, mouseInput];
                 let Some(input) = input else { continue };
+                let queue = dispatch_get_global_queue(HANDLER_PRIORITY, 0);
+                let _: () = msg_send![&*object, setHandlerQueue: queue];
                 let shared = counts.clone();
                 let handler = RcBlock::new(move |_input: *mut AnyObject, dx: f32, dy: f32| {
                     // GameController uses positive-up Y; the frontend uses positive-down.
@@ -133,6 +145,55 @@ mod native {
                 mice.push(Mouse { object, input });
             }
         }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn native_mouse_handlers_do_not_use_the_main_render_queue() {
+        // Headless API smoke: no window, HID injection or physical movement.
+        unsafe {
+            let queue = dispatch_get_global_queue(HANDLER_PRIORITY, 0);
+            assert!(!queue.is_null());
+            assert_ne!(queue, std::ptr::addr_of!(_dispatch_main_q).cast_mut());
+            let mut mice = Vec::new();
+            refresh(&mut mice, &Arc::new(Mutex::new(Counts::default())));
+            for mouse in mice {
+                let actual: *mut std::ffi::c_void = msg_send![&*mouse.object, handlerQueue];
+                assert_eq!(actual, queue, "every attached mouse must bypass the main render queue");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    #[ignore = "timed headless dispatch probe; run alone with --nocapture"]
+    fn native_handler_queue_delivery_while_main_is_not_pumped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        static MAIN_DELIVERED: AtomicBool = AtomicBool::new(false);
+        extern "C" fn main_callback(_: *mut std::ffi::c_void) {
+            MAIN_DELIVERED.store(true, Ordering::Release);
+        }
+        extern "C" fn independent_callback(context: *mut std::ffi::c_void) {
+            let (start, sender) = unsafe {
+                *Box::from_raw(context.cast::<(Instant, mpsc::Sender<Duration>)>())
+            };
+            let _ = sender.send(start.elapsed());
+        }
+        let (sender, receiver) = mpsc::channel::<Duration>();
+        let start = Instant::now();
+        unsafe {
+            dispatch_async_f(std::ptr::addr_of!(_dispatch_main_q).cast_mut(), std::ptr::null_mut(), main_callback);
+            let context = Box::into_raw(Box::new((start, sender))).cast();
+            dispatch_async_f(dispatch_get_global_queue(HANDLER_PRIORITY, 0), context, independent_callback);
+        }
+        let independent = receiver.recv_timeout(Duration::from_secs(5)).expect("independent queue delivers without a main run-loop pump");
+        // libtest waits for this test on its main thread instead of pumping
+        // AppKit. This is a real bounded main-queue backlog, not fake timestamps.
+        std::thread::sleep(Duration::from_millis(50));
+        let observed = start.elapsed();
+        assert!(!MAIN_DELIVERED.load(Ordering::Acquire), "run this probe alone without an AppKit pump");
+        eprintln!("dispatch delivery: default-main > {observed:?} (still pending); independent {independent:?}; not hardware press-to-orbit timing");
     }
 }
 

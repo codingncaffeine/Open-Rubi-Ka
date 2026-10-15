@@ -127,6 +127,69 @@ Synthetic CGEvent drags need not reach GCMouse and are not proof of raw-input
 delivery. Runnable accumulator regression:
 `cargo test --release -p ao-render reports_sum_without_acceleration_and_clear_at_capture_boundaries`.
 
+### Press-to-first-orbit callback delivery
+
+The retail press path is immediate: GUI `0x1002c2ee` arms pending camera mode
+when `LMBMouseLook` is enabled; `0x1002c09b` activates it on the first report;
+`0x1002c17b` forwards that same report through Gamecode `0x10015f91` directly
+to `n3Camera_t::MouseCameraControl`. GUI `0x1002c469` consults the `0.02`
+accumulator threshold only on release to classify a click. Neither GUI hold
+timers nor click/double-click decisions defer world orbit.
+
+The port already follows that path: `Play::input` checks `Gui::wants_mouse`
+on press, `Player::mouse` sets `Host::look` in the input event, and viewer
+`set_look` activates `RawMouse` and locks the cursor before returning.
+`Controls::on_mouse_motion` applies its first count; default camera mode 3
+does not angularly damp it. The remaining platform mismatch was leaving
+`GCMouse.handlerQueue` at its default main queue. Apple SDK `GCDevice.h`
+lines 18–29 explicitly specifies that default. Winit 0.30.13's
+`app_state.rs::cleared` invokes `RedrawRequested` synchronously on its main
+run loop; our viewer runs `State::frame` (including frontend work, rendering
+and presentation) inside that callback. Native reports submitted to that
+same main dispatch queue cannot run during it. A separate hardware callback
+queue removes this dependency; it does not speed up an actually blocked
+render frame or promise a numerical OS scheduling deadline.
+
+`raw_mouse::native::refresh` now sets every usable mouse's `handlerQueue`
+to `dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0)` **before**
+installing its movement handler. SDK `dispatch/queue.h` defines HIGH as 2
+(user-initiated QoS); the handler only adds counts under the existing mutex.
+The [reported GCMouse buffering problem and accepted workaround](https://stackoverflow.com/questions/79056173/gcmouse-input-buffering-and-latency)
+independently describes multi-second main-queue bursts and the same queue
+selection. This is supporting platform evidence, not an observed timing
+measurement of this app. No retail threshold, sensitivity, GUI ownership,
+cursor-grab semantics, backend grace or release flushing was changed.
+
+Deterministic regression
+`lmb_press_to_first_orbit_before_and_after_native_queue_backlog` drives
+real GUI press routing, Controls and Camera with one count at 1 ms, 16 ms
+redraws, and an explicitly modeled old callback backlog until 1000 ms.
+Its expected first-orbit times are **1008 ms before / 16 ms after**
+(992 ms difference), with synchronous capture and exactly 0.01 rad orbit
+without avatar rotation. These are clock-model expectations, **not measured
+runtime latency**. The independent headless macOS API smoke
+`native_mouse_handlers_do_not_use_the_main_render_queue` checks the selected
+queue is not main and reads back the installed queue for every attached
+mouse; it injects no HID and opens no window. With no attached mouse only
+the queue identity assertion is exercised.
+
+Required checks (not run by this change's sub-worker):
+`cargo test --release -p ao-render native_mouse_handlers_do_not_use_the_main_render_queue -- --nocapture`
+and
+`cargo test --release -p aomac lmb_press_to_first_orbit_before_and_after_native_queue_backlog -- --nocapture`.
+The latter uses the existing data-backed flow rig and can skip when its
+client data prerequisites are absent; inspect output rather than treating
+such a skip as latency proof. Real hardware callback timing remains to be
+measured by the parent under the live-window permission policy.
+
+For an actual headless dispatch measurement, run alone:
+`cargo test --release -p ao-render native_handler_queue_delivery_while_main_is_not_pumped -- --ignored --nocapture --test-threads=1`.
+This submits real callbacks to both queues while libtest's main thread does
+not pump AppKit. It prints elapsed independent delivery and an observed
+lower bound for the still-pending default-main callback after a bounded
+50 ms wait. It does not inject mouse movement, synthesize a one-second
+measurement, or claim a completed before-case/hardware-to-display latency.
+
 ### Drag release ordering (bug 6)
 
 **[RE]** GUI `0x1002c17b` activates pending look through `0x1002c09b` and

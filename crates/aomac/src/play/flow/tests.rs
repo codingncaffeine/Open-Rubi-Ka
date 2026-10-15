@@ -786,6 +786,49 @@ fn left_drag_orbits_on_first_delta_and_keeps_release_tail_at_ultrawide_size() {
     assert!((angle(r.host.camera.yaw, before_flick) - 0.31).abs() < 1e-4);
 }
 
+/// Clocked callback-scheduler model through real GUI/Controls/Camera code.
+/// This is a reproducible backlog scenario, not measured macOS runtime latency.
+#[test]
+fn lmb_press_to_first_orbit_before_and_after_native_queue_backlog() {
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    r.enter();
+    let size = (5120, 1440);
+    for _ in 0..30 { r.p.frame(0.016, size, &mut r.host); }
+    let (x, y, button) = (2560.0, 720.0, ao_gui::MouseButton::Left);
+    assert!(!r.p.gui.wants_mouse(x, y));
+    // Hardware moves one count 1 ms after press. Old default-main callback is
+    // unavailable until 1000 ms; new independent callback is available at 1 ms.
+    // At 16 ms redraw boundaries these produce first orbit at 1008 vs 16 ms.
+    // The native API smoke separately asserts the real installed handler queue.
+    for (callback_ms, expected_ms) in [(1000, 1008), (1, 16)] {
+        let before = r.host.camera.yaw;
+        let avatar = r.p.zone.own().unwrap().yaw;
+        r.p.input(ao_gui::InputEvent::MouseDown { x, y, button }, &mut r.host);
+        assert!(r.host.look, "capture must activate synchronously on press");
+        let mut delivered = false;
+        let mut first_orbit = None;
+        for frame_ms in (16..=1024).step_by(16) {
+            if !delivered && frame_ms >= callback_ms {
+                r.p.game_input(ao_render::GameInput::MouseMotion { dx: 1.0, dy: 0.0, dt: 0.016 }, &mut r.host);
+                delivered = true;
+            }
+            r.p.frame(0.016, size, &mut r.host);
+            let angle = (r.host.camera.yaw - before + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+            if angle.abs() > 1e-4 {
+                assert!((angle - 0.01).abs() < 1e-4, "first count must orbit without an activation threshold");
+                first_orbit = Some(frame_ms);
+                break;
+            }
+        }
+        assert_eq!(first_orbit, Some(expected_ms));
+        assert_eq!(r.p.zone.own().unwrap().yaw, avatar, "orbit must not turn the avatar");
+        r.p.input(ao_gui::InputEvent::MouseUp { x, y, button }, &mut r.host);
+        assert!(!r.host.look);
+    }
+}
+
 /// The client-initiated teleport try in the flow (docs/zone/world.md §10.2): `StartTryingTeleport` = `TeleportStarted` while the playfield keeps
 /// running (black viewport, game input stopped), the 30 s timeout = `TeleportFailed` = `TeleportEnded` (countdown restarts), and only the server's
 /// echo of our `CharInPlay` (`AliveMessage`) brings the viewport and the input back.
