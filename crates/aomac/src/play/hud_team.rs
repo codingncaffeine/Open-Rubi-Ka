@@ -32,6 +32,8 @@ pub(super) struct Member {
     pub id: Identity,
     pub name: String,
     pub level: u16,
+    /// Resolved native TeamManager group index (`100657b6` maps negative wire indices to the own group or zero).
+    pub sub_team: i32,
     /// `(current, max)` from `TeamMemberInfoIIR_t`.
     pub health: (i32, i32),
     pub nano: (i32, i32),
@@ -43,6 +45,7 @@ pub(super) struct TeamState {
     /// The own identity `{0xC350, char id}`.
     pub own: Identity,
     pub team: Option<Identity>,
+    pub own_sub_team: i32,
     pub members: Vec<Member>,
     pub leader: Option<Identity>,
     /// A pending `TeamInviteIIR_t` (`flag == 0`): who asked and under which name.
@@ -53,7 +56,7 @@ pub(super) struct TeamState {
 
 impl TeamState {
     pub(super) fn new(char_id: i32) -> Self {
-        Self { own: Identity { kind: n3::outgoing::DYNEL_CHAR, instance: char_id }, ..Self::default() }
+        Self { own: Identity { kind: n3::outgoing::DYNEL_CHAR, instance: char_id }, own_sub_team: -1, ..Self::default() }
     }
 
     pub(super) fn in_team(&self) -> bool {
@@ -69,6 +72,16 @@ impl TeamState {
         self.members.iter().any(|m| m.id == id)
     }
 
+    /// GC 1006581f OR 10065865: own group, plus all six groups while in a raid.
+    pub(super) fn target_member(&self, id: Identity) -> bool {
+        self.team.is_some_and(|t| t.kind == team::TEAM_KIND)
+            && self.members.iter().any(|m| m.id == id && if self.own_sub_team >= 0 {
+                (0..6).contains(&m.sub_team)
+            } else {
+                m.sub_team == 0
+            })
+    }
+
     /// `TeamViewModule_c::GetTeamLevel`: UNRESOLVED GUESS, the highest member level. The module stores the value of its team event `0x10` (`identity.instance`,
     /// `FUN_1007a5f2`), whose emitter in Gamecode was not found; no capture has a team.
     pub(super) fn level(&self) -> i32 {
@@ -77,6 +90,7 @@ impl TeamState {
 
     fn clear(&mut self) {
         self.team = None;
+        self.own_sub_team = -1;
         self.members.clear();
         self.leader = None;
     }
@@ -124,10 +138,12 @@ impl TeamState {
         }
         if t.member == self.own {
             self.team = Some(t.team);
+            self.own_sub_team = t.sub_team;
             self.invite = None;
         }
         let old = self.members.iter().position(|m| m.id == t.member);
-        let m = Member { id: t.member, name: t.name.clone(), level: t.level, health: (0, 0), nano: (0, 0) };
+        let sub_team = if t.sub_team < 0 { self.own_sub_team.max(0) } else { t.sub_team };
+        let m = Member { id: t.member, name: t.name.clone(), level: t.level, sub_team, health: (0, 0), nano: (0, 0) };
         match old {
             Some(i) => {
                 let keep = self.members[i].clone();

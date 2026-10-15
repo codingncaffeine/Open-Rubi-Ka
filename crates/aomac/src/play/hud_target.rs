@@ -99,8 +99,8 @@ pub struct TargetInfo {
     /// Retail `N3Msg_Consider` gradient used by `TargetHealthBar_c::SetTarget` (GUI 0x1007313a).
     pub color: u32,
     pub max_health: i32,
-    /// `FUN_100744ae` (GUI 0x100744ae): an NPC is attackable iff its `Side` (0x21) differs from the own one; players need
-    /// `N3Msg_CanAttack` (PvP rules, not modelled: never).
+    /// GUI 0x100744ae: N3Msg_IsNpc (class or dynel state0x800000) uses ordinary Side.
+    /// UNRESOLVED: ordinary players need full CanAttack state (GC10069556); see docs/zone/combat-net.md §6.
     pub hostile: bool,
     pub is_self: bool,
 }
@@ -130,7 +130,7 @@ pub fn info(zone: &Zone, id: i32) -> Option<TargetInfo> {
         health: if max > 0 { (health as f32 / max as f32).clamp(0.0, 1.0) } else { 0.0 },
         color: u32::from_be_bytes([0, r, g, b]),
         max_health: max,
-        hostile: d.npc && !is_self && side != own_side,
+        hostile: (d.npc || zone.tip_npc_state.get(&id).copied().unwrap_or(false)) && !is_self && side != own_side,
         is_self,
     })
 }
@@ -162,8 +162,8 @@ const CLOSE_TARGET_WRAP: f32 = 1000.0;
 
 /// `N3Msg_GetCloseTarget(current, friendly, forward)` (Gamecode 0x1001c411, called by `TargetingModule_t::Get{Next,Prev}{Friendly,
 /// Hostile}TargetMessage` 0x10025a52…, bound to Tab and the dock arrows). Candidates: dynels within 100 m of the own character
-/// except it and the current target; *hostile* = a `Side` (stat 0x21) different from the own one, *friendly* = the same (players
-/// of the own team and pets of the own team count as friendly: team state not modelled). Requires InPlay, IsVisible and world LOS.
+/// except it and the current target; *hostile* = different Side (0x21), or BattlestationSide (0x29c) in playfields 0x111c..0x1124.
+/// Non-NPC team/raid members and NPC pets of self/team/raid count as friendly. Requires InPlay, IsVisible and world LOS.
 /// Ordering: `m = d² − d²(current)` (0 without a current target), `+1000` when negative, and `+1000` when 0 for a candidate listed
 /// before the current one; `forward` takes the smallest `m`, backward the largest (starting at `f32::MIN_POSITIVE`, so `m = 0`
 /// never wins backwards). The original's list order (the locality query's) is unknown: candidates are listed by id.
@@ -174,7 +174,10 @@ pub fn cycle(zone: &Zone, player: Option<&super::player::Player>, hostile: bool,
 fn cycle_with_sight(zone: &Zone, hostile: bool, forward: bool, clear: impl Fn([f32; 3], [f32; 3]) -> bool) -> Option<i32> {
     let me = zone.own()?;
     let my_id = zone.char_id as i32;
-    let own_side = zone.stat(stats::SIDE).map_or(me.side, |s| s as u8);
+    let side_stat = if zone.playfield.is_some_and(|id| (0x111c..0x1125).contains(&id)) { 0x29c } else { stats::SIDE };
+    let side = |id, d: &DynelState| zone.stat_of(id, side_stat)
+        .unwrap_or(if side_stat == stats::SIDE { i32::from(d.side) } else { 2 }); // GC1005cb6a initializes stat668 to 2.
+    let own_side = side(my_id, me);
     let d2 = |d: &DynelState| Vec3::from(d.pos).distance_squared(Vec3::from(me.pos));
     let cur = zone.target.filter(|t| *t != my_id && zone.dynels.contains_key(t));
     let base = cur.map_or(0.0, |t| d2(&zone.dynels[&t]));
@@ -184,7 +187,14 @@ fn cycle_with_sight(zone: &Zone, hostile: bool, forward: bool, clear: impl Fn([f
     let mut best = (None, if forward { f32::MAX } else { f32::MIN_POSITIVE });
     for (n, id) in ids.iter().enumerate() {
         let d = &zone.dynels[id];
-        if *id == my_id || Some(*id) == cur || d2(d) > CLOSE_TARGET_RADIUS * CLOSE_TARGET_RADIUS || (d.side != own_side) != hostile {
+        let teammate = |id| zone.target_team.target_member(Identity { kind: DYNEL_CHAR, instance: id });
+        let friendly_override = if d.npc {
+            zone.stat_of(*id, PET_MASTER).is_some_and(|master| master != 0 && (master == my_id || teammate(master)))
+        } else {
+            teammate(*id)
+        };
+        if *id == my_id || Some(*id) == cur || d2(d) > CLOSE_TARGET_RADIUS * CLOSE_TARGET_RADIUS
+            || ((!friendly_override && side(*id, d) != own_side) != hostile) {
             continue;
         }
         if !zone.stat_of(*id, super::zone::IN_PLAY_STAT).is_some_and(|v| v != 0)
@@ -907,6 +917,56 @@ mod tests {
     }
 
     #[test]
+    fn close_target_native_battle_team_raid_and_pet_classification() {
+        use ao_net::n3::{outgoing::n3_frame, team::{self, TeamMember}};
+        let mut z = Zone::new(1);
+        z.dynels.insert(1, dyn_at("Me", [0.0; 3], false, 1));
+        z.dynels.insert(2, dyn_at("Candidate", [0.0, 0.0, 5.0], false, 2));
+        prepare_cycle(&mut z);
+        let member = |id, group, team_id| team::team_member(Identity { kind: DYNEL_CHAR, instance: 1 }, &TeamMember {
+            member: Identity { kind: DYNEL_CHAR, instance: id },
+            team: Identity { kind: team::TEAM_KIND, instance: team_id }, sub_team: group,
+            profession: 1, level: 5, name: "Member".into(),
+        });
+        assert_eq!(cycle(&z, None, true, true), Some(2));
+        z.on_frame(&n3_frame(1, 1, member(1, -1, 10)));
+        z.on_frame(&n3_frame(2, 1, member(2, -1, 10)));
+        assert_eq!(cycle(&z, None, true, true), None, "opposite-side ordinary teammate");
+        assert_eq!(cycle(&z, None, false, true), Some(2));
+        z.on_frame(&n3_frame(3, 1, member(2, 5, 10)));
+        assert_eq!(cycle(&z, None, true, true), Some(2), "other groups require raid membership");
+        z.on_frame(&n3_frame(4, 1, member(1, 2, 10)));
+        assert_eq!(cycle(&z, None, false, true), Some(2), "all six raid groups are friendly");
+        z.dynels.get_mut(&2).unwrap().npc = true;
+        assert_eq!(cycle(&z, None, true, true), Some(2), "NPC identity membership alone is not enough");
+        z.character_stats.get_mut(&2).unwrap().insert(PET_MASTER, 1);
+        assert_eq!(cycle(&z, None, false, true), Some(2), "own pet");
+        z.on_frame(&n3_frame(5, 1, member(3, 4, 10)));
+        z.character_stats.get_mut(&2).unwrap().insert(PET_MASTER, 3);
+        assert_eq!(cycle(&z, None, false, true), Some(2), "raid member pet without a visible master dynel");
+        z.on_frame(&n3_frame(6, 1, member(3, 4, 0)));
+        assert_eq!(cycle(&z, None, true, true), Some(2), "removed master's pet falls back to side");
+        z.character_stats.get_mut(&2).unwrap().insert(PET_MASTER, 0);
+        z.dynels.get_mut(&2).unwrap().npc = false;
+        z.on_frame(&n3_frame(7, 1, member(1, -1, 0)));
+        z.playfield = Some(0x111c);
+        z.skill_values.insert(0x29c, 0); // Native close-target reads the raw vtable+0x3c stat, not adjusted N3Msg_GetSkill.
+        assert_eq!(cycle(&z, None, false, true), Some(2), "native constructor initializes both missing station sides to 2");
+        z.character_stats.get_mut(&2).unwrap().insert(0x29c, 0);
+        assert_eq!(cycle(&z, None, true, true), Some(2), "explicit station side zero differs from the own default2");
+        z.character_stats.get_mut(&2).unwrap().insert(0x29c, 7);
+        z.stats.insert(0x29c, 7);
+        for pf in [0x111c, 0x1124] {
+            z.playfield = Some(pf);
+            assert_eq!(cycle(&z, None, false, true), Some(2), "BattleStation uses stat668, not Side");
+        }
+        for pf in [0x111b, 0x1125] {
+            z.playfield = Some(pf);
+            assert_eq!(cycle(&z, None, true, true), Some(2), "outside native BattleStation range uses Side");
+        }
+    }
+
+    #[test]
     fn close_target_filters_in_play_visibility_los_and_range_not_health() {
         let mut z = Zone::new(1);
         z.dynels.insert(1, dyn_at("Me", [0.0; 3], false, 1));
@@ -1086,6 +1146,12 @@ mod tests {
         z.dynels.insert(4, dyn_at("Friend", [0.0, 0.0, 3.0], false, 1));
         let i = info(&z, 2).unwrap();
         assert!(i.hostile && (i.health - 0.5).abs() < 1e-6 && i.level == 5);
+        z.dynels.get_mut(&2).unwrap().npc = false;
+        assert!(!info(&z, 2).unwrap().hostile, "ordinary player CanAttack inputs remain unresolved");
+        z.tip_npc_state.insert(2, true);
+        assert!(info(&z, 2).unwrap().hostile, "native IsNpc also includes dynel-state 0x800000");
+        z.tip_npc_state.remove(&2);
+        z.dynels.get_mut(&2).unwrap().npc = true;
         assert!(!info(&z, 4).unwrap().hostile);
         prepare_cycle(&mut z);
         assert_eq!(cycle(&z, None, true, true), Some(2));

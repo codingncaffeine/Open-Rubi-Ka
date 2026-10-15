@@ -93,6 +93,8 @@ pub const TELEPORT_TIMEOUT: f32 = 30.0;
 pub struct Zone {
     pub char_id: u32,
     pub playfield: Option<u32>,
+    /// Headless/gameplay projection of the same server-driven TeamManager as the Team window.
+    pub(super) target_team: super::hud_team::TeamState,
     /// Global research side timers, merged by id as in GC 1002bea2.
     pub research: std::collections::BTreeMap<i32, [i32; 3]>,
     /// Native Locks_t vector, FullCharacter +0x28; unknown until its server snapshot.
@@ -182,7 +184,7 @@ pub struct Zone {
 
 impl Zone {
     pub fn new(char_id: u32) -> Self {
-        Self { char_id, ..Self::default() }
+        Self { char_id, target_team: super::hud_team::TeamState::new(char_id as i32), ..Self::default() }
     }
 
     /// Global position and heading of a child at `rel` / `rel_yaw` relative to the character `parent` (`None` when it is unknown).
@@ -373,6 +375,15 @@ impl Zone {
         };
         *self.counts.entry(m.header.msg_type).or_default() += 1;
         let who = m.header.target;
+        if self.target_team.own.instance != self.char_id as i32 {
+            self.target_team = super::hud_team::TeamState::new(self.char_id as i32);
+        }
+        if who == self.target_team.own {
+            self.target_team.on_message(&m);
+        }
+        // The gameplay projection does not own invitations or UI feedback.
+        self.target_team.notices.clear();
+        self.target_team.invite = None;
         // HealthDamage Apply [GC 0x100a00c8] formats its nominal delta first
         // (flow's pre-apply chat), then sets absolute Health before the next IIR.
         if m.header.msg_type == 0x3710_256C && who.kind == CHAR_KIND && (who.instance == self.char_id as i32 || self.dynels.contains_key(&who.instance) || self.character_stats.contains_key(&who.instance)) {
@@ -437,6 +448,9 @@ impl Zone {
                         if let Some((Some(clan), _)) = &pc.extra {
                             s.insert(5, *clan);
                         }
+                    }
+                    if let Some(side) = u.battlestation_side {
+                        s.insert(0x29c, i32::from(side));
                     }
                     if let Some(master) = u.pet_master {
                         s.insert(0xc4, master);
@@ -583,6 +597,9 @@ impl Zone {
                 if who.instance == self.char_id as i32 {
                     self.own_update = Some(u.clone());
                     self.stats.insert(ao_formats::stats::HEALTH, u.health);
+                    if let Some(side) = u.battlestation_side {
+                        self.stats.insert(0x29c, i32::from(side));
+                    }
                     // GC 0x10077af2 reads the message's main flags bit 1, not VisualFlags.
                     self.stats.insert(IN_PLAY_STAT, i32::from(u.flags & ao_net::n3::dynel::flag::IN_PLAY != 0));
                     self.own_serial += 1;
@@ -977,6 +994,25 @@ mod tests {
         zone.on_frame(&frame);
         assert_eq!(zone.tip_npc_state.get(&id),Some(&true));
         assert!(!zone.dynels[&id].npc,"native character class is unchanged");
+    }
+
+    #[test]
+    fn full_update_preserves_battlestation_side_for_own_and_remote() {
+        let mut frame = frames(include_str!("../../../../docs/captures/zone_enter_ithaca.rec")).into_iter().find(|f| {
+            matches!(n3::decode(f).map(|m| m.body), Ok(N3::Dynel(Dynel::SimpleCharFullUpdate(u))) if !u.is_npc())
+        }).unwrap();
+        let id = n3::decode(&frame).unwrap().header.target.instance;
+        // Captured flags3 is zero; bit1 inserts the native one-byte stat668 before flag_32f.
+        let at = frame.payload.len() - 5;
+        assert_eq!(&frame.payload[at..at + 4], &[0; 4]);
+        frame.payload[at..at + 4].copy_from_slice(&2_u32.to_be_bytes());
+        frame.payload.insert(at + 4, 7);
+        for own in [0, id as u32] {
+            let mut zone = Zone::new(own);
+            zone.stats.insert(0x29c, 3);
+            zone.on_frame(&frame);
+            assert_eq!(zone.stat_of(id, 0x29c), Some(7));
+        }
     }
 
     #[test]
