@@ -367,7 +367,7 @@ movement as if much nearer. No random cloud layout is claimed identical to
 the user's unrecovered running state.
 
 **Exercised verification for this audit:** `cargo test --release --workspace -j2`
-passed1897 tests,0 failed,60 ignored across39 suite summaries. Strict
+passed1904 tests,0 failed,61 ignored across39 suite summaries on the final rebased tree. Strict
 `cargo clippy --release --workspace --all-targets -j2 -- -D warnings` passed.
 The final matched2090×1083 combined/sky-only/21 isolated-layer captures were
 rendered with the same camera/time as the17-layer baseline; the four formerly
