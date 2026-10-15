@@ -740,11 +740,21 @@ impl Char {
 }
 
 /// GC 0x1006fb56 sets speed at Play; DS 0x10072fde advances absolute milliseconds.
-fn advance_clip_clock(ms: &mut f32, rate: &mut f32, dt: f32, start_rate: impl FnOnce() -> f32) {
-    if *ms == 0.0 {
+fn advance_clip_clock(ms: &mut f32, rate: &mut f32, dt: f32, started: bool, start_rate: impl FnOnce() -> f32) {
+    if started {
         *rate = start_rate();
     }
     *ms += (dt * 1000.0 * *rate).abs();
+}
+
+/// GC 0x1006be27 -> 0x100108be interval mode 2 applies to remote characters too.
+/// Return the authored first sample and notes skipped before that interval.
+fn movement_interval(clip: &CatAnim, state: AnimState) -> (f32, u32) {
+    let start = if matches!(state, AnimState::Idle | AnimState::Walk | AnimState::WalkBack | AnimState::WalkLeft | AnimState::WalkRight | AnimState::Run | AnimState::RunBack | AnimState::TurnLeft | AnimState::TurnRight | AnimState::Swim | AnimState::IdleSwim) {
+        super::avatar::loop_span(clip).map_or(0.0, |span| span.0)
+    } else { 0.0 };
+    let notes = clip.events.iter().enumerate().filter(|(_, (ms, _))| (*ms as f32) < start).fold(0, |mask, (i, _)| mask | 1u32 << (i & 31));
+    (start, notes)
 }
 
 /// A corpse, vending machine, door, ... (everything that is not a `SimpleChar`): a fixed model at a fixed place.
@@ -2858,19 +2868,20 @@ impl Dynels {
             };
             // the variant is rolled when the clip starts, not while it loops
             let roll_key = (key, matches!(c.special, Special::None).then_some(state));
-            let started = c.roll.key != Some(roll_key);
+            let started = key != c.anim || c.roll.key != Some(roll_key);
             let clip = list.filter(|l| !l.is_empty()).map(|l| &l[c.roll.pick(roll_key, l.len(), &mut self.rng)]);
-            if key != c.anim || started {
+            let (clip_start, skipped_notes) = clip.filter(|_| c.special == Special::None).map_or((0.0, 0), |a| movement_interval(a, state));
+            if started {
                 c.anim = key;
                 c.base_layers = 3;
                 c.refresh_layers();
-                c.clip_ms = 0.0;
-                c.note_fired = 0;
-                c.body_phase = 0.0;
+                c.clip_ms = clip_start;
+                c.note_fired = skipped_notes;
+                c.body_phase = clip_start;
                 c.terminal_pose = false;
             }
             // GC 0x1006be27 / 0x1006fb56 set the rate once after Play, including idle.
-            advance_clip_clock(&mut c.clip_ms, &mut c.clip_rate, dt, || {
+            advance_clip_clock(&mut c.clip_ms, &mut c.clip_rate, dt, started, || {
                 if movement_rate {
                     let status = c.mover.status();
                     let reference = match status.mode {
@@ -2895,7 +2906,7 @@ impl Dynels {
                 let once = !matches!(c.special, Special::None | Special::Cast(_));
                 let local = super::avatar::clip_time(a, c.clip_ms, once);
                 if local < c.body_phase {
-                    c.note_fired = 0;
+                    c.note_fired = skipped_notes;
                 }
                 let note_id = *id;
                 let airborne = matches!(state, AnimState::JumpStand | AnimState::JumpForward);
@@ -3282,14 +3293,37 @@ mod tests {
     fn npc_clock_keeps_clip_start_rate_and_uses_absolute_milliseconds() {
         let (mut ms, mut rate) = (0.0, 1.0);
         // Idle uses the vehicle maximum too (GC 0x1006be27), not zero velocity.
-        advance_clip_clock(&mut ms, &mut rate, 0.2, || super::super::avatar::anim_rate(0.9, 50.0, 1.5, 1.5, false));
+        advance_clip_clock(&mut ms, &mut rate, 0.2, true, || super::super::avatar::anim_rate(0.9, 50.0, 1.5, 1.5, false));
         assert!((ms - 360.0).abs() < 0.001);
-        advance_clip_clock(&mut ms, &mut rate, 0.2, || panic!("not reset until Play"));
+        advance_clip_clock(&mut ms, &mut rate, 0.2, false, || panic!("not reset until Play"));
         assert!((ms - 720.0).abs() < 0.001);
         ms = 0.0;
-        advance_clip_clock(&mut ms, &mut rate, -0.1, || 0.5);
+        advance_clip_clock(&mut ms, &mut rate, -0.1, true, || 0.5);
         assert_eq!(ms, 50.0);
         assert_eq!(rate, 0.5);
+        ms = 1166.0;
+        advance_clip_clock(&mut ms, &mut rate, 0.2, true, || 1.25);
+        assert_eq!((ms, rate), (1416.0, 1.25), "nonzero authored loopstart must still initialize playback rate");
+        advance_clip_clock(&mut ms, &mut rate, 0.0, false, || panic!("zero delta is not another Play"));
+        assert_eq!((ms, rate), (1416.0, 1.25));
+    }
+
+    #[test]
+    fn remote_movement_starts_at_named_loop_and_skips_intro_notes() {
+        let clip = CatAnim { source_id: 10194, root: String::new(), events: vec![(733, "right".into()), (1166, "loopstart".into()), (1300, "left".into()), (1933, "loopend".into())], version: 0x106, duration: 4000.0, signature: 0, param: 0.0, tracks: vec![] };
+        for state in [AnimState::Idle, AnimState::Walk, AnimState::Run, AnimState::RunBack, AnimState::TurnLeft] {
+            let (start, mut fired) = movement_interval(&clip, state);
+            assert_eq!(start, 1166.0);
+            assert_eq!(fired, 1, "intro right-foot marker is already consumed");
+            assert!(super::super::combat::notes::fire(&clip.events, start, &mut fired).next().is_none());
+            assert_eq!(super::super::combat::notes::fire(&clip.events, 1300.0, &mut fired).count(), 1);
+            let (_, next_cycle) = movement_interval(&clip, state);
+            fired = next_cycle;
+            assert!(super::super::combat::notes::fire(&clip.events, start, &mut fired).next().is_none(), "wrapping does not replay the intro footstep");
+        }
+        assert_eq!(movement_interval(&clip, AnimState::JumpForward), (0.0, 0), "one-shot jump playback is not a movement loop interval");
+        let unmarked = CatAnim { events: vec![], ..clip };
+        assert_eq!(movement_interval(&unmarked, AnimState::Run), (0.0, 0));
     }
 
     #[test]

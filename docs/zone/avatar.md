@@ -53,12 +53,71 @@ convention, which is what the placement needs).
 Clip per `Role` (`role` -> `<set>_<clip>_01_01.ani`, `ao_formats::character::model_clips`). A role the model's set lacks falls back
 (`RunBack`->`WalkBack`->`Walk`->`Idle`, sit/crawl/jump->`Idle`); no clip = bind pose.
 
-**Loop markers** (found on every locomotion clip of the solitus male: walk `loopstart 733 / loopend 1733` of 2433 ms, run
-`1166/1933` of 4000, walk-back `666/1933`, ...): a clip is *intro, loop, outro*. While the role holds, playback wraps from `loopend`
-to `loopstart` (`avatar::clip_time`); clips without markers wrap over their whole length. Footstep markers `left`/`right` also exist
-(for sound). Changing between locomotion clips keeps the loop phase. **[GUESS]** the outro (after `loopend`) is not played when the
-role changes (the new role starts at once); jump clips (`jump-stand`/`jump-forward`, 3000 ms, no markers) play once and hold, `finished()`
-reports the end; sit/crawl clips have no markers and loop whole. The per-clip loop/one-shot flags of the original were not traced.
+**Idle/stand → run (fresh retail trace, 2026-10-15).** GC `1006be27` selects the
+holder's idle `+0x10/+0x34`, walk `+0xc`, or run `+4`, then calls holder vslot `+0x18`
+(`1003c392`) with priority 0, count −1 and interval mode **2**. `1003bd7a` forwards
+to `100108be`, whose mode-2 branch calls DS `SetTime(handle, loopstart, loopend)`;
+missing/invalid markers become 0/total. DS `10072125` initializes elapsed to zero,
+`10072cc7` installs the interval, and `100721d1` samples `start + fmod(elapsed, end-start)`.
+Thus the first run sample is **loopstart**, not clip time zero; walk↔run changes
+also restart their own named interval, never inherit a normalized gait phase.
+There is **no separately selected run-start/transition clip** in this path: the
+clip's intro/outro are excluded by the named interval. This corrects the former
+intro-first / gait-phase guess and the `5eca9fb` frame-zero crossfade.
+
+The weapon selection itself is unchanged and evidenced by GC `1009c858`:
+AnimSet **3 (rifle)** replaces run with `0x422/run-2h`, walk with `0x421/walk-2h`,
+and idle with list `0x29/0x41e/idle-2h`. AnimSet **8 (bazooka)** changes only idle
+to `0x424/idle-bazooka`; pistol, bow and other sets retain `0x78/idle-stand` and
+`0x65/run` outside combat. `0x41f/rifle-start-2h` and list `0x27` are equipment
+stance-pair clips, **not** locomotion startup clips (combat-anim.md §4).
+
+Actual installed CAT headers (rdb `1010003`; names from `1000010/1`; duration and
+event offsets: event count at byte32, events at36 in 36-byte entries, then kind,
+version, duration) give:
+
+| Clip set | stand id / duration ms | rifle idle id / duration ms | run id / [loopstart,loopend] ms | rifle run id / interval ms |
+|---|---|---|---|---|
+| male | 10173 / 3799 | 21626 / 3000 | 10194 / [1166,1933] | 81717 / [1166,1966] |
+| female | 10135 / 4233 | 13576 / 3833 | 10146 / [1166,1900] | 81716 / [566,1333] |
+| athrox | 9992 / 3533 | 21475 / 3000 | 9386 / [1166,1933] | 81715 / [1166,1966] |
+
+All six run clips above have 4000 ms total duration **except female rifle run,
+2433 ms**. Bazooka idles are male265784 / female265786 / athrox265782, duration0.
+The before/after sequence's one-second stand→run therefore has initial sample
+0→1166 ms for all ordinary runs (female rifle 0→566 ms), with 300 ms fade from
+stand/rifle idle and 200 ms from zero-duration bazooka idle.
+
+**Blend timing/curve (not an arbitrary ease).** DS `10073f23` computes preceding
+same-priority interval length `D=abs(end-start)` and remaining `R=D-fmod(elapsed,D)`.
+When both counts are negative and `R<200`, it first adds `ceil(200/D)*D`
+(`100218c5` is `ceil`), then clamps to `[200,300]` (float words `100af8a0=43480000`,
+`100af89c=43960000`). Zero interval/no predecessor uses200. Example: a male run
+at sample1900 has `D=767`, elapsed734, remaining33, so an infinite successor
+gets `clamp(33+767)=300`, not the positive-count helper's200. An idle with250 ms
+left gives250. `10072562` ramps **linearly** from0 to1; `10072fde` advances that
+clock by `abs(dt*1000*incoming speed scale)`, not wall time. At rate0.5 a300 ms
+fade takes600 wall ms; at300 wall ms its weight is0.5. DS `10074228` chains
+previous nodes until the incoming infinite node reaches full weight. Randy
+`10050586` uses shortest-path quaternion slerp (`10053d0b`); `1005063c` uses linear
+translation. The existing per-bone composition already implements those curves.
+Intro footstep notes are consumed on entry and each wrap, not emitted when the
+run starts at loopstart (GC note intervals `1003c036`).
+
+Regression commands (own-avatar sequence executed and inspected by parent Motion7; worker did not run builds/tests):
+`cargo test --release -p aomac play::avatar::tests -- --nocapture`.
+Optional before/after offscreen sequences in one build/run, no account/window:
+`AVATAR_RUN_SEQUENCE=/tmp/Motion7/run-sequence AOMAC_AUDIO_MUTE=1 cargo test --release -p aomac idle_to_run_before_after_frame_sequence -- --nocapture`.
+This writes unarmed/rifle/bazooka stance `{before,after}-{idle,000,016,060,120,200,300,400}.png`
+at900×600 in Arrival Hall4604 and logs selected set/ids/interval/start/fade/rate.
+`before` reproduces `5eca9fb`'s phase0/positive-count duration/wall-clock ramp;
+`after` uses the retail movement path. Stances use the capture's existing
+appearance/attractors, not fabricated weapon models. Parent Motion7 reports all
+48 PNGs rendered and inspected: ordinary/rifle `before` remained upright through
+400 ms, while `after` showed a running stride at200–400 ms; the0 ms fade did not
+pop. This is port before/after evidence, **not a retail-window capture**.
+Jump/emote one-shot flags outside this movement path remain the previously
+documented unresolved per-clip policy.
 
 **Playback rate (RE).** `FUN_1006fb56` (Gamecode 0x1006fb56, called with `(abstract clip id, play handle, speed, forced)` by
 `FUN_1006be27` (role -> clip), `FUN_1006d3ad` and `FUN_1006fc8e`) sets the speed scale of a freshly started clip to
@@ -84,7 +143,9 @@ if (rate > 0) SetSpeedScale(handle, rate)   // else the authored rate 1.0
 
 API: `AvatarPose { role, speed, ref_speed }` (`AvatarPose::still(role)` for idle/sit/emote), `Avatar::set_pose/update(dt)/frame()`.
 
-The shared CAT clock is milliseconds: DisplaySystem 0x10074bb4 → 0x10074228 → 0x10072fde advances `abs(frameSeconds * 1000 * speedScale)` (double 1000.0 at 0x1008aa78); Randy `SetTime` 0x10051cfc stores it unchanged. `ActorRig` samples the supplied time without wrapping; own-avatar and other-character playback choose loop-marker wrapping or one-shot clamping before sampling. Death samples exactly the last frame before holding its terminal pose. Other-character movement-state clips, **including idle**, call the calibration/body-scale/reference-speed formula once at clip start: `FUN_1006be27` calls holder Play at authored rate 1.0, then `FUN_1006fb56` with speed argument zero, which substitutes the vehicle maximum at `+0x3c`. A stopped vehicle does not imply a zero playback speed. The port retains this start rate until the next Play/state transition, starts at zero rather than an instance-id-derived phase, and samples every visible frame rather than invented 25/10/4-Hz distance tiers. View-distance culling no longer stops its clock. `npc_clock_keeps_clip_start_rate_and_uses_absolute_milliseconds` covers idle's maximum-speed input, retained start rate, restart and absolute millisecond advancement (not run during this change).
+The shared CAT clock is milliseconds: DisplaySystem `10074bb4 → 10074228 → 10072fde` advances `abs(frameSeconds * 1000 * speedScale)` (double1000 at `1008aa78`); Randy `SetTime` `10051cfc` stores it unchanged. Own and remote movement both start at the named loop interval (§3), not time0 or an instance-id-derived phase. The remote `movement_interval` applies the same GC `1006be27 → 100108be` selection to ordinary idle/walk/run/back/strafe/turn/swim states, consumes intro notes on entry and each wrap, and leaves one-shot/cast timing unchanged. Rate initialization uses the explicit clip-start event rather than `clip_ms == 0`, because a legitimate loop start is nonzero. Other-character movement-state clips, **including idle**, call the calibration/body-scale/reference-speed formula once at Play: `1006fb56` substitutes vehicle maximum `+0x3c` for its zero speed argument; stopped movement does not mean zero playback rate. View-distance culling does not stop the clock. Remote death samples exactly its final frame. Regressions `npc_clock_keeps_clip_start_rate_and_uses_absolute_milliseconds` and `remote_movement_starts_at_named_loop_and_skips_intro_notes` cover nonzero-start rate initialization, retained rate, absolute advancement and intro-note masks; these added remote checks have not yet been run.
+
+**Existing remote composition difference (not expanded by this fix):** `Char::layers` still submits its movement base at weight1 with no outgoing movement-node history. Therefore the shared phase/clock correction does not establish remote crossfade parity with DS `10074228`; the own-avatar before/after frames above cannot prove remote transition blending. Positive-count remote action histories are separate and unchanged.
 
 `retail_authored_gait_durations_use_milliseconds_and_abstract_calibration_keys` reads model 5907's CAT 10191/10194 and `Setupf/animcalibration.txt`: walk duration 2433 ms, loop 733–1733; run duration 4000 ms, loop 1166–1933. It checks the raw RDB-numbered file factors 0.90/1.15 separately from the runtime abstract-id lookup, whose factor is 1.0 for 0x64/0x65. Formula-derived reference-speed clock periods are therefore 1.000/0.767 seconds (ground distance 1.500/3.835 m per cycle), not the previously claimed source-id-calibrated values. This updated regression has not been run during this change; the periods are calculations, not a live or screenshot claim.
 

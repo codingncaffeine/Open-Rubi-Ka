@@ -3,7 +3,7 @@
 
 use ao_formats::character::{
     actor::{ActorAssets, ActorRig, PlayerLook},
-    animation_blend, animation_fade_ms, head_table, CachedCharacter, CatAnim, ClothEntry, Role, Skin,
+    animation_fade_ms, head_table, CachedCharacter, CatAnim, ClothEntry, Role, Skin,
 };
 use ao_formats::screens::wire_breed_sex;
 use ao_net::n3::dynel::SimpleCharFullUpdate;
@@ -168,9 +168,11 @@ fn stance_clip(set: i32, r: &Role) -> Option<String> {
     anim_name(id).map(|(n, _)| n.to_string())
 }
 
-/// Locomotion clips share a gait cycle: switching between them keeps the phase instead of restarting.
-fn locomotion(r: &Role) -> bool {
-    matches!(r, Role::Walk | Role::WalkBack | Role::WalkLeft | Role::WalkRight | Role::Run | Role::RunBack | Role::Sneak)
+/// Movement playback uses interval mode 2 (GC 0x1006be27 -> 0x1003c392 -> 0x100108be):
+/// start at `loopstart`, loop to `loopend`; no separate run-start clip or inherited gait phase.
+fn movement_loop(r: &Role) -> bool {
+    matches!(r, Role::Idle | Role::Walk | Role::WalkBack | Role::WalkLeft | Role::WalkRight | Role::Run | Role::RunBack | Role::Swim | Role::IdleSwim)
+        || matches!(r, Role::Clip(name) if name == "turn-left" || name == "turn-right")
 }
 
 /// Clip to fall back to when the model's set lacks `r` (Atrox has fewer sets than the other breeds, creatures fewer still).
@@ -208,10 +210,26 @@ pub fn clip_time(a: &CatAnim, ms: f32, once: bool) -> f32 {
     }
 }
 
-/// Phase (0..1) of `ms` inside the loop span, or of the whole clip without one.
-fn phase(a: &CatAnim, ms: f32) -> f32 {
-    let (s, e) = loop_span(a).unwrap_or((0.0, a.duration));
-    ((clip_time(a, ms, false) - s) / (e - s)).clamp(0.0, 1.0)
+/// DS 0x10073f23's infinite-count predecessor path extends a short remaining interval by
+/// ceil(200 / interval) whole cycles before clamping. Positive-count fades use the shared helper.
+fn body_fade_ms(old: &CatAnim, ms: f32, old_role: &Role, new_once: bool) -> f32 {
+    let (start, end) = if movement_loop(old_role) { loop_span(old).unwrap_or((0.0, old.duration)) } else { (0.0, old.duration) };
+    let duration = end - start;
+    if !one_shot(old_role, false) && !new_once && duration > 0.0 {
+        let mut remaining = duration - (ms - start).rem_euclid(duration);
+        if remaining < 200.0 {
+            remaining += (200.0 / duration).ceil() * duration;
+        }
+        remaining.clamp(200.0, 300.0)
+    } else {
+        animation_fade_ms(duration, ms - start)
+    }
+}
+
+/// Mark the intro's notes consumed too: retail's first/next note interval begins at loopstart.
+fn body_note_mask(clip: &CatAnim, role: &Role) -> u32 {
+    let start = if movement_loop(role) { loop_span(clip).map_or(0.0, |s| s.0) } else { return 0 };
+    clip.events.iter().enumerate().filter(|(_, (ms, _))| (*ms as f32) < start).fold(0, |mask, (i, _)| mask | 1u32 << (i & 31))
 }
 
 /// The own-character fade (`FadeCharacter*` Char prefs). Consumer: `VisualCATMesh_t::RefreshAlpha` (DisplaySystem 0x10073b7f, run every frame by
@@ -373,7 +391,7 @@ pub struct Avatar {
     /// Milliseconds into the current clip.
     ms: f32,
     /// Body-layer crossfade (`VisualCATMesh_t::SetAnimation` DS 0x10073f23: `CATAnimBlend_t` anim1 = previous clip, anim2 =
-    /// new one, blended over `animation_fade_ms`): the role's previous clip, kept alive and blended under the new one while
+    /// new one, blended over `body_fade_ms` on the incoming clip's clock): the role's previous clip, kept alive while
     /// `prev_fade_elapsed < prev_fade_ms`.
     prev_clip: Option<Arc<CatAnim>>,
     prev_ms: f32,
@@ -499,7 +517,7 @@ impl Avatar {
 
 
 
-    /// Switches the clip when the role changes; a change between locomotion clips keeps the gait phase, any other restarts.
+    /// Switches clips at the movement handler's authored loop start (GC 0x1006be27 / 0x100108be).
     pub fn set_pose(&mut self, store: &RecordStore, pose: AvatarPose) -> Result<()> {
         if pose.role != self.pose.role || self.clip.is_none() {
             let mut role = pose.role.clone();
@@ -520,16 +538,10 @@ impl Avatar {
             let old_ms = self.ms;
             let old_rate = self.rate;
             let old_clip = self.clip.clone();
-            self.ms = match (&self.clip, &clip) {
-                (Some(old), Some(new)) if locomotion(&self.pose.role) && locomotion(&pose.role) && old.duration > 0.0 && new.duration > 0.0 => {
-                    let (s, e) = loop_span(new).unwrap_or((0.0, new.duration));
-                    s + phase(old, self.ms) * (e - s)
-                }
-                _ => 0.0,
-            };
+            self.ms = clip.as_ref().filter(|_| movement_loop(&pose.role)).and_then(|a| loop_span(a)).map_or(0.0, |s| s.0);
             // body-layer crossfade (DS 0x10073f23): keep the outgoing clip blended underneath while it fades.
             if let Some(old) = old_clip {
-                self.prev_fade_ms = animation_fade_ms(old.duration, old_ms);
+                self.prev_fade_ms = body_fade_ms(&old, old_ms, &self.pose.role, one_shot(&pose.role, self.cast_loop));
                 self.prev_fade_elapsed = 0.0;
                 self.prev_ms = old_ms;
                 self.prev_rate = old_rate;
@@ -538,8 +550,8 @@ impl Avatar {
             self.clip = clip;
             self.clip_id = id;
             self.calibration_id = calibration_id;
-            self.note_fired = 0;
-            self.body_phase = 0.0;
+            self.note_fired = self.clip.as_ref().map_or(0, |a| body_note_mask(a, &pose.role));
+            self.body_phase = self.ms;
             self.body_layers = 3;
             self.refresh_masks();
         }
@@ -587,8 +599,8 @@ impl Avatar {
         self.actions.iter().rev().find_map(|a| a.role.as_ref())
     }
 
-    /// The weapon stance (`AnimSet` of the weapon in the first hand slot, `None` = nothing wielded): idle / walk / run play the weapon's lists
-    /// 0x10 / 0x2a / 0x2b ([`stance_clip`]) instead of the unarmed clips, the way [`Dynels`](super::dynels::Dynels) draws a wielding character.
+    /// Weapon stance of the first wielded hand: peace idle and rifle-only walk/run overrides
+    /// (`stance_clip`, GC 0x1009c858); fight idle independently uses list 0x10.
     pub fn set_stance(&mut self, set: Option<i32>) {
         if set != self.stance {
             self.stance = set;
@@ -612,7 +624,7 @@ impl Avatar {
         self.ms += dt * 1000.0 * self.rate;
         if self.prev_clip.is_some() {
             self.prev_ms += dt * 1000.0 * self.prev_rate;
-            self.prev_fade_elapsed += dt * 1000.0;
+            self.prev_fade_elapsed += dt * 1000.0 * self.rate.abs();
             if self.prev_fade_elapsed >= self.prev_fade_ms {
                 self.prev_clip = None;
             }
@@ -630,7 +642,7 @@ impl Avatar {
         if let Some(clip) = self.clip.clone() {
             let local = clip_time(&clip, self.ms, self.one_shot());
             if local < self.body_phase {
-                self.note_fired = 0;
+                self.note_fired = body_note_mask(&clip, &self.pose.role);
             }
             let airborne = self.airborne;
             use super::combat::notes::id as note;
@@ -650,7 +662,7 @@ impl Avatar {
     fn layers(&self) -> impl Clone + Iterator<Item = ao_formats::character::AnimLayer<'_>> {
         use ao_formats::character::AnimLayer;
         let prev_body = self.prev_clip.as_ref().map(|a| AnimLayer { clip: a, ms: clip_time(a, self.prev_ms, false), layers: self.body_layers, blend: 1.0 });
-        let body_blend = if self.prev_clip.is_some() { animation_blend(self.prev_fade_elapsed, self.prev_fade_ms, self.prev_fade_ms) } else { 1.0 };
+        let body_blend = if self.prev_clip.is_some() { (self.prev_fade_elapsed / self.prev_fade_ms).clamp(0.0, 1.0) } else { 1.0 };
         let body = self.clip.as_ref().map(|a| AnimLayer { clip: a, ms: clip_time(a, self.ms, self.one_shot()), layers: self.body_layers, blend: body_blend });
         let at = self.actions.partition_point(|a| a.priority >= self.body_priority);
         let (before, after) = self.actions.split_at(at);
@@ -973,34 +985,124 @@ pub(super) mod tests {
         assert_eq!(steps, 0, "airborne suppresses every step note, however many loops the clip crosses");
     }
 
-    /// `VisualCATMesh_t::SetAnimation` (DS 0x10073f23) always blends the new clip in over 200..300 ms instead of popping
-    /// straight to it: a role change (e.g. idle -> run, the "starting run looks wonky" report) must keep the outgoing clip
-    /// blended underneath the incoming one until the fade completes, not switch body pose in a single frame.
+    /// Movement is an infinite-count node: authored loop interval, linear blend, clip-rate clock.
     #[test]
     fn own_role_change_crossfades_body_pose_instead_of_popping() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
         let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
         let idle_clip = avatar.clip.clone().expect("retail idle clip resolves");
-        avatar.set_pose(&store, AvatarPose { role: Role::Run, speed: 5.0, ref_speed: 5.0 }).unwrap();
-        assert!(avatar.prev_clip.is_some(), "the outgoing idle clip must survive the role change to fade out");
+        avatar.set_pose(&store, AvatarPose { role: Role::Run, speed: 2.5, ref_speed: 5.0 }).unwrap();
+        let run = avatar.clip.as_ref().unwrap();
+        let start = loop_span(run).expect("retail run has loop markers").0;
+        assert!(start > 0.0);
+        assert_eq!(avatar.ms, start, "GC 100108be mode 2 skips the intro, not a run-start transition");
         assert_eq!(avatar.prev_clip.as_ref().unwrap().source_id, idle_clip.source_id);
-        assert!((200.0..=300.0).contains(&avatar.prev_fade_ms), "DS 0x100af8a0/0x100af89c clamp the fade to 200..300 ms");
+        assert_eq!(avatar.prev_fade_ms, body_fade_ms(&idle_clip, 0.0, &Role::Idle, false));
         let layers: Vec<_> = avatar.layers().collect();
-        assert_eq!(layers.len(), 2, "idle fading out under run fading in");
-        assert_eq!(layers[0].clip.source_id, idle_clip.source_id);
-        assert_eq!(layers[0].blend, 1.0, "the outgoing clip is the full base of the chain");
-        assert_eq!(layers[1].clip.source_id, avatar.clip.as_ref().unwrap().source_id);
-        assert_eq!(layers[1].blend, 0.0, "no pop: the new clip starts at zero weight, not full weight");
+        assert_eq!(layers.len(), 2);
+        assert_eq!((layers[0].clip.source_id, layers[0].blend), (idle_clip.source_id, 1.0));
+        assert_eq!((layers[1].ms, layers[1].blend), (start, 0.0));
         let half = avatar.prev_fade_ms / 2.0;
-        avatar.update(half / 1000.0);
-        let mid_blend = avatar.layers().last().unwrap().blend;
-        assert!(mid_blend > 0.0 && mid_blend < 1.0, "{mid_blend}: still ramping midway through the fade");
-        avatar.update(half / 1000.0 + 0.001);
-        assert!(avatar.prev_clip.is_none(), "the outgoing clip is dropped once the fade completes");
-        let layers: Vec<_> = avatar.layers().collect();
-        assert_eq!(layers.len(), 1);
-        assert_eq!(layers[0].blend, 1.0);
+        avatar.update(half / 1000.0 / avatar.rate);
+        assert!((avatar.layers().last().unwrap().blend - 0.5).abs() < 1e-6, "DS 10072562 is linear; 10072fde scales its clock by incoming rate");
+        assert!((avatar.ms - start - half).abs() < 1e-3);
+        avatar.update((half + 1.0) / 1000.0 / avatar.rate);
+        assert!(avatar.prev_clip.is_none());
+        assert_eq!(avatar.layers().count(), 1);
+        assert_eq!(avatar.layers().next().unwrap().blend, 1.0);
+        avatar.set_pose(&store, AvatarPose { role: Role::Walk, speed: 1.5, ref_speed: 1.5 }).unwrap();
+        assert_eq!(avatar.ms, loop_span(avatar.clip.as_ref().unwrap()).unwrap().0, "walk/run changes restart the named interval too, never inherit gait phase");
+    }
+
+    #[test]
+    fn own_movement_clips_match_retail_animsets() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut assets = ActorAssets::new(&store).unwrap();
+        // Name table 1000010/1 and CAT headers 1010003: set, stand, two-hand idle,
+        // bazooka idle, ordinary run, rifle run, authored run-loop starts.
+        for (breed, sex, stand, two_h, bazooka, run, rifle_run, start, rifle_start) in [
+            (1, 2, 10173, 21626, 265784, 10194, 81717, 1166.0, 1166.0),
+            (1, 3, 10135, 13576, 265786, 10146, 81716, 1166.0, 566.0),
+            (4, 2, 9992, 21475, 265782, 9386, 81715, 1166.0, 1166.0),
+        ] {
+            let mut u = own_update();
+            u.breed = breed;
+            u.sex = sex;
+            u.head_mesh = None;
+            u.attractors.clear();
+            let mut avatar = Avatar::new(&store, &dir, 7, &u, assets).unwrap();
+            for (set, idle, run, start) in [
+                (None, stand, run, start),
+                (Some(0), stand, run, start),
+                (Some(3), two_h, rifle_run, rifle_start),
+                (Some(6), stand, run, start),
+                (Some(8), bazooka, run, start),
+            ] {
+                avatar.set_stance(set);
+                avatar.set_pose(&store, AvatarPose::still(Role::Idle)).unwrap();
+                assert_eq!(avatar.clip_id, idle, "{breed}/{sex} AnimSet {set:?}: peace idle");
+                avatar.set_pose(&store, AvatarPose { role: Role::Run, speed: 5.0, ref_speed: 5.0 }).unwrap();
+                assert_eq!(avatar.clip_id, run, "{breed}/{sex} AnimSet {set:?}: run");
+                assert_eq!(avatar.ms, start);
+                let clip = avatar.clip.as_ref().unwrap();
+                for (i, (ms, name)) in clip.events.iter().enumerate().filter(|(_, (ms, _))| (*ms as f32) < start) {
+                    assert_ne!(avatar.note_fired & (1 << (i & 31)), 0, "intro note {name}@{ms} must not fire on loop entry");
+                }
+            }
+            assets = avatar.into_assets();
+        }
+    }
+
+    /// Optional, headless-only before/after frames; baseline reproduces 5eca9fb's zero-phase start.
+    #[test]
+    fn idle_to_run_before_after_frame_sequence() {
+        let Some(output) = std::env::var_os("AVATAR_RUN_SEQUENCE") else { return };
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let output = std::path::PathBuf::from(output);
+        std::fs::create_dir_all(&output).unwrap();
+        let u = own_update();
+        let pos = super::super::zone::scene_pos(u.pos);
+        let yaw = u.yaw().unwrap_or(0.0);
+        let f = super::super::zone::scene_forward(yaw);
+        let at = [pos[0], pos[1] + 1.0, pos[2]];
+        let eye = [at[0] + f[0] * 3.0, at[1] + 0.3, at[2] + f[2] * 3.0];
+        let scene = ao_formats::playfield::load_playfield(&store, &dir, 4604).unwrap();
+        for (stance, label) in [(None, "unarmed"), (Some(3), "rifle"), (Some(8), "bazooka")] {
+            for before in [true, false] {
+                let mut avatar = Avatar::new(&store, &dir, 7, &u, ActorAssets::new(&store).unwrap()).unwrap();
+                avatar.set_stance(stance);
+                avatar.set_pose(&store, AvatarPose::still(Role::Idle)).unwrap();
+                avatar.update(1.0);
+                let idle = avatar.clip.clone().unwrap();
+                let idle_ms = avatar.ms;
+                let version = if before { "before" } else { "after" };
+                let models = [(MODEL_KEY, avatar.model().clone())];
+                let png = output.join(format!("{label}-{version}-idle.png"));
+                ao_render::render_to_png_actors(&scene, &models, vec![avatar.frame()], eye, at, 900, 600, &png, 0.0).unwrap();
+                avatar.set_pose(&store, AvatarPose { role: Role::Run, speed: 5.0, ref_speed: 5.0 }).unwrap();
+                if before {
+                    avatar.ms = 0.0;
+                    avatar.prev_fade_ms = animation_fade_ms(idle.duration, idle_ms);
+                }
+                eprintln!("{label}-{version}: set={} idle={}/{}ms run={} interval={:?} initial={} fade={} rate={}", avatar.anim_set, idle.source_id, idle.duration, avatar.clip_id, loop_span(avatar.clip.as_ref().unwrap()), avatar.ms, avatar.prev_fade_ms, avatar.rate);
+                let mut last = 0;
+                for ms in [0, 16, 60, 120, 200, 300, 400] {
+                    let previous = if before { avatar.prev_clip.clone() } else { None };
+                    avatar.update((ms - last) as f32 / 1000.0);
+                    if before {
+                        // 5eca9fb advanced the fade in wall time, independently of the clip rate.
+                        avatar.prev_fade_elapsed = ms as f32;
+                        avatar.prev_clip = previous.filter(|_| avatar.prev_fade_elapsed < avatar.prev_fade_ms);
+                    }
+                    let png = output.join(format!("{label}-{version}-{ms:03}.png"));
+                    ao_render::render_to_png_actors(&scene, &models, vec![avatar.frame()], eye, at, 900, 600, &png, 0.0).unwrap();
+                    last = ms;
+                }
+            }
+        }
     }
 
     pub(in crate::play) fn own_update() -> SimpleCharFullUpdate {
@@ -1140,10 +1242,14 @@ pub(super) mod tests {
         let c = CatAnim { events: vec![(200, "loopstart".into()), (600, "loopend".into())], ..a.clone() };
         assert_eq!(clip_time(&c, 500.0, false), 500.0);
         assert_eq!(clip_time(&c, 700.0, false), 300.0, "wraps at loopend");
-        assert_eq!(phase(&c, 400.0), 0.5);
         assert_eq!(clip_time(&a, 5000.0, true), 1000.0);
         let b = CatAnim { events: vec![], ..a };
         assert_eq!(clip_time(&b, 1100.0, false), 100.0);
+        assert_eq!(body_fade_ms(&c, 550.0, &Role::Run, false), 300.0, "50 ms left in a 400 ms loop is extended by a cycle, then clamped");
+        assert_eq!(body_fade_ms(&c, 350.0, &Role::Run, false), 250.0, "250 ms left requires no extra cycle");
+        assert_eq!(body_fade_ms(&c, 550.0, &Role::Run, true), 200.0, "positive-count successor has no infinite-cycle extension");
+        let short = CatAnim { duration: 100.0, ..b };
+        assert_eq!(body_fade_ms(&short, 90.0, &Role::Idle, false), 210.0, "ceil(200 / 100) cycles plus the 10 ms remainder");
     }
 
     fn client() -> Option<std::path::PathBuf> {
