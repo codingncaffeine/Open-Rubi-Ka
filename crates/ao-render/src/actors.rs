@@ -553,6 +553,7 @@ pub(crate) fn same_material(a: &ao_scene::Submesh, b: &ao_scene::Submesh) -> boo
         prelit,
         uv_scroll,
         sky_fog,
+        sky_fog_color,
         uv_wave,
         sun_flicker,
         specular,
@@ -571,6 +572,7 @@ pub(crate) fn same_material(a: &ao_scene::Submesh, b: &ao_scene::Submesh) -> boo
         && *prelit == b.prelit
         && *uv_scroll == b.uv_scroll
         && *sky_fog == b.sky_fog
+        && *sky_fog_color == b.sky_fog_color
         && *uv_wave == b.uv_wave
         && *sun_flicker == b.sun_flicker
         && *specular == b.specular
@@ -598,6 +600,7 @@ fn submesh_shape(submeshes: &[ao_scene::Submesh]) -> Vec<ao_scene::Submesh> {
             prelit: s.prelit,
             uv_scroll: s.uv_scroll,
             sky_fog: s.sky_fog,
+            sky_fog_color: s.sky_fog_color,
             uv_wave: s.uv_wave,
             sun_flicker: s.sun_flicker,
             specular: s.specular,
@@ -733,6 +736,7 @@ mod tests {
             |s| s.prelit = true,
             |s| s.uv_scroll = [1.0, 0.0],
             |s| s.sky_fog = true,
+            |s| s.sky_fog_color = Some([0.1, 0.2, 0.3]),
             |s| s.uv_wave = [1.0, 0.0, 0.0, 0.0],
             |s| s.sun_flicker = true,
             |s| s.specular = [1.0, 0.0, 0.0],

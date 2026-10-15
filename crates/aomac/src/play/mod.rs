@@ -5,6 +5,8 @@
 mod avatar;
 mod camera;
 mod camera_views;
+#[cfg(test)]
+mod sky_shots;
 mod chat;
 mod combat;
 mod controls;

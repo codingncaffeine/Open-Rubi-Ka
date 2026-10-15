@@ -1,6 +1,6 @@
 struct G {
     vp: mat4x4<f32>,
-    eye: vec4<f32>,
+    eye: vec4<f32>,        // xyz = camera position, w = projection far (independent of local fog volumes)
     sun_dir: vec4<f32>,
     sun_color: vec4<f32>,
     ambient: vec4<f32>,
@@ -20,10 +20,10 @@ struct G {
 struct Mat {
     color: vec4<f32>,
     emissive: vec4<f32>, // rgb = emissive, w = 1 when texture alpha is a glow mask
-    scroll: vec4<f32>,   // xy = uv drift per second
+    scroll: vec4<f32>,   // xy = uv drift per second; z = sky fog (0 off, 1 live colour, 2 flags.yzw override)
     wave: vec4<f32>,     // sky: (curve_u, amp_u, curve_v, amp_v) uv offset amp * GameWaveCurve; scroll.w = 1 for a flickering sun fan
     spec: vec4<f32>,     // rgb = material specular (spec * shin_str, 0 = SPECULARENABLE off), w = power
-    flags: vec4<f32>,    // x = 1 when this material's texture addressing clamps (Submesh::texture_clamp)
+    flags: vec4<f32>,    // x = texture clamp; yzw = linear explicit sky fog colour
 }
 @group(0) @binding(0) var<uniform> g: G;
 @group(0) @binding(1) var<storage, read> lights: array<vec4<f32>>; // pairs: (pos, range), (colour, 0)
@@ -146,6 +146,10 @@ fn vs_actor(v: VIn, @location(8) emissive: vec4<f32>, @location(9) specular: vec
 fn vs_sky(v: VIn) -> VOut {
     var o = vtx(v);
     o.clip.z = o.clip.w;
+    if mat.scroll.z > 0.5 {
+        // ScaleByViewDistance: authored distance / 1000 becomes metres at the live projection far.
+        o.n.x = v.normal.x * g.eye.w;
+    }
     if mat.scroll.w > 0.5 && v.normal.z >= 0.0 {
         // e_SunRays rim alpha * (255 - trunc(255 * curve[i & 7])) / 255 (FUN_1005a3a9), interpolated per vertex like the client
         let k = u32(v.normal.z + 0.5) & 7u;
@@ -317,7 +321,7 @@ fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
     return vec4<f32>(rgb, a);
 }
 
-// Sky: unlit, unfogged; opaque ignores alpha.
+// Sky: unlit; optional source fog precedes the native blend equation. Opaque ignores alpha.
 fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
     let wu = u32(mat.wave.x);
     let wv = u32(mat.wave.z);
@@ -327,13 +331,14 @@ fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
     if mode == 1u && !a2c && c.a < 0.5 {
         discard;
     }
-    var rgb = c.rgb * (vec3<f32>(1.0) + mat.emissive.rgb);
+    var rgb = srgb_enc(clamp(c.rgb * (vec3<f32>(1.0) + mat.emissive.rgb), vec3<f32>(0.0), vec3<f32>(1.0)));
     if mat.scroll.z > 0.5 {
-        // atmosphere strip: fogged with the live fog at the camera (normal.x = its distance at the view distance)
-        rgb = mix(rgb, g.fog_color.rgb, clamp((i.n.x - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0));
+        // D3D fog follows the texture stage in gamma space, before blending (as in shade).
+        let fog_color = select(g.fog_g.rgb, srgb_enc(mat.flags.yzw), mat.scroll.z > 1.5);
+        rgb = mix(rgb, fog_color, clamp((i.n.x - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0));
     }
     // Preserve the sky's existing shading; only move the former target encoding before gamma-space blending.
-    return vec4<f32>(srgb_enc(rgb), select(1.0, c.a, mode >= 2u || (mode == 1u && a2c)));
+    return vec4<f32>(rgb, select(1.0, c.a, mode >= 2u || (mode == 1u && a2c)));
 }
 
 @fragment

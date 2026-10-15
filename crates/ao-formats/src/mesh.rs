@@ -122,10 +122,75 @@ pub fn decode_statel_mesh(store: &RecordStore, rdb_type: u32, id: u32, overrides
     decode_record(store, rdb_type, id, scene, false, overrides, inherited)
 }
 
-/// Like [`decode_mesh_into`] but with the vertices exactly as stored (node object space, the frame tree's matrices are
-/// not applied): what a `RTriMesh_t` visual built straight from the mesh data draws (the sky objects).
-pub fn decode_mesh_object_space(store: &RecordStore, id: u32, scene: &mut Scene) -> Result<Option<usize>> {
-    decode_record(store, MESH_TYPE, id, scene, true, &[], None)
+/// DisplaySystem's case-4 visual starts as `rock01.abiff` (1010001/36067).
+/// `SetTriMeshData` retains that visual's animation frame; `Init` with `MeshIndex`
+/// instead installs the selected data's frame (10063188, 100616e4, 1005e716).
+pub(crate) fn decode_generic_mesh(store: &RecordStore, id: u32, index: Option<usize>, camera_locked: bool, scene: &mut Scene) -> Result<Option<usize>> {
+    let Some(bytes) = store.get(MESH_TYPE, id)? else { return Ok(None) };
+    let ar = Archive::parse(&bytes)?;
+    let root = store.get(MESH_TYPE, 36067)?.context("missing GenericMeshObject factory mesh 1010001/36067")?;
+    let root = Archive::parse(&root)?;
+    let default = root.objects.iter().find(|o| o.get("anim_rot").is_some()).context("factory mesh without animation frame")?;
+    let mut textures = |key| {
+        if let std::collections::hash_map::Entry::Vacant(entry) = scene.textures.entry(key) {
+            if let Some(texture) = load_texture(store, key).ok().flatten() {
+                entry.insert(texture);
+            }
+        }
+        scene.textures.contains_key(&key)
+    };
+    let mesh = generic_mesh_archive(&ar, default, index, camera_locked, &mut textures)?;
+    scene.meshes.push(mesh);
+    Ok(Some(scene.meshes.len() - 1))
+}
+
+fn mesh_animation_matrix(data: &Object) -> Result<Mat> {
+    let rotation = data.f32s::<4>("anim_rot").context("mesh data without valid anim_rot")?;
+    let position = data.f32s::<3>("anim_pos").context("mesh data without valid anim_pos")?;
+    ensure!(rotation.iter().chain(position.iter()).all(|v| v.is_finite()), "nonfinite mesh animation frame");
+    Ok(frame_matrix(rotation, position, 1.0))
+}
+
+fn generic_mesh_archive(ar: &Archive, default: &Object, index: Option<usize>, camera_locked: bool, have_texture: &mut dyn FnMut(TextureKey) -> bool) -> Result<Mesh> {
+    let mut nodes = Vec::new();
+    fn collect(ar: &Archive, i: usize, nodes: &mut Vec<usize>, visited: &mut [bool], depth: usize) -> Result<()> {
+        ensure!(depth < MAX_DEPTH, "frame tree too deep");
+        let node = ar.objects.get(i).context("dangling frame ref")?;
+        ensure!(!std::mem::replace(&mut visited[i], true), "cyclic frame tree");
+        if node.ref1("data").is_some() {
+            nodes.push(i);
+        }
+        for child in node.refs("chld") {
+            collect(ar, child, nodes, visited, depth + 1)?;
+        }
+        Ok(())
+    }
+    collect(ar, ar.root, &mut nodes, &mut vec![false; ar.objects.len()], 0)?;
+    let selected = match index {
+        Some(i) => std::slice::from_ref(nodes.get(i).context("MeshIndex out of range")?),
+        None => nodes.as_slice(),
+    };
+    let mut builder = Builder {
+        ar, mesh: Mesh::default(), groups: HashMap::new(), have_texture,
+        visited: vec![], object_space: true, overrides: &[], slot: 0, last_tex: None,
+    };
+    for &i in selected {
+        let node = &ar.objects[i];
+        let data = ar.objects.get(node.ref1("data").context("mesh without data")?).context("dangling data ref")?;
+        // Multiple meshes become Child_Mesh_Misc objects with explicit MeshIndex.
+        let frame = if index.is_some() || nodes.len() > 1 { data } else { default };
+        let mut matrix = mesh_animation_matrix(frame)?;
+        // Process1005c334 replaces translation with camera + Position.
+        if camera_locked {
+            matrix[3] = [0.0, 0.0, 0.0, 1.0];
+        }
+        let state = node.ref1("delta_state").and_then(|i| ar.objects.get(i));
+        for mesh in data.refs("mesh") {
+            builder.simple_mesh(state, ar.objects.get(mesh).context("dangling mesh ref")?, &matrix)?;
+        }
+    }
+    builder.mesh.submeshes.retain(|s| !s.indices.is_empty());
+    Ok(builder.mesh)
 }
 
 fn decode_record(store: &RecordStore, rdb_type: u32, id: u32, scene: &mut Scene, object_space: bool, overrides: &[(u32, u32)], inherited: Option<TextureKey>) -> Result<Option<usize>> {
@@ -190,9 +255,14 @@ fn mul(a: &Mat, b: &Mat) -> Mat {
 
 /// `RRefFrame_t::UpdateWorldMatrix` local part without the animation matrix: quaternion rows, uniform scale, translation.
 fn base_matrix(n: &Object) -> Mat {
-    let [x, y, z, w] = n.f32s::<4>("local_rot").unwrap_or([0.0, 0.0, 0.0, 1.0]);
-    let s = n.f32s::<1>("scale").map_or(1.0, |s| s[0]);
-    let p = n.f32s::<3>("local_pos").unwrap_or([0.0; 3]);
+    frame_matrix(
+        n.f32s::<4>("local_rot").unwrap_or([0.0, 0.0, 0.0, 1.0]),
+        n.f32s::<3>("local_pos").unwrap_or([0.0; 3]),
+        n.f32s::<1>("scale").map_or(1.0, |s| s[0]),
+    )
+}
+
+fn frame_matrix([x, y, z, w]: [f32; 4], p: [f32; 3], s: f32) -> Mat {
     let mut m = [
         [1.0 - 2.0 * (y * y + z * z), 2.0 * (z * w + x * y), 2.0 * (x * z - w * y), 0.0],
         [2.0 * (x * y - z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x), 0.0],
@@ -543,6 +613,51 @@ pub fn decode_mesh_connectors(store: &RecordStore, rdb_type: u32, id: u32) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_visual_uses_factory_frame_or_selected_mesh_frame() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        let Ok(store) = RecordStore::open(&dir) else { return };
+        let names = crate::character::NameTable::load(&store).unwrap();
+        let rock = store.get(MESH_TYPE, 36067).unwrap().expect("rock01");
+        let rock = Archive::parse(&rock).unwrap();
+        let default = rock.objects.iter().find(|o| o.get("anim_rot").is_some()).unwrap();
+        let inherited = mesh_animation_matrix(default).unwrap();
+        let close = |a: [f32; 3], b: [f32; 3]| {
+            assert!((0..3).all(|k| (a[k] - b[k]).abs() < 0.001), "{a:?} != {b:?}");
+        };
+        for name in ["skydome_clouds.abiff", "horizon_object.abiff"] {
+            let id = names.id(MESH_TYPE, name).expect(name);
+            let bytes = store.get(MESH_TYPE, id).unwrap().unwrap();
+            let ar = Archive::parse(&bytes).unwrap();
+            let data = ar.objects[ar.root].ref1("data").expect("single mesh root");
+            let native = mesh_animation_matrix(&ar.objects[data]).unwrap();
+            let raw = decode_archive(&bytes, true, |_| false).unwrap();
+            let world = generic_mesh_archive(&ar, default, None, false, &mut |_| false).unwrap();
+            let locked = generic_mesh_archive(&ar, default, None, true, &mut |_| false).unwrap();
+            let selected = generic_mesh_archive(&ar, default, Some(0), false, &mut |_| false).unwrap();
+            assert_eq!(raw.vertices.len(), world.vertices.len());
+            assert_eq!(world.submeshes[0].indices, raw.submeshes[0].indices);
+            for (i, v) in raw.vertices.iter().enumerate() {
+                let p = [v.pos[0], v.pos[1], -v.pos[2]];
+                let n = [v.normal[0], v.normal[1], -v.normal[2]];
+                let xf = |p: [f32; 3], m: &Mat, translation: bool| {
+                    let mut out: [f32; 3] = std::array::from_fn(|j| (0..3).map(|k| p[k] * m[k][j]).sum::<f32>() + if translation { m[3][j] } else { 0.0 });
+                    out[2] = -out[2];
+                    out
+                };
+                close(world.vertices[i].pos, xf(p, &inherited, true));
+                close(locked.vertices[i].pos, xf(p, &inherited, false));
+                close(selected.vertices[i].pos, xf(p, &native, true));
+                let mut normal = xf(n, &inherited, false);
+                let length = normal.iter().map(|v| v * v).sum::<f32>().sqrt();
+                normal.iter_mut().for_each(|v| *v /= length);
+                close(locked.vertices[i].normal, normal);
+            }
+            assert!(generic_mesh_archive(&ar, default, Some(usize::MAX), false, &mut |_| false).is_err());
+        }
+    }
 
     #[test]
     fn fvf_0x112_is_32_bytes() {

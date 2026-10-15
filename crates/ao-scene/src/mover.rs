@@ -107,7 +107,7 @@ pub fn rot_between(a: V3, b: V3) -> [f32; 4] {
     [c[0], c[1], c[2], dot(a, h)]
 }
 
-/// Hamilton product `a·b` (`a [ROT] b`: `b` acts first), `[x, y, z, w]`.
+/// Hamilton product `a·b`, `[x, y, z, w]`. Script `a [ROT] b` instead calls this as `quat_mul(b, a)`.
 pub fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     [
         a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
@@ -132,8 +132,8 @@ pub enum RotTerm {
 /// playfield metres); [`Mover::transform`] converts to the scene.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mover {
-    /// Index into `Scene::instances`; the renderer overwrites its transform every frame. The mesh is the object-space
-    /// mesh (no rotation, no scale).
+    /// Index into `Scene::instances`; the renderer overwrites its transform every frame.
+    /// Geometry already includes its native generic visual frame, but not the tweak rotation/scale.
     pub instance: usize,
     /// `UniversePosition [N]`.
     pub waypoints: Vec<[f32; 3]>,
@@ -186,12 +186,12 @@ impl Mover {
     pub fn rotation(&self, s: &MoverState) -> [f32; 4] {
         self.rotation.iter().fold([0.0, 0.0, 0.0, 1.0], |q, t| {
             quat_mul(
-                q,
                 match *t {
                     RotTerm::Fixed(f) => f,
                     RotTerm::Forward => rot_between(self.forward_dir, s.forward),
                     RotTerm::Banking => rot_between(self.up_dir, s.banking),
                 },
+                q,
             )
         })
     }
@@ -320,6 +320,31 @@ mod tests {
         let q = m.rotation(&s);
         let r = rot_between([0.0, 0.0, 1.0], s.forward);
         assert_eq!(q, r);
+    }
+
+    #[test]
+    fn script_rotation_terms_compose_in_source_order() {
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        let fixed = [0.0, 0.0, h, h]; // +90 Z
+        let m = Mover {
+            rotation: vec![RotTerm::Fixed(fixed), RotTerm::Forward, RotTerm::Banking],
+            ..Default::default()
+        };
+        let s = MoverState {
+            forward: [1.0, 0.0, 0.0], // +90 Y from +Z
+            banking: [0.0, 0.0, 1.0], // +90 X from +Y
+            ..Default::default()
+        };
+        let expected = quat_mul(
+            rot_between(m.up_dir, s.banking),
+            quat_mul(rot_between(m.forward_dir, s.forward), fixed),
+        );
+        let q = m.rotation(&s);
+        assert!((0..4).all(|k| (q[k] - expected[k]).abs() < 1e-6));
+        // AO +X: Rz90 -> +Y, Ry90 -> +Y, Rx90 -> +Z.
+        // The scene-space transform mirrors that final Z.
+        let transform = m.transform(&s);
+        assert!(close([transform[0][0], transform[0][1], transform[0][2]], [0.0, 0.0, -1.0], 1e-5));
     }
 
     #[test]

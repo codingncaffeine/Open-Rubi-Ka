@@ -109,9 +109,11 @@ pub struct Submesh {
     /// Texture coordinate drift in uv units per second (added to the vertex uv, wrapped by the sampler): scrolling clouds,
     /// water-like layers. `[0, 0]` = static.
     pub uv_scroll: [f32; 2],
-    /// Sky submeshes only: vertex `normal.x` is the distance (metres, at the view distance) the vertex has in the client's
-    /// fogged atmosphere strip; the renderer fogs it with the live fog (colour / end at the camera) instead of a baked one.
+    /// Sky submeshes only: vertex `normal.x` is the distance as a fraction of camera far (authored distance / 1000) in
+    /// the client's fogged sky; the renderer applies live camera far and fog end, then fogs source RGB before blending.
     pub sky_fog: bool,
+    /// Linear RGB override for [`Self::sky_fog`]. `None` uses the live environment fog colour; ignored when fog is disabled.
+    pub sky_fog_color: Option<[f32; 3]>,
     /// Sky submeshes only: `[curve_u, amp_u, curve_v, amp_v]`, the uv offset `amp * GameWaveCurve<curve>(time)`
     /// ([`wave_curves`]) added to the vertex uv every frame (a tweak `ScrollMatrix` translation driven by `GAME.GameWaveCurve*`;
     /// the constant part is baked into the uv). `amp == 0` = off.
@@ -148,6 +150,7 @@ impl Submesh {
             prelit: false,
             uv_scroll: [0.0; 2],
             sky_fog: false,
+            sky_fog_color: None,
             uv_wave: [0.0; 4],
             sun_flicker: false,
             specular: [0.0; 3],

@@ -137,6 +137,7 @@ pub fn default_view(scene: &Scene) -> (Vec3, Vec3) {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Globals {
     view_proj: [[f32; 4]; 4],
+    /// xyz = camera position, w = projection far (not the local fog-volume end).
     eye: [f32; 4],
     sun_dir: [f32; 4],
     sun_color: [f32; 4],
@@ -156,7 +157,7 @@ struct Globals {
     dyn_info: [i32; 4],
 }
 
-/// One submesh draw. `pipe` = `blend as usize * 2 + two_sided as usize`; sky draws use `SKY_PIPE + blend`.
+/// One submesh draw. Scene pipes use `material_pipe`; sky draws use `sky_material_pipe`.
 #[derive(Clone, Copy)]
 struct Draw {
     mesh: usize,
@@ -177,12 +178,27 @@ const ENV_BLEND_PIPE: usize = 14;
 const FADE_PIPE: usize = 16;
 const SPRITE_PIPE: usize = 20;
 const NATIVE_BLEND_PIPE: usize = 22;
-/// The sky-only `SourceColorOne` pipe (`fs_sky_blend` + the native `(Src, One)` blend state): sky draws key their pipe off
-/// `SKY_PIPE + blend as usize`, which only covers the four contiguous base blends (`Opaque`..`Additive`); this native blend
-/// sits after `PremultipliedAlpha` in the enum, so it gets its own slot appended at the end of `pipe_specs` instead.
+/// Original two-sided sky `SourceColorOne` slot (`fs_sky_blend`, native `(Src, One)`).
+/// It is separate from the four contiguous base sky blends at `SKY_PIPE`.
 const SKY_GLOW_PIPE: usize = NATIVE_BLEND_PIPE + 8;
 const MESH_EFFECT_PIPE: usize = SKY_GLOW_PIPE + 1;
 const MESH_EFFECT_STRIDE: usize = SKY_GLOW_PIPE + 1;
+/// Append sky-only cull variants without moving world/actor pipeline slots.
+const SKY_CULL_PIPE: usize = SKY_GLOW_PIPE + 1;
+const SKY_NATIVE_PIPE: usize = SKY_CULL_PIPE + 8;
+const SKY_LAST_PIPE: usize = SKY_NATIVE_PIPE + 2;
+
+fn sky_material_pipe(s: &ao_scene::Submesh) -> usize {
+    if !s.two_sided {
+        SKY_CULL_PIPE + s.blend as usize
+    } else {
+        match s.blend {
+            Blend::Opaque | Blend::AlphaTest | Blend::AlphaBlend | Blend::Additive => SKY_PIPE + s.blend as usize,
+            Blend::SourceColorOne => SKY_GLOW_PIPE,
+            _ => SKY_NATIVE_PIPE + s.blend as usize - Blend::ZeroSourceColor as usize,
+        }
+    }
+}
 
 fn native_blend_state(blend: Blend) -> wgpu::BlendState {
     use wgpu::BlendFactor::*;
@@ -425,7 +441,9 @@ struct ColorAnim {
 /// Material uniform of a submesh (see `shader.wgsl` `Mat`).
 fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 24] {
     let [wu, au, wv, av] = s.uv_wave;
-    [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], s.sky_fog as u32 as f32, s.sun_flicker as u32 as f32, wu, au, wv, av, s.specular[0], s.specular[1], s.specular[2], s.shininess, s.texture_clamp as u32 as f32, 0.0, 0.0, 0.0]
+    let [fr, fg, fb] = s.sky_fog_color.unwrap_or([0.0; 3]);
+    let fog_mode = if !s.sky_fog { 0.0 } else if s.sky_fog_color.is_some() { 2.0 } else { 1.0 };
+    [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], fog_mode, s.sun_flicker as u32 as f32, wu, au, wv, av, s.specular[0], s.specular[1], s.specular[2], s.shininess, s.texture_clamp as u32 as f32, fr, fg, fb]
 }
 
 /// Last-frame counters (after frustum culling).
@@ -685,7 +703,7 @@ fn build_pipelines(
             }),
             primitive: wgpu::PrimitiveState {
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: (!two_sided && !sky && !matches!(effect, 1 | 4..=6)).then_some(wgpu::Face::Back),
+                cull_mode: (!two_sided && !matches!(effect, 1 | 4..=6)).then_some(wgpu::Face::Back),
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -715,15 +733,17 @@ fn build_pipelines(
         .map(|(b, two, sky, env, fade)| (b, two, sky, env, fade, false))
         .chain([false, true].map(|two| (Blend::AlphaBlend, two, false, false, false, true)))
         .chain([Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha, Blend::SourceColorOne].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, false, false))))
-        // sky draws key their pipe off `SKY_PIPE + blend as usize`, only valid for the four contiguous base blends;
-        // `SourceColorOne` is not contiguous with them (it sits after the other native blends), so it gets a lone
-        // dedicated sky slot at the very end of the table (`SKY_GLOW_PIPE`) instead.
-        .chain(std::iter::once((Blend::SourceColorOne, true, true, false, false, false)));
-    assert_eq!(pipe_specs.clone().count(), native_liquid::PIPE, "native liquid passes must follow the sky glow pipeline");
+        // Keep the original 31 entries as the actor table's stable prefix.
+        .chain(std::iter::once((Blend::SourceColorOne, true, true, false, false, false)))
+        .chain([Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive, Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha, Blend::SourceColorOne]
+            .map(|b| (b, false, true, false, false, false)))
+        .chain([Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha]
+            .map(|b| (b, true, true, false, false, false)));
+    assert_eq!(pipe_specs.clone().count(), native_liquid::PIPE, "native liquid passes must follow the last sky pipeline");
     let pipes: Vec<_> = pipe_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false, 0))
         .chain((12..=13).map(|effect| mk(Blend::AlphaBlend, true, false, false, false, false, false, effect))).collect();
     assert_eq!(pipes.len(), native_liquid::PIPE + 2);
-    let actor_pipes = (0..=7).flat_map(|effect| pipe_specs.clone().map(move |spec| (effect, spec)))
+    let actor_pipes = (0..=7).flat_map(|effect| pipe_specs.clone().take(MESH_EFFECT_STRIDE).map(move |spec| (effect, spec)))
         .map(|(effect, (b, two, sky, env, fade, sprite))| mk(b, two, sky, env, fade, sprite, true, effect)).collect();
     let ground_pipes = (8..=11).map(|effect| mk(Blend::Opaque, false, false, false, false, false, false, effect)).collect();
 
@@ -1309,7 +1329,7 @@ impl Renderer {
                     }));
                     self.sky.mats.len() - 1
                 });
-                let pipe = if s.blend == Blend::SourceColorOne { SKY_GLOW_PIPE } else { SKY_PIPE + s.blend as usize };
+                let pipe = sky_material_pipe(s);
                 draws.push(Draw { mesh: mi, first_index: first, count, mat, pipe });
             }
             let ibytes = (indices.len() * 4) as u64;
@@ -1612,7 +1632,7 @@ impl Renderer {
         let (water_color, water_dir) = self.water_light.unwrap_or_default();
         let g = Globals {
             view_proj: vp.to_cols_array_2d(),
-            eye: cam.pos.extend(1.0).to_array(),
+            eye: cam.pos.extend(far).to_array(),
             sun_dir: v4(Vec3::from(env.sun_dir).normalize_or_zero().to_array(), 0.0),
             sun_color: v4(env.sun_color, 0.0),
             ambient: v4(env.ambient, 0.0),
@@ -2146,6 +2166,131 @@ mod sky_tests {
         s.sky.push(Instance { mesh: 0, transform: IDENTITY });
         s.sky_spin.extend(spin.map(|d| SkySpin { instance: 0, axis: [0.0, 0.0, 1.0], pivot: [0.0; 3], degrees_per_second: d }));
         s
+    }
+
+    #[test]
+    fn sky_material_pipes_preserve_existing_slots_and_cover_every_blend() {
+        assert_eq!((ENV_PIPE, ENV_BLEND_PIPE, FADE_PIPE, SPRITE_PIPE, NATIVE_BLEND_PIPE), (12, 14, 16, 20, 22));
+        assert_eq!((MESH_EFFECT_PIPE, MESH_EFFECT_STRIDE), (31, 31), "actor effect slots must not move");
+        assert_eq!(native_liquid::PIPE, SKY_LAST_PIPE + 1);
+        let mut slots = std::collections::HashSet::new();
+        for blend in [Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive, Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha, Blend::SourceColorOne] {
+            for two_sided in [false, true] {
+                let sub = Submesh { blend, two_sided, ..Submesh::new(vec![], None) };
+                let pipe = sky_material_pipe(&sub);
+                assert!(pipe < native_liquid::PIPE, "{blend:?}: sky must not select a liquid pipeline");
+                assert!(slots.insert(pipe), "{blend:?}: each sky blend/cull combination needs its own pipeline");
+                if two_sided && (blend as usize) < 4 {
+                    assert_eq!(pipe, SKY_PIPE + blend as usize);
+                } else if two_sided && blend == Blend::SourceColorOne {
+                    assert_eq!(pipe, SKY_GLOW_PIPE);
+                }
+            }
+        }
+    }
+
+    /// Randy 0x10041ede defaults to CULL_CW (2); only explicit CULL_NONE (1) disables it.
+    #[test]
+    fn sky_backfaces_cull_unless_material_explicitly_disables_culling() {
+        let mut sky = scene([0.0; 2], None);
+        sky.meshes[0].submeshes[0].texture = None;
+        for vertex in &mut sky.meshes[0].vertices {
+            vertex.color = [1.0, 0.0, 0.0, 1.0];
+        }
+        let mut empty = sky.clone();
+        empty.sky.clear();
+        let shot = |s: &Scene| pixels(s, 0.0, "sky-culling").expect("sky culling regression requires an offscreen GPU adapter");
+        let background = shot(&empty);
+        // HorizonClouds 227651 inherits culling; rim 227745 explicitly sets CULL_NONE.
+        for blend in [Blend::AlphaBlend, Blend::SourceColorOne] {
+            sky.meshes[0].submeshes[0].blend = blend;
+            sky.meshes[0].submeshes[0].two_sided = false;
+            let front = shot(&sky);
+            assert_ne!(front, background, "{blend:?}: front faces must remain visible");
+            for triangle in sky.meshes[0].submeshes[0].indices.as_chunks_mut::<3>().0 {
+                triangle.swap(1, 2);
+            }
+            assert_eq!(shot(&sky), background, "{blend:?}: default sky material must cull back faces");
+            sky.meshes[0].submeshes[0].two_sided = true;
+            assert_eq!(shot(&sky), front, "{blend:?}: CULL_NONE must retain back faces");
+            for triangle in sky.meshes[0].submeshes[0].indices.as_chunks_mut::<3>().0 {
+                triangle.swap(1, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn sky_fog_scales_with_scenery_distance_but_not_local_fog_end() {
+        let mut s = scene([0.0; 2], None);
+        s.meshes[0].submeshes[0].texture = None;
+        s.meshes[0].submeshes[0].sky_fog = true;
+        for v in &mut s.meshes[0].vertices {
+            v.normal = [0.75, 0.0, 0.0]; // same angular geometry, distance = 75% of live far
+            v.color = [1.0, 0.0, 0.0, 1.0];
+        }
+        let mut previous = None;
+        for scenery in [1.0, 2.0] {
+            let far = 800.0 * scenery;
+            s.lens = Some(ao_scene::Lens { far: Some(far), ..Default::default() });
+            s.environment = Some(ao_scene::Environment {
+                sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 0.0, fog_end: far,
+                ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 0.0,
+            });
+            s.fog_model = None;
+            let Some(clear) = pixels(&s, 0.0, "sky_fog_scenery") else { return };
+            let clear = centre(&clear);
+            assert!((63..=65).contains(&clear), "75% native gamma-space fog leaves 25% red: {clear}");
+            if let Some(previous) = previous {
+                assert_eq!(clear, previous, "scenery 1x/2x must retain the same relative sky fog");
+            }
+            previous = Some(clear);
+            s.fog_model = Some(ao_scene::FogModel {
+                far, volumes: vec![ao_scene::FogVolume {
+                    pos: [0.0; 3], color: [0.0; 3], density: 0.25, radius: 100.0, room: None,
+                }], ..Default::default()
+            });
+            let Some(dense) = pixels(&s, 0.0, "sky_fog_volume") else { return };
+            assert!(centre(&dense) + 50 < clear, "a local fog volume must shorten fog end, not sky distance");
+        }
+    }
+
+    #[test]
+    fn sky_source_color_one_fogs_source_without_darkening_black_texels() {
+        let mut s = scene([0.0; 2], None);
+        let key = s.meshes[0].submeshes[0].texture.unwrap();
+        s.textures.get_mut(&key).unwrap().rgba = vec![0, 0, 0, 255, 255, 255, 255, 255];
+        let sub = &mut s.meshes[0].submeshes[0];
+        sub.blend = Blend::SourceColorOne;
+        sub.texture_clamp = true;
+        sub.sky_fog = true;
+        sub.sky_fog_color = Some([0.0; 3]);
+        s.lens = Some(ao_scene::Lens { far: Some(800.0), ..Default::default() });
+        s.environment = Some(ao_scene::Environment {
+            sky_color: [0.02; 3], fog_color: [0.8; 3], fog_start: 0.0, fog_end: 800.0,
+            ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 0.0,
+        });
+        for v in &mut s.meshes[0].vertices {
+            v.normal = [0.5, 0.0, 0.0]; // 50% fog at live far, independent of mesh position
+            v.color = [1.0; 4];
+        }
+        let shot = |s: &Scene, name: &str| pixels(s, 0.0, name).expect("source fog regression requires an offscreen GPU adapter");
+        let mut background = s.clone();
+        background.sky.clear();
+        let destination = centre(&shot(&background, "sky_source_fog_background"));
+        assert!(destination > 0, "nonblack destination must expose a darkening overlay");
+        for (u, white, name) in [(-1.0, false, "sky_fog_border"), (0.25, false, "sky_fog_black"), (0.75, true, "sky_fog_white")] {
+            for v in &mut s.meshes[0].vertices {
+                v.uv = [u, 0.5];
+            }
+            let actual = centre(&shot(&s, name));
+            if white {
+                // Fog white to 0.5 in gamma space, then SRCCOLOR/ONE adds 0.5² to destination.
+                let expected = f32::from(destination) + 0.25 * 255.0;
+                assert!((f32::from(actual) - expected).abs() <= 2.0, "source fog must precede self-multiply: got {actual}, expected {expected}");
+            } else {
+                assert_eq!(actual, destination, "{name}: fogged black source must leave destination untouched");
+            }
+        }
     }
 
     /// `GameWaveCurve2` is 1 at t = 0 and 0 at t = 3.6 s (phase 0, 50 deg/s): the wave driven uv offset, rotation and the sun fan

@@ -5,10 +5,10 @@
 //! Only objects whose formulas are literally the template ones are accepted (each field is compared after whitespace
 //! normalisation); anything else is skipped rather than guessed.
 
-use super::layers::{object_scale, position_expr};
+use super::layers::{mesh_index, object_scale, position_expr};
 use super::script::{self, Ctx, Obj};
 use crate::character::NameTable;
-use crate::mesh::{decode_mesh_object_space, MESH_TYPE};
+use crate::mesh::{decode_generic_mesh, MESH_TYPE};
 use ao_rdb::RecordStore;
 use ao_scene::{Counter, Instance, Mover, MoverState, RotTerm, Scene};
 use std::collections::HashMap;
@@ -114,23 +114,24 @@ pub fn mover_of(objs: &[Obj], o: &Obj) -> Option<Mover> {
     })
 }
 
-/// Adds the ship `o` (mesh in object space, shared per mesh name through `meshes`) to `scene.instances` / `scene.movers`,
+/// Adds the ship `o` (with its native generic visual frame, shared through `meshes`) to `scene.instances` / `scene.movers`,
 /// posed at `day_time` with the clock running at 1 game second per second.
-pub fn emit(objs: &[Obj], o: &Obj, store: &RecordStore, names: &NameTable, scene: &mut Scene, meshes: &mut HashMap<String, usize>, day_time: f32) {
+pub fn emit(objs: &[Obj], o: &Obj, store: &RecordStore, names: &NameTable, scene: &mut Scene, meshes: &mut HashMap<String, HashMap<Option<usize>, usize>>, day_time: f32) {
     let Some(mut mover) = mover_of(objs, o) else { return };
     let Some(name) = o.string("Mesh") else { return };
-    let mesh = match meshes.get(name) {
+    let index = mesh_index(o, &Ctx::at(day_time));
+    let mesh = match meshes.get(name).and_then(|versions| versions.get(&index)) {
         Some(&m) => m,
         None => {
             let mut tmp = Scene::default();
             let Some(id) = names.id(MESH_TYPE, name) else { return };
-            if !matches!(decode_mesh_object_space(store, id, &mut tmp), Ok(Some(_))) {
+            if !matches!(decode_generic_mesh(store, id, index, false, &mut tmp), Ok(Some(_))) {
                 return;
             }
             let Some(m) = tmp.meshes.pop() else { return };
             scene.textures.extend(tmp.textures);
             scene.meshes.push(m);
-            meshes.insert(name.to_string(), scene.meshes.len() - 1);
+            meshes.entry(name.to_owned()).or_default().insert(index, scene.meshes.len() - 1);
             scene.meshes.len() - 1
         }
     };

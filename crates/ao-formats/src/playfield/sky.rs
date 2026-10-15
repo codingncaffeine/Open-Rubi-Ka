@@ -24,7 +24,7 @@ mod traffic;
 use std::collections::HashSet;
 use std::path::Path;
 use ao_scene::{Mesh, Scene, Submesh, Vertex};
-use super::environment::{srgb_to_linear, VIEW_DISTANCE};
+use super::environment::srgb_to_linear;
 
 /// `Tweak_GAME_FrozenTime.txt` `CurrentDayTime`: the time `load_playfield` uses.
 pub const DEFAULT_DAY_TIME: f32 = 2648.69;
@@ -305,7 +305,7 @@ impl Sky {
     }
 
     /// Camera-locked sky dome (`Scene::sky`, drawn unlit and unfogged by the renderer): the atmosphere strip's gradient
-    /// fogged at render time with the live fog (the client draws the strip with `FOGENABLE`; `Submesh::sky_fog`, vertex normal.x = distance). Vertex alpha is the strip's
+    /// fogged at render time with the live fog (the client draws the strip with `FOGENABLE`; `Submesh::sky_fog`, vertex normal.x = distance / camera far). Vertex alpha is the strip's
     /// intensity `I`: the dome lets the star dome, dot stars and moons behind it show through at night.
     pub fn dome(&self) -> Mesh {
         const SEG: usize = 24;
@@ -318,7 +318,7 @@ impl Sky {
             // ray from the camera hits the strip (y = 0 @ z = 1000 -> y = 400 @ z = 200 -> y = 400 @ z = -500)
             let s = if e <= 0.0 { 0.0 } else { (1000.0 * tan / (400.0 + 800.0 * tan)).min(1.0) };
             let dist = if e <= 0.0 { 1000.0 } else if s < 1.0 { (400.0 * s).hypot(1000.0 - 800.0 * s) } else { 400.0 / er.sin() };
-            let d = dist / 1000.0 * VIEW_DISTANCE;
+            let d = dist / 1000.0;
             let c = [0, 1, 2].map(|k| bottom[k] * (1.0 - s) + top[k] * s);
             let alpha = self.bottom_i * (1.0 - s) + self.top_i * s;
             for j in 0..=SEG {
@@ -345,8 +345,8 @@ impl Sky {
 
 /// Adds the sky of the playfield's tweak script to `scene.sky`: the atmosphere dome and every `BackgroundSort` object
 /// (see `layers`).
-pub fn emit(sky: &Sky, tweaks: &Tweaks, store: &ao_rdb::RecordStore, scene: &mut Scene, fog_color: [f32; 3], fog_end: f32) {
-    layers::emit(sky, &tweaks.objects(), store, scene, sky.dome(), layers::Fog { color: fog_color, start: super::environment::NEAR, end: fog_end });
+pub fn emit(sky: &Sky, tweaks: &Tweaks, store: &ao_rdb::RecordStore, scene: &mut Scene) {
+    layers::emit(sky, &tweaks.objects(), store, scene, sky.dome());
 }
 
 /// `Color` (sRGB) of the playfield's `e_ClearScreen` object (`Tweak_BlackBackground`, `Color 0xFFFF0000`, included by
@@ -409,7 +409,7 @@ impl SkyClock {
         sky.set_weather(weather_at(&self.env, self.day, day_time));
         let mut environment = super::environment::to_scene(&self.env, true, Some(&sky));
         environment.sky_color = clear_color(&self.tweaks).map_or(environment.sky_color, |c| c.map(srgb_to_linear));
-        emit(&sky, &self.tweaks, &self.store, &mut scene, environment.fog_color, environment.fog_end);
+        emit(&sky, &self.tweaks, &self.store, &mut scene);
         scene.fog_model = Some(super::environment::fog_model(&self.env, Some(&sky), vec![]));
         scene.environment = Some(environment);
         scene.textures.retain(|k, _| self.sent.insert(*k));

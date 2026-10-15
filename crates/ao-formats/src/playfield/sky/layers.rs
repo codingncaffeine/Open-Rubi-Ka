@@ -9,7 +9,7 @@ use super::aurora;
 use super::script::{self, Ctx, Obj, Quat};
 use super::srgb_to_linear;
 use crate::character::NameTable;
-use crate::mesh::{decode_mesh_object_space, MESH_TYPE};
+use crate::mesh::{decode_generic_mesh, MESH_TYPE};
 use crate::texture::decode_texture;
 use ao_rdb::RecordStore;
 use ao_scene::{Blend, Instance, Mesh, Scene, SkyColors, SkySpin, SkyWaveSpin, Submesh, TextureKey, Vertex, IDENTITY, WHITE};
@@ -24,15 +24,7 @@ fn scene(v: [f32; 3]) -> [f32; 3] {
     [v[0], v[1], -v[2]]
 }
 
-/// The playfield's fog (linear colour, metres).
-pub struct Fog {
-    pub color: [f32; 3],
-    pub start: f32,
-    pub end: f32,
-}
-
 struct Builder<'a> {
-    fog: Fog,
     store: &'a RecordStore,
     names: NameTable,
     ctx: Ctx,
@@ -43,7 +35,7 @@ struct Builder<'a> {
 }
 
 /// Adds the sky of `objs` (and the atmosphere `dome`) to `scene.sky`, back to front.
-pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Scene, dome: Mesh, fog: Fog) {
+pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Scene, dome: Mesh) {
     let Ok(names) = NameTable::load(store) else { return };
     let sorts = objs.iter().find(|o| o.name == "BackgroundSort").map_or_else(HashMap::new, |o| {
         o.fields.iter().filter_map(|(k, v)| Some((k.clone(), script::eval(v, &|_| None)? as u32))).collect()
@@ -61,7 +53,7 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
         waves: [0.0; 16],
     };
     scene.water_light=water_light(objs,&ctx);
-    let mut b = Builder { fog, store, names, ctx, objs, sky, scene, sorts };
+    let mut b = Builder { store, names, ctx, objs, sky, scene, sorts };
     // (sort, mesh, constant spin, aurora simulation, wave driven turns)
     type Layer = (u32, Mesh, Option<SkySpin>, Option<(ao_scene::aurora::GloomySky, f32)>, Vec<SkyWaveSpin>, Option<f32>);
     let mut layers: Vec<Layer> = vec![(b.sorts.get("Atmosphere").copied().unwrap_or(ATMOSPHERE_SORT), dome, None, None, vec![], None)];
@@ -185,7 +177,7 @@ pub fn emit_distant(objs: &[Obj], store: &RecordStore, scene: &mut Scene, day_ti
         }
         let (Some(pos), Some(id)) = (o.field("Position").and_then(|e| position_expr(objs, o, e)), o.string("Mesh").and_then(|m| names.id(MESH_TYPE, m))) else { continue };
         let mut tmp = Scene::default();
-        if !matches!(decode_mesh_object_space(store, id, &mut tmp), Ok(Some(_))) {
+        if !matches!(decode_generic_mesh(store, id, mesh_index(o, &ctx), false, &mut tmp), Ok(Some(_))) {
             continue;
         }
         let Some(mut mesh) = tmp.meshes.pop() else { continue };
@@ -213,20 +205,39 @@ pub(super) fn is_far_away(o: &Obj) -> bool {
     o.field("ScaleType").is_some_and(|t| t.trim() == "e_ScaleVisibleFarAway")
 }
 
-/// The scale the client applies to a world-space mesh object. `GenericMeshObject` (`FUN_1005e716` @0x1005e716, DisplaySystem)
-/// reads the `Scale` field **only while `ScaleType` is 0** (`FUN_1001d156` = `RRefFrame::SetScale`); `e_ScaleByViewDistance` = 1,
-/// `e_ScaleByViewDistanceAndDirectionHeigh` = 2 and `e_ScaleVisibleFarAway` = 3 (value blocks of the FXS enum parser
-/// @0x1000b015 / 0x1000c7f8 / 0x1000c810 / 0x1000c827) do not use the `Scale` field either: `FUN_1005e716` tests `type == 0`
-/// only, and for type 3 the per-frame `FUN_1005c124` calls `SetScale` itself ([`ao_scene::far_away_pose`]). Outside its
-/// 950..5000 m window that scale is 1, so the object keeps the reference frame's default scale 1 (the 2 ships with
-/// `Scale 0.70`, `Alien_Craft_War_04/05`, are drawn at 1). The default of 1 is [INFERENCE]: the base `RRefFrame_t`
-/// constructor lives in randy31.dll.
+/// Base scale of world-space distant scenery. The installed world callers use
+/// type 3; `1005c124` sets their per-frame scale via [`ao_scene::far_away_pose`].
+/// Types 1/2 are processed separately for normalized camera-locked sky geometry.
 pub(super) fn object_scale(o: &Obj, ctx: &Ctx) -> f32 {
     if o.field("ScaleType").is_some_and(|t| t.trim().starts_with("e_Scale")) {
         1.0
     } else {
         script::float(o, ctx, "Scale", 1.0)
     }
+}
+
+pub(super) fn mesh_index(o: &Obj, ctx: &Ctx) -> Option<usize> {
+    o.field("MeshIndex").and_then(|e| script::eval_field(o, ctx, e, 0)).map(|v| v as usize)
+}
+
+/// Camera-locked geometry is authored at far=1000; projection cancels the common
+/// far/1000 scale. Type 2 additionally scales by the rotated InitDirection height
+/// (DisplaySystem1005c334; constants1008c078=.9,10089e20=.1).
+fn sky_scale(o: &Obj, ctx: &Ctx, rotation: Quat) -> f32 {
+    let scale = script::float(o, ctx, "Scale", 1.0);
+    if o.field("ScaleType").is_some_and(|t| t.trim() == "e_ScaleByViewDistanceAndDirectionHeigh") {
+        let direction = o.field("InitDirection").and_then(|e| script::vector(o, ctx, e, 0)).unwrap_or([0.0; 3]);
+        let height = rotation.rotate(direction)[1];
+        scale * (0.1 + 0.9 * if height <= 0.0 { 1.0 } else { 1.0 - height })
+    } else {
+        scale
+    }
+}
+
+fn sky_offset(o: &Obj, ctx: &Ctx) -> [f32; 3] {
+    // GenericMesh1005c334 uses Position*far/1000 (double1008aa78=1000),
+    // the same projection-relative units as its geometry and rotation pivots.
+    o.field("Position").and_then(|e| script::vector(o, ctx, e, 0)).unwrap_or([0.0; 3])
 }
 
 /// AO <-> scene (z mirrored).
@@ -301,47 +312,28 @@ impl Builder<'_> {
         }
     }
 
-    /// `FOGENABLE`: the linear fog of the playfield, evaluated per vertex at the distance the object's authored radius has at
-    /// the view distance (like the atmosphere strip). Opaque and blended layers get a fog coloured overlay (`FOGCOLOR`,
-    /// default the world fog colour); additive ones fade out (their fog colour is black). Without an explicit state,
-    /// ground scenery sorted at or after `BackgroundSort.Horizon` is fogged, everything before it is not [GUESS: the
-    /// client's default fog state is not stored in the scripts; the horizon map must not show as a brown band behind a
-    /// fogged terrain]; `SunlightType e_SunLight_CloudLayer*` objects (the horizon cloud bank, atmospheric, not ground
-    /// terrain) are excluded from that default: `HorizonClouds` sets no `FOGENABLE` of its own, and the guess otherwise
-    /// adds a near-opaque (vertex `amount` ~0.99 at this mesh's authored radius) fog-coloured overlay that flattens its
-    /// textured cloud detail into a solid colour (the grey sheet half of the daytime ICC pf 4582 report).
+    /// Fog is applied to the sampled source RGB before the native blend equation.
+    /// In particular, black fog on `SourceColorOne` must not become a black
+    /// alpha-blended overlay: that darkens the destination even at black texels.
+    /// The scenery-at/after-Horizon default remains a guess; cloud layers without
+    /// explicit FOGENABLE stay excluded from that default.
     fn fogged(&self, o: &Obj, mut mesh: Mesh) -> Mesh {
         let horizon = self.sorts.get("Horizon").copied().unwrap_or(u32::MAX);
         let cloud_layer = o.field("SunlightType").map(str::trim).is_some_and(|t| t.starts_with("e_SunLight_CloudLayer"));
         if !o.flag("FOGENABLE").unwrap_or(!cloud_layer && self.sort(o) >= horizon) {
             return mesh;
         }
-        let amount = |v: &Vertex| {
-            let d = v.pos.iter().map(|c| c * c).sum::<f32>().sqrt() / 1000.0 * super::VIEW_DISTANCE;
-            ((d - self.fog.start) / (self.fog.end - self.fog.start).max(1e-3)).clamp(0.0, 1.0)
-        };
-        let colour = match o.states.get("FOGCOLOR").and_then(|c| u32::from_str_radix(c.trim_start_matches("0x"), 16).ok()) {
-            Some(c) => [16, 8, 0].map(|s| srgb_to_linear(((c >> s) & 255) as f32 / 255.0)),
-            None => self.fog.color,
-        };
-        let n = mesh.vertices.len() as u32;
-        let overlay: Vec<Vertex> = mesh.vertices.iter().map(|v| Vertex { color: [colour[0], colour[1], colour[2], amount(v) * v.color[3]], ..*v }).collect();
-        let originals = mesh.submeshes.len();
+        let colour = o.states.get("FOGCOLOR")
+            .and_then(|c| u32::from_str_radix(c.trim_start_matches("0x"), 16).ok())
+            .map(|c| [16, 8, 0].map(|s| srgb_to_linear(((c >> s) & 255) as f32 / 255.0)));
+        // mesh_object has already consumed the lighting normals. The renderer
+        // converts this normalized distance to metres using live camera far.
         for v in &mut mesh.vertices {
-            let f = amount(v);
-            if mesh.submeshes.iter().any(|s| s.blend == Blend::Additive) {
-                v.color[3] *= 1.0 - f;
-            }
+            v.normal[0] = v.pos.iter().map(|c| c * c).sum::<f32>().sqrt() / 1000.0;
         }
-        if mesh.submeshes.iter().all(|s| s.blend == Blend::Additive) {
-            return mesh;
-        }
-        mesh.vertices.extend(overlay);
-        for i in 0..originals {
-            if mesh.submeshes[i].blend != Blend::Additive {
-                let idx = mesh.submeshes[i].indices.iter().map(|k| k + n).collect();
-                mesh.submeshes.push(Submesh { two_sided: true, blend: Blend::AlphaBlend, ..Submesh::new(idx, None) });
-            }
+        for submesh in &mut mesh.submeshes {
+            submesh.sky_fog = true;
+            submesh.sky_fog_color = colour;
         }
         mesh
     }
@@ -351,24 +343,13 @@ impl Builder<'_> {
     fn mesh_object(&mut self, o: &Obj) -> Option<Mesh> {
         let id = self.names.id(MESH_TYPE, o.string("Mesh")?)?;
         let mut tmp = Scene::default();
-        // the visual draws the mesh data as stored; the tweak `Rotation` supplies the orientation (Max Z-up -> world)
-        decode_mesh_object_space(self.store, id, &mut tmp).ok()??;
+        let camera_locked = o.field("PositionType").is_some_and(|p| p.trim() == "e_LockToCamera");
+        decode_generic_mesh(self.store, id, mesh_index(o, &self.ctx), camera_locked, &mut tmp).ok()??;
         let mut mesh = tmp.meshes.pop()?;
         self.scene.textures.extend(tmp.textures);
         let q = o.field("Rotation").and_then(|e| script::rotation(o, &self.ctx, e, 0)).unwrap_or(Quat::IDENTITY);
-        // `InitDirection`: where the object lies before `Rotation` (the moons: -X, the mesh itself is authored towards -Z)
-        let q = match o.field("InitDirection").and_then(|e| script::vector(o, &self.ctx, e, 0)) {
-            Some(init) => {
-                let mut c = mesh.vertices.iter().fold([0.0f32; 3], |a, v| [a[0] + v.pos[0], a[1] + v.pos[1], a[2] - v.pos[2]]);
-                let l = c.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
-                c = c.map(|v| v / l);
-                let il = init.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
-                Quat::between(c, init.map(|v| v / il)).then(q)
-            }
-            None => q,
-        };
-        let scale = script::float(o, &self.ctx, "Scale", 1.0);
-        let offset = o.field("Position").and_then(|e| script::vector(o, &self.ctx, e, 0)).unwrap_or([0.0; 3]);
+        let scale = sky_scale(o, &self.ctx, q);
+        let offset = sky_offset(o, &self.ctx);
         let light = self.light(o);
         let lit = o.flag("LIGHTING") != Some(false);
         let gain = if o.states.get("TSS_COLOROP").is_some_and(|v| v == "e_D3DTOP_MODULATE2X") { 2.0 } else { 1.0 };
@@ -404,8 +385,12 @@ impl Builder<'_> {
         for s in &mut mesh.submeshes {
             s.uv_scroll = uv_scroll;
             s.uv_wave = uv_wave;
-            s.two_sided = true;
             s.blend = object_blend(o, s.blend);
+            match o.states.get("CULLMODE").map(String::as_str) {
+                Some("e_D3DCULL_NONE") => s.two_sided = true,
+                Some("e_D3DCULL_CW") => s.two_sided = false,
+                _ => {}
+            }
             if !lit {
                 s.base_color = WHITE;
             }
@@ -430,7 +415,7 @@ impl Builder<'_> {
         let q0 = script::rotation(o, &self.ctx, e, 0)?;
         let q1 = script::rotation(o, &Ctx { delta_time: 1.0, ..self.ctx.clone() }, e, 0)?;
         let (axis, degrees) = q1.spin_from(q0)?;
-        let offset = o.field("Position").and_then(|e| script::vector(o, &self.ctx, e, 0)).unwrap_or([0.0; 3]);
+        let offset = sky_offset(o, &self.ctx);
         // AO space is left handed: the same turn about the mirrored axis runs the other way in scene space
         Some(SkySpin { instance: 0, axis: scene(axis), pivot: scene(offset), degrees_per_second: -degrees })
     }
@@ -641,7 +626,7 @@ impl Lcg {
 fn wave_spins(o: &Obj, base: &Ctx) -> Vec<SkyWaveSpin> {
     let Some(e) = o.field("Rotation") else { return vec![] };
     let Some(q0) = script::rotation(o, base, e, 0) else { return vec![] };
-    let offset = o.field("Position").and_then(|e| script::vector(o, base, e, 0)).unwrap_or([0.0; 3]);
+    let offset = sky_offset(o, base);
     wave_curves_read(o, e, 0)
         .into_iter()
         .filter_map(|k| {
@@ -691,6 +676,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_locked_scale_and_position_use_projection_relative_units() {
+        let objects = script::parse_objects("Object Moon\n{\n Float Scale: 11\n Unsigned ScaleType: e_ScaleByViewDistanceAndDirectionHeigh\n Vector InitDirection: v( -1,0,0 )\n Vector Position: v( 1,2,3 )\n Unsigned PositionType: e_LockToCamera\n}\n");
+        let o = &objects[0];
+        let ctx = Ctx::at(0.0);
+        let close = |a: f32, b: f32| assert!((a - b).abs() < 1e-5, "{a} != {b}");
+        close(sky_scale(o, &ctx, Quat::IDENTITY), 11.0);
+        // Rotation alone determines height; the inherited mesh frame must not
+        // rotate InitDirection a second time.
+        close(sky_scale(o, &ctx, Quat::axis_angle([0.0, 0.0, 1.0], -90.0)), 1.1);
+        close(sky_scale(o, &ctx, Quat::axis_angle([0.0, 0.0, 1.0], 90.0)), 11.0);
+        close(sky_scale(o, &ctx, Quat::axis_angle([0.0, 0.0, 1.0], -30.0)), 6.05);
+        assert_eq!(sky_offset(o, &ctx), [1.0, 2.0, 3.0]);
+        let mut world = o.clone();
+        world.fields.insert("PositionType".into(), "e_World".into());
+        assert_eq!(sky_offset(&world, &ctx), [1.0, 2.0, 3.0]);
+        world.fields.insert("ScaleType".into(), "e_ScaleByViewDistance".into());
+        close(sky_scale(&world, &ctx, Quat::IDENTITY), 11.0);
+    }
+
+    #[test]
     fn water_light_uses_authored_current_not_ground_or_unused_tracks() {
         let make=|current:&str|script::parse_objects(&format!("Object SunLight\n{{\n Quaternion WaterLightDirection: GAME.Sun1Rotation\n Float WaterLightR [2]: 0.25,0.75\n Float WaterLightG [2]: 0.5,1\n Float WaterLightB [2]: 0.75,0.25\n Vector WaterLightCurrent: {current}\n}}\n"));
         let ctx=Ctx::at(0.0);
@@ -708,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn scale_field_is_ignored_unless_scale_type_is_zero() {
+    fn distant_world_scale_field_is_ignored_unless_scale_type_is_zero() {
         let obj = |ty: Option<&str>| {
             let mut o = Obj::default();
             o.fields.insert("Scale".into(), "0.70".into());
@@ -805,19 +810,51 @@ Object VortexHorizon
             waves: [0.0; 16],
         };
         let mut scene = Scene::default();
-        let fog = Fog { color: [0.3, 0.45, 0.7], start: 0.5, end: 600.0 };
-        let mut b = Builder { fog, store: &store, names, ctx, objs: &objs, sky: &sky, scene: &mut scene, sorts };
+        let mut b = Builder { store: &store, names, ctx, objs: &objs, sky: &sky, scene: &mut scene, sorts };
 
         let clouds = objs.iter().find(|o| o.name == "HorizonClouds").expect("HorizonClouds");
         let mesh = b.mesh_object(clouds).expect("HorizonClouds mesh");
+        assert!(mesh.submeshes.iter().all(|s| !s.two_sided), "base cloud material keeps native default culling");
         let n_submeshes = mesh.submeshes.len();
         let fogged = b.fogged(clouds, mesh);
         assert_eq!(fogged.submeshes.len(), n_submeshes, "CloudLayer sky objects must not be swept into the ground-fog default guess");
+        assert!(fogged.submeshes.iter().all(|s| !s.sky_fog));
+        let mut no_cull = clouds.clone();
+        no_cull.states.insert("CULLMODE".into(), "e_D3DCULL_NONE".into());
+        assert!(b.mesh_object(&no_cull).unwrap().submeshes.iter().all(|s| s.two_sided));
+        let horizon = objs.iter().find(|o| o.name == "Horizon").expect("Horizon");
+        let dish = b.mesh_object(horizon).expect("horizon dish");
+        let bounds: [[f32; 2]; 3] = std::array::from_fn(|k| {
+            dish.vertices.iter().fold([f32::INFINITY, f32::NEG_INFINITY], |[lo, hi], v| [lo.min(v.pos[k]), hi.max(v.pos[k])])
+        });
+        assert!(bounds[1][1] - bounds[1][0] < 200.0, "native factory + source-ordered tweak must keep the dish horizontal: {bounds:?}");
+        assert!(bounds[0][1] - bounds[0][0] > 1900.0 && bounds[2][1] - bounds[2][0] > 1900.0, "{bounds:?}");
 
         let rim = objs.iter().find(|o| o.name == "HorizonCloudsRim").expect("HorizonCloudsRim");
         let rim_mesh = b.mesh_object(rim).expect("HorizonCloudsRim mesh");
+        assert!(rim_mesh.submeshes.iter().all(|s| s.two_sided), "rim material explicitly sets CULL_NONE");
         let reds: Vec<f32> = rim_mesh.vertices.iter().map(|v| v.color[0]).collect();
         let (min_r, max_r) = reds.iter().fold((f32::MAX, f32::MIN), |(mn, mx), &r| (mn.min(r), mx.max(r)));
         assert!(max_r - min_r > 0.05, "CloudLayer lighting must vary with the surface normal like CloudLightDirection implies, not be a flat tint ({min_r}..{max_r})");
+        let original_vertices = rim_mesh.vertices.clone();
+        let mut culled = rim.clone();
+        culled.states.insert("CULLMODE".into(), "e_D3DCULL_CW".into());
+        assert!(b.mesh_object(&culled).unwrap().submeshes.iter().all(|s| !s.two_sided));
+        let original_indices = rim_mesh.submeshes[0].indices.clone();
+        let original_texture = rim_mesh.submeshes[0].texture;
+        let fogged = b.fogged(rim, rim_mesh);
+        assert_eq!(fogged.submeshes.len(), 1, "source fog must never add a destination-darkening overlay");
+        assert_eq!(fogged.vertices.len(), original_vertices.len());
+        let material = &fogged.submeshes[0];
+        assert_eq!(material.blend, Blend::SourceColorOne);
+        assert_eq!(material.texture, original_texture);
+        assert_eq!(material.indices, original_indices);
+        assert!(material.sky_fog);
+        assert_eq!(material.sky_fog_color, Some([0.0; 3]));
+        for (v, original) in fogged.vertices.iter().zip(original_vertices) {
+            assert_eq!(v.color, original.color, "source fog must preserve the texture/vertex alpha mask");
+            let distance = v.pos.iter().map(|c| c * c).sum::<f32>().sqrt() / 1000.0;
+            assert!((v.normal[0] - distance).abs() < 1e-6);
+        }
     }
 }

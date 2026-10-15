@@ -1,5 +1,5 @@
 //! The part of the FXS tweak language that the sky objects use: `Object` blocks, left-to-right expressions and
-//! quaternions (`v(axis), degrees`, `q(w,x,y,z)`, `a [ROT] b`).
+//! quaternions (`v(axis), degrees`, `q(x,y,z,w)`, `a [ROT] b`).
 //!
 //! Evaluation context (offline, no game running): `GAME.CurrentDayTime` / `DayTimeFactor` come from the requested time of
 //! day; every other value the game writes every frame (`GameDeltaTime`, wind, the `Counter` fields that integrate delta
@@ -297,18 +297,7 @@ impl Quat {
         Quat { w: c, x: axis[0] / len * s, y: axis[1] / len * s, z: axis[2] / len * s }
     }
 
-    /// Shortest rotation taking the unit vector `from` to the unit vector `to`.
-    pub fn between(from: [f32; 3], to: [f32; 3]) -> Quat {
-        let dot: f32 = (0..3).map(|k| from[k] * to[k]).sum();
-        let cross = [from[1] * to[2] - from[2] * to[1], from[2] * to[0] - from[0] * to[2], from[0] * to[1] - from[1] * to[0]];
-        if dot < -0.9999 {
-            return Quat::axis_angle([0.0, 1.0, 0.0], 180.0);
-        }
-        let l = ((1.0 + dot) * 2.0).sqrt();
-        Quat { w: l / 2.0, x: cross[0] / l, y: cross[1] / l, z: cross[2] / l }
-    }
-
-    /// Apply `self`, then `next` (`next [ROT] self` in script order).
+    /// Apply `self`, then `next` (`self [ROT] next` in script order).
     pub fn then(self, n: Quat) -> Quat {
         Quat {
             w: n.w * self.w - n.x * self.x - n.y * self.y - n.z * self.z,
@@ -459,11 +448,12 @@ pub fn rotation(obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<Quat> {
     if depth == 0 {
         reset_budget();
     }
-    // `a [ROT] b` is the Hamilton product `a * b`: `b` acts first (FXS `FUN_10004f91` computes `param * this`; the only
-    // order that stands Old Athen's / the horizon map's Max Z-up meshes upright under `Rz(90) [ROT] Ry(90)`)
+    // FXS10008a11 appends operands in source order;10008914 traverses forward.
+    // Evaluator10005600 calls10004f91 with accumulator=this,RHS=param, computing
+    // RHS*accumulator: `a [ROT] b` applies a first, then b.
     expr.split("[ROT]").try_fold(Quat::IDENTITY, |total, term| {
         spend()?;
-        Some(term_rotation(obj, ctx, term.trim(), depth)?.then(total))
+        Some(total.then(term_rotation(obj, ctx, term.trim(), depth)?))
     })
 }
 
@@ -579,13 +569,15 @@ Object Next
     }
 
     #[test]
-    fn rot_operator_acts_right_operand_first_like_the_real_horizon_objects() {
-        // Tweak_Rubi-Ka_Horizon: `Rz(90) [ROT] Ry(90)` must carry the Max Z-up mesh's up axis (+z) to world +y
+    fn rot_operator_applies_left_operand_first() {
+        // Source-ordered FXS evaluation computes b*a, not the old inferred a*b.
         let text = "Object H\n{\n  Quaternion U1: v( 0,0,1 ), 90\n  Quaternion U2: v( 0,1,0 ), 90\n  Quaternion Rotation: This.U1 [ROT] This.U2\n}\n";
         let o = parse_objects(text);
         let q = rotation(&o[0], &ctx(0.0), o[0].field("Rotation").unwrap(), 0).unwrap();
-        let up = q.rotate([0.0, 0.0, 1.0]);
-        assert!((up[1].abs() - 1.0).abs() < 1e-5 && up[0].abs() < 1e-5 && up[2].abs() < 1e-5, "{up:?}");
+        let up = q.rotate([1.0, 0.0, 0.0]);
+        assert!((up[1] - 1.0).abs() < 1e-5 && up[0].abs() < 1e-5 && up[2].abs() < 1e-5, "{up:?}");
+        let right = q.rotate([0.0, 0.0, 1.0]);
+        assert!((right[0] - 1.0).abs() < 1e-5 && right[1].abs() < 1e-5 && right[2].abs() < 1e-5, "{right:?}");
     }
 
     #[test]

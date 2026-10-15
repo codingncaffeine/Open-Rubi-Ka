@@ -160,7 +160,7 @@ pub fn load_playfield_report_on_day(store: &RecordStore, client_dir: &Path, id: 
         environment.sky_color = c.map(environment::srgb_to_linear);
     }
     if let (Some(s), Some(t), true) = (&sky, &tweaks, rec.is_outdoor()) {
-        sky::emit(s, t, store, &mut scene, environment.fog_color, environment.fog_end);
+        sky::emit(s, t, store, &mut scene);
         sky::emit_distant(t, store, &mut scene, day_time);
     }
     scene.environment = Some(environment);

@@ -5,7 +5,7 @@ use super::{Renderer, Vec3};
 use crate::gpu_stats::GpuStatsExt;
 
 // The two native passes follow the final ordinary/sky pipeline, not the native blend block.
-pub(super) const PIPE: usize = super::SKY_GLOW_PIPE + 1;
+pub(super) const PIPE: usize = super::SKY_LAST_PIPE + 1;
 
 pub(super) struct LiquidRun {
     pub source: Surface,
