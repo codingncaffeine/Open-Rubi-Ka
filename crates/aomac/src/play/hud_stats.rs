@@ -1555,6 +1555,15 @@ mod tests {
             let id = ao_net::n3::inventory::item_identity(slot);
             assert_eq!(hud.take_info_urls(), [format!("itemid://{}/{}", id.kind, id.instance)]);
             assert!(hud.take_outbox().is_empty());
+            let ctrl = ao_gui::Modifiers { ctrl: true, ..Default::default() };
+            for _ in 0..2 {
+                hud.input(&mut gui, &zone, &InputEvent::MouseDown { x, y, button }, ctrl);
+                assert!(hud.dnd.press.is_some(), "Ctrl keeps ordinary item press/drag handling");
+                hud.input(&mut gui, &zone, &InputEvent::MouseUp { x, y, button }, ctrl);
+                hud.event(&mut gui, &Event::CanvasClick { window: w, view: view.into(), x: local.0 + 4.0, y: local.1 + 4.0 }, &zone);
+            }
+            assert!(hud.take_info_urls().is_empty(), "Ctrl-only must not inspect");
+            assert_eq!(hud.take_outbox().len(), 1, "Ctrl-only must not suppress double-click activation");
             hud.input(&mut gui, &zone, &InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Right }, Default::default());
             assert!(hud.take_info_urls().is_empty());
             assert_eq!(hud.take_outbox().len(), 1, "right click activates the same wear/use policy");
