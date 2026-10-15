@@ -1652,6 +1652,10 @@ impl Renderer {
         for r in &mut self.movers {
             r.state = ao_scene::MoverState::settled(&r.mover, day, self.day_time_rate);
         }
+        for a in &mut self.sky.colors {
+            a.sim = ao_scene::aurora::GloomySky::new(a.sim.params.clone());
+            a.sim.advance_to(time);
+        }
     }
 
     /// Scene radius; viewer uses it for speed.
@@ -1755,7 +1759,7 @@ impl Renderer {
             }
         }
         for a in &mut self.sky.colors {
-            a.sim.advance_to(self.time);
+            a.sim.frame_at(self.time);
             let lin = |c: u32, shift: u32| srgb_to_linear(((c >> shift & 255) as f32 / 255.0 * a.gain).min(1.0));
             for (v, &c) in a.vertices.iter_mut().zip(a.sim.vertex_colors()) {
                 v.color = [lin(c, 16), lin(c, 8), lin(c, 0), (c >> 24) as f32 / 255.0];

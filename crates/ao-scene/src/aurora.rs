@@ -12,10 +12,10 @@
 //! 4. the map is copied to the vertex colours (`ClearUpper` zeroes two vertices of every row of the copy);
 //! 5. `Div2Fade2` halves the map and `SubtractFade` takes that much off every alpha (pixel cleared below) for the next frame.
 //!
-//! The client runs this once per rendered frame, so the feedback depends on its frame rate, which is not stored anywhere:
-//! [`STEP`] is an assumed 30 Hz **[UNRESOLVED]**.
+//! The client runs feedback once per rendered frame, independently of elapsed time. Live rendering uses
+//! [`GloomySky::frame_at`]; offline seeking alone assumes 30 Hz because no historical frame times exist.
 
-/// Seconds per simulation frame (assumed client frame rate, 30 Hz) **[UNRESOLVED]**.
+/// Seconds per offline seek frame (assumed historical frame rate, 30 Hz) **[UNRESOLVED]**.
 pub const STEP: f32 = 1.0 / 30.0;
 
 /// One `CurveN*` set of the tweak object.
@@ -107,6 +107,12 @@ impl GloomySky {
             self.step(STEP);
             self.frames += 1;
         }
+    }
+
+    /// One native render callback at an absolute animation time. Even zero elapsed time runs feedback:
+    /// DisplaySystem `10047300` does not quantize, accumulate or skip its map update at a fixed rate.
+    pub fn frame_at(&mut self, time: f32) {
+        self.step((time - self.time).max(0.0));
     }
 
     /// One frame (`FUN_10047300` after the state blob setup).
@@ -333,6 +339,23 @@ mod tests {
         // row r: vertex r*8 and r*8 + 4 - 1
         assert!(v[0] == 0 && v[3] == 0 && v[8] == 0 && v[11] == 0 && v[16] == 0 && v[24] == 0 && v[27] == 0);
         assert_eq!(v[1], 0xffff_ffff);
+    }
+
+    #[test]
+    fn rendered_frames_run_feedback_without_a_thirty_hertz_gate() {
+        let mut p = params();
+        p.clear_each_frame = false;
+        p.div2_fade = [true, false];
+        p.curves.clear();
+        let mut s = GloomySky::new(p);
+        s.map[5] = 0x8040_20fe;
+        s.frame_at(1.0 / 120.0);
+        assert_eq!(s.vertex_colors()[5], 0x4020_107f);
+        s.frame_at(1.0 / 120.0);
+        assert_eq!(s.vertex_colors()[5], 0x2010_083f);
+        s.frame_at(0.2);
+        assert_eq!(s.vertex_colors()[5], 0x1008_041f);
+        assert_eq!(s.time, 0.2);
     }
 
     #[test]
