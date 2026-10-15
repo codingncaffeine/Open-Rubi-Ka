@@ -1791,11 +1791,17 @@ impl Frontend for Play {
         if self.screen == Screen::InWorld {
             let own = self.zone.own().map_or(host.camera.pos.to_array(), |d| zone::scene_pos(d.pos));
             let indicators = super::tags::indicators(&self.zone);
+            let battle_side = self.zone.playfield.filter(|pf| (0x111c..0x1125).contains(pf))
+                .map(|_| self.zone.skill_value(0x29c).or_else(|| self.zone.stat_of(self.zone.char_id as i32, 0x29c)).unwrap_or(2)); // GC1005cb6a.
             let stats = &self.zone.character_stats;
             let org_names = &self.zone.org_names;
-            self.zone.world.name_tags(dt, &mut self.gui, host, own, &indicators, |id| {
-                stats.get(&id).and_then(|s| s.get(&5)).and_then(|org| org_names.get(org)).cloned()
-            });
+            let npc_state = &self.zone.tip_npc_state;
+            self.zone.world.name_tags(dt, &mut self.gui, host, own, &indicators,
+                |id| battle_side.filter(|_| !npc_state.get(&id).copied().unwrap_or(false))
+                    .map(|own| (own, stats.get(&id).and_then(|s| s.get(&0x29c)).copied().unwrap_or(2))),
+                |id| {
+                    stats.get(&id).and_then(|s| s.get(&5)).and_then(|org| org_names.get(org)).cloned()
+                });
             self.fight_draw(host, &mut list);
             if let Some(h) = self.hud.as_mut() {
                 let (mx, my) = h.mouse_pos();

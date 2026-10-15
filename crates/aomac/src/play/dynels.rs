@@ -3104,13 +3104,13 @@ impl Dynels {
     /// The tag of `id` for `kind` (`FUN_10024e14` text and colours, `FUN_10024d5b` position): the text of [`name_tag`], centred on the head
     /// anchor (`GetIndicatorPosition`: attractor 0 + 0.5 m, scaled with the dynel); `None` while the dynel has no model, or its anchor
     /// fails the `x > 0` test of `FUN_10024d5b`. `bar` = health bar inputs `((health, max), colour)`.
-    fn tag_of(&self, id: i32, kind: IndicatorKind, bar: Option<((i32, i32), u32)>) -> Option<Tag> {
+    fn tag_of(&self, id: i32, kind: IndicatorKind, bar: Option<((i32, i32), u32)>, battlestation: Option<(i32, i32)>) -> Option<Tag> {
         let c = self.chars.get(&id)?;
         let Some(Model::Ready { built, .. }) = self.models.get(&c.key) else { return None };
         if !c.in_play || !c.visible || !built.visible || c.parent.is_some() || !tag_anchor_visible(c.pose.pos[0]) {
             return None;
         }
-        let t = name_tag(&NameTagInput { name: &c.name, is_npc: c.npc, flags: c.flags, features: INVALID_STAT, visual_flags: c.visual_flags, side: c.side as i32, ..Default::default() });
+        let t = name_tag(&NameTagInput { name: &c.name, is_npc: c.npc, flags: c.flags, features: INVALID_STAT, visual_flags: c.visual_flags, side: c.side as i32, battlestation, ..Default::default() });
         let p = scene_pos(c.pose.pos);
         Some(Tag {
             id,
@@ -3127,11 +3127,11 @@ impl Dynels {
     /// target's `Flags` bit 0x400 is clear), then — with `ShowAllNames` — the nametag set: every character except the client character
     /// within [`NAME_TAG_RADIUS`] of `own_pos` at the last 2 s rebuild (`HandleNametags`), except the dynels that carry an indicator,
     /// nearest first.
-    fn collect_tags(&mut self, dt: f32, own_pos: [f32; 3], indicators: &[Indicator]) -> Vec<Tag> {
+    fn collect_tags(&mut self, dt: f32, own_pos: [f32; 3], indicators: &[Indicator], battlestation: impl Fn(i32) -> Option<(i32, i32)>) -> Vec<Tag> {
         let mut tags: Vec<Tag> = indicators
             .iter()
             .filter(|i| i.kind != IndicatorKind::Selection || self.chars.get(&i.id).is_some_and(|c| selection_indicator_exists(c.flags)))
-            .filter_map(|i| self.tag_of(i.id, i.kind, i.bar))
+            .filter_map(|i| self.tag_of(i.id, i.kind, i.bar, battlestation(i.id)))
             .collect();
         if !self.show_all_names {
             self.listing.clear();
@@ -3158,14 +3158,15 @@ impl Dynels {
         );
         let mut ids: Vec<(f32, i32)> = listed.iter().filter(|id| !marked(**id)).filter_map(|id| Some((dist2(chars.get(id)?), *id))).collect();
         ids.sort_by(|a, b| a.0.total_cmp(&b.0));
-        tags.extend(ids.into_iter().filter_map(|(_, id)| self.tag_of(id, IndicatorKind::Nametag, None)));
+        tags.extend(ids.into_iter().filter_map(|(_, id)| self.tag_of(id, IndicatorKind::Nametag, None, battlestation(id))));
         tags
     }
 
     /// Adds the world-space tags of this frame to `host` (docs/zone/motion.md §6, `play/tags.rs`): `own_pos` = the player's scene
     /// position, `indicators` from [`super::tags::indicators`].
-    pub fn name_tags(&mut self, dt: f32, gui: &mut Gui, host: &mut Host, own_pos: [f32; 3], indicators: &[Indicator], org_name: impl Fn(i32) -> Option<String>) {
-        let mut tags = self.collect_tags(dt, own_pos, indicators);
+    #[allow(clippy::too_many_arguments)]
+    pub fn name_tags(&mut self, dt: f32, gui: &mut Gui, host: &mut Host, own_pos: [f32; 3], indicators: &[Indicator], battlestation: impl Fn(i32) -> Option<(i32, i32)>, org_name: impl Fn(i32) -> Option<String>) {
+        let mut tags = self.collect_tags(dt, own_pos, indicators, battlestation);
         if self.show_org_names {
             for tag in &mut tags {
                 if let Some(name) = org_name(tag.id) {
@@ -3969,11 +3970,11 @@ mod tests {
         }
         // pref off: nothing without indicators
         w.show_all_names = false;
-        assert!(w.collect_tags(0.016, own_pos, &[]).is_empty());
+        assert!(w.collect_tags(0.016, own_pos, &[], |_| None).is_empty());
         // pref on: the characters within 30 m, nearest first, never the client character
         w.own = 25988;
         w.show_all_names = true;
-        let tags = w.collect_tags(0.016, own_pos, &[]);
+        let tags = w.collect_tags(0.016, own_pos, &[], |_| None);
         assert!(tags.len() > 3, "{} tags", tags.len());
         assert!(tags.len() > 3 && tags.iter().all(|t| t.kind == IndicatorKind::Nametag && t.bar.is_none() && t.id != 25988));
         let d = |id: i32| {
@@ -3983,20 +3984,32 @@ mod tests {
         assert!(tags.iter().all(|t| d(t.id) <= NAME_TAG_RADIUS) && tags.windows(2).all(|p| d(p[0].id) <= d(p[1].id)));
         // the set is rebuilt only every 2 s: walking away keeps it, 2 s later it is empty
         let far = [own_pos[0] + 500.0, own_pos[1], own_pos[2]];
-        assert_eq!(w.collect_tags(0.016, far, &[]).len(), tags.len());
-        assert!(w.collect_tags(2.1, far, &[]).is_empty());
+        assert_eq!(w.collect_tags(0.016, far, &[], |_| None).len(), tags.len());
+        assert!(w.collect_tags(2.1, far, &[], |_| None).is_empty());
         // indicators: the selected dynel gets a plate + bar tag first and no plain tag; flags bit 0x400 suppresses the selection one
-        w.collect_tags(2.1, own_pos, &[]);
-        let id = w.collect_tags(0.016, own_pos, &[])[0].id;
+        w.collect_tags(2.1, own_pos, &[], |_| None);
+        let id = w.collect_tags(0.016, own_pos, &[], |_| None)[0].id;
         let sel = Indicator { id, kind: IndicatorKind::Selection, bar: Some(((30, 60), 0x00ff00)) };
-        let t = w.collect_tags(0.016, own_pos, &[sel]);
+        let t = w.collect_tags(0.016, own_pos, &[sel], |_| None);
         assert_eq!((t[0].id, t[0].kind, t[0].bar), (id, IndicatorKind::Selection, Some((32, 0x00ff00))));
         assert_eq!(t.iter().filter(|t| t.id == id).count(), 1);
+        let npc = w.chars[&id].npc;
+        w.chars.get_mut(&id).unwrap().npc = false;
+        w.chars.get_mut(&id).unwrap().flags = 0;
+        let red = w.collect_tags(0.016, own_pos, &[sel], |_| Some((1, 2)));
+        assert_eq!(red.iter().find(|t| t.id == id).unwrap().rgb, 0xff0000);
+        assert_eq!(w.tag_of(id, IndicatorKind::Nametag, None, Some((1, 1))).unwrap().rgb, 0xffffff);
+        w.chars.get_mut(&id).unwrap().npc = true;
+        assert_eq!(w.tag_of(id, IndicatorKind::Nametag, None, Some((1, 2))).unwrap().rgb, 0xffffff, "NPCs do not get BattleStation name tint");
+        w.chars.get_mut(&id).unwrap().npc = false;
+        w.chars.get_mut(&id).unwrap().flags = 1 << 22;
+        assert_eq!(w.tag_of(id, IndicatorKind::Nametag, None, Some((1, 2))).unwrap().rgb, 0x00ee00, "native special-name colour takes precedence");
+        w.chars.get_mut(&id).unwrap().npc = npc;
         w.chars.get_mut(&id).unwrap().flags = 0x400;
-        let t = w.collect_tags(0.016, own_pos, &[sel]);
+        let t = w.collect_tags(0.016, own_pos, &[sel], |_| None);
         assert!(t.iter().all(|t| t.kind == IndicatorKind::Nametag) && t.iter().any(|t| t.id == id));
         w.chars.get_mut(&id).unwrap().in_play = false;
-        assert!(w.collect_tags(0.016, own_pos, &[sel]).iter().all(|t| t.id != id));
+        assert!(w.collect_tags(0.016, own_pos, &[sel], |_| None).iter().all(|t| t.id != id));
         w.chars.get_mut(&id).unwrap().in_play = true;
         let child = ao_net::msg::Identity { kind: CHAR_KIND, instance: id };
         let prop = ao_net::msg::Identity { kind: 0xc76a, instance: -1 };
@@ -4008,20 +4021,20 @@ mod tests {
         };
         relocate(w, ao_net::msg::Identity { kind: CHAR_KIND, instance: 25988 });
         assert!(!w.on_ground(prop));
-        assert!(w.collect_tags(0.016, own_pos, &[sel]).iter().all(|t| t.id != id));
+        assert!(w.collect_tags(0.016, own_pos, &[sel], |_| None).iter().all(|t| t.id != id));
         relocate(w, ao_net::msg::Identity::default());
         assert!(w.on_ground(prop));
         let key = w.chars[&id].key;
         if let Some(Model::Ready { built, .. }) = w.models.get_mut(&key) {
             built.visible = false;
         }
-        assert!(w.collect_tags(0.016, own_pos, &[sel]).iter().all(|t| t.id != id));
+        assert!(w.collect_tags(0.016, own_pos, &[sel], |_| None).iter().all(|t| t.id != id));
         if let Some(Model::Ready { built, .. }) = w.models.get_mut(&key) {
             built.visible = true;
         }
         // an unplaced dynel (server x <= 0) shows nothing
         w.chars.get_mut(&id).unwrap().pose.pos[0] = 0.0;
-        assert!(w.collect_tags(0.016, own_pos, &[]).iter().all(|t| t.id != id));
+        assert!(w.collect_tags(0.016, own_pos, &[], |_| None).iter().all(|t| t.id != id));
     }
 
     /// A door of playfield 4582 (`{0xC748, 0xC00011E6}`, mesh 245910 with 7 animated nodes) follows `DoorStatusUpdate`: it slides open over
