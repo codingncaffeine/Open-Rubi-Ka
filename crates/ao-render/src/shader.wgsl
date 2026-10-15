@@ -15,8 +15,7 @@ struct G {
     view: mat4x4<f32>,     // world -> camera space (env map texgen)
     water_dir: vec4<f32>,
     water_g: vec4<f32>,    // authored WaterLightCurrent, not doubled GroundLightCurrent
-    dyn_info: vec4<i32>,   // x = active dynamic (per-frame moving) light count in `dyn_lights`, y = aomac Enhanced "Per-Pixel
-                            // Lighting" toggle (audit item 11, not retail; 0/1), zw unused.
+    dyn_info: vec4<i32>,   // x = active dynamic (per-frame moving) light count in `dyn_lights`, yzw unused
 }
 struct Mat {
     color: vec4<f32>,
@@ -72,11 +71,6 @@ struct VOut {
     @location(8) fade: f32,
     @location(9) @interpolate(flat) effect: u32,
     @location(10) @interpolate(flat) effect_time: f32,
-    // aomac Enhanced "Per-Pixel Lighting" (audit item 11, opt-in, not retail): the exact `light_vertex_sun` inputs the
-    // vertex shader already used, carried through so `shade` can call the *same* function again per pixel instead of
-    // interpolating `light`/`dlight`/`spec`. xyz = effective emissive colour, w = effective specular power.
-    @location(11) eff_light: vec4<f32>,
-    @location(12) eff_spec: vec3<f32>, // effective specular colour
 }
 
 fn vtx(v: VIn) -> VOut {
@@ -92,8 +86,6 @@ fn vtx(v: VIn) -> VOut {
     o.fade = 1.0 + v.m0.w;
     o.effect = 0u;
     o.effect_time = 0.0;
-    o.eff_light = vec4<f32>(mat.emissive.rgb, mat.spec.w);
-    o.eff_spec = mat.spec.rgb;
     return o;
 }
 
@@ -131,12 +123,10 @@ fn vs_actor(v: VIn, @location(8) emissive: vec4<f32>, @location(9) specular: vec
     o.effect = u32(power.z);
     o.effect_time = power.w;
     // Actor overrides replace the submesh material's emissive/specular/power per instance (holo, degraded nanobots,
-    // CAT effects); the same effective inputs feed both the vertex lighting below and `shade`'s per-pixel relight.
+    // CAT effects) before evaluating vertex lighting.
     let eff_emissive = select(mat.emissive.rgb, emissive.rgb, emissive.w > 0.5);
     let eff_spec = select(mat.spec.rgb, specular.rgb, specular.w > 0.5);
     let eff_power = select(mat.spec.w, power.x, power.y > 0.5);
-    o.eff_light = vec4<f32>(eff_emissive, eff_power);
-    o.eff_spec = eff_spec;
     let prelit = mat.emissive.w > 1.5 && (o.effect == 0u || o.effect == 3u || o.effect == 7u);
     let l = light_vertex(o.wpos, o.n, eff_emissive, eff_spec, eff_power);
     o.light = select(l.light, v.color.rgb, prelit);
@@ -288,9 +278,7 @@ fn light_vertex_sun(p: vec3<f32>, n_in: vec3<f32>, emissive: vec3<f32>, specular
 
 // mode: 0 opaque, 1 alpha test, 2 alpha blend, 3 additive; 4 / 5 = opaque / alpha test of an actor with alpha < 1 (`ActorFrame::alpha`: alpha blended
 // with the material alpha = the frame's transparency, `RVisual_t::RenderWithTransparency`; the opaque texture alpha is not used)
-// `eligible` is false for draws whose vertex shader fed `light_vertex_sun` a different sun/light set than `g.sun_dir`/
-// `g.sun_g` (liquids: `vs_liquid`'s authored water light), so the per-pixel relight below never substitutes the wrong formula.
-fn shade(i: VOut, fade_mode: u32, eligible: bool) -> vec4<f32> {
+fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
     let sprite = fade_mode == 6u;
     let faded = fade_mode >= 4u && !sprite;
     let mode = select(select(fade_mode, fade_mode - 4u, faded), 2u, sprite);
@@ -309,17 +297,6 @@ fn shade(i: VOut, fade_mode: u32, eligible: bool) -> vec4<f32> {
     let to_eye = g.eye.xyz - i.wpos;
     var light = i.light;
     var spec = i.spec;
-    // aomac Enhanced "Per-Pixel Lighting" (audit item 11, opt-in, default off = retail per-vertex exactly): the same
-    // `light_vertex_sun` the vertex shader called, with the interpolated (not re-normalized-until-inside) world position
-    // and normal instead of the per-vertex one -- identical D3D7 8-light limit, range cut, attenuation and 1.0 clamp, so
-    // it can only ever sharpen falloff/highlights, never exceed the per-vertex path's clamp. Skipped for prelit (baked
-    // lightmap dungeons, unaffected) and the full-bright actor effects that already force `light = 1`.
-    let per_pixel = eligible && g.dyn_info.y > 0 && mat.emissive.w <= 1.5 && i.effect != 1u && i.effect != 5u && i.effect != 6u;
-    if per_pixel {
-        let relit = light_vertex_sun(i.wpos, i.n, i.eff_light.xyz, i.eff_spec, i.eff_light.w, g.sun_dir.xyz, g.sun_g, g.sun_g.rgb);
-        light = relit.light;
-        spec = relit.spec;
-    }
     if mat.emissive.w > 1.5 && i.effect != 2u && i.effect != 4u && i.effect != 5u && i.effect != 6u {
         // prelit: vertex colour is additive light (engine: tex * saturate(lightmap + 0.8 * ambient + dlight))
         light = clamp(i.light + 0.8 * g.ambient_g.rgb + i.dlight, vec3<f32>(0.0), vec3<f32>(1.0));
@@ -360,25 +337,21 @@ fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
 }
 
 @fragment
-fn fs_opaque(i: VOut) -> @location(0) vec4<f32> { return shade(i, 0u, true); }
+fn fs_opaque(i: VOut) -> @location(0) vec4<f32> { return shade(i, 0u); }
 @fragment
-fn fs_fade_opaque(i: VOut) -> @location(0) vec4<f32> { return shade(i, 4u, true); }
+fn fs_fade_opaque(i: VOut) -> @location(0) vec4<f32> { return shade(i, 4u); }
 @fragment
-fn fs_fade_test(i: VOut) -> @location(0) vec4<f32> { return shade(i, 5u, true); }
+fn fs_fade_test(i: VOut) -> @location(0) vec4<f32> { return shade(i, 5u); }
 @fragment
-fn fs_test(i: VOut) -> @location(0) vec4<f32> { return shade(i, 1u, true); }
+fn fs_test(i: VOut) -> @location(0) vec4<f32> { return shade(i, 1u); }
 @fragment
-fn fs_blend(i: VOut) -> @location(0) vec4<f32> { return shade(i, 2u, true); }
+fn fs_blend(i: VOut) -> @location(0) vec4<f32> { return shade(i, 2u); }
 @fragment
-fn fs_sprite(i: VOut) -> @location(0) vec4<f32> { return shade(i, 6u, true); }
+fn fs_sprite(i: VOut) -> @location(0) vec4<f32> { return shade(i, 6u); }
 @fragment
-fn fs_add(i: VOut) -> @location(0) vec4<f32> { return shade(i, 3u, true); }
+fn fs_add(i: VOut) -> @location(0) vec4<f32> { return shade(i, 3u); }
 @fragment
-fn fs_mesh_add(i: VOut) -> @location(0) vec4<f32> { return shade(i, 3u, true); }
-// Liquids (`vs_liquid`) light with the authored water direction/colour, not `g.sun_dir`/`g.sun_g`: not eligible for
-// `shade`'s per-pixel relight (audit item 11), which only knows the sun-lit formula.
-@fragment
-fn fs_liquid(i: VOut) -> @location(0) vec4<f32> { return shade(i, 2u, false); }
+fn fs_mesh_add(i: VOut) -> @location(0) vec4<f32> { return shade(i, 3u); }
 
 // HoloDeltaState, DS1006c005: camera-space position transformed back through the camera's world
 // matrix, with X erased and Y scrolled. COUNT3 is not D3DTTFF_PROJECTED (no divide).

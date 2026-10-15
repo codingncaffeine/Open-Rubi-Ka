@@ -128,9 +128,6 @@ pub struct Host {
     /// Lets the aomac Enhanced "Anti-aliased Text" option (not retail, audit item 13) rasterize TrueType glyphs
     /// at the real backing scale through `ao_gui::Gui::set_text_scale`.
     pub window_scale: u32,
-    /// aomac Enhanced "Per-Pixel Lighting" (audit item 11, opt-in, not retail; default off = retail per-vertex
-    /// exactly). Applied unconditionally every frame like `spaceships_shown`/`realistic_water` (not drained).
-    pub per_pixel_lighting: bool,
 }
 
 fn present_mode(wait: bool) -> wgpu::PresentMode {
@@ -174,7 +171,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1,per_pixel_lighting:false }
+        Host { smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -687,7 +684,6 @@ impl State {
         }
         self.renderer.set_spaceships_shown(g.host.spaceships_shown);
         self.renderer.set_realistic_water(g.host.realistic_water);
-        self.renderer.set_per_pixel_lighting(g.host.per_pixel_lighting);
         if let Some((realistic,simple))=g.host.cloud_preferences.take() {self.renderer.set_cloud_preferences(realistic,simple,false);}
         if let Some((quality, radius)) = g.host.ground_detail.take() {
             self.renderer.set_ground_detail(quality, radius);
@@ -1115,7 +1111,6 @@ impl Offscreen {
         }
         self.r.set_spaceships_shown(self.host.spaceships_shown);
         self.r.set_realistic_water(self.host.realistic_water);
-        self.r.set_per_pixel_lighting(self.host.per_pixel_lighting);
         if let Some((realistic,simple))=self.host.cloud_preferences.take() {self.r.set_cloud_preferences(realistic,simple,false);}
         if let Some((quality, radius)) = self.host.ground_detail.take() {
             self.r.set_ground_detail(quality, radius);

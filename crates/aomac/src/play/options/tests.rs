@@ -793,7 +793,6 @@ fn enhanced_page_options_default_to_retail_and_persist_across_a_restart() {
     assert_eq!(r.d.get("AomacWidescreenFOV"), Some(&super::super::dvalue::Variant::Bool(false)), "default must be off, matching retail's fixed 90 degree FOV");
     assert_eq!(r.d.get("AomacSceneryDistance"), Some(&super::super::dvalue::Variant::Float(1.0)), "default must be 1.0x, matching retail's ViewDistance far plane");
     assert_eq!(r.d.get("AomacSmoothText"), Some(&super::super::dvalue::Variant::Bool(false)), "default must be off, matching retail's hinted 1-bit bitmap");
-    assert_eq!(r.d.get("AomacPerPixelLighting"), Some(&super::super::dvalue::Variant::Bool(false)), "default must be off, matching retail's per-vertex D3D7 lighting");
     let tmp = std::env::temp_dir().join("aomac-enhanced-options-persist");
     let _ = std::fs::remove_dir_all(&tmp);
     r.d.open_user(&tmp, "acct", 7);
@@ -846,10 +845,6 @@ fn enhanced_page_options_default_to_retail_and_persist_across_a_restart() {
     assert!(!r.gui.checked(r.win(), &c6));
     r.click(&c6);
     assert_eq!(r.d.get("AomacSmoothText"), Some(&super::super::dvalue::Variant::Bool(true)));
-    let c7 = r.show("AomacPerPixelLighting");
-    assert!(!r.gui.checked(r.win(), &c7));
-    r.click(&c7);
-    assert_eq!(r.d.get("AomacPerPixelLighting"), Some(&super::super::dvalue::Variant::Bool(true)));
     r.d.save_user();
     let dir = ao_gui::client_dir();
     let mut again = DValues::new(&dir);
@@ -864,6 +859,5 @@ fn enhanced_page_options_default_to_retail_and_persist_across_a_restart() {
     assert_eq!(again.get("AomacWidescreenFOV"), Some(&super::super::dvalue::Variant::Bool(true)));
     assert_eq!(again.get("AomacSceneryDistance"), Some(&super::super::dvalue::Variant::Float(2.0)));
     assert_eq!(again.get("AomacSmoothText"), Some(&super::super::dvalue::Variant::Bool(true)));
-    assert_eq!(again.get("AomacPerPixelLighting"), Some(&super::super::dvalue::Variant::Bool(true)));
     let _ = std::fs::remove_dir_all(&tmp);
 }

@@ -215,11 +215,6 @@ impl DValues {
         // (`ao_gui::font::TtFont::glyph`'s `scale` parameter / `Flatten::fill_aa`) instead of retail's hinted 1-bit
         // bitmap; bitmap fonts (tooltips, shell, chat, name tags) are always pixel art regardless. Default off.
         s.add("AomacSmoothText", Variant::Bool(false), true, CAT_MAIN, None, None, false);
-        // Audit item 11: calls the shared D3D7 light-accumulation function (`shader.wgsl`'s `light_vertex_sun`,
-        // static grid + dynamic Light Bar lights) once per pixel instead of interpolating the vertex result; same
-        // 8-light limit, range cut, attenuation and 1.0 clamp, so it can only sharpen falloff/highlights, never
-        // exceed the per-vertex path. Baked-lighting dungeons and liquids are unaffected. Default off = retail.
-        s.add("AomacPerPixelLighting", Variant::Bool(false), true, CAT_MAIN, None, None, false);
         s
     }
 

@@ -1239,10 +1239,6 @@ impl Frontend for Play {
             host.borderless_game = hud.dvalues.flag("AomacBorderlessFullscreen");
             host.pinch_zoom = hud.dvalues.flag("AomacPinchZoom");
             self.smooth_text = hud.dvalues.flag("AomacSmoothText");
-            // Audit item 11, not retail, opt-in: relights every pixel with the same D3D7 light-accumulation formula
-            // the vertex shader already uses (`shader.wgsl`'s `shade`/`light_vertex_sun`). Off (default) reproduces
-            // retail's per-vertex lighting exactly.
-            host.per_pixel_lighting = hud.dvalues.flag("AomacPerPixelLighting");
         }
         // audit item 2: every screen, including the login screen before any HUD exists.
         host.interface_scale = Some(self.interface_scale);
