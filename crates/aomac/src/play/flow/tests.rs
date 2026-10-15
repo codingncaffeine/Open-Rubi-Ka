@@ -667,6 +667,53 @@ fn mouse_look_captures_before_the_next_frame_not_after() {
     assert!(turned.abs() > 0.5 && turned.abs() < 1.5, "turned {turned} rad without an intervening frame() before the first motion");
 }
 
+/// Viewer release ordering: flush queued raw counts, then dispatch MouseUp,
+/// without a redraw between the press and release. A tiny delta still orbits;
+/// the 0.02 threshold classifies only the eventual click, never look activation.
+#[test]
+fn left_drag_orbits_on_first_delta_and_keeps_release_tail_at_ultrawide_size() {
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    r.enter();
+    let size = (5120, 1440);
+    for _ in 0..30 {
+        r.p.frame(0.016, size, &mut r.host);
+    }
+    let (x, y, button) = (2560.0, 720.0, ao_gui::MouseButton::Left);
+    assert!(!r.p.gui.wants_mouse(x, y), "test press must reach the world");
+    let yaw0 = r.p.zone.own().unwrap().yaw.unwrap_or(0.0);
+    let camera0 = r.host.camera.yaw;
+    r.p.input(ao_gui::InputEvent::MouseDown { x, y, button }, &mut r.host);
+    assert!(r.host.look, "left press captures before any redraw");
+    r.p.game_input(ao_render::GameInput::MouseMotion { dx: 1.0, dy: 0.0, dt: 0.016 }, &mut r.host);
+    r.p.frame(0.016, size, &mut r.host);
+    let angle = |a: f32, b: f32| (a - b + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+    assert!((angle(r.host.camera.yaw, camera0) - 0.01).abs() < 1e-4,
+        "one count orbits immediately, with no deadzone or angular damping");
+    // Tail counts are delivered by viewer::State::flush_mouse BEFORE MouseUp,
+    // not discarded when set_look(false) clears the raw accumulator.
+    r.p.game_input(ao_render::GameInput::MouseMotion { dx: 30.0, dy: 0.0, dt: 0.016 }, &mut r.host);
+    r.p.input(ao_gui::InputEvent::MouseUp { x, y, button }, &mut r.host);
+    assert!(!r.host.look);
+    assert!(r.p.player.as_mut().unwrap().take_clicks().is_empty(), "drag release must not become a click");
+    r.p.frame(0.016, size, &mut r.host);
+    assert!((angle(r.host.camera.yaw, camera0) - 0.31).abs() < 1e-4, "release tail included without another look frame");
+    assert!(angle(r.p.zone.own().unwrap().yaw.unwrap_or(0.0), yaw0).abs() < 1e-6,
+        "left orbit must not turn the character");
+    // Entire second drag between redraws: no activation frame is needed.
+    let before_flick = r.host.camera.yaw;
+    r.p.input(ao_gui::InputEvent::MouseDown { x, y, button }, &mut r.host);
+    assert!(r.host.look);
+    let buffered_counts = (12.0 + 19.0, 0.0);
+    r.p.game_input(ao_render::GameInput::MouseMotion { dx: buffered_counts.0, dy: buffered_counts.1, dt: 0.016 }, &mut r.host);
+    r.p.input(ao_gui::InputEvent::MouseUp { x, y, button }, &mut r.host);
+    assert!(!r.host.look);
+    assert!(r.p.player.as_mut().unwrap().take_clicks().is_empty());
+    r.p.frame(0.016, size, &mut r.host);
+    assert!((angle(r.host.camera.yaw, before_flick) - 0.31).abs() < 1e-4);
+}
+
 /// The client-initiated teleport try in the flow (docs/zone/world.md §10.2): `StartTryingTeleport` = `TeleportStarted` while the playfield keeps
 /// running (black viewport, game input stopped), the 30 s timeout = `TeleportFailed` = `TeleportEnded` (countdown restarts), and only the server's
 /// echo of our `CharInPlay` (`AliveMessage`) brings the viewport and the input back.

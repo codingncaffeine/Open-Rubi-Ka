@@ -127,6 +127,36 @@ Synthetic CGEvent drags need not reach GCMouse and are not proof of raw-input
 delivery. Runnable accumulator regression:
 `cargo test --release -p ao-render reports_sum_without_acceleration_and_clear_at_capture_boundaries`.
 
+### Drag release ordering (bug 6)
+
+**[RE]** GUI `0x1002c17b` activates pending look through `0x1002c09b` and
+applies that same movement; there is no initial movement deadzone. The `0.02`
+threshold belongs only to release click classification (`0x1002c469`).
+N3 `0x1001f537` has radial return but no angular damping in default mode 3.
+
+**Port root cause:** `06d473d` already updates capture in `Player::mouse` on
+button-down; `Controls::on_mouse_motion` already activates and applies its first
+delta. The viewer, however, drained raw counts only at redraw. A button release
+first ended the frontend look, then `set_look(false)` cleared unread counts.
+A whole between-redraw drag could therefore become a click, and longer drags
+lost their final partial-frame motion. `State::flush_mouse` now drains the same
+native/AppKit-selected accumulator before mouse-button transitions reach
+`Frontend::input`, as well as before `Frontend::frame`. Release flush uses elapsed
+time since the last frame, not zero (right-drag turn-speed limits consume `dt`).
+Focus loss still cancels rather than replaying motion. No sensitivity, backend
+handoff timeout, camera-mode damping or display-size scaling was changed.
+
+Regression coverage added (not run by the fix worker):
+`release_flush_preserves_between_frame_motion_without_replaying_it` covers both
+raw/native and winit count accumulation and capture reset;
+`left_drag_orbits_on_first_delta_and_keeps_release_tail_at_ultrawide_size`
+uses real `Play` frontend input/game-input/frame handlers at 5120×1440,
+checks one count gives 0.01 rad immediately, release tails and an entire
+between-redraw 31-count flick give exactly 0.31 rad, no drag click, and no
+character turn. The frontend test replays the viewer's flush-before-release
+ordering; it does not instantiate an OS window or prove native report delivery.
+
+
 
 ## 3. Third-person camera (mode 3, `CameraVehicleFixedThird_t`)
 

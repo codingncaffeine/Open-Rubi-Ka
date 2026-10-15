@@ -630,14 +630,22 @@ impl State {
         }
     }
 
-    /// Runs the frontend; returns its draw list (`None` without a frontend). True in `.1` = quit.
-    fn run_gui(&mut self, dt: f32) -> (Option<ao_gui::DrawList>, bool) {
-        let Some(g) = &mut self.gui else { return (None, false) };
+    /// Deliver counts while the button state that collected them is still active.
+    /// In particular, release must not clear an entire between-redraw drag.
+    fn flush_mouse(&mut self, dt: f32) {
+        let Some(g) = &mut self.gui else { return };
         let (dx, dy) = self.raw_mouse.take();
         g.host.camera = self.cam;
         if !g.host.fly && (dx != 0.0 || dy != 0.0) {
             g.frontend.game_input(GameInput::MouseMotion { dx, dy, dt }, &mut g.host);
         }
+        self.cam = g.host.camera;
+    }
+
+    /// Runs the frontend; returns its draw list (`None` without a frontend). True in `.1` = quit.
+    fn run_gui(&mut self, dt: f32) -> (Option<ao_gui::DrawList>, bool) {
+        self.flush_mouse(dt);
+        let Some(g) = &mut self.gui else { return (None, false) };
         // audit item 2: live-apply a scale change from the Enhanced page without a restart.
         if let Some(requested) = g.host.interface_scale.take() {
             g.requested_scale = requested;
@@ -885,6 +893,11 @@ impl ApplicationHandler for App {
         let Some(s) = &mut self.state else { return };
         if let WindowEvent::Focused(focused) = &ev { s.focused = *focused; }
         if let WindowEvent::ModifiersChanged(m) = &ev { s.mods = m.state(); }
+        // Raw reports are batched until redraw. Drain before a button changes the
+        // frontend's look mode or releases capture (which clears the accumulator).
+        if matches!(&ev, WindowEvent::MouseInput { .. }) && s.looking && !s.fly() {
+            s.flush_mouse(s.last.elapsed().as_secs_f32());
+        }
         if let Some(g) = &mut s.gui {
             let gi = gui_input(&ev, &mut g.cursor, &mut g.mods, g.scale, &mut g.scroll_accum);
             g.host.mods = g.mods;

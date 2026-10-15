@@ -140,6 +140,22 @@ mod native {
 mod tests {
     use super::*;
     #[test]
+    fn release_flush_preserves_between_frame_motion_without_replaying_it() {
+        for native in [false, true] {
+            let mut c = Counts::default();
+            let now = Instant::now();
+            c.set_active(true);
+            if native { c.add(3.0, -2.0); } else { c.winit(3.0, -2.0); }
+            // viewer drains before MouseUp reaches Frontend::input and ends capture.
+            assert_eq!(c.take(now).0, (3.0, -2.0));
+            c.set_active(false);
+            assert_eq!(c.take(now).0, (0.0, 0.0));
+            c.set_active(true);
+            assert_eq!(c.take(now).0, (0.0, 0.0));
+        }
+    }
+
+    #[test]
     fn reports_sum_without_acceleration_and_clear_at_capture_boundaries() {
         let mut c = Counts { active: true, ..Default::default() };
         let now = Instant::now();
