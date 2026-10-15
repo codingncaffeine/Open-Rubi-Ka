@@ -355,12 +355,11 @@ all-mode synthetic timeline and raw-click classification regressions are include
 The ignored CPU benchmark and the standalone synthetic before/after command were
 also exercised successfully; no real-device timing is implied by these gates.
 
-**Remaining user symptom:** the saved login configuration selects mode 3,
-which already passes immediate-first-count regression. Fixing mode 2 and release
-bugs does **not** establish the cause of the user's mode-3 slight delay.
-The actual headless CPU audit rules out the proposed scene-picking/GUI press
-stall for this populated capture; native physical delivery/grab/display timing
-remains unmeasured and must not be reported as fixed.
+**User confirmation (real window, 2026-10-15):** the user reported the slight
+LMB grab delay gone after `2053134` (manual-orbit immediacy, first-person
+release heading, locked-cursor release selection). Which of those changes was
+responsible for the reported mode-3 delay was not isolated; the headless CPU
+audit above had already ruled out a press-time picking/GUI stall.
 
 
 ### Drag release ordering (bug 6)
