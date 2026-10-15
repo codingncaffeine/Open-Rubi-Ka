@@ -210,6 +210,20 @@ fn sky_material_pipe(s: &ao_scene::Submesh) -> usize {
     }
 }
 
+/// Drop invalid whole primitives without truncating a point list to a multiple of three.
+fn append_primitive_indices(out: &mut Vec<u32>, s: &ao_scene::Submesh, vertex_count: u32) {
+    if s.sky_points {
+        // D3DPT_POINTLIST consumes one vertex per primitive (Randy100227b6).
+        out.extend(s.indices.iter().copied().filter(|&i| i < vertex_count));
+    } else {
+        for triangle in s.indices.as_chunks::<3>().0 {
+            if triangle.iter().all(|&i| i < vertex_count) {
+                out.extend_from_slice(triangle.as_slice());
+            }
+        }
+    }
+}
+
 fn native_blend_state(blend: Blend) -> wgpu::BlendState {
     use wgpu::BlendFactor::*;
     // D3D7 has no separate alpha state: SRCCOLOR/DSTCOLOR use the alpha channels for alpha too.
@@ -1178,12 +1192,7 @@ impl Renderer {
             for (si, s) in mesh.submeshes.iter().enumerate() {
                 let first = indices.len() as u32;
                 let nv = mesh.vertices.len() as u32;
-                // Drop whole triangles that index out of range rather than crash the GPU.
-                for t in s.indices.as_chunks::<3>().0 {
-                    if t.iter().all(|&i| i < nv) {
-                        indices.extend_from_slice(t.as_slice());
-                    }
-                }
+                append_primitive_indices(&mut indices, s, nv);
                 let count = indices.len() as u32 - first;
                 if count > 0 {
                     let view = s.texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0);
@@ -1343,11 +1352,7 @@ impl Renderer {
             let (mut indices, mut draws) = (Vec::with_capacity(idx_total), vec![]);
             for s in &mesh.submeshes {
                 let first = indices.len() as u32;
-                for t in s.indices.as_chunks::<3>().0 {
-                    if t.iter().all(|&i| i < nv) {
-                        indices.extend_from_slice(t.as_slice());
-                    }
-                }
+                append_primitive_indices(&mut indices, s, nv);
                 let count = indices.len() as u32 - first;
                 if count == 0 {
                     continue;
@@ -2379,12 +2384,62 @@ mod sky_tests {
                 let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
                 let mut rgba = vec![0; decoder.output_buffer_size()];
                 let info = decoder.next_frame(&mut rgba).unwrap();
-                let colored: Vec<_> = rgba[..info.buffer_size()].chunks_exact(4).filter(|p| p[..3] != [0, 0, 0]).collect();
+                let colored: Vec<_> = rgba[..info.buffer_size()].as_chunks::<4>().0.iter().filter(|p| p[..3] != [0, 0, 0]).collect();
                 assert_eq!(colored.len(), 1, "point size is one framebuffer pixel, independent of viewport/far");
                 assert!(colored[0][..3].iter().all(|&c| (127..=129).contains(&c)),
                     "half-depth black source fog leaves half RGB, even with alpha zero (ONE/ONE): {:?}", colored[0]);
             }
         }
+    }
+
+    #[test]
+    fn primitive_index_validation_preserves_points_and_whole_triangles() {
+        let mut sub = Submesh { sky_points: true, ..Submesh::new((0..500).collect(), None) };
+        let mut indices = Vec::new();
+        append_primitive_indices(&mut indices, &sub, 500);
+        assert_eq!(indices, sub.indices, "all 500 native points survive in source order");
+        sub.indices = vec![0, 500, 499];
+        indices.clear();
+        append_primitive_indices(&mut indices, &sub, 500);
+        assert_eq!(indices, [0, 499], "invalid points do not discard adjacent valid points");
+        sub.sky_points = false;
+        sub.indices = vec![0, 1, 2, 0, 500, 2, 3];
+        indices.clear();
+        append_primitive_indices(&mut indices, &sub, 500);
+        assert_eq!(indices, [0, 1, 2], "triangle validation still drops whole invalid/incomplete triangles");
+    }
+
+    #[test]
+    fn native_point_population_survives_initial_upload_and_sky_replacement() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).expect("native population regression requires GPU");
+        let points = |count: u32| Scene {
+            meshes: vec![Mesh {
+                vertices: vec![Vertex { pos: [0.0, 0.0, -500.0], ..Default::default() }; count as usize],
+                submeshes: vec![Submesh { sky_points: true, two_sided: true, blend: Blend::Additive,
+                    ..Submesh::new((0..count).collect(), None) }],
+            }],
+            sky: vec![Instance { mesh: 0, transform: IDENTITY }],
+            ..Scene::default()
+        };
+        let all = points(500);
+        let assert_population = |r: &Renderer, expected| {
+            assert_eq!(r.sky.draws.len(), 1);
+            assert_eq!(r.sky.draws[0].0.count, expected);
+            assert_eq!(r.sky.draws[0].0.pipe, SKY_POINT_PIPE);
+        };
+        r.upload(&all);
+        assert_population(&r, 500);
+        let rebuilds = r.sky_rebuilds();
+        r.set_sky(&all);
+        assert_population(&r, 500);
+        assert_eq!(r.sky_rebuilds(), rebuilds, "same-topology replacement uses the live fast path");
+        r.set_sky(&points(1));
+        assert_population(&r, 1);
+        r.set_sky(&all);
+        assert_population(&r, 500);
+        r.upload(&all);
+        assert_population(&r, 500);
     }
 
     #[test]
