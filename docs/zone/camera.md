@@ -173,14 +173,11 @@ queue is not main and reads back the installed queue for every attached
 mouse; it injects no HID and opens no window. With no attached mouse only
 the queue identity assertion is exercised.
 
-Required checks (not run by this change's sub-worker):
-`cargo test --release -p ao-render native_mouse_handlers_do_not_use_the_main_render_queue -- --nocapture`
-and
-`cargo test --release -p aomac lmb_press_to_first_orbit_before_and_after_native_queue_backlog -- --nocapture`.
-The latter uses the existing data-backed flow rig and can skip when its
-client data prerequisites are absent; inspect output rather than treating
-such a skip as latency proof. Real hardware callback timing remains to be
-measured by the parent under the live-window permission policy.
+Executed headlessly on 2026-10-15: the queue-readback smoke and the data-backed
+Play regression passed, as did the complete workspace test and clippy gates.
+The Play regression's 1008/16 ms values remain a controlled model, not measured
+physical input latency. Real hardware press-to-display timing was not measured:
+this assignment permits no window, HID injection or desktop capture.
 
 For an actual headless dispatch measurement, run alone:
 `cargo test --release -p ao-render native_handler_queue_delivery_while_main_is_not_pumped -- --ignored --nocapture --test-threads=1`.
@@ -189,6 +186,10 @@ not pump AppKit. It prints elapsed independent delivery and an observed
 lower bound for the still-pending default-main callback after a bounded
 50 ms wait. It does not inject mouse movement, synthesize a one-second
 measurement, or claim a completed before-case/hardware-to-display latency.
+
+The actual dispatch probe passed on 2026-10-15: independent delivery **44.041 µs**;
+default-main callback still pending after **59.526583 ms**. This measures the
+queue-delivery dependency directly, not a retail or hardware-camera latency.
 
 ### Drag release ordering (bug 6)
 
