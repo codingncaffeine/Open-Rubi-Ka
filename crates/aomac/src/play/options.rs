@@ -292,7 +292,7 @@ fn enhanced_page() -> Page {
         borders: String::new(),
     };
     Page {
-        label: "Enhanced (aomac, not retail)".to_string(),
+        label: "Enhanced".to_string(),
         items: vec![
             Item::Text { value: "aomac-only additions: none of these exist in the original client. Every default matches retail exactly.".to_string(), borders: String::new() },
             Item::Opt(opt("AomacTextureSharpening", "Texture Sharpening (anisotropic filtering)", &[("Off (1x, retail)", 0), ("2x", 1), ("4x", 2), ("8x", 3), ("16x", 4)])),

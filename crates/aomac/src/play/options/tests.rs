@@ -126,6 +126,7 @@ fn label_paths_split_into_folder_levels() {
     let l = levels("GUI/Control Center");
     assert_eq!(l, [("GUI".into(), "GUI".into(), false), ("GUIControl Center".into(), "Control Center".into(), true)]);
     assert_eq!(levels("Audio"), [("Audio".into(), "Audio".into(), true)]);
+    assert_eq!(enhanced_page().label, "Enhanced");
 }
 
 #[test]
@@ -392,6 +393,73 @@ fn closing_and_reopening_restores_selection_and_frame() {
     r.tick();
     assert_eq!(r.opt.win.as_ref().unwrap().selected, page);
     assert_eq!(r.gui.window_outer_frame(r.win()), Some(frame));
+}
+
+#[test]
+fn options_border_drag_resizes_within_content_limits_and_restores_frame() {
+    let Some(mut r) = Rig::new() else { return };
+    let id = r.win();
+    let start = r.gui.window_outer_frame(id).unwrap();
+    let (minimum, maximum) = r.gui.window_preferred_size_limits(id).unwrap();
+    assert!(maximum.0 > minimum.0 && maximum.1 > minimum.1, "Options must have an elastic content range: {minimum:?}..{maximum:?}");
+    let drag = |r: &mut Rig, dx: f32, dy: f32| {
+        let (x, y, w, h) = r.gui.window_outer_frame(r.win()).unwrap();
+        let (x, y) = ((x + w as i32 - 1) as f32, (y + h as i32 - 1) as f32);
+        r.send(InputEvent::MouseMove { x, y });
+        r.send(InputEvent::MouseDown { x, y, button: MouseButton::Left });
+        r.send(InputEvent::MouseMove { x: x + dx, y: y + dy });
+        r.send(InputEvent::MouseUp { x: x + dx, y: y + dy, button: MouseButton::Left });
+    };
+    drag(&mut r, 80.0, 60.0);
+    let grown = r.gui.window_outer_frame(id).unwrap();
+    assert_eq!(grown, (start.0, start.1, start.2 + 80, start.3 + 60));
+    // Selection must not replace the range with a fixed visible-page size.
+    r.show("AomacTextureSharpening");
+    assert_eq!(r.gui.window_outer_frame(id), Some(grown));
+    drag(&mut r, -100000.0, -100000.0);
+    assert_eq!(r.gui.window_size(id), minimum);
+    drag(&mut r, 100000.0, 100000.0);
+    assert_eq!(r.gui.window_size(id), maximum);
+    drag(&mut r, minimum.0 as f32 + 80.0 - maximum.0 as f32, minimum.1 as f32 + 60.0 - maximum.1 as f32);
+    let frame = r.gui.window_outer_frame(id).unwrap();
+    r.opt.close(&mut r.gui, &mut r.d);
+    r.opt.open(&mut r.gui, &r.d);
+    r.tick();
+    assert_eq!(r.gui.window_outer_frame(r.win()), Some(frame));
+}
+
+#[test]
+fn options_border_drag_survives_hud_updates() {
+    use super::super::hud::{Hud, WindowKind};
+    use super::super::zone::Zone;
+    let dir = ao_gui::client_dir();
+    if !dir.join("cd_image/gui/Default/OptionPanel/Root.xml").exists() { return; }
+    let mut gui = Gui::new(&dir, None).unwrap();
+    let mut hud = Hud::new(&mut gui, &dir, (1280, 800)).unwrap();
+    let mut zone = Zone::default();
+    hud.open(&mut gui, WindowKind::Options);
+    hud.update(&mut gui, &mut zone, 0.0);
+    let id = gui.window_ids().into_iter().find(|&id| gui.view_rect(id, TREE).is_some()).unwrap();
+    let start = gui.window_outer_frame(id).unwrap();
+    let (x, y) = ((start.0 + start.2 as i32 - 1) as f32, (start.1 + start.3 as i32 - 1) as f32);
+    for ev in [
+        InputEvent::MouseMove { x, y },
+        InputEvent::MouseDown { x, y, button: MouseButton::Left },
+        InputEvent::MouseMove { x: x + 80.0, y: y + 60.0 },
+        InputEvent::MouseUp { x: x + 80.0, y: y + 60.0, button: MouseButton::Left },
+    ] {
+        for event in gui.input(ev) {
+            hud.event(&mut gui, &event, &zone);
+        }
+        hud.update(&mut gui, &mut zone, 0.0);
+    }
+    let frame = (start.0, start.1, start.2 + 80, start.3 + 60);
+    assert_eq!(gui.window_outer_frame(id), Some(frame));
+    hud.close_kind(&mut gui, WindowKind::Options);
+    hud.open(&mut gui, WindowKind::Options);
+    hud.update(&mut gui, &mut zone, 0.0);
+    let id = gui.window_ids().into_iter().find(|&id| gui.view_rect(id, TREE).is_some()).unwrap();
+    assert_eq!(gui.window_outer_frame(id), Some(frame));
 }
 
 /// `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac -- options_shots`: the Preferences window on its first page, the control-centre page, and two others.
