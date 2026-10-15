@@ -274,6 +274,22 @@ impl Armory {
         self.by.get(&holder)?.slots.get(&slot)
     }
 
+    /// The item behind a special-attack list key (`SpecialAttackWeaponIIR_t`'s own key, e.g. 142 Brawl, 144 Dimach):
+    /// martial-arts-style specials that have their own `DummyItemBase_t` list entry.
+    pub fn special_item(&self, holder: i32, special: i32) -> Option<&Item> {
+        self.by.get(&holder)?.specials.get(&special)
+    }
+
+    /// What `FUN_1003b947` reads `AttackDelay`/`RechargeDelay` of for the "Special" HUD timer bar
+    /// (`Dynels::start_special_bar`): the special's own list item if it has one (Brawl/Dimach/...), else the
+    /// *wielded weapon* (live evidence, `docs/captures/zone_special_burst_fixr_ithaca.rec`: Aomacfixr's rifle
+    /// Burst(148) is absent from the own `SpecialAttackWeaponIIR_t` list -- only `{100 bare hands, 144 Dimach,
+    /// 142 Brawl, 1}` -- so a ranged weapon's own specials (Burst/Fling/Full Auto) must read the equipped weapon
+    /// item directly, matching `FUN_1003b947`'s `DummyItemBase_t` RTTI-cast-fails branch).
+    pub fn special_or_wielded_item(&self, holder: i32, special: i32) -> Option<&Item> {
+        self.special_item(holder, special).or_else(|| self.attack_slots(holder).into_iter().find_map(|slot| self.slot_item(holder, slot)))
+    }
+
     /// GC 0x10068969: hands 8/6, or bare hands 0 only when neither is occupied -- every wielded hand, for `in_attack_range`
     /// and the per-hand Attack timer bar (`item_round_seconds`, `hud_stats::update_attack_timers`).
     pub fn attack_slots(&self, holder: i32) -> Vec<i32> {
@@ -345,6 +361,19 @@ mod tests {
         a.unwield_slot(1, 6);
         assert!(a.in_attack_range(1, 1.99, 0));
         assert!(!a.in_attack_range(1, 2.0, 0));
+    }
+
+    /// `FUN_1003b947`'s two branches: a keyed special-list item (Dimach/Brawl) resolves directly; a ranged weapon's
+    /// own special (Burst/Fling, absent from the list -- live evidence, `docs/captures/zone_special_burst_fixr_
+    /// ithaca.rec`) falls back to the wielded hand.
+    #[test]
+    fn special_or_wielded_item_falls_back_to_the_weapon() {
+        let mut a = player();
+        assert_eq!(a.special_or_wielded_item(1, 144).map(|i| i.dtype), Some(MELEE), "Dimach resolves from the own list");
+        assert!(a.special_item(1, 148).is_none(), "Burst is not a special-list key");
+        assert_eq!(a.special_or_wielded_item(1, 148).map(|i| i.dtype), Some(MELEE), "falls back to the bare-hands wield");
+        a.wield(1, 500, 6, None, &[(STAT_DAMAGE_TYPE, PROJECTILE)]);
+        assert_eq!(a.special_or_wielded_item(1, 148).map(|i| i.dtype), Some(PROJECTILE), "falls back to the rifle in hand");
     }
 
     #[test]

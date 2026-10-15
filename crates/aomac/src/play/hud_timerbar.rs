@@ -1,7 +1,7 @@
 //! `TimerBarBase_c` / `GameTimerBar_c` (GUI.dll ctor `FUN_100512ae` 0x100512ae): the progress bar `TimerSystemModule_t::CreateTimer`
 //! opens for a timed action (the `/camp` "Logout" countdown, `hud_use.rs`; the own item-action delay, `hud_stats.rs`;
-//! the per-hand Attack round, the Reload bar and the own Nano-cast bar, `combat/glue.rs` + `hud_use.rs` + `dynels.rs`,
-//! docs/zone/combat-timers.md). A `PowerBar`
+//! the per-hand Attack round, the Reload bar, the own Nano-cast bar and the Special-attack bar, `combat/glue.rs` +
+//! `hud_use.rs` + `dynels.rs`, docs/zone/combat-timers.md). A `PowerBar`
 //! (`GFX_GUI_TIMERBAR_EMPTY`/`_FULL`) tinted by the timer's kind (`RenderWindow_t::SetColor`), with a `TOOLTIP`-font label solid
 //! black (`TextLine_t::SetDefaultColor(this, 0)` 0x100223ef: the colour field is a plain RGB int, not a palette index -- 0 is
 //! black, not white).
@@ -16,11 +16,8 @@
 //! `TimerSystemModule_t::StartTimerBar` 0x10051a27 (text.mdb category 10000) colours the bar by `TimerEntry_t` kind: Attack
 //! `0xaaffaa` "Timer_Attack", Special `0xaaffff` "Timer_Special", Nano `0xffaaaa` "Timer_Nano", **Item `0xaaaaff` "Timer_Item"**
 //! (= "Item", not an "Equipping <name>" label; shown only when the duration is at least [`MIN_SECONDS`], `_DAT_101a9f9c`), Reload
-//! untinted `0xffffff`. Special (kind 2) is **not yet ported**: Gamecode evidence points to a `DummyItemBase_t`
-//! special-attack-item trigger (`FUN_1003b947`, gated on wield-state transitions `{3,5,0x20}`) distinct from the
-//! hotbar icon-fader recharge overlay (`hud_bar.rs`/`hud_special.rs`, a separate, already-ported, additional
-//! indicator -- not a replacement for this bar), but the exact received message was not pinned down.
-//! docs/zone/combat-timers.md §5.
+//! untinted `0xffffff`. The hotbar icon-fader recharge overlay (`hud_bar.rs`/`hud_special.rs`) is a separate,
+//! additional indicator, not a replacement for any of these bars.
 
 use ao_gui::{GfxId, Gui, WindowId, WindowSize};
 
@@ -30,10 +27,16 @@ pub(super) const COLOR_ITEM: u32 = 0xaaaaff;
 pub(super) const LABEL_ITEM: &str = "Item";
 /// `StartTimerBar` type 1 tint; text.mdb 10000 "Timer_Attack" = "Attack". One bar per wielded hand while fighting,
 /// filling over the initiative-scaled AttackDelay+RechargeDelay round time (`combat::arms::item_round_seconds`,
-/// `combat/glue.rs`); corroborated by the kind-2 "Special" bar's own Gamecode evidence (`FUN_1003b947`, stat 0x126
-/// AttackDelay + stat 0xd2 RechargeDelay of the `DummyItemBase_t` special-attack item, docs/zone/combat-timers.md §5).
+/// `combat/glue.rs`); corroborated by the kind-2 "Special" bar's own Gamecode evidence (below).
 pub(super) const COLOR_ATTACK: u32 = 0xaaffaa;
 pub(super) const LABEL_ATTACK: &str = "Attack";
+/// `StartTimerBar` type 2 tint; text.mdb 10000 "Timer_Special" = "Special". GC `FUN_1003b947` (gated by
+/// `FUN_1003bac9`'s wield-state check), reads `AttackDelay`(0x126) + `RechargeDelay`(0xd2) of the special's own list
+/// item (Brawl/Dimach), or, when the `DummyItemBase_t` RTTI cast fails, the wielded weapon (Burst/Fling/Full Auto --
+/// live-confirmed, `docs/captures/zone_special_burst_fixr_ithaca.rec`: Aomacfixr's rifle Burst(148) is absent from
+/// its own `SpecialAttackWeaponIIR_t` list). `Dynels::start_special_bar`, `combat::arms::special_or_wielded_item`.
+pub(super) const COLOR_SPECIAL: u32 = 0xaaffff;
+pub(super) const LABEL_SPECIAL: &str = "Special";
 /// `StartTimerBar` type 5: untinted (`uVar4 = 0xffffff`, no `LDBface::GetTextPtr` call precedes the fallthrough, but
 /// text.mdb 10000 "Timer_Reload" = "Reload" matches the kind's own name). Duration: the ranged hand's raw
 /// `RechargeDelay` stat (0xd2/210) alone, no initiative scaling -- traced to `ReloadIIR_t` 0x26515E61's apply

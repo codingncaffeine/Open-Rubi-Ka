@@ -86,23 +86,38 @@ strong indirect confirmation that an ordinary weapon's round bar uses the identi
   `CastNanoSpellIIR_t` apply path (`Dynels::on_message` + `nano_visual_frame`) and checks the bar opens with label
   "Nano program" at a free stacking slot alongside the Attack/Reload bars, shown in the offscreen screenshot.
 
-## 5. Special (kind 2): evidence found, **not yet ported**
+## 5. Special (kind 2): traced live, implemented
 
 One of the six `FUN_1003d7ce` callers, `FUN_1003b947` (gated by `FUN_1003bac9(state)` on `state ∈ {3, 5, 0x20}`,
 called twice within itself depending on whether a `DummyItemBase_t` RTTI cast of the relevant item succeeds), reads
-**both** `AttackDelay`(0x126) and `RechargeDelay`(0xd2) of a `DummyItemBase_t` (the special-attack item base class
-`combat::arms` already models as `DummyWeapon_t`) via the same `(**vtable+0x3c)(statId, 2)` accessor as Reload, sums
-them for an internal `< 0x1f` (31 hundredths) refusal check, and passes both raw values into `FUN_1003d7ce`.
+`AttackDelay`(0x126) and `RechargeDelay`(0xd2) via the same `(**vtable+0x3c)(statId, 2)` effective-stat accessor as
+Reload, sums them for an internal `< 0x1f` (31 hundredths) refusal check, and passes both raw values into
+`FUN_1003d7ce`. The exact `CharSecSpecAttackIIR_t`/`SpecialAttackInfoIIR_t` apply addresses in `docs/zone/combat-
+log.md` §2.2 never reference this function, so the receive-side trigger could not be pinned down from static RE
+alone -- resolved instead with a live capture.
 
-What is **not** resolved: the exact message/state transition `{3, 5, 0x20}` corresponds to (not an obvious
-`CharSecSpecAttackIIR_t`/`SpecialAttackInfoIIR_t` apply address -- those already have a comprehensively-documented
-apply chain in `docs/zone/combat-log.md` §2.2 that does not mention this function), and which of `uStack_18`/
-`uStack_1c` in the two-word `TimerEntry_t` payload holds which value (`StartTimerBar`'s kind-4 branch reads only one
-of its two analogous fields, selected by a flag bit set after construction; kind 2's own read path in `StartTimerBar`
-was not decompiled bit-for-bit against this write). Implementing kind 2 now would mean guessing the receive-side
-trigger, which is exactly what was asked not to do. **Left unported**, flagged in `hud_timerbar.rs`'s module doc and
-here, pending either a live special-attack capture or further disassembly of `FUN_1003bac9`'s three callers (state
-transition producers) to identify the real message.
+**Live capture** (`docs/captures/zone_special_burst_fixr_ithaca.rec`, headless `live_walk`, muted, within the 5-minute
+live-session budget): `AOMAC_LIVE_CHAR=Aomacfixr AOMAC_NET_TRACE=<path> AOMAC_LIVE_STEPS='goto=hunt,Q=0.1,wait=5,
+M=0.1,wait=10,goto=hunt,Q=0.1,wait=5,L=0.1,wait=10' cargo test --release -p aomac live_walk -- --ignored --nocapture`
+(`M`/`L` are Aomacfixr's saved keybinds for Burst/Fling, per the existing `arm=burst:1:special,M=0.1,...` recipe in
+this same file's own doc comment). Aomacfixr's rifle landed a real Burst: `CharSecSpecAttackIIR_t` send
+`{target: 1080207, special: 148}` immediately followed by the server's `SpecialAttackInfoIIR_t`
+`{slot: 6, damage: 43, target: 1080207, special: 148}`. **Critically, the SAME capture's own
+`SpecialAttackWeaponIIR_t` re-announcement of Aomacfixr's own list** (sent right after, matching retail's existing
+documented "fight-start re-announce" pattern) **carries only `{100 bare hands, 144 Dimach, 142 Brawl, 1}` -- no 148**.
+Burst is therefore **not** a special-list item for a rifle; it must read the *wielded weapon* directly, exactly
+matching `FUN_1003b947`'s other branch (the `DummyItemBase_t` RTTI cast failing falls through to reading the
+controller's own slot item instead). `combat::arms::special_or_wielded_item` implements this: try the special's own
+list key first (Brawl/Dimach-style `DummyItemBase_t` entries), else the wielded hand (`attack_slots`, Burst/Fling/
+Full Auto).
+
+**Trigger, as ported**: client-predicted like Attack/Reload/Item -- `combat/glue.rs`'s `fight_special` (hotbar/
+action-menu) and `fight_cmd` (keyboard, the path the live capture's own `M` key used) both call
+`Dynels::start_special_bar(own, id)` the moment `combat::module::is_special_id(id)` recognises the id as one of the
+special-attack actions (`Module::special_action`'s own `Command::Special` id set, shared via a single function so
+the two cannot drift). Duration = `(AttackDelay + RechargeDelay) / 100` of `special_or_wielded_item`, no initiative
+scaling (matching Reload's own evidence: `FUN_1003b947`'s refusal check and `FUN_1003d7ce` construction both use the
+raw stat sum, no `GameTime_t`/initiative-slope code in this function either).
 
 The hotbar icon-fader recharge overlay (`CharacterActionIIR_t` action `0x14`, `hud_bar.rs`/`hud_special.rs`, already
 ported before this investigation) is a **separate, additional** indicator -- it existed independently of this
@@ -114,10 +129,17 @@ ported before this investigation) is a **separate, additional** indicator -- it 
   hundredths` / `attack_slots_follow_wielded_hands`: the Attack-bar formula against the tooltip's own fixture.
 * `dynels::tests::attack_and_reload_bars_track_hands_swings_and_fight_state`: the state machine (open on fight
   start, restart on swing, ignore an untracked slot, clear on fight stop) and the exact Reload duration (raw
-  `RechargeDelay`/100, pinned to `5.0` for stat `0xd2 = 500`, no initiative term, no `AttackDelay` sum).
+  `RechargeDelay`/100, pinned to `5.0` for stat `0xd2 = 500`, no initiative term, no `AttackDelay` sum) and the
+  Special bar's fall-through to the wielded weapon for Burst(148), pinned to `10.0` for AttackDelay=RechargeDelay=500.
+* `combat::arms::tests::special_or_wielded_item_falls_back_to_the_weapon`: the special-list-then-wielded-weapon
+  resolution order.
 * `combat::glue::health_tests::captured_fight_drives_the_attack_bar`: replays `docs/captures/zone_fight_ithaca.rec`
   through a real `Module` + `Zone`, checking the Attack bar for the own character's bare hands opens, restarts once
   per own swing and clears on `StopFight`.
+* `combat::glue::health_tests::captured_burst_drives_the_special_bar`: replays the live Burst capture through a real
+  `Zone`, checking the sent `CharSecSpecAttackIIR_t`/received `SpecialAttackInfoIIR_t` special ids match, Burst is
+  confirmed absent from the own special list, and the bar's duration matches the real installed Solar-Powered
+  Assault Rifle's `AttackDelay`+`RechargeDelay` exactly.
 * `hud_stats::tests::combat_timer_bars_stack_and_show_mid_fight`: two Attack bars (dual hands), a Reload bar and a
   real Body-Boost-driven Nano bar, each at a distinct `FindNextFreePos` slot with the retail label text, and an
   offscreen screenshot (`combat-timer-bars.png`).
