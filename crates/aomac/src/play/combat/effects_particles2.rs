@@ -299,7 +299,7 @@ mod tests {
         }
         let out = std::env::var_os("AOMAC_EFFECT_FRAMES")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| "/tmp/FxRest/frames".into());
+            .unwrap_or_else(|| crate::play::prefs::test_dir().join("FxRest/frames"));
         std::fs::create_dir_all(&out)?;
         let mut renderer = Renderer::open(&ao_gui::client_dir())?;
         let mut host = ao_render::Host::headless();

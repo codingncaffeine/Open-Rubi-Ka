@@ -201,7 +201,7 @@ mod tests {
         use super::super::Templates;
         use ao_scene::{Mesh,Submesh,Scene,ActorFrame,TextureKey};
         let templates=Templates::open(&ao_gui::client_dir())?;
-        let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(||"/tmp/FxClasses/frames".into());
+        let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(||crate::play::prefs::test_dir().join("FxClasses/frames"));
         std::fs::create_dir_all(&out)?;
         // Renderer supplies the real material texture; bypass only the located
         // factory, which natively cannot construct this integer-overload class.
@@ -232,7 +232,7 @@ mod tests {
     #[ignore = "installed retail assets and offscreen Metal rendering"]
     fn retail_native2001_frames() -> Result<()> {
         use super::super::{Binding, Renderer};
-        let out = std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(|| "/tmp/FxClasses/frames".into());
+        let out = std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(|| crate::play::prefs::test_dir().join("FxClasses/frames"));
         std::fs::create_dir_all(&out)?;
         let mut renderer = Renderer::open(&ao_gui::client_dir())?;
         let origin = Vec3::new(5000.0, 10.0, 5000.0); let eye = origin + Vec3::new(2.0, 2.0, 5.0);

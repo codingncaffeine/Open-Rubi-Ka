@@ -470,7 +470,7 @@ mod tests {
         use super::super::{Creation,HitLocationRequest};
         let mut renderer=Renderer::open(&ao_gui::client_dir())?;
         let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from)
-            .unwrap_or_else(|| "/tmp/FxClasses/meta-frames".into());
+            .unwrap_or_else(|| crate::play::prefs::test_dir().join("FxClasses/meta-frames"));
         std::fs::create_dir_all(&out)?;
         let source=(50000,1);
         let target=(50000,2);

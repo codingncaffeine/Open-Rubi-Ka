@@ -279,8 +279,7 @@ mod tests {
         if !client.join("cd_image/gui").exists() {
             return None;
         }
-        crate::play::prefs::set_test_dir(std::env::temp_dir().join("aomac-social-hub-prefs"));
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("aomac-social-hub-prefs"));
+        crate::play::prefs::set_test_dir(crate::play::prefs::test_dir());
         let (l, db) = (TextDb::load(&client).ok()?, TextDb::load(&client).ok()?);
         let mut gui = Gui::new(&client, Some(Box::new(move |s: &str| Some(l.label(s)).filter(|r| r != s)))).ok()?;
         let mut c = Chat::new(false);

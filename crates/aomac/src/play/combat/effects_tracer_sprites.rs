@@ -328,7 +328,7 @@ mod tests {
         let mut effect = TracerMesh::new(template, &store, &names, Mat4::IDENTITY, &mut resources, EffectConfig::default()).unwrap();
         assert!(effect.scenes()[0].1.meshes.iter().any(|mesh| !mesh.vertices.is_empty()));
         let models: Vec<_> = effect.scenes().iter().map(|(key, scene)| (u64::from(*key), scene.as_ref().clone())).collect();
-        let out = std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(|| "/tmp/FxRest/frames".into());
+        let out = std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(|| crate::play::prefs::test_dir().join("FxRest/frames"));
         std::fs::create_dir_all(&out).unwrap();
         for frame in 1..=60 {
             assert!(effect.frame(1.0/60.0).unwrap());

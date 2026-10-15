@@ -1839,7 +1839,7 @@ mod tests {
     #[ignore = "retail assets and offscreen Metal rendering"]
     fn retail_effect_frames() {
         let dir = ao_gui::client_dir();
-        let out = std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(|| "/tmp/FxRest/frames".into());
+        let out = std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(|| crate::play::prefs::test_dir().join("FxRest/frames"));
         std::fs::create_dir_all(&out).unwrap();
         let mut renderer = Renderer::open(&dir).unwrap();
         let continuous = renderer.templates.by_id.iter().filter(|(_,t)| t.kind==1005 && t.float(10).is_ok_and(|r| r>0.0)).map(|(&id,_)| id).min().expect("retail continuous flare");

@@ -323,7 +323,7 @@ mod tests {
         let templates = super::super::Templates::open(&dir).unwrap();
         let names = NameTable::load(&store).unwrap();
         let mut resources = HashMap::new();
-        let out = std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(|| "/tmp/FxRest/frames".into());
+        let out = std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(|| crate::play::prefs::test_dir().join("FxRest/frames"));
         std::fs::create_dir_all(&out).unwrap();
         let mut ids: Vec<_> = templates.by_id.iter().filter(|(_, t)| matches!(t.kind,1027|1029)).collect();
         ids.sort_by_key(|(id, _)| **id);

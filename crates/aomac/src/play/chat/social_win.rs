@@ -798,8 +798,7 @@ mod tests {
         if !client.join("cd_image/gui").exists() {
             return None;
         }
-        crate::play::prefs::set_test_dir(std::env::temp_dir().join("aomac-social-test-prefs"));
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("aomac-social-test-prefs"));
+        crate::play::prefs::set_test_dir(crate::play::prefs::test_dir());
         let labels = TextDb::load(&client).ok()?;
         let db = TextDb::load(&client).ok()?;
         let mut gui = Gui::new(&client, Some(Box::new(move |s: &str| Some(labels.label(s)).filter(|r| r != s)))).ok()?;
@@ -810,8 +809,7 @@ mod tests {
     #[test]
     fn social_frames_and_pin_persist_per_character() {
         let Some((mut gui, db)) = rig() else { return };
-        let root = std::env::temp_dir().join("aomac-social-frame-regression");
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::play::prefs::test_dir();
         crate::play::prefs::set_test_dir(&root);
         let character = root.join("Account/Char1");
         let tx = Texts(&db);

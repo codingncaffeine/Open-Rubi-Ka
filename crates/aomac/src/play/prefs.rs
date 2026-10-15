@@ -40,6 +40,42 @@ pub fn dir() -> Option<PathBuf> {
 #[cfg(test)]
 thread_local! { static TEST_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) }; }
 
+#[cfg(test)]
+struct TestDir(PathBuf);
+
+#[cfg(test)]
+impl TestDir {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let path = std::env::temp_dir().join(format!("aomac-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("cannot create test directory {}: {e}", path.display()),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+thread_local! { static TEST_SCRATCH: TestDir = TestDir::new(); }
+
+/// Lazily created scratch directory unique to this process and test thread; removed when the thread exits.
+/// Use [`set_test_dir`] to route preferences here without replacing an explicit override.
+#[cfg(test)]
+pub fn test_dir() -> PathBuf {
+    TEST_SCRATCH.with(|d| d.0.clone())
+}
+
 /// Test scratch directory, isolated to the current test thread without mutating the process environment.
 #[cfg(test)]
 pub fn set_test_dir(d: impl Into<PathBuf>) {
@@ -144,24 +180,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parallel_test_directories_leave_native_environment_unchanged() {
+    fn parallel_test_directories_are_stable_and_cleaned_without_changing_native_environment() {
         let before = std::env::var_os("AOMAC_PREFS_DIR");
-        let start = std::sync::Barrier::new(4);
-        std::thread::scope(|scope| {
-            for i in 0..4 {
+        let start = std::sync::Barrier::new(2);
+        let paths = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2).map(|_| {
                 let before = &before;
                 let start = &start;
                 scope.spawn(move || {
-                    let scratch = std::env::temp_dir().join(format!("aomac-prefs-isolation-{i}"));
+                    let scratch = test_dir();
+                    set_test_dir(&scratch);
+                    std::fs::write(scratch.join("owned"), b"cleanup regression").unwrap();
                     start.wait();
-                    for _ in 0..100 {
-                        set_test_dir(&scratch);
-                        assert_eq!(dir(), Some(scratch.clone()));
-                        assert_eq!(std::env::var_os("AOMAC_PREFS_DIR"), *before);
-                    }
-                });
-            }
+                    assert_eq!(test_dir(), scratch);
+                    assert_eq!(dir(), Some(scratch.clone()));
+                    assert_eq!(std::env::var_os("AOMAC_PREFS_DIR"), *before);
+                    scratch
+                })
+            }).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
         });
+        assert_ne!(paths[0], paths[1]);
+        assert!(paths.iter().all(|path| !path.exists()), "thread exit must remove its scratch directory and contents");
     }
 
     /// Naming/folder regression: a fresh folder gets created, names count up `scrn0000.png`, `scrn0001.png`, ...
@@ -169,8 +209,7 @@ mod tests {
     /// `stat64i32` check) is skipped rather than overwritten.
     #[test]
     fn screenshot_path_creates_the_folder_and_counts_up_skipping_existing_files() {
-        let scratch = std::env::temp_dir().join(format!("aomac-screenshot-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&scratch);
+        let scratch = test_dir();
         set_test_dir(&scratch);
         reset_screenshot_counter();
         let first = next_screenshot_path().unwrap();
@@ -180,7 +219,6 @@ mod tests {
         std::fs::write(scratch.join("Screenshots/scrn0001.png"), b"existing capture").unwrap();
         let next = next_screenshot_path().unwrap();
         assert_eq!(next, scratch.join("Screenshots/scrn0002.png"), "must skip past files already on disk, never overwrite");
-        std::fs::remove_dir_all(&scratch).unwrap();
     }
 }
 

@@ -215,7 +215,7 @@ mod tests {
     #[test]
     #[ignore="installed retail assets and offscreen Metal rendering"]
     fn retail_vein3014_frames()->Result<()> {
-        let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(||"/tmp/FxClasses/frames".into());std::fs::create_dir_all(&out)?;
+        let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(||crate::play::prefs::test_dir().join("FxClasses/frames"));std::fs::create_dir_all(&out)?;
         let mut renderer=Renderer::open(&ao_gui::client_dir())?;
         let origin=Vec3::new(5000.0,10.0,5000.0);
         let mut host=ao_render::Host::headless();

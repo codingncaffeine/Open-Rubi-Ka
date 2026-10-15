@@ -251,7 +251,7 @@ mod tests {
         let names = NameTable::load(&store)?;
         let templates = super::super::Templates::open(&dir)?;
         let out = std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from)
-            .unwrap_or_else(|| "/tmp/FxClasses/special-frames".into());
+            .unwrap_or_else(|| crate::play::prefs::test_dir().join("FxClasses/special-frames"));
         std::fs::create_dir_all(&out)?;
         let mut resources = std::collections::HashMap::new();
         for id in [2693,2694] {

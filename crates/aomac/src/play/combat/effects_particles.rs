@@ -226,7 +226,7 @@ mod tests {
     #[ignore="installed retail assets and offscreen Metal rendering"]
     fn retail_class3020_frames() {
         use super::super::{Binding,Creation,Renderer};
-        let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(||"/tmp/FxRest/frames".into());
+        let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(||crate::play::prefs::test_dir().join("FxRest/frames"));
         std::fs::create_dir_all(&out).unwrap();
         let mut renderer=Renderer::open(&ao_gui::client_dir()).unwrap();
         let origin=Vec3::new(5000.0,10.0,5000.0);

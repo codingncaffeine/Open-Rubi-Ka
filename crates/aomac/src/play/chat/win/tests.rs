@@ -87,7 +87,6 @@ fn shipped_template_parses() {
 #[test]
 fn chat_documents_are_character_local_and_legacy_customizations_survive_once() {
     let root = test_dir().join("character-local");
-    let _ = std::fs::remove_dir_all(&root);
     let first = root.join("Account/Char1");
     let second = root.join("Account/Char2");
     let legacy = root.join("Chat/Windows/Window1");
@@ -124,17 +123,12 @@ fn frames_are_placed_inside_the_screen() {
     assert_eq!(place(Some([100.0, 100.0, 1799.0, 199.0]), (1280, 828)), (0, 100, 1700, 100));
 }
 
-/// `ChatWindows::new` reads the prefs dir from the process environment: serialise the set + open.
-static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// A prefs dir private to the running test.
 fn test_dir() -> PathBuf {
-    let t = std::thread::current();
-    std::env::temp_dir().join(format!("aomac-chatgui-{}", t.name().unwrap_or("t").replace("::", "-")))
+    crate::play::prefs::test_dir()
 }
 
 fn open_in(gui: &mut Gui, dir: &Path, screen: (u32, u32)) -> ChatWindows {
-    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
     crate::play::prefs::set_test_dir(dir);
     ChatWindows::new(gui, screen).unwrap()
 }
@@ -146,7 +140,6 @@ fn rig(screen: (u32, u32)) -> Option<(Gui, ChatWindows)> {
         return None;
     }
     let dir = test_dir();
-    let _ = std::fs::remove_dir_all(&dir);
     write_interaction_windows(&client, &dir, screen);
     let mut gui = Gui::new(&client, None).unwrap();
     let ch = open_in(&mut gui, &dir, screen);
@@ -172,7 +165,6 @@ fn fresh_characters_start_framed_tabbed_with_input_and_can_switch_modes() {
         return eprintln!("skipping: no client");
     }
     let root = test_dir();
-    let _ = std::fs::remove_dir_all(&root);
     crate::play::prefs::set_test_dir(&root);
     let character = root.join("Account/Char1");
     let mut gui = Gui::new(&client, None).unwrap();
@@ -333,8 +325,7 @@ fn chat_win_shot() {
     if !client.join("cd_image/gui").exists() {
         return eprintln!("skipping: no client");
     }
-    crate::play::prefs::set_test_dir(std::env::temp_dir().join("aomac-chatgui-shot-prefs"));
-    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("aomac-chatgui-shot-prefs"));
+    crate::play::prefs::set_test_dir(test_dir());
     let labels = TextDb::load(&client).unwrap();
     let mut gui = Gui::new(&client, Some(Box::new(move |s: &str| Some(labels.label(s)).filter(|r| r != s)))).unwrap();
     let mut zone = Zone::default();
@@ -593,7 +584,6 @@ fn chat_frame_shot() {
     let labels = TextDb::load(&client).unwrap();
     let mut gui = Gui::new(&client, Some(Box::new(move |s: &str| Some(labels.label(s)).filter(|r| r != s)))).unwrap();
     let dir = test_dir();
-    let _ = std::fs::remove_dir_all(&dir);
     write_interaction_windows(&client, &dir, size);
     let mut ch = open_in(&mut gui, &dir, size);
     sample(&mut gui, &mut ch);

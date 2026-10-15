@@ -1257,8 +1257,7 @@ mod tests {
         if !client.join("cd_image/gui").exists() {
             return;
         }
-        let dir = std::env::temp_dir().join("aomac_chat_keys");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::play::prefs::test_dir();
         super::super::prefs::set_test_dir(&dir);
         let mut gui = Gui::new(&client, None).unwrap();
         let mut c = Chat::new(false);

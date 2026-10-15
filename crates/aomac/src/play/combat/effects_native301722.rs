@@ -293,7 +293,7 @@ mod tests {
     #[ignore="installed retail assets and offscreen Metal rendering"]
     fn authored_native3017_3022_frames() {
         use super::super::{Binding,Renderer};
-        let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(||"/tmp/FxClasses/frames".into());
+        let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(||crate::play::prefs::test_dir().join("FxClasses/frames"));
         std::fs::create_dir_all(&out).unwrap();
         let mut renderer=Renderer::open(&ao_gui::client_dir()).unwrap();
         let mut ids:Vec<_>=renderer.templates.by_id.iter().filter(|(_,t)|matches!(t.kind,3017|3022)).map(|(&id,_)|id).collect();ids.sort_unstable();

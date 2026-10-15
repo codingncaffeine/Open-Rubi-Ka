@@ -184,7 +184,7 @@ mod tests {
     fn retail_legacy303x_frames()->Result<()> {
         use ao_scene::{ActorFrame,Mesh,Scene,Submesh,TextureKey};
         let renderer=Renderer::open(&ao_gui::client_dir())?;
-        let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(||"/tmp/FxClasses/frames".into());
+        let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(||crate::play::prefs::test_dir().join("FxClasses/frames"));
         std::fs::create_dir_all(&out)?;
         let origin=Vec3::new(5000.0,10.0,5000.0);let eye=origin+Vec3::new(8.0,6.0,12.0);
         for (&id,t) in renderer.templates.by_id.iter().filter(|(_,t)|matches!(t.kind,3033|3035)) {

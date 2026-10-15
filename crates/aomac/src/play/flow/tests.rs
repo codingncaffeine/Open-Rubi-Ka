@@ -315,7 +315,7 @@ fn rig() -> Option<Rig> {
         eprintln!("skipping: no client at {}", dir.display());
         return None;
     }
-    let scratch = std::env::temp_dir().join(format!("aomac-play-test-{}", std::process::id()));
+    let scratch = crate::play::prefs::test_dir();
     crate::play::prefs::set_test_dir(&scratch);
     let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = l.local_addr().unwrap().port();
@@ -1459,11 +1459,11 @@ fn dropping_play_without_explicit_shutdown_still_saves_the_viewer_cache() {
             _ => None,
         }
     }).next().expect("captured own update");
-    const CHAR_ID: u32 = 0x5a11ee; // distinct from every other test sharing this process's scratch prefs dir
+    const CHAR_ID: u32 = 0x5a11ee;
     r.p.zone.char_id = CHAR_ID;
     r.p.zone.own_update = Some(Box::new(u.clone()));
     drop(r.p); // no explicit save_viewer_cache()/show_login() call: only `Drop` can save it
-    let scratch = std::env::temp_dir().join(format!("aomac-play-test-{}", std::process::id()));
+    let scratch = crate::play::prefs::test_dir();
     let cache = ao_formats::character::ViewerCache::load(&scratch);
     let saved = cache.0.get(&(CHAR_ID as i32)).expect("Play::drop must have saved the viewer cache entry");
     assert_eq!(saved.head_mesh() as i32, u.head_mesh.unwrap_or(saved.head_mesh() as i32), "the saved entry must reflect the live update's appearance");

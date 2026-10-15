@@ -306,7 +306,7 @@ fn slider_drag_writes_the_value_and_shows_it_formatted() {
 #[test]
 fn settings_survive_a_restart() {
     let Some(mut r) = Rig::new() else { return };
-    let tmp = std::env::temp_dir().join("aomac-options-persist");
+    let tmp = crate::play::prefs::test_dir().join("aomac-options-persist");
     let _ = std::fs::remove_dir_all(&tmp);
     r.d.open_user(&tmp, "acct", 7);
     let c = r.show("cc_compass");
@@ -793,7 +793,7 @@ fn enhanced_page_options_default_to_retail_and_persist_across_a_restart() {
     assert_eq!(r.d.get("AomacWidescreenFOV"), Some(&super::super::dvalue::Variant::Bool(false)), "default must be off, matching retail's fixed 90 degree FOV");
     assert_eq!(r.d.get("AomacSceneryDistance"), Some(&super::super::dvalue::Variant::Float(1.0)), "default must be 1.0x, matching retail's ViewDistance far plane");
     assert_eq!(r.d.get("AomacSmoothText"), Some(&super::super::dvalue::Variant::Bool(false)), "default must be off, matching retail's hinted 1-bit bitmap");
-    let tmp = std::env::temp_dir().join("aomac-enhanced-options-persist");
+    let tmp = crate::play::prefs::test_dir().join("aomac-enhanced-options-persist");
     let _ = std::fs::remove_dir_all(&tmp);
     r.d.open_user(&tmp, "acct", 7);
     let g = r.show("AomacTextureSharpening");
