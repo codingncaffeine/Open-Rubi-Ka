@@ -478,7 +478,7 @@ It is not the earlier south-facing beach view or a recovered retail capture.
   Material loading`100601dc` uses four full separate PNGs, no atlas.
   These seam vertices are interior grid33/43/34, not the authored border.
   No invented UV remap or alpha fade is added.
-  **Retail would clip identically under the same far and cloud state**:
+  **[INFERENCE] Retail would clip identically under the same far and cloud state**:
   projection and cloud scale read the same camera+b8
   (`1004b183→1002ab22`, `10054e7e..8a`), CLIPPING136 is true, and
   `10054e07` draws raw XYZ with flags0. Final native ZENABLE is1 or2,
@@ -491,8 +491,8 @@ It is not the earlier south-facing beach view or a recovered retail capture.
   At saved ViewDistance0.8, native and port far are800; increasing
   ViewDistance scales the sky and clipping range together. Corrected
   tilt moves the cut16.38–18.73 pixels down; the straight band remains.
-* **Exercised follow-up verification:** release workspace1908 passed,
-  0 failed,61 ignored across39 suite summaries; strict release
+* **Exercised follow-up verification:** final rebased release workspace1933 passed,
+  0 failed,62 ignored across40 suite summaries; strict release
   workspace/all-target Clippy with `-D warnings` passed. Headless matched
   before/after frames, layer/cumulative/omit/dry captures, three ordinary
   far settings and the fixed-geometry projection-only GPU proof are retained
